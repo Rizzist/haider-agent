@@ -100,10 +100,27 @@ pub(crate) struct DelegationHandle {
 pub(crate) struct StallDeadlineTestClock {
     now_ms: AtomicU64,
     checked: Mutex<(u64, u64)>,
+    parked_checks: Mutex<(u64, u64)>,
+    wait_clock_origin: Option<tokio::time::Instant>,
 }
 
 #[cfg(all(test, unix))]
 impl StallDeadlineTestClock {
+    /// Anchor the fixture's persisted wait budget to paused Tokio time.
+    /// Stall time stays frozen while the test exercises only the absolute wait.
+    pub(crate) fn for_paused_wait_deadline() -> Self {
+        Self {
+            wait_clock_origin: Some(tokio::time::Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn wait_elapsed_ms(&self) -> Option<u64> {
+        self.wait_clock_origin.map(|origin| {
+            duration_millis(tokio::time::Instant::now().saturating_duration_since(origin))
+        })
+    }
+
     pub(crate) fn set_now_ms(&self, now_ms: u64) {
         self.now_ms.store(now_ms, Ordering::SeqCst);
     }
@@ -117,6 +134,31 @@ impl StallDeadlineTestClock {
             checked.1
         } else {
             0
+        }
+    }
+
+    pub(crate) fn parked_checks_at(&self, expected_ms: u64) -> u64 {
+        let checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == expected_ms {
+            checked.1
+        } else {
+            0
+        }
+    }
+
+    fn observe_park(&self) {
+        let now_ms = self.now_ms.load(Ordering::SeqCst);
+        let mut checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == now_ms {
+            checked.1 = checked.1.saturating_add(1);
+        } else {
+            *checked = (now_ms, 1);
         }
     }
 
@@ -334,15 +376,31 @@ impl DelegationHandle {
         stall_deadline: Duration,
         stall_deadline_clock: Arc<StallDeadlineTestClock>,
     ) -> Self {
-        Self {
-            #[cfg(test)]
-            establishment_fault: false,
+        Self::with_wait_budgets_and_stall_clock(
             hub,
             stall_deadline,
-            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
-            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
-            stall_deadline_clock: Some(stall_deadline_clock),
-        }
+            CHILD_RUN_WAIT_TIMEOUT,
+            CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            stall_deadline_clock,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_wait_budgets_and_stall_clock(
+        hub: SessionHub,
+        stall_deadline: Duration,
+        run_wait_timeout: Duration,
+        settlement_tail_timeout: Duration,
+        stall_deadline_clock: Arc<StallDeadlineTestClock>,
+    ) -> Self {
+        let mut handle = Self::with_wait_budgets(
+            hub,
+            stall_deadline,
+            run_wait_timeout,
+            settlement_tail_timeout,
+        );
+        handle.stall_deadline_clock = Some(stall_deadline_clock);
+        handle
     }
 
     #[cfg(test)]
@@ -424,6 +482,10 @@ impl DelegationHandle {
             .map(|view| view.providers)
             .unwrap_or_default();
         let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let explicit_provider = request
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty());
         Ok(authority
             .resolve_child_selector(
                 &parent.provider,
@@ -431,11 +493,35 @@ impl DelegationHandle {
                 request.model.as_deref(),
                 request.provider.as_deref(),
             )
-            .map(|(provider, model)| {
+            .and_then(|(provider, model)| {
                 let mut child = parent.clone();
-                if child.provider != provider {
-                    // A child that explicitly chooses another provider starts
-                    // under that provider's own account and endpoint.
+                if explicit_provider || child.provider != provider || child.model != model {
+                    let validated = authority.validate_selection_with_status(
+                        &parent.provider,
+                        Some(&provider),
+                        &model,
+                    )?;
+                    let budget =
+                        haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                            parent.max_tokens_source,
+                            parent.max_tokens,
+                        )
+                        .apply(
+                            validated.max_output_tokens,
+                            validated.explicit_max_output_tokens,
+                        );
+                    child.max_tokens = budget.max_tokens;
+                    child.max_tokens_source = Some(budget.source);
+                    // This is the child's own explicit selection, rather than
+                    // inheritance of an already-started parent's provenance.
+                    child.selection_epoch = Some(0);
+                    child.route_reset_epoch = Some(0);
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
+                }
+                if explicit_provider || child.provider != provider {
+                    // An explicit provider pick starts under that provider's
+                    // own account and endpoint, even when the pair is unchanged.
                     child.account_alias = None;
                     child.provider_base_url = None;
                     child.provider_rebind_id = None;
@@ -444,7 +530,7 @@ impl DelegationHandle {
                 }
                 child.provider = provider;
                 child.model = model;
-                child
+                Ok(child)
             }))
     }
 
@@ -453,7 +539,7 @@ impl DelegationHandle {
     /// `AgentSpawn` outcome before [`Self::launch`] crosses that boundary.
     pub(crate) async fn establish(
         &self,
-        coordinates: SpawnCoordinates,
+        mut coordinates: SpawnCoordinates,
         request: SpawnSubagent,
     ) -> Result<EstablishedSpawn, HaiderError> {
         let (public_headless, direct_operator_spawn) =
@@ -487,6 +573,81 @@ impl DelegationHandle {
         let lease = LeaseId::new(format!("lease-child-{identity}"));
         let callsign = callsign_from_identity(&identity);
         let existing_spawn = self.hub.delegation(agent_id.clone()).await?;
+        // A retry uses the child admission that was actually committed. A
+        // catalog edit may re-derive a different effective budget, and older
+        // receipts omit max_tokens_source altogether. Neither is a caller
+        // change. Compare caller intent and the other coordinates below.
+        let original_admission = self
+            .hub
+            .child_create_admission(
+                format!("delegation-session-{identity}"),
+                child_session_id.clone(),
+                coordinates.parent_session_id.clone(),
+            )
+            .await?;
+        if existing_spawn.is_some() && original_admission.is_none() {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "established child has no creation admission",
+                false,
+            ));
+        }
+        if let Some((original, admitted)) = original_admission {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            let old_max = old
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "child creation admission has no output budget",
+                        false,
+                    )
+                })?;
+            if haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                coordinates.metadata.max_tokens_source,
+                coordinates.metadata.max_tokens,
+            ) != haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                admitted.max_tokens_source,
+                admitted.max_tokens,
+            ) {
+                return Err(workflow_rejection(
+                    "changed_child_budget",
+                    "child budget intent differs from its durable admission",
+                ));
+            }
+            coordinates.metadata.max_tokens = old_max;
+            // Old explicit same-provider selectors retained the parent's
+            // route. Clearing now applies to new child admissions; an
+            // unchanged retry keeps the Store-proven original route, from
+            // its digest, frozen reply or creation-bounded parent history.
+            // ce9d0976 also wrote current-schema receipts with the retained
+            // route. Restore only a route identical to the frozen reply;
+            // the Store still compares the complete replay body strictly.
+            let recorded_route_matches = [
+                ("inherited_account_alias", &admitted.account_alias),
+                ("inherited_provider_base_url", &admitted.provider_base_url),
+                ("inherited_provider_rebind_id", &admitted.provider_rebind_id),
+            ]
+            .into_iter()
+            .all(|(key, value)| old.get(key) == Some(&serde_json::json!(value)));
+            if (old.get("inheritance_parent_session_id").is_none() || recorded_route_matches)
+                && request
+                    .provider
+                    .as_deref()
+                    .is_some_and(|provider| provider.trim() == admitted.provider)
+                && coordinates.metadata.provider == admitted.provider
+                && coordinates.metadata.model == admitted.model
+                && coordinates.metadata.account_alias.is_none()
+                && coordinates.metadata.provider_base_url.is_none()
+                && coordinates.metadata.provider_rebind_id.is_none()
+            {
+                coordinates.metadata.account_alias = admitted.account_alias;
+                coordinates.metadata.provider_base_url = admitted.provider_base_url;
+                coordinates.metadata.provider_rebind_id = admitted.provider_rebind_id;
+            }
+        }
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -671,6 +832,43 @@ impl DelegationHandle {
             "lockdown": child_lockdown,
             "auto_hermetic": coordinates.auto_hermetic,
         });
+        if request.model.is_some()
+            && let Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested,
+            }) = coordinates.metadata.max_tokens_source
+            && requested > coordinates.metadata.max_tokens
+        {
+            // A model-selected child has no CLI response. Publish the same
+            // typed clamp notice in its durable spawn fact for observers.
+            manifest_coordinates["output_budget"] =
+                serde_json::json!(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                    max_tokens: coordinates.metadata.max_tokens,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested,
+                    },
+                    clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                        requested,
+                        max_output_tokens: coordinates.metadata.max_tokens,
+                    }),
+                });
+        }
+        if let Some(existing) = &existing_spawn {
+            // A display coordinate introduced after the original spawn is
+            // not part of the caller's retry semantics.
+            match existing
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|value| value.get("output_budget"))
+            {
+                Some(budget) => manifest_coordinates["output_budget"] = budget.clone(),
+                None => {
+                    if let Some(fields) = manifest_coordinates.as_object_mut() {
+                        fields.remove("output_budget");
+                    }
+                }
+            }
+        }
         // Display identity is not new retry semantics. Reuse the first
         // durable value (including legacy absence) after a registry edit;
         // grants/CLI scope still undergo the existing semantics check.
@@ -723,9 +921,11 @@ impl DelegationHandle {
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
+            // The durable child already owns its original fence. A daemon
+            // restart advances the worker generation but does not turn the
+            // same child-establishment retry into a new delegation.
             fencing_epoch: existing_spawn
                 .as_ref()
-                .filter(|_| direct_operator_spawn)
                 .map_or(self.hub.worker_generation(), |record| {
                     record.manifest.fencing_epoch
                 }),
@@ -765,7 +965,7 @@ impl DelegationHandle {
         } else {
             haider_protocol::session::SessionInteractionModeV1::Interactive
         };
-        let create_json = serde_json::to_string(&serde_json::json!({
+        let create_value = serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
@@ -783,14 +983,15 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
-            // Needed only to reconstruct the implicit inheritance of a
-            // pre-route-digest receipt, from durable history at create time.
             "inheritance_parent_session_id": coordinates.parent_session_id,
             "inherited_account_alias": coordinates.metadata.account_alias,
             "inherited_provider_base_url": coordinates.metadata.provider_base_url,
             "inherited_provider_rebind_id": coordinates.metadata.provider_rebind_id,
-        }))
-        .map_err(internal_serialization)?;
+        });
+        // Store owns the one legacy digest-equivalence rule. Its historical
+        // route witness and frozen response validate additions without changing
+        // the original receipt; the effective budget above stays admitted.
+        let create_json = serde_json::to_string(&create_value).map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
         self.hub
             .create_internal_session_with_interaction_mode(
@@ -977,7 +1178,32 @@ impl DelegationHandle {
                 fields.remove("worker_generation");
             }
         }
-        let turn_json = serde_json::to_string(&turn_value).map_err(internal_serialization)?;
+        let original_turn = self
+            .hub
+            .child_turn_admission(
+                format!("delegation-turn-{identity}"),
+                record.child_session_id.clone(),
+            )
+            .await?;
+        let replaying_turn = original_turn.is_some();
+        let turn_json = if let Some(original) = original_turn {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            if let Some(generation) = old.get("worker_generation") {
+                turn_value["worker_generation"] = generation.clone();
+            } else if let Some(fields) = turn_value.as_object_mut() {
+                fields.remove("worker_generation");
+            }
+            if turn_value != old {
+                return Err(workflow_rejection(
+                    "changed_child_turn",
+                    "child first-turn coordinates differ from the durable admission",
+                ));
+            }
+            original
+        } else {
+            serde_json::to_string(&turn_value).map_err(internal_serialization)?
+        };
         let mut accepted = self
             .hub
             .accept_internal_turn(TurnAcceptCommand {
@@ -998,7 +1224,7 @@ impl DelegationHandle {
                 device_id: self.hub.device_id(),
             })
             .await?;
-        if direct_operator_spawn {
+        if direct_operator_spawn || replaying_turn {
             accepted.worker_generation = self.hub.worker_generation();
         }
         Ok(EstablishedSpawn {
@@ -1317,12 +1543,18 @@ impl DelegationHandle {
                         _ => {}
                     }
                 }
+                #[cfg(all(test, unix))]
+                if progress.human_required
+                    && let Some(clock) = &self.stall_deadline_clock
+                {
+                    clock.observe_park();
+                }
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
                         return Ok(ChildWaitWake::ParentCancelled(record));
                     }
-                    () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+                    () = self.wait_for_collection_poll() => {}
                 }
             }
         };
@@ -1428,9 +1660,16 @@ impl DelegationHandle {
         // from the journal instead of restarting a relative timer.
         let now = tokio::time::Instant::now();
         let started_at_ms = self.parent_run_started_at_ms(record).await?;
+        let now_ms = unix_time_ms();
+        #[cfg(all(test, unix))]
+        let now_ms = self
+            .stall_deadline_clock
+            .as_ref()
+            .and_then(|clock| clock.wait_elapsed_ms())
+            .map_or(now_ms, |elapsed| started_at_ms.saturating_add(elapsed));
         let deadline = anchored_child_wait_deadline(
             now,
-            unix_time_ms(),
+            now_ms,
             started_at_ms,
             self.run_wait_timeout,
             run_deadline,
@@ -2740,11 +2979,11 @@ impl DelegationHandle {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) async fn terminal_mirror_times_out_for_test(
+    pub(crate) async fn terminal_mirror_timeout_for_test(
         &self,
         record: &DelegationRecord,
         limit: Duration,
-    ) -> Result<bool, HaiderError> {
+    ) -> Result<Option<haider_platform::WaitTimeout>, HaiderError> {
         let ticket = DeferredTicket {
             id: record.agent_id.as_str().to_owned(),
             manifest: record.manifest.clone(),
@@ -2755,7 +2994,10 @@ impl DelegationHandle {
         mirror.emit_projections = false;
         self.mirror_until_child_terminal(record, &mut mirror, tokio::time::Instant::now() + limit)
             .await
-            .map(|outcome| matches!(outcome, ChildSettlementOutcome::TerminalTimedOut(_)))
+            .map(|outcome| match outcome {
+                ChildSettlementOutcome::TerminalTimedOut(timeout) => Some(timeout),
+                _ => None,
+            })
     }
 
     async fn mirror_child_chip_states(
@@ -3214,6 +3456,21 @@ impl DelegationHandle {
             "test_crash_window",
         )
         .await
+    }
+
+    async fn wait_for_collection_poll(&self) {
+        // The paused fixture keeps policy time fixed during native store I/O.
+        // Poll its actual collector without consuming that deadline clock.
+        #[cfg(all(test, unix))]
+        if self
+            .stall_deadline_clock
+            .as_ref()
+            .is_some_and(|clock| clock.wait_elapsed_ms().is_some())
+        {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
     }
 
     async fn stall_cancel_requested(&self, record: &DelegationRecord) -> Result<bool, HaiderError> {

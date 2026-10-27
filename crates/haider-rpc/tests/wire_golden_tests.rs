@@ -934,6 +934,7 @@ fn shell_registry_events_are_additive_and_golden() {
             profile: "prod".into(),
         },
         status: haider_rpc::ShellStatusWire::Starting,
+        setup_error: None,
         title: "prod: tests".into(),
         cwd_or_host: "prod.example.invalid".into(),
         created_at_ms: 10,
@@ -947,6 +948,7 @@ fn shell_registry_events_are_additive_and_golden() {
         WireFrame::ShellState {
             shell: haider_rpc::ShellWire {
                 status: haider_rpc::ShellStatusWire::Running,
+                setup_error: None,
                 ..base.clone()
             },
         },
@@ -2196,6 +2198,66 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     assert!(daemon_version.is_empty());
     assert!(features.is_empty());
     assert!(!user_command_withheld);
+}
+
+#[test]
+fn activity_request_hello_decodes_with_released_daemon_shape() {
+    #[derive(Deserialize)]
+    struct OldHello {
+        v: u32,
+        kind: String,
+        protocol_min: u32,
+        protocol_max: u32,
+        client_name: String,
+        client_version: String,
+        client_instance_id: String,
+        client_kind: haider_rpc::ClientKind,
+        capabilities_requested: haider_rpc::CapabilitySet,
+        max_receive_frame: u32,
+        encodings: Vec<String>,
+    }
+    let frame = WireFrame::Hello(Hello {
+        protocol_min: 1,
+        protocol_max: 1,
+        client_name: "new-client".into(),
+        client_version: "0.0.973".into(),
+        client_instance_id: "client-1".into(),
+        client_kind: haider_rpc::ClientKind::Tui,
+        capabilities_requested: [haider_rpc::Capability::View].into_iter().collect(),
+        features_requested: [haider_rpc::FEATURE_SESSION_ACTIVITY_V1.to_owned()]
+            .into_iter()
+            .collect(),
+        max_receive_frame: 1_048_576,
+        encodings: vec!["json".into()],
+    });
+    for encoding in [
+        haider_rpc::WireEncoding::Json,
+        haider_rpc::WireEncoding::MessagePack,
+    ] {
+        let bytes = uds_codec::encode_with(&frame, 1_048_576, encoding).expect("new Hello encodes");
+        let old: OldHello = match encoding {
+            haider_rpc::WireEncoding::Json => {
+                serde_json::from_slice(&bytes[4..]).expect("old JSON Hello")
+            }
+            haider_rpc::WireEncoding::MessagePack => {
+                rmp_serde::from_slice(&bytes[4..]).expect("old MessagePack Hello")
+            }
+        };
+        assert_eq!(
+            (old.v, old.kind.as_str(), old.protocol_min, old.protocol_max),
+            (1, "hello", 1, 1)
+        );
+        assert_eq!(old.client_name, "new-client");
+        assert_eq!(old.client_version, "0.0.973");
+        assert_eq!(old.client_instance_id, "client-1");
+        assert_eq!(old.client_kind, haider_rpc::ClientKind::Tui);
+        assert!(
+            old.capabilities_requested
+                .contains(&haider_rpc::Capability::View)
+        );
+        assert_eq!(old.max_receive_frame, 1_048_576);
+        assert_eq!(old.encodings, vec!["json".to_owned()]);
+    }
 }
 
 /// MUTATION CHECK: make `permission_overrides` required or default either
@@ -4189,6 +4251,62 @@ fn session_select_model_output_budget_fields_are_golden() {
     assert_eq!(
         serde_json::from_str::<WireFrame>(&encoded).expect("decode budget response"),
         response
+    );
+}
+
+#[test]
+fn session_provider_rebind_output_budget_is_additive_and_golden() {
+    use haider_rpc::haider_protocol::output_budget::{
+        OutputBudgetClampV1, SessionOutputBudgetSourceV1, SessionOutputBudgetV1,
+    };
+    let old = r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7}"#;
+    let decoded: ResponseBody = serde_json::from_str(old).expect("older response decodes");
+    assert!(matches!(
+        decoded,
+        ResponseBody::SessionProviderRebind {
+            output_budget: None,
+            active_output_budget: None,
+            ..
+        }
+    ));
+    let body = ResponseBody::SessionProviderRebind {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        provider: "haider-code".into(),
+        base_url: None,
+        account: None,
+        selected_seq: 43,
+        worker_generation: 7,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 8_192,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: Some(OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 8_192,
+            }),
+        }),
+        active_output_budget: Some(
+            haider_rpc::haider_protocol::session::ActiveRunOutputBudgetV1 {
+                run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+                model: "active-small".into(),
+                budget: SessionOutputBudgetV1 {
+                    max_tokens: 8_192,
+                    source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+                    clamped: Some(OutputBudgetClampV1 {
+                        requested: 20_000,
+                        max_output_tokens: 8_192,
+                    }),
+                },
+            },
+        ),
+    };
+    let encoded = serde_json::to_string(&body).expect("encode new response");
+    assert_eq!(
+        encoded,
+        r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}},"active_output_budget":{"run_id":"run-1","model":"active-small","budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}}}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ResponseBody>(&encoded).expect("decode new response"),
+        body
     );
 }
 
@@ -6398,4 +6516,35 @@ fn android_shell_capability_is_additive_and_round_trips_over_uds() {
     let batch = uds_codec::Decoder::new(TEST_FRAME_LIMIT).push(&bytes);
     assert!(batch.error.is_none());
     assert_eq!(batch.frames, vec![frame]);
+}
+
+#[test]
+fn shell_setup_errors_are_additive_and_roundtrip_in_both_codecs() {
+    let legacy = serde_json::json!({
+        "id": "fixture", "kind": {"kind": "ssh", "profile": "fixture"},
+        "status": {"status": "exited"}, "title": "fixture", "cwd_or_host": "127.0.0.1",
+        "created_at_ms": 0, "last_activity_ms": 0, "bytes_out": 0
+    });
+    let mut shell: haider_rpc::ShellWire =
+        serde_json::from_value(legacy.clone()).expect("old shell shape");
+    assert!(shell.setup_error.is_none());
+    assert_eq!(
+        serde_json::to_value(&shell).expect("unchanged old shape"),
+        legacy
+    );
+    shell.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+        code: "ssh_connection_failed".into(),
+        message: "synthetic refusal".into(),
+        retryable: true,
+    });
+    let json = serde_json::to_vec(&shell).expect("JSON");
+    let msgpack = rmp_serde::to_vec_named(&shell).expect("MessagePack");
+    assert_eq!(
+        serde_json::from_slice::<haider_rpc::ShellWire>(&json).expect("JSON decode"),
+        shell
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<haider_rpc::ShellWire>(&msgpack).expect("MessagePack decode"),
+        shell
+    );
 }

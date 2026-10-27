@@ -545,6 +545,68 @@ def run_harness(
     resource_baseline: dict[str, dict[str, float]] | None = None,
     commit_label: str | None = None,
 ) -> dict[str, Any]:
+    """Measure with phases off; requested attribution uses its own short run.
+
+    Diagnostic samples never contribute to the wall/CPU/RSS adjudication.
+    A fresh daemon bounds attribution independently of the measurement length.
+    """
+    report = _run_warm_harness(
+        bin_dir, warmups=warmups, measured=measured, load_limit=load_limit,
+        trace=trace, phases=False, keep_root=keep_root, budget_ms=budget_ms,
+        resource_baseline=resource_baseline, commit_label=commit_label,
+    )
+    report["attribution"] = {"status": "not_requested"}
+    if phases:
+        diagnostic = _run_warm_harness(
+            bin_dir, warmups=1, measured=1, load_limit=load_limit,
+            trace=trace, phases=True, keep_root=keep_root, commit_label=commit_label,
+        )
+        report["attribution"] = {
+            **diagnostic["phase_trace"],
+            "mode": "separate_short_run",
+            "report": diagnostic,
+        }
+        # Product correctness failures in a diagnostic are still failures;
+        # its load/sample pins and trace capacity never adjudicate wall timing.
+        report["correctness_failures"].extend(diagnostic["correctness_failures"])
+        report["failures"] = report["correctness_failures"] + report["budget_failures"]
+        report["passed"] = report["measurement_accepted"] and not report["failures"]
+    return report
+
+
+def _attribute_warm_rows(phase_dir: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        phase_records, phase_pids = attribution.read_records(phase_dir)
+        maps = [attribution.partition(
+            phase_records, **row["phase_boundary"], available_pids=phase_pids,
+        ) for row in rows]
+    except attribution.PhaseTraceError as error:
+        return {"status": "truncated" if error.reason in ("record_capacity", "incomplete_trace") else "unavailable",
+                "reason": error.reason, "detail": str(error)}
+    except ValueError as error:
+        return {"status": "unavailable", "reason": "invalid_attribution", "detail": str(error)}
+    missing = sorted({pid for result in maps for pid in result["missing_pids"]})
+    if missing:
+        return {"status": "unavailable", "reason": "missing_process_traces", "missing_pids": missing}
+    for row, result in zip(rows, maps):
+        row.pop("phase_boundary")
+        row["phase_attribution"] = result
+    return {"status": "complete", "coverage": "record_stream; unobserved work remains residual"}
+
+
+def _run_warm_harness(
+    bin_dir: Path,
+    *,
+    warmups: int = WARMUPS_PER_SHAPE,
+    measured: int = MEASURED_PER_SHAPE,
+    load_limit: float = LOAD_LIMIT,
+    trace: bool = False,
+    phases: bool = True,
+    keep_root: bool = False,
+    budget_ms: dict[str, float] | None = None,
+    resource_baseline: dict[str, dict[str, float]] | None = None,
+    commit_label: str | None = None,
+) -> dict[str, Any]:
     if warmups < 0 or measured < 1:
         raise ProofError("warmups must be non-negative and measured must be positive")
     cpu_accounting = cpu_accounting_self_check()
@@ -708,11 +770,11 @@ def run_harness(
         if sys.exc_info()[0] is not None and profile is not None:
             profile.dispose()
 
+    phase_trace = {"status": "not_requested"}
     if phases:
-        phase_records, phase_pids = attribution.read_records(phase_dir)
-        for row in [*warmup_rows, *samples["single"], *samples["tool"]]:
-            row["phase_attribution"] = attribution.partition(
-                phase_records, **row.pop("phase_boundary"), available_pids=phase_pids)
+        phase_trace = _attribute_warm_rows(
+            phase_dir, [*warmup_rows, *samples["single"], *samples["tool"]],
+        )
 
     overload = [name for name, value in load.items() if value >= load_limit]
     parameter_reasons = []
@@ -866,12 +928,12 @@ def run_harness(
                     correctness_failures.append(f"trace turn identity reused={key!r}")
                 seen_turns.add(key)
                 records = grouped.get(key, [])
-                phases = [record.get("phase") for record in records]
+                event_phases = [record.get("phase") for record in records]
                 for phase in ("accept", "terminal_commit"):
-                    if phases.count(phase) != 1:
+                    if event_phases.count(phase) != 1:
                         correctness_failures.append(
                             f"trace turn={ordinal} phase={phase} expected=1 "
-                            f"actual={phases.count(phase)}"
+                            f"actual={event_phases.count(phase)}"
                         )
                 for phase in ("request_attempt_commit", "provider_open", "first_byte"):
                     phase_records = [record for record in records if record.get("phase") == phase]
@@ -1004,8 +1066,9 @@ def run_harness(
         "summary": summary,
         "trace_records": trace_records,
         "trace_stage_summary": trace_stage_summary,
+        "phase_trace": phase_trace,
         "phase_summary": {shape: attribution.summarize([row["phase_attribution"] for row in rows])
-                          for shape, rows in samples.items()} if phases else None,
+                          for shape, rows in samples.items()} if phase_trace["status"] == "complete" else None,
         "provider_ledger": provider_ledger,
         "provider_ledger_sha256": sha256_file(proxy_ledger),
         "correctness_failures": correctness_failures,
@@ -1038,7 +1101,7 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--load-limit", type=float, default=LOAD_LIMIT)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--phases", action=argparse.BooleanOptionalAction, default=True,
-                        help="buffer content-free phase attribution (default: enabled)")
+                        help="request content-free phase attribution (warm mode: separate short run; default: enabled)")
     parser.add_argument("--keep-root", action="store_true")
     parser.add_argument("--single-budget-ms", type=float)
     parser.add_argument("--tool-budget-ms", type=float)

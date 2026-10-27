@@ -1597,6 +1597,8 @@ surface tables above.
 | fleet node `parent_agent_id` | no parent-agent coordinate (the required `parent_session_id` still owns ancestry) |
 | fleet node `metrics` | no direct metric snapshot; `FleetMetricsTotalsWire.usage=None` means at least one returned node lacks durable usage truth |
 | fleet `children=[]`, `folded_children=0` | a real leaf. A positive `folded_children` says bounded children were omitted; the rollup covers only returned nodes |
+| fleet node `activity` | the agent is quiet (no call active or recent), terminal, or the daemon predates 973-activity-icons; never "idle" as a state claim. Values: `computer`, `mobile`, `web`, `remote`, `edit`, `run`, `read`, `orchestrate`; an unknown future value renders nothing |
+| fleet node `activities=[]` | no typed activity was observed (or not reported); otherwise every activity used so far, highest priority first |
 | hook `trust_state` | old daemon; only the legacy `trusted` boolean may be used, with no invented revoked-by-edit state |
 | branch/fork/metafork response `source_branch_id` | source was the implicit main branch |
 | fork response / summary `forked_from` | legacy exact-node fork, non-forked session, or an older daemon; when present its sequence names the selected source prompt returned as the draft, not the copied-history boundary |
@@ -3617,6 +3619,14 @@ surface is `None`. They do not issue the method and do not return a made-up
 an older daemon may manage SSH profiles without a terminal registry or expose
 local terminal tracking without SSH profiles.
 
+`ssh_typed_setup_errors_v1` additionally promises that failed SSH setup has a
+`ShellWire::setup_error` in its completion row. With this feature, an exited row
+without that field is ordinary command completion, including an exit with no
+numeric status. Clients must not reinterpret its output as a setup error when
+the Running event was missed. Without the feature, the TUI preserves the legacy
+fallback for uncoded completion before an observed Running event. The TUI
+snapshots this capability when opening each terminal attempt.
+
 SSH public values contain only name, optional description, host, user, port,
 optional default cwd, optional pinned-host-key metadata, last-used time,
 multiplexing capability, and an `in_scope` flag. Authentication kinds,
@@ -3636,10 +3646,11 @@ opaque shell id and treat `closed` as an explicit operator action distinct from
 natural `exited`. `shell.close` is idempotent. Closing an SSH shell closes only
 its channel, not the reusable authenticated profile connection.
 
-The SSH/shell family adds 13 request methods and two feature strings. After the
-additive v0.0.966 prompt-fork extension, the exhaustive fixtures still contain
-**123** request methods, the compact transcript contains **177** frames, and
-the ordinary daemon Welcome advertises **101** feature strings.
+The SSH/shell family adds 13 request methods and three feature strings. The
+third feature is additive: the RPC envelope and persisted formats are unchanged.
+The v0.0.966 prompt-fork fixture recount remains **123** request methods and
+**177** transcript frames. The current daemon Welcome advertises **123** feature
+strings, pinned by `welcome_features_pin_served_management_families`.
 
 ## 20. Provider lockdown v1
 

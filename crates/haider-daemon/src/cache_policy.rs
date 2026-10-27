@@ -30,7 +30,7 @@ impl CacheChangeWarning {
             "$—".to_owned()
         };
         format!(
-            "cache epoch change: {fields}; {} stable-prefix tokens invalidated; estimated next-turn re-warm {cost}; repeat the same selection to confirm a new epoch",
+            "cache epoch change: {fields}; {} stable-prefix tokens invalidated; estimated next-turn re-warm {cost}; pass --confirm-epoch to confirm a new epoch",
             self.invalidated_stable_tokens
         )
     }

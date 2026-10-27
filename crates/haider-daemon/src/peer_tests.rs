@@ -46,6 +46,32 @@ impl haider_provider::Provider for HeldPeerProvider {
 
 struct HeldPeerProviderFactory;
 
+/// An explicit outbox drain does not join concurrent maintenance. Subscribe
+/// before scanning so its post-permit settlement cannot race this observer.
+#[cfg(unix)]
+pub(crate) async fn wait_for_peer_delivery_quiescence(hub: &crate::session_hub::SessionHub) {
+    let mut changes = hub.subscribe_peer_reconcile();
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        loop {
+            if hub
+                .daemon_is_durably_quiescent()
+                .await
+                .expect("durable peer quiescence scan")
+            {
+                return;
+            }
+            match changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("peer settlement stream closed before durable quiescence");
+                }
+            }
+        }
+    })
+    .await
+    .expect("peer delivery settles before the fixture watchdog");
+}
+
 #[async_trait::async_trait]
 impl crate::worker::ProviderFactory for HeldPeerProviderFactory {
     async fn resolve_for_turn(
@@ -808,6 +834,7 @@ async fn peer_endpoint_refuses_approval_frames_and_notifies_idle_once() {
         client_instance_id: "probe".into(),
         client_kind: haider_rpc::ClientKind::Cli,
         capabilities_requested: [haider_rpc::Capability::Control].into(),
+        features_requested: Default::default(),
         max_receive_frame: 128 * 1024,
         encodings: Vec::new(),
     });

@@ -642,10 +642,13 @@ async fn host_loopback_gate_authenticates_and_advertises_capabilities() {
     assert_eq!(rejection.body["type"], "authReject");
     let mut closed = [0_u8; 1];
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut closed))
-            .await
-            .expect("auth rejection close timeout")
-            .expect("read auth rejection close"),
+        tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            rejected.read(&mut closed)
+        )
+        .await
+        .expect("auth rejection close timeout")
+        .expect("read auth rejection close"),
         0
     );
 

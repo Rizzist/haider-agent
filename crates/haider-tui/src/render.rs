@@ -1288,8 +1288,9 @@ fn image_reveal_hits(
 /// Workspace version shown on boot/launcher (single source: the crate).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Render the whole frame for the current screen. Returns the frame's
-/// clickable regions (hit map) for the runtime's mouse dispatch.
+/// Render the whole frame for the current screen. Returns only clickable
+/// regions. The model also records the painted input owner, just as it
+/// records render geometry for subsequent input dispatch.
 pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // TUI6.1 fix 1: every frame advances the geometry epoch and stamps
     // its composer hits with the NEW value — only hits from the LATEST
@@ -1389,32 +1390,43 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Sessions => render_sessions(model, theme, frame, body, &mut hits),
         }
     }
-    if model.tool_detail.is_some() {
-        render_tool_detail(model, theme, frame, body, &mut hits);
-    } else if model.inbox_open {
-        render_inbox(model, theme, frame, body);
-        hits.clear();
-    } else if model.help_open {
-        render_help(model, theme, frame, body);
-        hits.clear();
-    } else if model.shells_open {
-        render_shells_overlay(model, theme, frame, body, &mut hits);
-    } else if model.ssh_open {
-        render_ssh_overlay(model, theme, frame, body, &mut hits);
-    } else if model.monitors_open {
-        render_monitors_overlay(model, theme, frame, body, &mut hits);
-    }
-    if model.lockdown_overlay {
-        render_lockdown_overlay(model, theme, frame, body);
-        hits.clear();
+    match model.input_owner() {
+        crate::app::InputOwner::Lockdown => {
+            render_lockdown_overlay(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::ToolDetail => {
+            render_tool_detail(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::Inbox => {
+            render_inbox(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::Help => {
+            render_help(model, theme, frame, body);
+            hits.clear();
+        }
+        crate::app::InputOwner::Shells => {
+            render_shells_overlay(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::SshList | crate::app::InputOwner::SshForm => {
+            render_ssh_overlay(model, theme, frame, body, &mut hits)
+        }
+        crate::app::InputOwner::Monitors => {
+            render_monitors_overlay(model, theme, frame, body, &mut hits)
+        }
+        _ => {}
     }
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
     }
+    hits.retain(|(_, hit)| model.hit_owned(hit));
     // The in-app selection highlight (owner item 9) paints LAST, over
     // every widget on every screen — a screen-space overlay, ground only
     // (the hover-band law: selBg shifts the ground, never the ink).
-    if let Some(selection) = &model.selection {
+    if model.selection_is_visible()
+        && let Some(selection) = &model.selection
+    {
         crate::select::apply_highlight(frame.buffer_mut(), selection, theme);
     }
     // Hit-map seam guard (review r6 P2-1b): a hit must be a real, visible
@@ -1426,6 +1438,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             && rect.x.saturating_add(rect.width) <= area.x.saturating_add(area.width)
             && rect.y.saturating_add(rect.height) <= area.y.saturating_add(area.height)
     });
+    model.record_painted_input();
     hits
 }
 
@@ -2027,7 +2040,7 @@ fn render_launcher(
     // The BIG centered mark and the shahada belong to the boot splash
     // alone now — people open many terminals; the settled launcher scans
     // like a working surface, not a poster.
-    let showing_backtrack = model.backtrack.is_some();
+    let showing_backtrack = model.input_owner() == crate::app::InputOwner::HistoryChooser;
     let palette = if showing_backtrack {
         backtrack_block(model, theme, area.width)
     } else if model.palette_open() {
@@ -5582,6 +5595,7 @@ fn render_usage(
                     Hit::UsageAccountTab {
                         provider: group.provider.clone(),
                         index: position,
+                        alias: entry.alias.clone(),
                     },
                 ));
                 spans.push(Span::styled(
@@ -6330,7 +6344,10 @@ fn render_session(
     // turns menu answers into typed secret bytes (a `1` meant for an
     // option landed in the mask; Enter staged a garbage credential). The
     // menu waits, unrendered and unclickable, until the card closes.
-    let menu = if model.login.is_some() {
+    let menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         // A zero-option ask never REPLACES the composer — the composer is
@@ -6341,7 +6358,10 @@ fn render_session(
             .open_menu()
             .filter(|menu| !menu.options.is_empty())
     };
-    let ask_menu = if model.login.is_some() {
+    let ask_menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         model
@@ -6516,7 +6536,7 @@ fn render_session(
         u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
     };
     let mut subtree_height = subtree_needed(model, false);
-    let showing_backtrack = model.backtrack.is_some();
+    let showing_backtrack = model.input_owner() == crate::app::InputOwner::HistoryChooser;
     let palette = if showing_backtrack {
         backtrack_block(model, theme, area.width)
     } else if model.palette_open() {
@@ -7070,12 +7090,14 @@ fn render_session(
     // D4: an open `plan` proposal owns the transcript area — the full
     // markdown document renders here (scrolled), while the decision menu
     // keeps the composer band through the ordinary blocking-menu path.
-    let plan_menu = model
-        .projection
-        .open_menu()
-        .filter(|open| open.origin == "plan" && !open.options.is_empty() && model.login.is_none());
+    let plan_menu = model.projection.open_menu().filter(|open| {
+        open.origin == "plan"
+            && !open.options.is_empty()
+            && model.login.is_none()
+            && model.talk_setup.is_none()
+    });
     let file_review_menu = model.projection.open_menu().and_then(|open| {
-        if open.options.is_empty() || model.login.is_some() {
+        if open.options.is_empty() || model.login.is_some() || model.talk_setup.is_some() {
             return None;
         }
         let review = crate::app::menu_file_review(open)?;
@@ -7161,7 +7183,6 @@ fn render_session(
             transcript_area,
             hits,
         );
-        render_transcript_search(model, theme, frame, transcript_area);
     }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
@@ -7281,6 +7302,16 @@ fn render_session(
         // First-match dispatch: the chip paints over the transcript row
         // beneath it, so its hit must lead (the sticky-band precedent).
         hits.insert(0, (band_rect, Hit::JumpToBottom));
+    }
+
+    // Search owns the transcript's top row, including when a sticky prompt
+    // would otherwise be painted there. Retire every covered target after
+    // all transcript chrome has populated the map.
+    if model.input_owner() == crate::app::InputOwner::Search && transcript_area.height > 0 {
+        hits.retain(|(rect, _)| {
+            rect.y > transcript_area.y || rect.y + rect.height <= transcript_area.y
+        });
+        render_transcript_search(model, theme, frame, transcript_area);
     }
 
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
@@ -7610,6 +7641,7 @@ fn render_session(
     }
 
     if model.login.is_none()
+        && model.talk_setup.is_none()
         && let Some(card) = model.projection.permission_card()
     {
         // The computer OS-permission grant card takes the blocking-menu slot,
@@ -7698,31 +7730,7 @@ fn render_session(
             }
         }
     } else if let Some(ask) = ask_menu.filter(|_| composer_area.height > ask_rows) {
-        let ask_area = Rect {
-            x: composer_area.x,
-            y: composer_area.y,
-            width: composer_area.width,
-            height: ask_rows.min(composer_area.height),
-        };
-        let mut ask_lines = vec![Line::from(vec![
-            Span::styled("? ", theme.warn_style()),
-            Span::styled(ask.title.clone(), theme.warn_style()),
-        ])];
-        for line in &ask.body {
-            ask_lines.push(Line::styled(line.clone(), theme.text_style()));
-        }
-        ask_lines.push(Line::styled(
-            "type your answer below · ⏎ answers · esc interrupts",
-            theme.dim_style(),
-        ));
-        frame.render_widget(Paragraph::new(ask_lines), ask_area);
-        let shifted = Rect {
-            x: composer_area.x,
-            y: composer_area.y + ask_area.height,
-            width: composer_area.width,
-            height: composer_area.height - ask_area.height,
-        };
-        render_composer(model, theme, frame, rule_area, shifted, hits);
+        render_question_composer(model, theme, frame, rule_area, composer_area, hits, ask);
     } else if effort_picker_showing(model) {
         render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
@@ -7747,7 +7755,8 @@ fn render_session(
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, false, hits);
     }
-    if model.token_panel {
+    if model.token_panel && model.input_owner() == crate::app::InputOwner::Composer(Screen::Session)
+    {
         render_token_panel(model, theme, frame, area, rule_area.y);
     }
 }
@@ -9257,6 +9266,17 @@ fn render_subtree(
             }
             return;
         }
+        // 973-activity-icons: every row reserves the same activity slot so
+        // callsigns align; no activity anywhere → no slot.
+        let activity_glyphs: Vec<Option<&'static str>> = rows
+            .iter()
+            .map(|(_, chip)| {
+                model
+                    .chip_activity(chip)
+                    .and_then(|kind| model.activity_display.glyph(kind))
+            })
+            .collect();
+        let activity_slot = activity_slot_width(&activity_glyphs);
         for (index, (depth, chip)) in rows.iter().enumerate() {
             let connector = if chip.closed {
                 "⊘"
@@ -9309,18 +9329,23 @@ fn render_subtree(
             let mut spans = vec![
                 Span::styled(format!(" {indent}{connector} "), theme.faint_style()),
                 Span::styled(format!("{glyph} "), glyph_style),
-                Span::styled(
-                    format!("{} {}", chip.callsign, chip.hon),
-                    if chip.closed {
-                        theme.faint_style()
-                    } else if viewing {
-                        // The viewed node is bold (owner item 3).
-                        theme.bright_style().add_modifier(Modifier::BOLD)
-                    } else {
-                        theme.bright_style()
-                    },
-                ),
             ];
+            spans.extend(activity_slot_span(
+                activity_glyphs.get(index).copied().flatten(),
+                activity_slot,
+                theme,
+            ));
+            spans.push(Span::styled(
+                format!("{} {}", chip.callsign, chip.hon),
+                if chip.closed {
+                    theme.faint_style()
+                } else if viewing {
+                    // The viewed node is bold (owner item 3).
+                    theme.bright_style().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.bright_style()
+                },
+            ));
             // D1: a typed child's task label leads with `@type ·` (the C2
             // spawn convention) — paint the type segment in its Loom accent
             // and glyph so specialization reads at a glance.
@@ -9425,6 +9450,39 @@ fn render_subtree(
             ));
         }
     }
+}
+
+/// 973-activity-icons: the widest activity glyph among a set of rows — the
+/// column slot every row reserves so NAMES stay aligned. Zero when no row
+/// has an activity (then no slot at all: the row is byte-identical to a
+/// fleet without activity).
+fn activity_slot_width(glyphs: &[Option<&'static str>]) -> usize {
+    glyphs
+        .iter()
+        .flatten()
+        .map(|glyph| unicode_width::UnicodeWidthStr::width(*glyph))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 973-activity-icons: one row's activity slot — the glyph padded to
+/// `slot` measured columns (emoji width is measured per grapheme, VS16
+/// included), plus a separating space; blanks for a row with none.
+fn activity_slot_span(
+    glyph: Option<&'static str>,
+    slot: usize,
+    theme: &Theme,
+) -> Option<Span<'static>> {
+    if slot == 0 {
+        return None;
+    }
+    Some(match glyph {
+        Some(glyph) => {
+            let pad = slot.saturating_sub(unicode_width::UnicodeWidthStr::width(glyph));
+            Span::styled(format!("{glyph}{} ", " ".repeat(pad)), theme.dim_style())
+        }
+        None => Span::raw(" ".repeat(slot + 1)),
+    })
 }
 
 /// One fleet list row's glyph ink — the mockup's `.fg` vocabulary: live
@@ -10887,6 +10945,57 @@ fn render_fleet(
                 if !metric.is_empty() {
                     lines.push(Line::styled(format!("  {metric}"), theme.dim_style()));
                 }
+                // 973-activity-icons: what the member is doing NOW and every
+                // activity it has used so far. Nothing when icons are off
+                // or nothing was observed.
+                let display = model.activity_display;
+                let used = model.node_activities(node);
+                if display != haider_protocol::activity::ActivityDisplay::Off && !used.is_empty() {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled("activity", theme.gold_style()));
+                    let now = model
+                        .node_activity(node)
+                        .and_then(|kind| display.glyph(kind).map(|glyph| (kind, glyph)));
+                    lines.push(match now {
+                        Some((kind, glyph)) => Line::from(vec![
+                            Span::styled("  now  ", theme.dim_style()),
+                            Span::styled(
+                                format!("{glyph} {}", kind.description()),
+                                theme.text_style(),
+                            ),
+                        ]),
+                        None => Line::styled("  now  quiet", theme.dim_style()),
+                    });
+                    if let Some(summary) = fleet::activities_summary(&used, display) {
+                        let budget = width.saturating_sub(8);
+                        let summary = if unicode_width::UnicodeWidthStr::width(summary.as_str())
+                            > budget
+                        {
+                            // Drop whole entries from the tail, never a glyph half.
+                            let mut kept = String::new();
+                            for part in summary.split(" · ") {
+                                let next = if kept.is_empty() {
+                                    part.to_owned()
+                                } else {
+                                    format!("{kept} · {part}")
+                                };
+                                if unicode_width::UnicodeWidthStr::width(next.as_str()) + 2 > budget
+                                {
+                                    kept.push_str(" …");
+                                    break;
+                                }
+                                kept = next;
+                            }
+                            kept
+                        } else {
+                            summary
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("  used ", theme.dim_style()),
+                            Span::styled(summary, theme.dim_style()),
+                        ]));
+                    }
+                }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("workflow", theme.gold_style()));
                 match &view.detail_graph {
@@ -11054,6 +11163,20 @@ fn render_fleet(
             } else {
                 sel.saturating_sub(body_rows.saturating_sub(1))
             };
+            // 973-activity-icons: one aligned activity slot per visible page.
+            let activity_glyphs: Vec<Option<&'static str>> = rows
+                .iter()
+                .map(|row| {
+                    model
+                        .node_activity(row.node)
+                        .and_then(|kind| model.activity_display.glyph(kind))
+                })
+                .collect();
+            let activity_slot = activity_slot_width(
+                activity_glyphs
+                    .get(scroll..(scroll + body_rows).min(activity_glyphs.len()))
+                    .unwrap_or(&[]),
+            );
             for (index, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
                 let node = row.node;
                 let selected = index == sel;
@@ -11074,8 +11197,18 @@ fn render_fleet(
                         glyph.to_owned(),
                         fleet_glyph_style(theme, node.state, model.anim_phase),
                     ),
-                    Span::styled(format!(" {callsign}"), name_style),
                 ];
+                if let Some(slot) = activity_slot_span(
+                    activity_glyphs.get(index).copied().flatten(),
+                    activity_slot,
+                    theme,
+                ) {
+                    spans.push(Span::raw(" "));
+                    spans.push(slot);
+                    spans.push(Span::styled(callsign.to_owned(), name_style));
+                } else {
+                    spans.push(Span::styled(format!(" {callsign}"), name_style));
+                }
                 if let Some(marker) = fleet::child_marker(node) {
                     spans.push(Span::styled(format!(" {marker}"), theme.faint_style()));
                 }
@@ -11235,8 +11368,37 @@ fn render_fleet(
                     };
                     let pad_l = (FLEET_CELL_W - 4) / 2;
                     let pad_r = FLEET_CELL_W - 4 - pad_l;
-                    for (target, row) in [(&mut matrix_a, &row_a), (&mut matrix_b, &row_b)] {
-                        target.push(Span::raw(" ".repeat(pad_l)));
+                    // 973-activity-icons: the cell's activity emoji sits in
+                    // the matrix's left margin (2 columns + gap = pad_l), so
+                    // the grid geometry never moves. Text labels do not fit
+                    // a cell; the plain/list surfaces carry them instead.
+                    let cell_emoji = if model.activity_display
+                        == haider_protocol::activity::ActivityDisplay::Emoji
+                    {
+                        model
+                            .node_activity(node)
+                            .map(haider_protocol::activity::ActivityKind::emoji)
+                            .filter(|emoji| {
+                                !emoji.is_empty()
+                                    && unicode_width::UnicodeWidthStr::width(*emoji) < pad_l
+                            })
+                    } else {
+                        None
+                    };
+                    for (matrix_row, (target, row)) in
+                        [(&mut matrix_a, &row_a), (&mut matrix_b, &row_b)]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        match cell_emoji.filter(|_| matrix_row == 0) {
+                            Some(emoji) => {
+                                let pad = pad_l
+                                    .saturating_sub(unicode_width::UnicodeWidthStr::width(emoji));
+                                target.push(Span::styled(emoji.to_owned(), theme.dim_style()));
+                                target.push(Span::raw(" ".repeat(pad)));
+                            }
+                            None => target.push(Span::raw(" ".repeat(pad_l))),
+                        }
                         target.extend(dot_span(row));
                         target.push(Span::raw(" ".repeat(pad_r)));
                         target.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
@@ -11345,10 +11507,50 @@ fn render_fleet(
     }
 }
 
-/// The subagent view (§2.10): breadcrumb head, the chip's OWN transcript,
-/// the shared SubTree map, and a composer that steers THIS chip — its
-/// question card replaces the composer, but the parent is never blocked
-/// (esc always walks back).
+/// The shared answer line for session and child free-text questions.
+#[allow(clippy::too_many_arguments)]
+fn render_question_composer(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    rule_area: Rect,
+    composer_area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+    ask: &haider_protocol::menu::Menu,
+) {
+    let ask_rows = u16::try_from(2 + ask.body.len()).unwrap_or(u16::MAX);
+    let ask_area = Rect {
+        x: composer_area.x,
+        y: composer_area.y,
+        width: composer_area.width,
+        height: ask_rows.min(composer_area.height),
+    };
+    let mut ask_lines = vec![Line::from(vec![
+        Span::styled("? ", theme.warn_style()),
+        Span::styled(ask.title.clone(), theme.warn_style()),
+    ])];
+    for line in &ask.body {
+        ask_lines.push(Line::styled(line.clone(), theme.text_style()));
+    }
+    ask_lines.push(Line::styled(
+        if model.screen == Screen::Subagent {
+            "type your answer below · ⏎ answers · esc back to session"
+        } else {
+            "type your answer below · ⏎ answers · esc interrupts"
+        },
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(ask_lines), ask_area);
+    let shifted = Rect {
+        x: composer_area.x,
+        y: composer_area.y + ask_area.height,
+        width: composer_area.width,
+        height: composer_area.height - ask_area.height,
+    };
+    render_composer(model, theme, frame, rule_area, shifted, hits);
+}
+
+/// The child transcript, subtree and decision or steering composer.
 fn render_subagent(
     model: &AppModel,
     theme: &Theme,
@@ -11364,13 +11566,21 @@ fn render_subagent(
     };
     // The login card outranks the chip's question card on the band too
     // (TUI6.2c finding 3, same law as the session menu).
-    let menu = if model.login.is_some() {
+    let menu = if matches!(
+        model.input_owner(),
+        crate::app::InputOwner::Login | crate::app::InputOwner::TalkSetup
+    ) {
         None
     } else {
         chip.question_menu()
     };
+    let ask_menu = menu.filter(|menu| menu.options.is_empty());
+    let menu = menu.filter(|menu| !menu.options.is_empty());
+    let ask_rows = ask_menu.map_or(0, |menu| {
+        u16::try_from(2 + menu.body.len()).unwrap_or(u16::MAX)
+    });
     let needed_input = menu.map_or_else(
-        || composer_height(model, area.width),
+        || composer_height(model, area.width).saturating_add(ask_rows),
         |m| {
             u16::try_from(
                 1 + wrapped_menu_body(m, area.width, model.clock_ms).len() + m.options.len() + 1,
@@ -11797,6 +12007,8 @@ fn render_subagent(
                 ));
             }
         }
+    } else if let Some(ask) = ask_menu.filter(|_| composer_area.height > ask_rows) {
+        render_question_composer(model, theme, frame, rule_area, composer_area, hits, ask);
     } else if effort_picker_showing(model) {
         render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
@@ -12969,17 +13181,7 @@ const THEME_PICKER_ROWS: u16 = 8;
 /// that hosts it, with no daemon card holding the input slot (the menu /
 /// ask branches outrank it — local chrome never sits on a live ask).
 fn theme_picker_showing(model: &AppModel) -> bool {
-    model.theme_picker.is_some()
-        && matches!(
-            model.screen,
-            Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
-        )
-        && model.projection.open_menu().is_none()
-        && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+    model.input_owner() == crate::app::InputOwner::ThemePicker
 }
 
 /// The `/theme` picker (owner spec §3): a numbered arrow-highlight card in
@@ -13071,14 +13273,7 @@ fn render_theme_picker(
 /// session surface, with no daemon card holding the input slot — the same
 /// outranking law as `/theme`.
 fn effort_picker_showing(model: &AppModel) -> bool {
-    model.effort_picker.is_some()
-        && matches!(model.screen, Screen::Session | Screen::Subagent)
-        && model.projection.open_menu().is_none()
-        && model.login.is_none()
-        && !(model.screen == Screen::Subagent
-            && model
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+    model.input_owner() == crate::app::InputOwner::EffortPicker
 }
 
 /// Rows the `/effort` picker card needs: title + body + the option rows +

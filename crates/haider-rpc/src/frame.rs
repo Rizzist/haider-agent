@@ -397,6 +397,9 @@ pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// display identity plus its resolved model/provider pair. Every field is
 /// absence-preserving; clients must not infer coordinates when it is absent.
 pub const FEATURE_SESSION_FLEET_IDENTITY_V1: &str = "session_fleet_identity_v1";
+/// Activity fields and provider-transport effects are sent only to clients
+/// that explicitly request this token in Hello and receive it in Welcome.
+pub const FEATURE_SESSION_ACTIVITY_V1: &str = "session_activity_v1";
 /// Daemon implements the reconnectable, per-child-cursor descendant stream.
 pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -636,6 +639,9 @@ pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// SSH setup failures use `ShellWire::setup_error`; uncoded completion is not
+/// inferred to be a setup failure from ordinary terminal output.
+pub const FEATURE_SSH_TYPED_SETUP_ERRORS_V1: &str = "ssh_typed_setup_errors_v1";
 /// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
 pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
@@ -799,6 +805,10 @@ pub struct Hello {
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
+    /// Optional additive feature opt-ins. Old daemons ignore this field;
+    /// unlike an unknown Capability enum value it cannot reject the Hello.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features_requested: BTreeSet<String>,
     /// Largest encoded body this client can receive.
     ///
     /// The daemon must not send a frame larger than the smaller of this value
@@ -1299,6 +1309,12 @@ pub struct ModelDetailWire {
     /// the remote catalog omits the field or cannot be reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Where `max_output_tokens` came from. Additive (973-output-cap-fixes):
+    /// older peers omit it, and a spelling this peer does not know decodes as
+    /// [`ModelOutputLimitSourceWire::Unknown`]; either leaves the daemon to
+    /// derive provenance from its own tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<ModelOutputLimitSourceWire>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1353,6 +1369,24 @@ impl ModelDetailSourceWire {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Provenance of one [`ModelDetailWire::max_output_tokens`] value. Numeric
+/// equality with a local fallback is never provenance, so the daemon carries
+/// this explicitly from projection to selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOutputLimitSourceWire {
+    /// The provider's model catalog declared the maximum: it is exact.
+    Declared,
+    /// The daemon's pinned table, from a published provider maximum: exact.
+    Static,
+    /// A local value the provider does not publish; explicit budgets may
+    /// exceed it within the global and context-window bounds.
+    Fallback,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One provider's read-only management projection.
@@ -1942,12 +1976,23 @@ pub enum ShellStatusWire {
     Closed,
 }
 
+/// Coded refusal during asynchronous shell setup, before a remote command
+/// starts. Kept separate from the remote command's numeric exit status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSetupErrorWire {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 /// Public, secret-free projection of one entry in the unified shell registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellWire {
     pub id: String,
     pub kind: ShellKindWire,
     pub status: ShellStatusWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<ShellSetupErrorWire>,
     pub title: String,
     pub cwd_or_host: String,
     pub created_at_ms: u64,
@@ -2588,6 +2633,17 @@ pub struct FleetNodeWire {
     /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AgentMetricsSnapshot>,
+    /// 973-activity-icons: what this agent is DOING at `generated_at_ms`
+    /// (not its state), derived from typed tool identity in its own journal
+    /// by [`haider_protocol::activity::ActivityTracker`]. Absent when it is
+    /// quiet, terminal, or the daemon predates the field; old clients ignore
+    /// it. Unknown future kinds decode as `unknown` and render nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<haider_protocol::activity::ActivityKind>,
+    /// Every activity this agent has used so far, highest priority first
+    /// (the detail view's history). Empty when none or when not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<haider_protocol::activity::ActivityKind>,
     /// Exact number of this node's direct durable children omitted by the
     /// snapshot bounds. Zero means the empty `children` list is a real leaf.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -5316,6 +5372,10 @@ pub enum ResponseBody {
         account: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {

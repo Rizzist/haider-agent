@@ -374,7 +374,7 @@ impl SqliteStoreHandle {
             device_id,
         )
         .await
-        .map(|(epoch, _)| epoch)
+        .map(|(epoch, _)| epoch.unwrap_or(expected_epoch))
     }
 
     /// Commit route provenance and return only durable facts for publication.
@@ -386,7 +386,7 @@ impl SqliteStoreHandle {
         expected_epoch: u64,
         resolved_alias: Option<&str>,
         device_id: &haider_protocol::ids::DeviceId,
-    ) -> Result<(u64, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
+    ) -> Result<(Option<u64>, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         let expected_provider = expected_provider.to_owned();
@@ -742,6 +742,54 @@ impl SqliteStoreHandle {
             owner.with_store(|store| {
                 store.session_create_receipt(&command_id, &request_digest, &request_json)
             })
+        })
+        .await
+    }
+
+    pub async fn child_create_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        parent_session_id: SessionId,
+    ) -> Result<Option<(String, SessionMetadataV1)>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.child_create_admission(&command_id, &session_id, &parent_session_id)
+            })
+        })
+        .await
+    }
+
+    pub async fn child_turn_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<String>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.child_turn_admission(&command_id, &session_id))
+        })
+        .await
+    }
+
+    pub async fn automatic_run_switches(
+        &self,
+        session_id: SessionId,
+    ) -> Result<std::collections::BTreeMap<u64, RunId>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.automatic_run_switches(&session_id)))
+            .await
+    }
+
+    pub async fn session_output_pair_at(
+        &self,
+        session_id: SessionId,
+        through_seq: u64,
+    ) -> Result<Option<haider_store::SessionOutputPairSnapshot>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.session_output_pair_at(&session_id, through_seq))
         })
         .await
     }
@@ -3484,7 +3532,7 @@ mod error_wave_tests {
 
         // Simulates a profile-level `let _ = mutation(...)` call site.
         let _ = handle.advance_management_revision().await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, faults.changed())
             .await
             .expect("profile write fault must surface promptly")
             .expect("fault edge");
@@ -3550,7 +3598,7 @@ mod error_wave_tests {
         // must happen inside the shared store owner before the caller drops
         // the typed mutation error.
         let _ = StoreHandle::append(&handle, &mut failed).await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), faults.changed())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, faults.changed())
             .await
             .expect("journal write fault must surface promptly")
             .expect("fault edge");

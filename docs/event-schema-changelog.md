@@ -21,6 +21,118 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — durable run output pair
+
+Additive, UI-hidden and prompt-omitted extension `run_output_pair_pinned_v1` records
+`provider`, `model`, `max_tokens` and `source` once per run. Headless admission
+pins its spec; native worker pickup pins the selection under the selection
+fence. The equally hidden `run_worker_pickup_v1` marks pickup before provider resolution, so a
+rebind during startup can see the active run. Rebind, recovery and delegated
+children reduce the pin together with later pair-switch and rebind facts.
+The optional `route_snapshot` field retains the complete boundary: rebind id,
+endpoint, account selector, resolved alias/seen state, selection epoch and reset
+epoch. A present snapshot with null selectors records an unselected route;
+a missing snapshot requires historical reconstruction. `provider_route` remains
+the explicit-rebind compatibility projection. These contain no credentials.
+The hidden, prompt-omitted `run_output_route_snapshot_v1` records owned route
+observations even without a rebind id; `run_output_route_resolved_v1` retains
+the older explicit-rebind shape. These update only the run's route. They never
+borrow later session selectors or epochs. Legacy history that cannot prove the
+boundary fails with `StoreCorrupt` and `run-route-history-unavailable` rather
+than borrowing the current session. Later turns resolve their own selections.
+These remain existing Extension items with additive JSON fields, decodable
+by the schema-33 wave base.
+
+### v0.0.973 — subagent activity on fleet nodes
+
+`FleetNodeWire` (`session.fleet`, `haider agent list --json`) gains two
+additive, absence-preserving fields: `activity` (one of `computer`, `mobile`,
+`web`, `remote`, `edit`, `run`, `read`, `orchestrate`) — what the child is
+DOING at `generated_at_ms`, distinct from its `state` — and `activities`, every
+activity used so far in priority order. Both are derived by
+`haider_protocol::activity::ActivityTracker` from typed journal facts only
+(`ToolCall.activity`, `FileChange`, `ChildSpawn`,
+`RunState`), never from free text. Priority (highest first) is the order
+above. Timing: an open call is active until it completes; a finished call
+stays hot for 8 s (hot kinds compete on priority); a quiet agent then shows
+its most recent activity until 60 s of quiet, then none; a node with live
+children is orchestrating; terminal nodes carry no current activity. The
+enum is `#[serde(other)]`-tolerant (`unknown`). Completed `ToolCall` items
+gain an optional `activity` discriminator; old journals without it do not
+infer activity from the display name. An ACP agent's typed `ToolKind` maps
+read/search to read, edit/delete/move to edit, execute to run, fetch to web,
+and think/switch_mode/other to none. Anthropic web_search/web_fetch and the
+hard-coded OpenAI/Gemini web_search carry web; unknown provider names and
+orphan results carry none. Local calls use only a daemon-registered route.
+Effectless registered `web_search`, `session_transcript`, `list_models`
+and `peer_list` also put typed `activity_kind` and `activity_call_id`
+metadata on their existing `running_tool` state event. This opens a live
+icon at the accepted dispatch boundary; only successful completion enters
+history. Legacy peers receive the original state event without those keys.
+Provider admission recovery uses `provider_transport`, which never counts as
+agent activity. This is an additive event shape change, and a
+peer that did not negotiate `session_activity_v1` receives the exact
+pre-activity payload on fleet, metrics and Event frames. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
+the base defaults to text presentation, two columns each) or the text
+fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
+`HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
+and limited `TERM` values select the form. `AgentMetricsSnapshot` (session
+summaries, observe digests and fleet node metrics) gains an additive
+`activity` object — the time-independent tracker state (`open`, `touched`,
+`latest`, `terminal`) clients evaluate on their own clock; it is likewise
+withheld from peers without `session_activity_v1`. Only work that
+really ran counts: live activity opens on a `Dispatched` effect (by its
+typed `EffectClass`) or an accepted typed effectless route and closes at
+its outcome/settlement; a completed `ToolCall`
+counts only with status `completed` and a typed activity. A tool name the model merely
+requested (unadvertised, ungranted, malformed or refused) sets no icon and
+adds no history. The computer-use overlay names an acting subagent
+(`🖥️ <callsign> is using your screen`), re-labels when a different actor
+takes over a shown surface (relabels debounce for 150 ms to coalesce rapid
+alternation), and follows the daemon's `HAIDER_ACTIVITY_ICONS`
+then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
+choice does not apply to it).
+
+**Effect-class downgrade policy:** operator undo, redo and rollback retain
+`CheckpointRestore` provenance in memory; provider recovery retains
+`ProviderTransport` provenance. New journal writes use only released 0.0.972
+class values: `fs_write` plus additive `effect_origin: "checkpoint_restore"`,
+or `network { host: "provider-request" }` plus
+`effect_origin: "provider_transport"`. The released intent structs ignore
+unknown fields. The previous wave-base daemon at the same database schema
+version can start, list and operate on the profile without an unknown-enum
+startup error. It treats restores as ordinary file effects and provider
+recovery as historical transport bookkeeping. Its typed
+projections may omit the additive origin; raw journal records retain it.
+On re-upgrade the current reader prefers the typed additive origin, validates
+its carrier, and restores the distinct mutation admission, graph provenance
+and activity semantics. Ordinary file/network effects have no origin field
+and keep their exact historical shape; names and summaries never supply
+origin. Unknown future origin values retain the released carrier's meaning;
+they never gain restore or transport authority through aliases or text.
+Known origins with mismatched carriers are rejected. Current readers also
+accept direct class values written by earlier
+lane candidates, but normalize all new writes to the released carriers.
+Those unreleased experimental records remain immutable: a profile already
+containing direct new enum values still needs the current daemon. This fix
+protects journals upgraded to the new writer from strict effect-enum
+decoding failures; it does not make pre-fix experimental profiles
+downgrade-safe by rewriting history. Database schema downgrade policy is
+separate: released 0.0.972 uses schema 31 and refuses a newer schema 33
+profile. The real downgrade probes use the schema-33 wave base; compatible
+effect records do not bypass the released daemon's schema-version check.
+Peers without `session_activity_v1` receive the historical intent with the
+origin removed. The frozen enum and complete old-intent decoder tests pin
+both compatible writes and strict rejection of direct new enum values;
+real wave-base daemon probes cover startup, operations and re-upgrade.
+
+**Release note (CLI behaviour change):** `haider agent list` without
+`--json` now prints a human fleet tree (state glyph, activity glyph, name,
+task, metrics) instead of pretty-printed JSON. Scripts must use `--json`,
+whose document is the standard `{schema, ok, result, error}` envelope — the
+fleet is at `.result.roots` (previously the bare default output exposed
+`.roots`).
+
 ### v0.0.973 — provider-request budgets become opt-in
 
 Omitting `RunBudgetV1.request_budget` or a delegated child's request policy now
@@ -305,6 +417,11 @@ version from journal replay; an already admitted request retains its captured
 adapter. Legacy metadata omits the additive `provider_base_url` and
 `provider_rebind_id` fields. Raw readers preserve this additive kind without
 changing schema version 1.
+The optional `output_budget` describes the queued next-turn pair after a
+rebind. When a run is active, optional `active_output_budget` records its run
+ID, model, resolved budget source and any clamp against the destination
+provider. The same active record appears in the rebind receipt and RPC
+response. Older readers ignore it; older records decode with the field absent.
 
 ### v0.0.970 — recoverable invalid tool calls
 
@@ -746,3 +863,46 @@ forward-compatibility behavior.
   terminal discriminator remains `cancellation`; no new terminal kind is added.
   All these fields are durable and replay byte-for-byte; `schema_version`
   remains 1. Unknown supplemental payloads retain the raw-envelope law.
+
+### v0.0.973 — client-requested session activity
+
+`session_activity_v1` is an explicit client opt-in. New clients add the optional
+`Hello.features_requested` string list; released daemons ignore that unknown
+field and complete the existing handshake. A new daemon grants the token in
+`Welcome.features` only when it was requested and the Welcome fits the peer's
+receive ceiling. It withholds this newest token before the older fallback
+tokens. The token name ties the activity state and effect class to the session
+wire surface; it is separate from `session_fleet_identity_v1`, which predates
+activity.
+
+Peers without fleet identity keep the pre-identity fleet shape. Peers with
+fleet identity but without activity keep model/provider identity, while all
+activity fields in events, history, observation, lists, roster and recursive
+fleet are omitted. The internal `provider_transport` effect is presented as
+the historical `network { host: "provider-request" }` shape to both older peer
+classes. Operator checkpoint undo/redo/rollback journal the historical `fs_write`
+class with additive `effect_origin: "checkpoint_restore"`; the current
+reader restores the typed class, and older peers omit the origin. Neither operator shell `CommandExecution` nor a
+checkpoint restore counts as agent activity. Old user-shell journals are
+excluded by the typed item kind and the typed `user_typed` authorization
+source on their `process_exec` effect. The typed `CommandExecution` admission
+also identifies its operator run, preserving the preceding agent terminal
+state across shell run states and recovery instead of reviving an older icon.
+This uses existing journal provenance and introduces no additional wire field.
+An untyped `running_tool` fact alone cannot revive a terminal activity icon;
+the accepted typed dispatch or activity metadata opens the next agent tool.
+Old checkpoint journals are excluded after
+their typed `checkpoint_recorded` fact identifies the contiguous, same-run
+and same-effect atomic transaction during replay, with or without child-agent
+attribution. This restores the preceding
+activity state without erasing prior or intervening agent work; tool-origin
+checkpoints remain agent edits. Agent-authored typed tool calls and effects
+retain their activity. Overlay relabels retain the first pending timestamp for
+an unchanged actor label, so a steady actor faster than the 150 ms debounce
+still gets named on the next presence tick.
+
+The TUI requires the granted activity token for chip, fleet and history
+badges, including inferred orchestration. Its attached, background and
+parked-branch reducers preserve raw envelope provenance and effectless
+running-tool metadata, so operator run states obey the same rules as the
+daemon. Demo mode continues to use its locally fabricated typed activity.

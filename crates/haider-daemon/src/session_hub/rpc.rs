@@ -481,7 +481,7 @@ fn checkpoint_effect_envelopes(
     let payloads = vec![
         EventPayload::Effect(EffectPhase::Intent(EffectIntent {
             effect: effect_id.clone(),
-            class: EffectClass::FsWrite,
+            class: EffectClass::CheckpointRestore,
             summary: format!("{} workspace checkpoint", checkpoint.origin.as_str()),
             args_digest,
             workspace_revision: None,
@@ -905,6 +905,9 @@ async fn session_agent_metrics_truth(
 struct FleetChildTruth {
     state: haider_rpc::FleetAgentStateWire,
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    /// 973-activity-icons: the child's own typed tool activity, folded from
+    /// the same sealed journal head as its state and metrics.
+    activity: haider_protocol::activity::ActivityTracker,
 }
 
 /// Reduces one child's exact durable run and direct metrics from the same
@@ -918,6 +921,7 @@ async fn fleet_child_truth(
 ) -> Result<FleetChildTruth, HaiderError> {
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
     let mut latest_state = None;
+    let mut activity = haider_protocol::activity::ActivityTracker::new();
     let mut since_seq = 0;
     while since_seq < through_seq {
         let page = store
@@ -943,6 +947,15 @@ async fn fleet_child_truth(
             {
                 latest_state = Some(state);
             }
+            // Only the child's OWN facts: grandchild mirrors carry their
+            // own agent id and show on their own fleet node.
+            if envelope
+                .agent_id
+                .as_ref()
+                .is_none_or(|agent| agent == &record.agent_id)
+            {
+                activity.observe_raw(&envelope);
+            }
             folder.push(&envelope);
         }
         if !advanced {
@@ -955,7 +968,11 @@ async fn fleet_child_truth(
         Some(&record.agent_id),
         through_seq,
     );
-    Ok(FleetChildTruth { state, metrics })
+    Ok(FleetChildTruth {
+        state,
+        metrics,
+        activity,
+    })
 }
 
 fn fleet_agent_state(
@@ -990,7 +1007,40 @@ struct FleetFlatNode {
     record: haider_core::DelegationRecord,
     state: haider_rpc::FleetAgentStateWire,
     metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
+    activity: haider_protocol::activity::ActivityTracker,
     direct_child_count: u32,
+}
+
+fn fleet_state_is_terminal(state: haider_rpc::FleetAgentStateWire) -> bool {
+    matches!(
+        state,
+        haider_rpc::FleetAgentStateWire::Done
+            | haider_rpc::FleetAgentStateWire::Failed
+            | haider_rpc::FleetAgentStateWire::Cancelled
+    )
+}
+
+/// 973-activity-icons: one node's current activity and history at the
+/// snapshot instant. A terminal node shows no current activity; a node with
+/// live children is orchestrating (see `haider_protocol::activity`).
+fn fleet_node_activity(
+    node: &FleetFlatNode,
+    generated_at_ms: u64,
+    live_parents: &std::collections::HashSet<SessionId>,
+) -> (
+    Option<haider_protocol::activity::ActivityKind>,
+    Vec<haider_protocol::activity::ActivityKind>,
+) {
+    use haider_protocol::activity::ActivityKind;
+    let mut used = node.activity.used();
+    if node.direct_child_count > 0 && !used.contains(&ActivityKind::Orchestrate) {
+        used.push(ActivityKind::Orchestrate);
+    }
+    if fleet_state_is_terminal(node.state) {
+        return (None, used);
+    }
+    let live_children = live_parents.contains(&node.record.child_session_id);
+    (node.activity.current(generated_at_ms, live_children), used)
 }
 
 fn fleet_snapshot(
@@ -1015,6 +1065,12 @@ fn fleet_snapshot(
         *count = count.saturating_add(1);
     }
     let (metrics, metrics_complete) = fleet_metrics_totals(&nodes, generated_at_ms);
+    // Parents with at least one non-terminal child are orchestrating.
+    let live_parents: std::collections::HashSet<SessionId> = nodes
+        .iter()
+        .filter(|node| !fleet_state_is_terminal(node.state))
+        .map(|node| node.record.parent_session_id.clone())
+        .collect();
     let rollup = haider_rpc::FleetRollupWire {
         node_count: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
         states,
@@ -1034,6 +1090,7 @@ fn fleet_snapshot(
                 .or_default()
                 .push(index);
             let identity = fleet_node_identity(&node.record.manifest);
+            let (activity, activities) = fleet_node_activity(&node, generated_at_ms, &live_parents);
             Some(haider_rpc::FleetNodeWire {
                 agent_id: node.record.agent_id,
                 session_id: node.record.child_session_id,
@@ -1046,6 +1103,8 @@ fn fleet_snapshot(
                 parent_agent_id: node.record.parent_agent_id,
                 state: node.state,
                 metrics: node.metrics,
+                activity,
+                activities,
                 folded_children: node.direct_child_count,
                 children: Vec::new(),
             })
@@ -3618,6 +3677,8 @@ async fn effect_probe_observation(
         // peer delivery and local/remote execution. Keep this exhaustive so a
         // new authority class cannot inherit probe semantics accidentally.
         EffectClass::ProcessExec
+        | EffectClass::ProviderTransport
+        | EffectClass::CheckpointRestore
         | EffectClass::RemoteExecution
         | EffectClass::GitOp
         | EffectClass::PeerMessage
@@ -3652,10 +3713,11 @@ fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::S
 /// value is an exact user-set override, and an override above the row's
 /// explicit ceiling is a typed refusal rather than a silent clamp — the user
 /// asked for that exact value in this request. The explicit ceiling equals the
-/// row maximum when that maximum is sourced; when it is only the unverified
-/// fallback guess, explicit values up to `MAX_OUTPUT_LIMIT` (strictly below a
-/// known context window) are admitted and the provider-stated one-shot retry
-/// is the backstop.
+/// row maximum when that maximum is declared by the catalog or published by
+/// the provider; when it is an unpublished local value (the unverified
+/// fallback, or a conservative default beside a published window), explicit
+/// values up to `MAX_OUTPUT_LIMIT` (strictly below a known context window) are
+/// admitted and the provider-stated one-shot retry is the backstop.
 pub(super) fn resolve_session_output_limit(
     requested: u64,
     selection: &crate::model_select::ValidatedModelSelection,
@@ -7667,6 +7729,21 @@ impl HubConnection {
                     Ok(profile) => profile,
                     Err(error) => return self.respond_ssh_error(request_id, error),
                 };
+                if let Err(error) = crate::ssh::validate_pty_request(&term, size) {
+                    return self.respond_ssh_error(request_id, error);
+                }
+                // Pending SSH negotiation uses the same bounded budget as
+                // other external waits while the dispatcher remains available.
+                let Ok(permit) = Arc::clone(&self.identity_lease.peer_requests).try_acquire_owned()
+                else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_OVERLOADED,
+                        "too many pending external requests on this connection",
+                        true,
+                        None,
+                    );
+                };
                 let (shell, controls) = self
                     .hub
                     .shell_registry()
@@ -7680,28 +7757,40 @@ impl HubConnection {
                     )
                     .map_err(|error| SessionHubError::Task(error.to_string()))?;
                 let (activate, activation) = tokio::sync::oneshot::channel();
-                match ssh
-                    .runtime
-                    .start_pty(crate::ssh::SshPtyRequest {
-                        profile: name,
-                        term,
-                        size,
-                        shell,
-                        controls,
-                        activation: Some(activation),
-                    })
-                    .await
-                {
-                    Ok(shell) => {
-                        self.send(WireFrame::Response {
-                            request_id,
-                            body: ResponseBody::SshShellOpen { shell },
-                        })?;
-                        let _ = activate.send(());
-                        Ok(())
+                // Admit the pending shell coordinate before connecting. The
+                // client can cancel even a peer stalled in SSH negotiation;
+                // Running/Exited are published by the registry afterwards.
+                let starting = self
+                    .hub
+                    .shell_registry()
+                    .get(shell.id())
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::SshShellOpen { shell: starting },
+                })?;
+                let _ = activate.send(());
+                // The connection dispatcher must return to reading requests,
+                // including ShellClose. The registry owns cancellation: close,
+                // connection loss and teardown all wake the setup's close watch.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = ssh
+                        .runtime
+                        .start_pty(crate::ssh::SshPtyRequest {
+                            profile: name,
+                            term,
+                            size,
+                            shell,
+                            controls,
+                            activation: Some(activation),
+                        })
+                        .await
+                    {
+                        tracing::debug!(%error, "SSH terminal setup stopped");
                     }
-                    Err(error) => self.respond_ssh_error(request_id, error),
-                }
+                });
+                Ok(())
             }
             RequestBody::SshShellInput { id, data_b64 } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -10517,6 +10606,7 @@ impl HubConnection {
         summaries: &mut Vec<ProviderSummaryWire>,
         provider: &str,
         model: &str,
+        session_id: Option<&SessionId>,
     ) -> Result<(), InventoryRefreshError> {
         let cached_serves_model = summaries
             .iter()
@@ -10538,6 +10628,12 @@ impl HubConnection {
         if !needs_refresh {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(session_id) = session_id {
+            self.hub.pause_selection_network(session_id).await;
+        }
+        #[cfg(not(test))]
+        let _ = session_id;
         let facade = self
             .hub
             .accounts()
@@ -12119,47 +12215,92 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
-        let Some(current) = (match self.hub.session_metadata(&session_id).await {
-            Ok(metadata) => metadata,
-            Err(error) => return self.respond_turn_error(request_id, error),
-        }) else {
-            return self.respond_error(
-                request_id,
-                ERROR_CODE_NOT_FOUND,
-                "model selection requires a live session with typed metadata",
-                false,
-                None,
-            );
-        };
-        let (mut summaries, descriptors) = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map_or_else(
-                || (Vec::new(), Vec::new()),
-                |view| (view.providers, view.descriptors),
-            );
-        let selected_provider = provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|provider| !provider.is_empty())
-            .unwrap_or(&current.provider);
-        match self
-            .refresh_inventory_if_needed(&mut summaries, selected_provider, model.trim())
-            .await
-        {
-            Ok(()) => {}
-            Err(InventoryRefreshError::Hub(error)) => return Err(error),
-            Err(InventoryRefreshError::Provider(error)) => {
+        // Inventory refresh can perform network I/O. Read a speculative pair,
+        // fetch outside the per-session lock, then validate the same pair
+        // under the lock through the durable commit. If another writer moved
+        // it while fetching, discard the snapshot and retry.
+        let (_selection, current, summaries, descriptors) = loop {
+            let Some(before) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
                 return self.respond_error(
                     request_id,
-                    &error.code,
-                    &error.message,
-                    error.retryable,
-                    error.data,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
                 );
+            };
+            let (mut summaries, descriptors) = self
+                .hub
+                .accounts()?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |view| (view.providers, view.descriptors),
+                );
+            let selected_provider = provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .unwrap_or(&before.provider);
+            let refresh = self
+                .refresh_inventory_if_needed(
+                    &mut summaries,
+                    selected_provider,
+                    model.trim(),
+                    Some(&session_id),
+                )
+                .await;
+            let selection = self.hub.lock_workflow_selection(&session_id).await;
+            let Some(current) = (match self.hub.session_metadata(&session_id).await {
+                Ok(metadata) => metadata,
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }) else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_NOT_FOUND,
+                    "model selection requires a live session with typed metadata",
+                    false,
+                    None,
+                );
+            };
+            if (
+                before.provider.as_str(),
+                before.model.as_str(),
+                before.max_tokens,
+                before.max_tokens_source,
+                before.provider_base_url.as_deref(),
+                before.provider_rebind_id.as_deref(),
+                before.account_alias.as_deref(),
+            ) != (
+                current.provider.as_str(),
+                current.model.as_str(),
+                current.max_tokens,
+                current.max_tokens_source,
+                current.provider_base_url.as_deref(),
+                current.provider_rebind_id.as_deref(),
+                current.account_alias.as_deref(),
+            ) {
+                drop(selection);
+                continue;
             }
-        }
+            match refresh {
+                Ok(()) => {}
+                Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                Err(InventoryRefreshError::Provider(error)) => {
+                    return self.respond_error(
+                        request_id,
+                        &error.code,
+                        &error.message,
+                        error.retryable,
+                        error.data,
+                    );
+                }
+            }
+            break (selection, current, summaries, descriptors);
+        };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -12191,6 +12332,10 @@ impl HubConnection {
             },
             None => reapply_session_output_budget(&current, &validated),
         };
+        #[cfg(test)]
+        self.hub
+            .pause_model_selection_after_budget(&session_id)
+            .await;
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted
@@ -12277,6 +12422,7 @@ impl HubConnection {
             provider: resolved_provider,
             model: resolved_model,
             expected_pair: None,
+            automatic_run: None,
             // A model or output-budget choice never selects an account. The
             // descriptor above is only for cache preflight; passing it to the
             // store would turn an unpinned session into a durable pin.
@@ -16797,15 +16943,11 @@ impl HubConnection {
                 None,
             );
         }
-        if model.trim().is_empty() || max_tokens > haider_provider::MAX_OUTPUT_LIMIT {
+        if model.trim().is_empty() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                &format!(
-                    "session model must be non-empty and max_tokens must be in 0..={} \
-                     (0 derives the model default)",
-                    haider_provider::MAX_OUTPUT_LIMIT
-                ),
+                "session model must be non-empty",
                 false,
                 None,
             );
@@ -16816,7 +16958,7 @@ impl HubConnection {
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
-            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim())
+            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim(), None)
             .await
         {
             Ok(()) => {}
@@ -18000,6 +18142,7 @@ impl HubConnection {
                 record,
                 state: truth.state,
                 metrics: truth.metrics,
+                activity: truth.activity,
                 direct_child_count,
             });
         }
@@ -19153,17 +19296,11 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::ssh::SshError,
     ) -> Result<(), SessionHubError> {
-        let retryable = matches!(
-            &error,
-            crate::ssh::SshError::SshConnection { .. }
-                | crate::ssh::SshError::SshChannelQuota { .. }
-                | crate::ssh::SshError::Vault { .. }
-        );
         self.respond_error(
             request_id,
             error.code(),
             &error.to_string(),
-            retryable,
+            error.retryable(),
             None,
         )
     }
@@ -19173,6 +19310,15 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::shell_registry::ShellRegistryError,
     ) -> Result<(), SessionHubError> {
+        if let Some(setup_error) = self.hub.shell_registry().setup_error_for_control(&error) {
+            return self.respond_error(
+                request_id,
+                &setup_error.code,
+                &setup_error.message,
+                setup_error.retryable,
+                None,
+            );
+        }
         let retryable = matches!(
             &error,
             crate::shell_registry::ShellRegistryError::ControlBusy(_)

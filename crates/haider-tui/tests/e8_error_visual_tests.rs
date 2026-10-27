@@ -534,6 +534,7 @@ fn e8e_web_fetch_retry_note_on_completed_row_is_dim() {
                     name: "web_fetch".into(),
                     args: serde_json::json!({}),
                     status: haider_protocol::item::ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ));
@@ -568,6 +569,7 @@ fn e8e_web_fetch_retry_note_on_completed_row_is_dim() {
                     name: "web_fetch".into(),
                     args: serde_json::json!({}),
                     status: status.item_status(),
+                    activity: None,
                 },
             }),
         ));

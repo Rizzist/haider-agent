@@ -9,7 +9,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::provider::FinishReason;
 use haider_protocol::session::SessionMetadataV1;
 use haider_provider::{FakeProvider, FakeStep, Provider};
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
@@ -150,22 +150,38 @@ impl World {
     }
 
     async fn await_done(&self, session_id: &SessionId, run_id: &RunId) {
-        timeout(Duration::from_secs(10), async {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             loop {
                 let events = self
                     .store
                     .read(session_id, 0, 2048)
                     .await
                     .expect("read journal");
-                if events.iter().any(|event| {
-                    event.run_id.as_ref() == Some(run_id)
+                let done_seq = events.iter().find_map(|event| {
+                    (event.run_id.as_ref() == Some(run_id)
                         && event.payload.decode_event().is_ok_and(|payload| {
                             matches!(payload, EventPayload::RunState(RunState::Done))
-                        })
+                        }))
+                    .then_some(event.seq)
+                });
+                // Done precedes the worker's final aggregate-idle commit.
+                // Fence that tail before taking the head and paging receipts.
+                if done_seq.is_some_and(|done_seq| {
+                    events.iter().any(|event| {
+                        event.seq > done_seq
+                            && event.payload.decode_event().is_ok_and(|payload| {
+                                matches!(
+                                    payload,
+                                    EventPayload::SessionState(
+                                        haider_protocol::state::SessionState::Idle { .. }
+                                    )
+                                )
+                            })
+                    })
                 }) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -256,7 +272,7 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
         .append(&mut source_events)
         .await
         .expect("source journal");
-    world.run_turn("handoff", "read the prior session").await;
+    let run = world.run_turn("handoff", "read the prior session").await;
     assert_eq!(
         world
             .store
@@ -265,11 +281,40 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
             .expect("unchanged source"),
         source_events
     );
-    let events = world
-        .store
-        .read(&world.session_id, 0, 2048)
-        .await
-        .expect("receipts");
+    // Done precedes the supervisor's final Idle append. Wait for that
+    // committed boundary before comparing a paginated immutable journal.
+    let events = timeout(Duration::from_secs(10), async {
+        loop {
+            let events = world
+                .store
+                .read(&world.session_id, 0, 2048)
+                .await
+                .expect("receipts");
+            let done = events.iter().find(|event| {
+                event.run_id.as_ref() == Some(&run)
+                    && matches!(
+                        event.payload.decode_event(),
+                        Ok(EventPayload::RunState(RunState::Done))
+                    )
+            });
+            if let Some(done) = done
+                && events.iter().any(|event| {
+                    event.seq > done.seq
+                        && matches!(
+                            event.payload.decode_event(),
+                            Ok(EventPayload::SessionState(
+                                haider_protocol::state::SessionState::Idle { .. }
+                            ))
+                        )
+                })
+            {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("final session idle committed");
     let results: Vec<_> = events
         .iter()
         .filter_map(|event| match event.payload.decode_event().ok()? {

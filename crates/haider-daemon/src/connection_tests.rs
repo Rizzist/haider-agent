@@ -355,6 +355,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_SHELL_REGISTRY_V1`. Expected runtime failure: clients expose a
 /// management or terminal-registry surface that the handshake says is absent.
 ///
+/// MUTATION CHECK: remove `FEATURE_SSH_TYPED_SETUP_ERRORS_V1`. Expected
+/// runtime failure: clients cannot distinguish typed setup errors from legacy
+/// text-only setup errors after an uncoded command exit.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_FLEET_IDENTITY_V1`. Expected
 /// RUNTIME failure: clients cannot distinguish manifest-backed name/model/
 /// provider rows from the legacy fleet shape.
@@ -366,9 +370,9 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        122,
-        "model output limits add one feature to the existing \
-         121-feature set"
+        123,
+        "typed SSH setup errors add one feature to the existing \
+         122-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -476,6 +480,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_LINEAGE_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
             FEATURE_SSH_PROFILES_V1.to_owned(),
+            FEATURE_SSH_TYPED_SETUP_ERRORS_V1.to_owned(),
             FEATURE_SHELL_REGISTRY_V1.to_owned(),
             haider_rpc::FEATURE_USER_COMMAND_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
@@ -497,6 +502,114 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_CHECKPOINT_V1.to_owned(),
         ])
     );
+}
+
+#[test]
+fn activity_token_requires_hello_request_and_follows_newer_withholding() {
+    let mut hello = Hello {
+        protocol_min: 1,
+        protocol_max: 1,
+        client_name: "released-client".into(),
+        client_version: "0.0.972".into(),
+        client_instance_id: "instance".into(),
+        client_kind: haider_rpc::ClientKind::Tui,
+        capabilities_requested: [Capability::View].into_iter().collect(),
+        features_requested: Default::default(),
+        max_receive_frame: 1_048_576,
+        encodings: Vec::new(),
+    };
+    assert!(!welcome_features_for(&hello).contains(FEATURE_SESSION_ACTIVITY_V1));
+    for near_miss in [
+        "Session_Activity_V1",
+        " session_activity_v1",
+        "session_activity_v1 ",
+        "session-activity-v1",
+        "session_activity_v",
+        "session_activity_v10",
+        "sеssion_activity_v1", // Cyrillic e is not the ASCII token.
+        "",
+    ] {
+        hello.features_requested.insert(near_miss.to_owned());
+        assert!(!welcome_features_for(&hello).contains(FEATURE_SESSION_ACTIVITY_V1));
+        hello.features_requested.clear();
+    }
+    hello
+        .features_requested
+        .insert(FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    hello.features_requested.insert("future_feature_v1".into());
+    let features = welcome_features_for(&hello);
+    assert!(!features.contains("future_feature_v1"));
+    assert!(features.contains(FEATURE_SESSION_ACTIVITY_V1));
+    assert!(features.contains(FEATURE_SESSION_FLEET_IDENTITY_V1));
+    let welcome = Welcome {
+        protocol: 1,
+        instance_id: "daemon".into(),
+        daemon_generation: 1,
+        frame_limit: 1_048_576,
+        profile_id: "profile".into(),
+        daemon_version: "0.0.973".into(),
+        lifecycle_phase: LifecyclePhase::Ready,
+        capabilities_granted: [Capability::View].into_iter().collect(),
+        features,
+        user_command_withheld: false,
+        encoding: None,
+    };
+    let full_len = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
+        .expect("full Welcome")
+        .len()
+        - 4;
+    let granted = encode_welcome_for_peer(welcome.clone(), full_len).expect("grant fits");
+    assert!(granted.features.contains(FEATURE_SESSION_ACTIVITY_V1));
+    let newest_withheld =
+        encode_welcome_for_peer(welcome.clone(), full_len - 1).expect("newest token withheld");
+    assert!(
+        !newest_withheld
+            .features
+            .contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1)
+    );
+    assert!(
+        newest_withheld
+            .features
+            .contains(FEATURE_SESSION_ACTIVITY_V1)
+    );
+    let withheld = encode_welcome_for_peer(welcome, newest_withheld.bytes.len() - 5)
+        .expect("activity withheld after the newer token");
+    assert!(!withheld.features.contains(FEATURE_SESSION_ACTIVITY_V1));
+    assert!(
+        withheld
+            .features
+            .contains(FEATURE_SESSION_FLEET_IDENTITY_V1)
+    );
+    let summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "child", "head_seq": 1, "worker_generation": 1
+    }))
+    .expect("summary");
+    let frame = WireFrame::SessionRosterDelta {
+        summaries: vec![haider_rpc::SessionSummary {
+            agent_metrics: Some(identity_gate_metrics()),
+            ..summary
+        }],
+    };
+    for (features, has_activity) in [
+        (granted.features, true),
+        (newest_withheld.features, true),
+        (withheld.features, false),
+    ] {
+        for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+            let sink = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: features.contains(FEATURE_SESSION_FLEET_IDENTITY_V1),
+                activity: features.contains(FEATURE_SESSION_ACTIVITY_V1),
+            };
+            let bytes = outbound_bytes(sink.encode(&frame).expect("roster encodes"));
+            assert_eq!(
+                bytes.windows(8).any(|window| window == b"activity"),
+                has_activity
+            );
+        }
+    }
 }
 
 #[test]
@@ -544,268 +657,243 @@ fn welcome_advertises_resident_session_binding_token_echo() {
     );
 }
 
-/// MUTATION CHECK: reverse the withholding order or omit the retained feature
-/// set. Expected runtime failure: a peer at a preceding Welcome limit no
-/// longer receives byte-identical pre-runperm/pre-K1/pre-X1/v0.0.965 bytes,
-/// or the grant admits a shape that its Welcome did not advertise.
-///
-/// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
-/// second fallback with `false`. Expected runtime failure: the older tight
-/// Welcome loses the already-shipped causal marker pinned below.
+// Literal reply bodies and byte ceilings emitted by 56e4a29a's encoder, before
+// ssh_typed_setup_errors_v1 existed. Never build the predecessor from today's
+// feature list: that would let an additive token move every compatibility limit.
+// Never regenerate welcome-wave56.json from a later tree, including for a
+// release-identity bump: tests that compare against the real daemon's own
+// serialisation substitute only the pinned daemon_version (see
+// `pinned_reply_for_current_daemon`).
+#[derive(serde::Deserialize)]
+struct PreviousWelcome {
+    activity: bool,
+    control: bool,
+    encoding: Option<String>,
+    withheld_count: usize,
+    limit: usize,
+    reply: String,
+}
+
+fn previous_welcomes() -> Vec<PreviousWelcome> {
+    let rows: Vec<PreviousWelcome> = serde_json::from_str(include_str!("welcome-wave56.json"))
+        .expect("pinned wave Welcome bytes");
+    assert_eq!(rows.len(), 64);
+    rows
+}
+
+fn previous_welcome(row: &PreviousWelcome) -> Welcome {
+    assert_eq!(row.reply.len(), row.limit, "literal previous byte ceiling");
+    let welcome: Welcome = serde_json::from_str(&row.reply).expect("previous Welcome");
+    assert!(!welcome.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+    assert_eq!(welcome.user_command_withheld, row.withheld_count == 7);
+    welcome
+}
+
+fn current_welcome(row: &PreviousWelcome) -> Welcome {
+    let mut welcome = previous_welcome(row);
+    welcome.features = welcome_features();
+    if row.activity {
+        welcome
+            .features
+            .insert(FEATURE_SESSION_ACTIVITY_V1.to_owned());
+    }
+    welcome.user_command_withheld = false;
+    welcome
+}
+
+/// The version every wave-56 row was pinned with. The fixture stays literal.
+const WAVE56_DAEMON_VERSION_FIELD: &str = "\"daemon_version\":\"0.0.972\"";
+
+/// The pinned reply as today's daemon serialises it: exactly one substitution,
+/// the pinned `daemon_version` for this crate's version. The real dispatch path
+/// writes `env!("CARGO_PKG_VERSION")`, so a version bump must not move the
+/// expected bytes or their ceiling; every other byte stays literal.
+fn pinned_reply_for_current_daemon(reply: &str) -> String {
+    assert_eq!(
+        reply.matches(WAVE56_DAEMON_VERSION_FIELD).count(),
+        1,
+        "each pinned reply carries the pinned daemon_version exactly once"
+    );
+    reply.replacen(
+        WAVE56_DAEMON_VERSION_FIELD,
+        &format!("\"daemon_version\":\"{}\"", env!("CARGO_PKG_VERSION")),
+        1,
+    )
+}
+
+fn pinned_welcome_bytes(body: &str) -> Vec<u8> {
+    let mut bytes = u32::try_from(body.len())
+        .expect("fixture length")
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
+/// Killed mutations: never withhold the new token; withhold it after an older
+/// capability; derive expected bytes from the current set. The fixture is fixed
+/// independently of welcome_features(), including its eight old boundaries.
 #[test]
-fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
-    let welcome = Welcome {
-        protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
-        instance_id: "instance".into(),
-        daemon_generation: 7,
-        frame_limit: 1_024,
-        profile_id: "profile".into(),
-        daemon_version: "test".into(),
-        lifecycle_phase: LifecyclePhase::Ready,
-        capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
-        features: welcome_features(),
-        user_command_withheld: false,
-        encoding: None,
-    };
-    let full = uds_codec::encode(&WireFrame::Welcome(welcome.clone()), usize::MAX)
-        .expect("full Welcome encodes");
-    let full_body_len = full.len() - 4;
-
-    let ample = encode_welcome_for_peer(welcome.clone(), full_body_len)
-        .expect("exact full limit carries every feature");
-    assert_eq!(ample.bytes.as_slice(), full.as_slice());
-    assert_eq!(ample.features, welcome.features);
+fn tight_welcome_preserves_all_64_wave56_replies() {
+    let mut failures = Vec::new();
+    for row in previous_welcomes() {
+        let expected = pinned_welcome_bytes(&row.reply);
+        // An actual old feature list remains a negative control.
+        let old = encode_welcome_for_peer(previous_welcome(&row), row.limit)
+            .expect("unchanged previous reply fits");
+        assert_eq!(old.bytes.as_slice(), expected);
+        let result = encode_welcome_for_peer(current_welcome(&row), row.limit);
+        let exact = result.as_ref().is_ok_and(|encoded| {
+            encoded.bytes.as_slice() == expected
+                && encoded.features == previous_welcome(&row).features
+        });
+        println!(
+            "previous Welcome: encoding={:?} activity={} control={} boundary={} limit={} preserved={exact}",
+            row.encoding, row.activity, row.control, row.withheld_count, row.limit
+        );
+        if !exact {
+            failures.push((row.encoding, row.activity, row.control, row.withheld_count));
+        }
+    }
     assert!(
-        !std::str::from_utf8(&ample.bytes[4..])
-            .expect("Welcome is JSON")
-            .contains("\"uw\""),
-        "nothing withheld serializes no marker, never false"
+        failures.is_empty(),
+        "previous connection capability list changed: {failures:?}"
     );
-    let mut ample_decoder = uds_codec::Decoder::new(full_body_len);
-    let ample_frames = ample_decoder.push(&ample.bytes).frames;
-    assert!(matches!(
-        ample_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
-            if features == &welcome.features && !user_command_withheld
-    ));
-
-    let mut pre_agent_cli_welcome = welcome.clone();
-    assert!(
-        pre_agent_cli_welcome
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    let pre_agent_cli = uds_codec::encode(
-        &WireFrame::Welcome(pre_agent_cli_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-agent-CLI Welcome encodes");
-    let pre_agent_cli_body_len = pre_agent_cli.len() - 4;
-    let agent_cli_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
-        .expect("tight peer first withholds only the new agent CLI shape");
-    assert_eq!(agent_cli_tight.bytes.as_slice(), pre_agent_cli.as_slice());
-    assert_eq!(agent_cli_tight.features, pre_agent_cli_welcome.features);
-
-    let mut pre_read_only_welcome = pre_agent_cli_welcome.clone();
-    assert!(
-        pre_read_only_welcome
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    let pre_read_only = uds_codec::encode(
-        &WireFrame::Welcome(pre_read_only_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-read-only Welcome encodes");
-    let pre_read_only_body_len = pre_read_only.len() - 4;
-    let read_only_tight = encode_welcome_for_peer(welcome.clone(), pre_agent_cli_body_len - 1)
-        .expect("tight peer retains the exact pre-read-only handshake");
-    assert_eq!(read_only_tight.bytes.as_slice(), pre_read_only.as_slice());
-    assert_eq!(read_only_tight.features, pre_read_only_welcome.features);
-    assert!(
-        !read_only_tight
-            .features
-            .contains(FEATURE_SESSION_READ_ONLY_V1)
-    );
-
-    let mut pre_cancel_welcome = pre_read_only_welcome.clone();
-    assert!(
-        pre_cancel_welcome
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    let pre_cancel = uds_codec::encode(&WireFrame::Welcome(pre_cancel_welcome.clone()), usize::MAX)
-        .expect("pre-cancel Welcome encodes");
-    let pre_cancel_body_len = pre_cancel.len() - 4;
-    let cancel_tight = encode_welcome_for_peer(welcome.clone(), pre_read_only_body_len - 1)
-        .expect("tight peer retains the exact pre-cancel handshake");
-    assert_eq!(cancel_tight.bytes.as_slice(), pre_cancel.as_slice());
-    assert_eq!(cancel_tight.features, pre_cancel_welcome.features);
-    assert!(
-        !cancel_tight
-            .features
-            .contains(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-
-    let mut pre_identity_welcome = pre_cancel_welcome.clone();
-    assert!(
-        pre_identity_welcome
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    let pre_identity = uds_codec::encode(
-        &WireFrame::Welcome(pre_identity_welcome.clone()),
-        usize::MAX,
-    )
-    .expect("pre-identity Welcome encodes");
-    let pre_identity_body_len = pre_identity.len() - 4;
-    let identity_tight = encode_welcome_for_peer(welcome.clone(), pre_cancel_body_len - 1)
-        .expect("tight peer retains the exact pre-identity handshake");
-    assert_eq!(identity_tight.bytes.as_slice(), pre_identity.as_slice());
-    assert_eq!(identity_tight.features, pre_identity_welcome.features);
-    assert!(
-        !identity_tight
-            .features
-            .contains(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-
-    let mut pre_prompt_welcome = pre_identity_welcome.clone();
-    assert!(
-        pre_prompt_welcome
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    let pre_prompt = uds_codec::encode(&WireFrame::Welcome(pre_prompt_welcome.clone()), usize::MAX)
-        .expect("pre-prompt Welcome encodes");
-    let pre_prompt_body_len = pre_prompt.len() - 4;
-    let prompt_tight = encode_welcome_for_peer(welcome.clone(), pre_identity_body_len - 1)
-        .expect("tight peer retains the exact pre-prompt handshake");
-    assert_eq!(prompt_tight.bytes.as_slice(), pre_prompt.as_slice());
-    assert_eq!(prompt_tight.features, pre_prompt_welcome.features);
-    assert!(
-        !prompt_tight
-            .features
-            .contains(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-
-    let tight = encode_welcome_for_peer(welcome.clone(), pre_prompt_body_len - 1)
-        .expect("older user-command fallback still fits");
-    let mut without_features = pre_prompt_welcome.clone();
-    assert!(without_features.features.remove(FEATURE_USER_COMMAND_V1));
-    let without_features = uds_codec::encode(&WireFrame::Welcome(without_features), usize::MAX)
-        .expect("unmarked Welcome without either additive feature encodes");
-    let without_features_body_len = without_features.len() - 4;
-    let tight_body_len = tight.bytes.len() - 4;
-    assert_eq!(
-        pre_prompt_body_len - without_features_body_len,
-        18,
-        "the real encoder's feature-array element costs 18 bytes"
-    );
-    assert_eq!(
-        tight_body_len - without_features_body_len,
-        10,
-        "the short true marker costs 10 bytes"
-    );
-    assert_eq!(
-        pre_prompt_body_len - tight_body_len,
-        8,
-        "replacement must be strictly smaller than the withheld token"
-    );
-    assert!(
-        std::str::from_utf8(&tight.bytes[4..])
-            .expect("Welcome is JSON")
-            .contains("\"uw\":true"),
-        "a withheld token carries the causal marker"
-    );
-    let mut tight_decoder = uds_codec::Decoder::new(pre_prompt_body_len - 1);
-    let tight_frames = tight_decoder.push(&tight.bytes).frames;
-    let mut expected = pre_prompt_welcome.features.clone();
-    assert!(expected.remove(FEATURE_USER_COMMAND_V1));
-    assert_eq!(tight.features, expected);
-    assert!(matches!(
-        tight_frames.as_slice(),
-        [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
-            if features == &expected && *user_command_withheld
-    ));
-
-    let mut selected_encoding = welcome;
-    selected_encoding.encoding = Some("msgpack".into());
-    let mut selected_unmarked = selected_encoding.clone();
-    assert!(
-        selected_unmarked
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    assert!(
-        selected_unmarked
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    assert!(selected_unmarked.features.remove(FEATURE_USER_COMMAND_V1));
-    let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
-        .expect("selected-encoding unmarked Welcome encodes");
-    let mut selected_pre_prompt = selected_encoding.clone();
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_READ_ONLY_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
-    );
-    assert!(
-        selected_pre_prompt
-            .features
-            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
-    );
-    let selected_pre_prompt =
-        uds_codec::encode(&WireFrame::Welcome(selected_pre_prompt), usize::MAX)
-            .expect("selected-encoding pre-prompt Welcome encodes");
-    let selected_pre_prompt_body_len = selected_pre_prompt.len() - 4;
-    let selected_tight =
-        encode_welcome_for_peer(selected_encoding, selected_pre_prompt_body_len - 1)
-            .expect("selected-encoding fallback fits");
-    assert_eq!(
-        selected_pre_prompt_body_len - (selected_unmarked.len() - 4),
-        18
-    );
-    assert_eq!(
-        (selected_tight.bytes.len() - 4) - (selected_unmarked.len() - 4),
-        10
-    );
-    assert_eq!(
-        selected_pre_prompt_body_len - (selected_tight.bytes.len() - 4),
-        8
-    );
-
     assert_unadvertised_fleet_identity_is_byte_identical();
+}
+
+#[test]
+fn tight_welcome_preserves_non_ready_wave56_replies_and_ample_peers() {
+    for row in previous_welcomes() {
+        let current = current_welcome(&row);
+        let full = uds_codec::encode(&WireFrame::Welcome(current.clone()), usize::MAX)
+            .expect("ample Welcome");
+        let ample = encode_welcome_for_peer(current.clone(), full.len() - 4).expect("ample peer");
+        assert_eq!(ample.bytes.as_slice(), full);
+        assert!(ample.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+        for (phase, name) in [
+            (LifecyclePhase::Starting, "starting"),
+            (LifecyclePhase::Recovering, "recovering"),
+            (LifecyclePhase::Draining, "draining"),
+            (LifecyclePhase::Finalizing, "finalizing"),
+            (LifecyclePhase::Stopped, "stopped"),
+            (LifecyclePhase::Failed, "failed"),
+            (LifecyclePhase::Unknown, "unknown"),
+        ] {
+            // Only the lifecycle spelling changes in these literal old bytes.
+            let body = row.reply.replace(
+                "\"lifecycle_phase\":\"ready\"",
+                &format!("\"lifecycle_phase\":\"{name}\""),
+            );
+            assert_ne!(body, row.reply);
+            let mut welcome = current.clone();
+            welcome.lifecycle_phase = phase;
+            let encoded =
+                encode_welcome_for_peer(welcome, body.len()).expect("non-Ready old ceiling");
+            assert_eq!(
+                encoded.bytes.as_slice(),
+                pinned_welcome_bytes(&body),
+                "{name}"
+            );
+        }
+        if row.withheld_count == 7 {
+            assert!(
+                encode_welcome_for_peer(current, row.limit - 1).is_err(),
+                "a peer below the shipped minimum still cannot connect"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache() {
+    let (_root, hub) = liveness_hub().await;
+    let mut context = liveness_context(hub);
+    context.instance_id = "local-instance".into();
+    context.profile_id = "local-profile".into();
+    let (_sender, drain) = watch::channel(None);
+    // Tight first, then ample, then tight again: a cached full reply must not
+    // displace old capabilities, and a tight reply must never poison the cache.
+    for ample in [false, true, false] {
+        for row in previous_welcomes() {
+            // The peer limit is the ceiling of the reply this daemon would have
+            // sent, sized from the substituted body, not from today's set.
+            let reply = pinned_reply_for_current_daemon(&row.reply);
+            let lane = OutboundLane::new(1, 1_048_576, 1_048_576);
+            let mut grant = None;
+            let hello = Hello {
+                protocol_min: 1,
+                protocol_max: 1,
+                client_name: "local-peer-check".into(),
+                client_version: "synthetic".into(),
+                client_instance_id: "local-peer".into(),
+                client_kind: haider_rpc::ClientKind::Tui,
+                capabilities_requested: previous_welcome(&row).capabilities_granted,
+                features_requested: if row.activity {
+                    BTreeSet::from([FEATURE_SESSION_ACTIVITY_V1.to_owned()])
+                } else {
+                    BTreeSet::new()
+                },
+                max_receive_frame: if ample {
+                    1_048_576
+                } else {
+                    u32::try_from(reply.len()).expect("peer limit")
+                },
+                encodings: row.encoding.iter().cloned().collect(),
+            };
+            let encoding = negotiate_hello(
+                hello,
+                &context,
+                &drain,
+                &lane,
+                &mut grant,
+                if ample { 1_048_576 } else { reply.len() },
+            )
+            .expect("previous peer connects");
+            assert_eq!(
+                encoding,
+                Some(if row.encoding.is_some() {
+                    WireEncoding::MessagePack
+                } else {
+                    WireEncoding::Json
+                })
+            );
+            let bytes = outbound_bytes(lane.recv().await.expect("Welcome queued").bytes);
+            let grant = grant.expect("connection grant");
+            if ample {
+                assert!(grant.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
+            } else {
+                assert_eq!(bytes, pinned_welcome_bytes(&reply));
+                assert_eq!(grant.features, previous_welcome(&row).features);
+            }
+        }
+    }
+}
+
+fn identity_gate_metrics() -> haider_protocol::agent::AgentMetricsSnapshot {
+    use haider_protocol::activity::{ActivityKind, ActivityStateV1, ActivityTouchV1};
+    haider_protocol::agent::AgentMetricsSnapshot {
+        agent: Some(haider_protocol::ids::AgentId::new("identity-gate-agent")),
+        session_id: haider_protocol::ids::SessionId::new("identity-gate-child"),
+        head_seq: 9,
+        started_at_ms: 1,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: None,
+        activity: Some(ActivityStateV1 {
+            open: vec![ActivityKind::Edit],
+            touched: vec![ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }],
+            latest: Some(ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }),
+            terminal: false,
+        }),
+    }
 }
 
 fn assert_unadvertised_fleet_identity_is_byte_identical() {
@@ -833,7 +921,15 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     parent_session_id: root_session_id.clone(),
                     parent_agent_id: None,
                     state: haider_rpc::FleetAgentStateWire::Live,
-                    metrics: None,
+                    // 973-activity-icons: populated metrics carry the
+                    // activity state the legacy sink must drop too.
+                    metrics: Some(identity_gate_metrics()),
+                    // 973-activity-icons: the legacy sink omits these too.
+                    activity: Some(haider_protocol::activity::ActivityKind::Edit),
+                    activities: vec![
+                        haider_protocol::activity::ActivityKind::Edit,
+                        haider_protocol::activity::ActivityKind::Read,
+                    ],
                     folded_children: 0,
                     children: Vec::new(),
                 }],
@@ -871,6 +967,20 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
         parent_anchors: haider_rpc::DescendantParentAnchorsWire::default(),
         children: Vec::new(),
     };
+    let mut fleet = fleet;
+    if let WireFrame::Response {
+        body: ResponseBody::SessionFleet { snapshot },
+        ..
+    } = &mut fleet
+    {
+        let mut grandchild = snapshot.roots[0].clone();
+        grandchild.depth = 2;
+        snapshot.roots[0].children.push(grandchild);
+    }
+    let mut descendant_node = descendant_node;
+    let mut grandchild = descendant_node.clone();
+    grandchild.depth = 2;
+    descendant_node.children.push(grandchild);
     let baseline = WireFrame::Response {
         request_id: RequestId::new("identity-gate-descendants"),
         body: ResponseBody::SessionDescendantsAttach {
@@ -901,13 +1011,69 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
         },
     };
 
-    let rich_frames = [fleet, baseline, delta];
+    let roster: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+    }))
+    .expect("minimal summary");
+    let roster = WireFrame::SessionRosterDelta {
+        summaries: vec![haider_rpc::SessionSummary {
+            agent_metrics: Some(identity_gate_metrics()),
+            ..roster
+        }],
+    };
+    let summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+    }))
+    .expect("minimal list summary");
+    let summary = haider_rpc::SessionSummary {
+        agent_metrics: Some(identity_gate_metrics()),
+        ..summary
+    };
+    let digest: haider_rpc::SessionObserveDigest = serde_json::from_value(serde_json::json!({
+        "session_id": "identity-gate-child",
+        "head_seq": 9,
+        "worker_generation": 1,
+        "title": "identity gate",
+        "run_state": "running",
+        "main_head_seq": 9,
+        "updated_at_ms": 1,
+    }))
+    .expect("minimal observe digest");
+    let digest = haider_rpc::SessionObserveDigest {
+        agent_metrics: Some(identity_gate_metrics()),
+        ..digest
+    };
+    let list = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-list"),
+        body: ResponseBody::SessionList {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    };
+    let observe = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-observe"),
+        body: ResponseBody::SessionObserve {
+            digest: digest.clone(),
+        },
+    };
+    let observe_batch = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-observe-batch"),
+        body: ResponseBody::SessionObserveBatch {
+            digests: vec![digest],
+        },
+    };
+    let rich_frames = [fleet, baseline, delta, roster, list, observe, observe_batch];
     for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
         let sink = ConnectionFrameSink {
             lane: OutboundLane::new(1, 1_048_576, 1_048_576),
             outbound_limit: 1_048_576,
             encoding,
             fleet_identity: false,
+            activity: false,
         };
         for rich_frame in &rich_frames {
             let mut legacy_frame = (*rich_frame).clone();
@@ -916,8 +1082,52 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     body: ResponseBody::SessionFleet { snapshot },
                     ..
                 } => {
-                    snapshot.roots[0].model = None;
-                    snapshot.roots[0].provider = None;
+                    for node in &mut snapshot.roots {
+                        node.model = None;
+                        node.provider = None;
+                        node.activity = None;
+                        node.activities.clear();
+                        if let Some(metrics) = node.metrics.as_mut() {
+                            metrics.activity = None;
+                        }
+                        let child = &mut node.children[0];
+                        child.model = None;
+                        child.provider = None;
+                        child.activity = None;
+                        child.activities.clear();
+                        if let Some(metrics) = child.metrics.as_mut() {
+                            metrics.activity = None;
+                        }
+                    }
+                }
+                WireFrame::SessionRosterDelta { summaries } => {
+                    if let Some(metrics) = summaries[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionList { sessions, .. },
+                    ..
+                } => {
+                    if let Some(metrics) = sessions[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionObserve { digest },
+                    ..
+                } => {
+                    if let Some(metrics) = digest.agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionObserveBatch { digests },
+                    ..
+                } => {
+                    if let Some(metrics) = digests[0].agent_metrics.as_mut() {
+                        metrics.activity = None;
+                    }
                 }
                 WireFrame::Response {
                     body: ResponseBody::SessionDescendantsAttach { baseline, .. },
@@ -925,6 +1135,8 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 } => {
                     baseline.roots[0].model = None;
                     baseline.roots[0].provider = None;
+                    baseline.roots[0].children[0].model = None;
+                    baseline.roots[0].children[0].provider = None;
                 }
                 WireFrame::SessionDescendantStream {
                     event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
@@ -932,17 +1144,41 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 } => {
                     child.model = None;
                     child.provider = None;
+                    child.children[0].model = None;
+                    child.children[0].provider = None;
                 }
                 _ => unreachable!("identity gate fixture covers all delivery shapes"),
             }
+            if matches!(
+                legacy_frame,
+                WireFrame::Response {
+                    body: ResponseBody::SessionFleet { .. }
+                        | ResponseBody::SessionDescendantsAttach { .. },
+                    ..
+                } | WireFrame::SessionDescendantStream {
+                    event: haider_rpc::SessionDescendantStreamEventWire::Delta { .. },
+                    ..
+                }
+            ) {
+                assert!(
+                    serde_json::to_string(&legacy_frame)
+                        .expect("legacy identity frame serializes")
+                        .contains("\"callsign\":\"jade-fox-a1b2c3\""),
+                    "the pre-existing callsign field survives the X1 feature gate"
+                );
+            }
             assert!(
-                serde_json::to_string(&legacy_frame)
-                    .expect("legacy identity frame serializes")
-                    .contains("\"callsign\":\"jade-fox-a1b2c3\""),
-                "the pre-existing callsign field survives the X1 feature gate"
+                !serde_json::to_string(&legacy_frame)
+                    .expect("legacy frame serializes")
+                    .contains("\"activit"),
+                "no 973 activity field reaches a legacy peer"
             );
             let expected = uds_codec::encode_with(&legacy_frame, 1_048_576, encoding)
                 .expect("legacy identity frame encodes");
+            assert!(
+                !expected.windows(7).any(|part| part == b"activit"),
+                "legacy {encoding:?} frame must not encode activity keys"
+            );
             let encoded = sink.encode(rich_frame).expect("legacy sink encodes");
             let actual = match encoded {
                 OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
@@ -961,6 +1197,117 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                 }
             };
             assert_eq!(actual, expected);
+            let inconsistent = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: false,
+                activity: true,
+            };
+            assert_eq!(
+                outbound_bytes(
+                    inconsistent
+                        .encode(rich_frame)
+                        .expect("class 1 remains legacy")
+                ),
+                expected
+            );
+            // Released 966–972 peers negotiate fleet identity but never
+            // request session_activity_v1. They retain model/provider while
+            // every activity key is absent in both encodings.
+            let mut identity_only = legacy_frame.clone();
+            match &mut identity_only {
+                WireFrame::Response {
+                    body: ResponseBody::SessionFleet { snapshot },
+                    ..
+                } => {
+                    snapshot.roots[0].model = Some("gpt-5.6".into());
+                    snapshot.roots[0].provider = Some("openai".into());
+                    snapshot.roots[0].children[0].model = Some("gpt-5.6".into());
+                    snapshot.roots[0].children[0].provider = Some("openai".into());
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+                    ..
+                } => {
+                    baseline.roots[0].model = Some("gpt-5.6".into());
+                    baseline.roots[0].provider = Some("openai".into());
+                    baseline.roots[0].children[0].model = Some("gpt-5.6".into());
+                    baseline.roots[0].children[0].provider = Some("openai".into());
+                }
+                WireFrame::SessionDescendantStream {
+                    event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
+                    ..
+                } => {
+                    child.model = Some("gpt-5.6".into());
+                    child.provider = Some("openai".into());
+                    child.children[0].model = Some("gpt-5.6".into());
+                    child.children[0].provider = Some("openai".into());
+                }
+                _ => {}
+            }
+            let class2 = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: true,
+                activity: false,
+            };
+            let expected_class2 = uds_codec::encode_with(&identity_only, 1_048_576, encoding)
+                .expect("identity-only frame encodes");
+            assert_eq!(
+                outbound_bytes(class2.encode(rich_frame).expect("class 2 encodes")),
+                expected_class2
+            );
+            assert!(
+                !serde_json::to_string(&identity_only)
+                    .expect("class 2 JSON")
+                    .contains("\"activit")
+            );
+            if matches!(
+                rich_frame,
+                WireFrame::Response {
+                    body: ResponseBody::SessionFleet { .. },
+                    ..
+                }
+            ) {
+                assert!(
+                    serde_json::to_string(&identity_only)
+                        .expect("fleet JSON")
+                        .contains("\"model\":\"gpt-5.6\"")
+                );
+            }
+            let class3 = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: true,
+                activity: true,
+            };
+            assert_eq!(
+                outbound_bytes(class3.encode(rich_frame).expect("class 3 encodes")),
+                uds_codec::encode_with(rich_frame, 1_048_576, encoding)
+                    .expect("full frame encodes")
+            );
+        }
+    }
+}
+
+fn outbound_bytes(encoded: OutboundBytes) -> Vec<u8> {
+    match encoded {
+        OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+        OutboundBytes::Framed(frame) => {
+            let mut bytes = Vec::with_capacity(frame.framed_len());
+            bytes.extend_from_slice(frame.prefix());
+            bytes.extend_from_slice(frame.body());
+            bytes
+        }
+        OutboundBytes::Event(frame) => {
+            let mut bytes = Vec::with_capacity(frame.framed_len());
+            frame
+                .write_to(&mut bytes)
+                .expect("event frame reconstructs");
+            bytes
         }
     }
 }
@@ -1493,6 +1840,7 @@ fn queued_byte_budget_covers_the_four_byte_prefix_at_the_exact_boundary() {
         outbound_limit: frame_limit,
         encoding: haider_rpc::WireEncoding::Json,
         fleet_identity: true,
+        activity: true,
     };
     assert!(
         matches!(sink.offer(&attachment_id, &event), SendAdmission::Sent),
@@ -1595,6 +1943,7 @@ async fn handshake_over(client: &mut UnixStream) {
         client_instance_id: "client-liveness".into(),
         client_kind: haider_rpc::ClientKind::Cli,
         capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+        features_requested: Default::default(),
         max_receive_frame: 1024 * 1024,
         encodings: Vec::new(),
     });
@@ -1706,6 +2055,7 @@ impl PairedClient {
             client_instance_id: "paired-client".into(),
             client_kind: haider_rpc::ClientKind::Headless,
             capabilities_requested: capabilities,
+            features_requested: Default::default(),
             max_receive_frame: 1024 * 1024,
             encodings: Vec::new(),
         }))
@@ -1729,6 +2079,7 @@ impl PairedClient {
             client_instance_id: "paired-msgpack-client".into(),
             client_kind: haider_rpc::ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View]),
+            features_requested: Default::default(),
             max_receive_frame: 1024 * 1024,
             encodings: vec!["msgpack".into()],
         }))
@@ -1917,7 +2268,7 @@ async fn resident_binding_frame_routes_across_the_paired_connection() {
         .await;
 
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), observed_rx.recv())
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, observed_rx.recv())
             .await
             .expect("binding push is prompt")
             .expect("observer stays open"),
@@ -2007,6 +2358,7 @@ async fn msgpack_drain_waits_for_json_welcome_on_paired_uds() {
         client_instance_id: "paired-drain-order-client".into(),
         client_kind: haider_rpc::ClientKind::Headless,
         capabilities_requested: CapabilitySet::from([Capability::View]),
+        features_requested: Default::default(),
         max_receive_frame: 1024 * 1024,
         encodings: vec!["msgpack".into()],
     });
@@ -2492,4 +2844,714 @@ async fn welcome_barrier_holds_every_other_lane_until_the_welcome_writes() {
         b"event-before",
         "the held lane flows only after the welcome popped"
     );
+}
+
+#[test]
+fn gate_f2_legacy_event_frame_strips_metrics_activity() {
+    use haider_protocol::activity::{ActivityKind, ActivityStateV1, ActivityTouchV1};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{AgentId, DeviceId, EventId, RunId, SessionId};
+    let snapshot = haider_protocol::agent::AgentMetricsSnapshot {
+        agent: Some(AgentId::new("repro-agent")),
+        session_id: SessionId::new("repro-child"),
+        head_seq: 9,
+        started_at_ms: 1,
+        terminal_at_ms: None,
+        live: true,
+        tool_attempts: 2,
+        usage: None,
+        activity: Some(ActivityStateV1 {
+            open: vec![ActivityKind::Edit],
+            touched: vec![ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }],
+            latest: Some(ActivityTouchV1 {
+                kind: ActivityKind::Edit,
+                at_ms: 1,
+            }),
+            terminal: false,
+        }),
+    };
+    let envelope: haider_protocol::envelope::RawEnvelope = EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("delegation-metrics-repro-agent-9"),
+        seq: 12,
+        session_id: SessionId::new("repro-parent"),
+        branch_id: None,
+        run_id: Some(RunId::new("repro-parent-run")),
+        agent_id: None,
+        device_id: DeviceId::new("repro-device"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 1,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: snapshot.to_payload_value().expect("payload").into(),
+    };
+    let frame = WireFrame::Event {
+        attachment_id: AttachmentId::new("repro-attachment"),
+        session_id: SessionId::new("repro-parent"),
+        envelope: envelope.clone(),
+    };
+    let descendant = WireFrame::SessionDescendantStream {
+        attachment_id: AttachmentId::new("repro-attachment"),
+        event: haider_rpc::SessionDescendantStreamEventWire::Envelope {
+            session_id: SessionId::new("repro-child"),
+            agent_id: AgentId::new("repro-agent"),
+            envelope: envelope.clone(),
+        },
+    };
+    let read = WireFrame::Response {
+        request_id: RequestId::new("read"),
+        body: ResponseBody::SessionRead {
+            result: haider_rpc::SessionReadResult {
+                session_id: SessionId::new("repro-child"),
+                range: haider_rpc::SeqRange {
+                    start_seq: 12,
+                    end_seq: 12,
+                },
+                head_seq: 12,
+                metadata: None,
+                latest_context_footprint: None,
+                envelopes: vec![envelope],
+            },
+        },
+    };
+    for frame in [frame, descendant, read] {
+        for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+            let mut legacy = frame.clone();
+            omit_activity(&mut legacy);
+            omit_fleet_identity(&mut legacy);
+            let json = serde_json::to_string(&legacy).expect("serializes");
+            assert!(
+                !json.contains("\"activit"),
+                "legacy event frame leaked metrics activity ({encoding:?}): {json}"
+            );
+            assert!(
+                serde_json::to_string(&frame)
+                    .expect("activity frame fixture")
+                    .contains("\"activity\"")
+            );
+            let bytes = uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("encodes");
+            assert!(!bytes.windows(7).any(|part| part == b"activit"));
+            let sink = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: false,
+                activity: false,
+            };
+            let sent = sink.encode(&frame).expect("legacy sink encodes");
+            let actual = match sent {
+                OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+                OutboundBytes::Framed(frame) => {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(frame.prefix());
+                    bytes.extend_from_slice(frame.body());
+                    bytes
+                }
+                OutboundBytes::Event(frame) => {
+                    let mut bytes = Vec::new();
+                    frame.write_to(&mut bytes).expect("writes event");
+                    bytes
+                }
+            };
+            assert_eq!(actual, bytes, "sink preserves pre-lane bytes");
+            let mut identity_only = frame.clone();
+            omit_activity(&mut identity_only);
+            let class2 = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: true,
+                activity: false,
+            };
+            assert_eq!(
+                outbound_bytes(class2.encode(&frame).expect("class 2 event encodes")),
+                uds_codec::encode_with(&identity_only, 1_048_576, encoding)
+                    .expect("old event encodes")
+            );
+            let class3 = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity: true,
+                activity: true,
+            };
+            assert_eq!(
+                outbound_bytes(class3.encode(&frame).expect("class 3 event encodes")),
+                uds_codec::encode_with(&frame, 1_048_576, encoding).expect("full event encodes")
+            );
+            if let WireFrame::Event {
+                attachment_id,
+                session_id,
+                envelope,
+            } = &frame
+            {
+                let prepared = sink
+                    .prepare_event(attachment_id, session_id, envelope)
+                    .expect("attachment Event encodes");
+                let encoded = prepared.encoded_bytes().expect("prepared bytes");
+                let actual = match encoded {
+                    OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+                    OutboundBytes::Framed(frame) => {
+                        let mut bytes = Vec::new();
+                        bytes.extend_from_slice(frame.prefix());
+                        bytes.extend_from_slice(frame.body());
+                        bytes
+                    }
+                    OutboundBytes::Event(frame) => {
+                        let mut bytes = Vec::new();
+                        frame.write_to(&mut bytes).expect("writes event");
+                        bytes
+                    }
+                };
+                assert_eq!(
+                    actual, bytes,
+                    "prepared attach/replay Event is legacy identical"
+                );
+                let prepared_class2 = class2
+                    .prepare_event(attachment_id, session_id, envelope)
+                    .expect("class 2 prepared event");
+                assert_eq!(
+                    outbound_bytes(
+                        prepared_class2
+                            .encoded_bytes()
+                            .expect("prepared bytes")
+                            .clone()
+                    ),
+                    uds_codec::encode_with(&identity_only, 1_048_576, encoding)
+                        .expect("old event encodes")
+                );
+                let prepared_class3 = class3
+                    .prepare_event(attachment_id, session_id, envelope)
+                    .expect("class 3 prepared event");
+                assert_eq!(
+                    outbound_bytes(
+                        prepared_class3
+                            .encoded_bytes()
+                            .expect("prepared bytes")
+                            .clone()
+                    ),
+                    uds_codec::encode_with(&frame, 1_048_576, encoding)
+                        .expect("full event encodes")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_event_strips_typed_tool_activity_but_modern_keeps_it() {
+    use haider_protocol::activity::ActivityKind;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId, ItemId, SessionId};
+    use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+    let payload = haider_protocol::EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("tool"),
+        item: TurnItem::ToolCall {
+            call_id: "tool".into(),
+            name: "computer".into(),
+            args: serde_json::Value::Null,
+            status: ToolStatus::Completed,
+            activity: Some(ActivityKind::Read),
+        },
+    });
+    let frame = WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload)
+                .expect("activity frame fixture")
+                .into(),
+        },
+    };
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        let mut legacy = frame.clone();
+        omit_activity(&mut legacy);
+        omit_fleet_identity(&mut legacy);
+        let modern = serde_json::to_string(&frame).expect("activity frame fixture");
+        let old = serde_json::to_string(&legacy).expect("activity frame fixture");
+        assert!(modern.contains("\"activity\":\"read\""));
+        assert!(!old.contains("\"activit"));
+        let bytes =
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture");
+        assert!(!bytes.windows(7).any(|part| part == b"activit"));
+        let class2 = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: false,
+        };
+        assert_eq!(
+            outbound_bytes(class2.encode(&frame).expect("old tool shape")),
+            bytes
+        );
+        let class3 = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: true,
+        };
+        assert_eq!(
+            outbound_bytes(class3.encode(&frame).expect("full tool shape")),
+            uds_codec::encode_with(&frame, 1_048_576, encoding).expect("full tool bytes")
+        );
+    }
+}
+
+#[test]
+fn legacy_recovery_event_keeps_the_previous_network_shape() {
+    use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EffectId, EventId, SessionId};
+    let intent = EffectIntent {
+        effect: EffectId::new("provider-admission-r-1"),
+        class: EffectClass::ProviderTransport,
+        summary: "provider request attempt 1 admitted before daemon restart".into(),
+        args_digest: "sha256:0".into(),
+        workspace_revision: None,
+    };
+    let event = |class| WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(haider_protocol::EventPayload::Effect(
+                EffectPhase::Intent(EffectIntent {
+                    class,
+                    ..intent.clone()
+                }),
+            ))
+            .expect("activity frame fixture")
+            .into(),
+        },
+    };
+    let modern = event(EffectClass::ProviderTransport);
+    let historical = event(EffectClass::Network {
+        host: "provider-request".into(),
+    });
+    let mut legacy = modern.clone();
+    omit_activity(&mut legacy);
+    omit_fleet_identity(&mut legacy);
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        assert_eq!(
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture"),
+            uds_codec::encode_with(&historical, 1_048_576, encoding)
+                .expect("activity frame fixture"),
+        );
+        let identity_only = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: false,
+        };
+        assert_eq!(
+            outbound_bytes(identity_only.encode(&modern).expect("class 2 transport")),
+            uds_codec::encode_with(&historical, 1_048_576, encoding).expect("historical transport")
+        );
+        let no_identity = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: false,
+            activity: false,
+        };
+        assert_eq!(
+            outbound_bytes(no_identity.encode(&modern).expect("class 1 transport")),
+            uds_codec::encode_with(&historical, 1_048_576, encoding).expect("historical transport")
+        );
+        let full = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: true,
+        };
+        assert_eq!(
+            outbound_bytes(full.encode(&modern).expect("class 3 transport")),
+            uds_codec::encode_with(&modern, 1_048_576, encoding).expect("full transport")
+        );
+    }
+    assert!(
+        serde_json::to_string(&modern)
+            .expect("activity frame fixture")
+            .contains("provider_transport")
+    );
+}
+
+#[test]
+fn operator_checkpoint_effect_keeps_the_previous_fs_write_shape_for_older_peers() {
+    use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EffectId, EventId, SessionId};
+    let event = |class| WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(haider_protocol::EventPayload::Effect(
+                EffectPhase::Intent(EffectIntent {
+                    effect: EffectId::new("operator"),
+                    class,
+                    summary: "undo workspace checkpoint".into(),
+                    args_digest: "digest".into(),
+                    workspace_revision: None,
+                }),
+            ))
+            .expect("effect")
+            .into(),
+        },
+    };
+    let modern = event(EffectClass::CheckpointRestore);
+    let old = event(EffectClass::FsWrite);
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        for fleet_identity in [false, true] {
+            let sink = ConnectionFrameSink {
+                lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                outbound_limit: 1_048_576,
+                encoding,
+                fleet_identity,
+                activity: false,
+            };
+            assert_eq!(
+                outbound_bytes(sink.encode(&modern).expect("old checkpoint frame")),
+                uds_codec::encode_with(&old, 1_048_576, encoding).expect("old FsWrite frame")
+            );
+        }
+        let modern_sink = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: true,
+        };
+        assert_eq!(
+            outbound_bytes(modern_sink.encode(&modern).expect("new checkpoint frame")),
+            uds_codec::encode_with(&modern, 1_048_576, encoding).expect("new checkpoint bytes")
+        );
+    }
+}
+
+#[test]
+fn legacy_running_tool_event_omits_live_activity_metadata() {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId, SessionId};
+    let base = serde_json::json!({"type":"run_state","state":"running_tool"});
+    let mut rich = base.clone();
+    rich["activity_kind"] = serde_json::json!("read");
+    rich["activity_call_id"] = serde_json::json!("registered");
+    let frame = |payload: serde_json::Value| WireFrame::Event {
+        attachment_id: AttachmentId::new("a"),
+        session_id: SessionId::new("s"),
+        envelope: EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("e"),
+            seq: 1,
+            session_id: SessionId::new("s"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("d"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: payload.into(),
+        },
+    };
+    let modern = frame(rich);
+    let historical = frame(base);
+    let mut legacy = modern.clone();
+    omit_activity(&mut legacy);
+    omit_fleet_identity(&mut legacy);
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        assert_eq!(
+            uds_codec::encode_with(&legacy, 1_048_576, encoding).expect("activity frame fixture"),
+            uds_codec::encode_with(&historical, 1_048_576, encoding)
+                .expect("activity frame fixture"),
+        );
+        let class2 = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: false,
+        };
+        assert_eq!(
+            outbound_bytes(class2.encode(&modern).expect("old run-state shape")),
+            uds_codec::encode_with(&historical, 1_048_576, encoding).expect("old run-state bytes")
+        );
+        let class3 = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: true,
+            activity: true,
+        };
+        assert_eq!(
+            outbound_bytes(class3.encode(&modern).expect("full run-state shape")),
+            uds_codec::encode_with(&modern, 1_048_576, encoding).expect("full run-state bytes")
+        );
+    }
+    assert!(
+        serde_json::to_string(&modern)
+            .expect("activity frame fixture")
+            .contains("activity_kind")
+    );
+}
+
+#[test]
+fn activity_peer_classes_preserve_historical_bytes_on_every_envelope_path() {
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{AgentId, DeviceId, EventId, SessionId};
+    let metrics = identity_gate_metrics();
+    let mut old_metrics = metrics.clone();
+    old_metrics.activity = None;
+    let payloads = [
+        (
+            metrics.to_payload_value().expect("rich metrics"),
+            old_metrics.to_payload_value().expect("old metrics"),
+        ),
+        (
+            serde_json::json!({"type":"item", "event":"completed", "item_id":"i", "item":{"item":"tool_call", "call_id":"c", "name":"computer", "args":{}, "status":"completed", "activity":"read"}}),
+            serde_json::json!({"type":"item", "event":"completed", "item_id":"i", "item":{"item":"tool_call", "call_id":"c", "name":"computer", "args":{}, "status":"completed"}}),
+        ),
+        (
+            serde_json::json!({"type":"run_state", "state":"running_tool", "activity_kind":"read", "activity_call_id":"c"}),
+            serde_json::json!({"type":"run_state", "state":"running_tool"}),
+        ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"provider_transport"}, "summary":"recovery", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"network", "host":"provider-request"}, "summary":"recovery", "args_digest":"digest"}),
+        ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"checkpoint_restore"}, "summary":"undo", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "summary":"undo", "args_digest":"digest"}),
+        ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"network", "host":"provider-request"}, "effect_origin":"provider_transport", "summary":"recovery", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"network", "host":"provider-request"}, "summary":"recovery", "args_digest":"digest"}),
+        ),
+        (
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "effect_origin":"checkpoint_restore", "summary":"undo", "args_digest":"digest"}),
+            serde_json::json!({"type":"effect", "phase":"intent", "effect":"e", "class":{"class":"fs_write"}, "summary":"undo", "args_digest":"digest"}),
+        ),
+        // Negative control: activity-like keys inside model arguments are data.
+        (
+            serde_json::json!({"type":"item", "event":"completed", "item_id":"i", "item":{"item":"tool_call", "call_id":"c", "name":"custom", "args":{"activity":"keep", "activity_kind":"keep"}, "status":"completed"}}),
+            serde_json::json!({"type":"item", "event":"completed", "item_id":"i", "item":{"item":"tool_call", "call_id":"c", "name":"custom", "args":{"activity":"keep", "activity_kind":"keep"}, "status":"completed"}}),
+        ),
+    ];
+    let envelope = |payload: serde_json::Value| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("matrix-event"),
+        seq: 1,
+        session_id: SessionId::new("child"),
+        branch_id: None,
+        run_id: None,
+        agent_id: Some(AgentId::new("child-agent")),
+        device_id: DeviceId::new("device"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 1,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: payload.into(),
+    };
+    let frames = |envelope: haider_protocol::envelope::RawEnvelope| {
+        [
+            WireFrame::Event {
+                attachment_id: AttachmentId::new("a"),
+                session_id: envelope.session_id.clone(),
+                envelope: envelope.clone(),
+            },
+            WireFrame::SessionDescendantStream {
+                attachment_id: AttachmentId::new("a"),
+                event: haider_rpc::SessionDescendantStreamEventWire::Envelope {
+                    session_id: envelope.session_id.clone(),
+                    agent_id: AgentId::new("child-agent"),
+                    envelope: envelope.clone(),
+                },
+            },
+            WireFrame::Response {
+                request_id: RequestId::new("read"),
+                body: ResponseBody::SessionRead {
+                    result: haider_rpc::SessionReadResult {
+                        session_id: envelope.session_id.clone(),
+                        range: haider_rpc::SeqRange {
+                            start_seq: 1,
+                            end_seq: 1,
+                        },
+                        head_seq: 1,
+                        metadata: None,
+                        latest_context_footprint: None,
+                        envelopes: vec![envelope],
+                    },
+                },
+            },
+        ]
+    };
+    for (rich, old) in payloads {
+        let rich_frames = frames(envelope(rich));
+        let old_frames = frames(envelope(old));
+        for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+            for (fleet_identity, activity) in [(false, false), (true, false), (true, true)] {
+                let sink = ConnectionFrameSink {
+                    lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+                    outbound_limit: 1_048_576,
+                    encoding,
+                    fleet_identity,
+                    activity,
+                };
+                for (rich_frame, old_frame) in rich_frames.iter().zip(&old_frames) {
+                    let expected = if activity { rich_frame } else { old_frame };
+                    let bytes = uds_codec::encode_with(expected, 1_048_576, encoding)
+                        .expect("independent expected bytes");
+                    assert_eq!(
+                        outbound_bytes(sink.encode(rich_frame).expect("outbound frame")),
+                        bytes,
+                        "{encoding:?}, identity={fleet_identity}, activity={activity}"
+                    );
+                    if let WireFrame::Event {
+                        attachment_id,
+                        session_id,
+                        envelope,
+                    } = rich_frame
+                    {
+                        let prepared = sink
+                            .prepare_event(attachment_id, session_id, envelope)
+                            .expect("prepared replay");
+                        assert_eq!(
+                            outbound_bytes(
+                                prepared.encoded_bytes().expect("prepared bytes").clone()
+                            ),
+                            bytes
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn activity_handshake_opt_in_never_leaks_through_the_standard_welcome_cache() {
+    let (_root, hub) = liveness_hub().await;
+    let context = liveness_context(hub);
+    let (_sender, drain) = watch::channel(None);
+    for requested in [false, true, false, true] {
+        for encodings in [Vec::new(), vec!["msgpack".to_owned()]] {
+            let lane = OutboundLane::new(1, 1_048_576, 1_048_576);
+            let mut grant = None;
+            let hello = Hello {
+                protocol_min: 1,
+                protocol_max: 1,
+                client_name: "activity-reader".into(),
+                client_version: "0.0.973".into(),
+                client_instance_id: "client".into(),
+                client_kind: haider_rpc::ClientKind::Tui,
+                capabilities_requested: [Capability::View, Capability::Control]
+                    .into_iter()
+                    .collect(),
+                features_requested: if requested {
+                    [FEATURE_SESSION_ACTIVITY_V1.to_owned()]
+                        .into_iter()
+                        .collect()
+                } else {
+                    Default::default()
+                },
+                max_receive_frame: 1_048_576,
+                encodings,
+            };
+            assert!(
+                negotiate_hello(hello, &context, &drain, &lane, &mut grant, 1_048_576)
+                    .expect("handshake")
+                    .is_some()
+            );
+            let granted = grant.expect("connection grant");
+            assert_eq!(
+                granted.features.contains(FEATURE_SESSION_ACTIVITY_V1),
+                requested
+            );
+            let welcome = lane.recv().await.expect("welcome");
+            let bytes = outbound_bytes(welcome.bytes);
+            let frames = uds_codec::Decoder::new(1_048_576).push(&bytes).frames;
+            assert!(
+                matches!(frames.as_slice(), [WireFrame::Welcome(w)] if w.features.contains(FEATURE_SESSION_ACTIVITY_V1) == requested)
+            );
+        }
+    }
 }

@@ -1,6 +1,10 @@
 {
   "schema": 1,
   "counts": {
+    "crossterm": {
+      "production": 16,
+      "test": 1
+    },
     "haider-accounts": {
       "production": 0,
       "test": 0
@@ -38,8 +42,8 @@
       "test": 0
     },
     "haider-platform": {
-      "production": 113,
-      "test": 6
+      "production": 118,
+      "test": 20
     },
     "haider-protocol": {
       "production": 0,
@@ -55,7 +59,7 @@
     },
     "haider-store": {
       "production": 0,
-      "test": 0
+      "test": 2
     },
     "haider-stt": {
       "production": 0,

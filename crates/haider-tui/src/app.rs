@@ -263,6 +263,94 @@ pub enum Screen {
     Loom,
 }
 
+/// The topmost surface that may consume input in the current frame.
+/// Render and every input path derive their precedence from this value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputOwner {
+    Lockdown,
+    ToolDetail,
+    Inbox,
+    Help,
+    Shells,
+    SshList,
+    Monitors,
+    SshTerminal,
+    SshForm,
+    ModelPicker,
+    Login,
+    TalkSetup,
+    CustomProviderForm,
+    AccountsReplace,
+    SessionMenu,
+    /// Integration seam for a deferred usage decision. Its visibility
+    /// predicate must rank it below pickers, Search and History.
+    SpendCard,
+    SubagentQuestion,
+    PlanDoc,
+    FileReviewDoc,
+    Search,
+    EffortPicker,
+    ThemePicker,
+    HistoryChooser,
+    FleetMemberDetail,
+    Screen(Screen),
+    Composer(Screen),
+}
+
+/// The input surface shown by a completed frame. The instance distinguishes
+/// two cards with the same owner (including a replaced permission menu).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedInput {
+    pub owner: InputOwner,
+    pub surface: UiGeneration,
+    pub instance: Option<String>,
+}
+
+impl InputOwner {
+    pub(crate) const fn confirms_decision(self) -> bool {
+        matches!(
+            self,
+            Self::SessionMenu
+                | Self::SpendCard
+                | Self::SubagentQuestion
+                | Self::PlanDoc
+                | Self::FileReviewDoc
+        )
+    }
+    /// Owners with a visible draft field. A shared answer-line card joins
+    /// here without changing every input route independently.
+    const fn accepts_composer_edits(self) -> bool {
+        matches!(self, Self::Composer(_))
+    }
+
+    const fn accepts_session_edits(self) -> bool {
+        matches!(self, Self::Composer(Screen::Session))
+    }
+
+    const fn scrolls_transcript(self) -> bool {
+        matches!(
+            self,
+            Self::Composer(Screen::Session | Screen::Subagent)
+                | Self::SessionMenu
+                | Self::SpendCard
+                | Self::Search
+                | Self::ThemePicker
+                | Self::EffortPicker
+                | Self::HistoryChooser
+                | Self::SubagentQuestion
+        )
+    }
+}
+
+#[derive(Debug)]
+struct PendingDictation {
+    session: SessionId,
+    ui_generation: UiGeneration,
+    talk_generation: u64,
+    text: zeroize::Zeroizing<String>,
+    downgraded_submit: bool,
+}
+
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
 #[must_use]
 pub fn auth_label(method: haider_protocol::credential::AuthMethod) -> &'static str {
@@ -1648,6 +1736,16 @@ impl UsageState {
     }
 }
 
+/// Only the numbered quick picks drawn beside options commit a choice.
+/// Model-supplied option keys are answer identities, not keyboard shortcuts.
+fn menu_shortcut_index(menu: &Menu, c: char) -> Option<usize> {
+    if !('1'..='9').contains(&c) {
+        return None;
+    }
+    let index = c as usize - '1' as usize;
+    (index < menu.options.len()).then_some(index)
+}
+
 /// A chip's pending question (the amber `?` / recovery `⌁`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChipQuestion {
@@ -1708,6 +1806,10 @@ pub struct ChipModel {
     /// (`agent_graph_rollup_v1`). `None` = the child runs no pinned
     /// workflow (or an older daemon) — the row keeps plain activity.
     pub graph: Option<haider_protocol::agent::AgentGraphRollupV1>,
+    /// 973-activity-icons: live ACTIVITY (what the child is doing, not its
+    /// state), folded from the typed items this chip applies — see
+    /// [`haider_protocol::activity`] for the priority and timing contract.
+    pub activity: haider_protocol::activity::ActivityTracker,
     pub closed: bool,
     pub removing: bool,
     pub children: Vec<ChipModel>,
@@ -1747,6 +1849,7 @@ impl ChipModel {
                                 name: name.clone(),
                                 args: serde_json::json!({ "desc": desc, "meta": meta }),
                                 status: haider_protocol::item::ToolStatus::Completed,
+                                activity: None,
                             },
                         },
                     ));
@@ -1777,6 +1880,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -1846,6 +1950,7 @@ impl ChipModel {
             metrics: None,
             question: None,
             graph: None,
+            activity: haider_protocol::activity::ActivityTracker::new(),
             closed: false,
             removing: false,
             children: Vec::new(),
@@ -3161,8 +3266,20 @@ impl std::fmt::Debug for SshTerminalInput {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SshTerminalPane {
+    pub attempt_id: u64,
     pub profile: String,
     pub shell_id: Option<String>,
+    pub connecting: bool,
+    // Older daemons emit setup failures as output before terminalizing.
+    // Keep that fallback distinct from output-based connection recovery.
+    reported_running: bool,
+    typed_setup_errors: bool,
+    // Results can precede the admission reply. Keep them with this attempt,
+    // independently of shell-list snapshots, until the reply identifies its shell.
+    observed_shells: Vec<haider_rpc::ShellWire>,
+    // Completion can replace Running before the reply binds the shell ID.
+    observed_running_shells: HashSet<String>,
+    pending_output: Vec<(String, zeroize::Zeroizing<Vec<u8>>)>,
     output: zeroize::Zeroizing<Vec<u8>>,
     pub size: haider_rpc::SshPtySizeWire,
 }
@@ -3171,6 +3288,7 @@ impl std::fmt::Debug for SshTerminalPane {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SshTerminalPane")
+            .field("attempt_id", &self.attempt_id)
             .field("profile", &self.profile)
             .field("shell_id", &self.shell_id)
             .field("output", &"<remote terminal bytes>")
@@ -3184,8 +3302,15 @@ impl SshTerminalPane {
 
     fn opening(profile: String, size: haider_rpc::SshPtySizeWire) -> Self {
         Self {
+            attempt_id: 0,
             profile,
             shell_id: None,
+            connecting: true,
+            reported_running: false,
+            typed_setup_errors: false,
+            observed_shells: Vec::new(),
+            observed_running_shells: HashSet::new(),
+            pending_output: Vec::new(),
             output: zeroize::Zeroizing::new(Vec::new()),
             size,
         }
@@ -3201,6 +3326,38 @@ impl SshTerminalPane {
             self.output.drain(..remove);
         }
         self.output.extend_from_slice(&bytes[bytes.len() - keep..]);
+    }
+
+    fn observe_shell(&mut self, shell: &haider_rpc::ShellWire) {
+        if !matches!(&shell.kind, haider_rpc::ShellKindWire::Ssh { profile } if profile == &self.profile)
+            || self.shell_id.as_ref().is_some_and(|id| id != &shell.id)
+        {
+            return;
+        }
+        if shell.status == haider_rpc::ShellStatusWire::Running {
+            self.observed_running_shells.insert(shell.id.clone());
+        }
+        let progress = |status: &haider_rpc::ShellStatusWire| match status {
+            haider_rpc::ShellStatusWire::Starting => 0,
+            haider_rpc::ShellStatusWire::Running => 1,
+            haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed => 2,
+        };
+        if let Some(prior) = self.observed_shells.iter_mut().find(|s| s.id == shell.id) {
+            // A shell cannot return to setup or running after completion. An
+            // older/empty list must not erase observed progress, even when the
+            // admission and result have equal millisecond timestamps.
+            if progress(&shell.status) < progress(&prior.status)
+                || (progress(&shell.status) == progress(&prior.status)
+                    && (prior.last_activity_ms > shell.last_activity_ms
+                        || (progress(&prior.status) == 2
+                            && (prior.setup_error.is_some() || shell.setup_error.is_none()))))
+            {
+                return;
+            }
+            *prior = shell.clone();
+        } else {
+            self.observed_shells.push(shell.clone());
+        }
     }
 
     #[must_use]
@@ -3578,6 +3735,7 @@ pub enum AppRequest {
         profile: String,
     },
     SshShellOpen {
+        attempt_id: u64,
         profile: String,
         size: haider_rpc::SshPtySizeWire,
     },
@@ -4161,6 +4319,19 @@ pub struct SessionCacheRates {
     pub reread_basis_points: Option<u32>,
 }
 
+/// Dynamic input rows, including unselected rows which queued navigation
+/// may reach. Compare only at outside replies, never on cadence redraws.
+#[derive(PartialEq, Eq)]
+pub(crate) enum InputRows {
+    Models(Vec<ModelPickerRow>),
+    Sessions(Vec<SessionBrowserRow>),
+    Inbox(Vec<InboxRow>),
+    Efforts(Vec<EffortPickerRow>),
+    Ssh(Vec<haider_rpc::SshProfileWire>),
+    Palette(Vec<PaletteItem>),
+    Mentions(Vec<String>),
+}
+
 /// One rendered row of the `/resume` browser — roster truth only, no
 /// journal replay (the 936 attention fields are exactly what this needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4454,12 +4625,12 @@ pub enum Hit {
     },
     /// Persistent provider-lockdown status segment.
     LockdownStatus,
-    /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
-    /// the index WITHIN its group, so a stale hit map can never select a
-    /// different account.
+    /// One `/usage` account tab chip (U2). The alias fences the group index
+    /// against a refreshed report reordering its accounts during a press.
     UsageAccountTab {
         provider: String,
         index: usize,
+        alias: haider_protocol::ids::CredentialAlias,
     },
     /// One `/usage` scope-strip label. Value-carrying so a stale hit map
     /// can only select the scope that occupied the clicked cell.
@@ -5405,6 +5576,11 @@ pub struct AppModel {
     /// T2 — the LIVE talk state machine (phase, generation, ghost
     /// assembly, wave ring). Demo mode never engages it.
     pub talk: crate::talk::TalkState,
+    talk_origin: Option<(SessionId, UiGeneration, u64)>,
+    pending_dictation: Option<PendingDictation>,
+    /// A refused mirror edit must apply before any retained dictation, so a
+    /// foreign replacement cannot erase words just delivered to the draft.
+    pub(crate) mirror_waiting_for_owner: bool,
     /// The `/talk` setup card, while open. Owns the input band and the
     /// keyboard (the login-card modality) — the Deepgram key never
     /// reaches the composer.
@@ -5664,6 +5840,16 @@ pub struct AppModel {
     /// commit counter the runtime watches to persist a change.
     pub notifications_enabled: bool,
     pub notification_commits: u64,
+    /// 973-activity-icons: how subagent ACTIVITY renders (emoji · text ·
+    /// off). `AppModel::new` defaults to emoji; boot resolves the persisted
+    /// setting, `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`. `/icons`
+    /// changes it and bumps the commit counter the runtime persists.
+    pub activity_display: haider_protocol::activity::ActivityDisplay,
+    pub activity_display_commits: u64,
+    /// Explicit intent, independent of the environment-resolved display.
+    pub activity_display_choice: Option<haider_protocol::activity::ActivityDisplay>,
+    /// Last attempted commit; failed saves stay dirty without retrying every frame.
+    pub activity_display_attempted_commits: u64,
     /// Model retention (owner 2026-08-15): bumped on every COMMITTED model
     /// pick so the runtime persists the pair and the next boot opens on it.
     pub model_commits: u64,
@@ -5745,6 +5931,7 @@ pub struct AppModel {
     /// Full-body interactive SSH pane. Distinct from the shell-list overlay,
     /// monitor details, and subagent surfaces.
     pub ssh_terminal: Option<SshTerminalPane>,
+    ssh_open_generation: u64,
     /// Existing monitor details floated over the body from the band's
     /// `· N monitors` count.
     pub monitors_open: bool,
@@ -5895,11 +6082,33 @@ pub struct AppModel {
     /// after release (the highlight survives the auto-copy), cleared by the
     /// next click or keypress. Screen-space — see [`crate::select`].
     pub selection: Option<crate::select::Selection>,
+    /// Owner of the frame where a screen-space mouse selection began.
+    pub(crate) selection_owner: Option<InputOwner>,
     /// A left button went down here and has not resolved yet: the potential
     /// selection anchor AND the pending click. On Up with no meaningful
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    pub(crate) mouse_press_owner: Option<PresentedInput>,
+    pub(crate) mouse_press_hit: Option<Hit>,
+    pub(crate) mouse_press_rect: Option<ratatui::layout::Rect>,
+    pub(crate) mouse_press_epoch: Option<u64>,
+    pub(crate) mouse_press_dwell_ready: bool,
+    pub(crate) painted_input: std::cell::RefCell<Option<PresentedInput>>,
+    pub(crate) painted_epoch: std::cell::Cell<u64>,
+    pub(crate) input_rebase: Option<crate::runtime::InputRebase>,
+    pub(crate) input_refused: bool,
+    /// Last text lost from the pending burst. A guarded commit or passive
+    /// report preserves it; accepted replacement input or 10 s expires it.
+    pub(crate) discarded_edit_at: Option<std::time::Instant>,
+    /// Foreign mirror and inject replacements own a fresh draft. Local
+    /// typing keeps this revision stable so a burst can remain one cohort.
+    composer_replacement_epoch: u64,
+    pub(crate) pointer_presentation:
+        std::cell::RefCell<Option<(PresentedInput, std::time::Instant)>>,
+    /// A visible answer card keeps its age across local completion edits.
+    pub(crate) text_question_presentation:
+        std::cell::RefCell<Option<(PresentedInput, std::time::Instant)>>,
     /// TUI5 item 5 — a left button went down INSIDE the composer text: the
     /// drag (if any) is a COMPOSER selection, never the transcript's
     /// screen-space drag (region disambiguation by drag START). Transient
@@ -6074,6 +6283,9 @@ impl Default for AppModel {
             voice: VoiceState::default(),
             listening: false,
             talk: crate::talk::TalkState::default(),
+            talk_origin: None,
+            pending_dictation: None,
+            mirror_waiting_for_owner: false,
             talk_setup: None,
             talk_config: haider_stt::config::TranscriptionConfig::default(),
             talk_config_error: None,
@@ -6151,6 +6363,10 @@ impl Default for AppModel {
             focus_reported: false,
             notifications_enabled: true,
             notification_commits: 0,
+            activity_display: haider_protocol::activity::ActivityDisplay::Emoji,
+            activity_display_commits: 0,
+            activity_display_choice: None,
+            activity_display_attempted_commits: 0,
             model_commits: 0,
             notification_run_state: None,
             background_notification_states: std::collections::HashMap::new(),
@@ -6188,6 +6404,7 @@ impl Default for AppModel {
                 pixel_height: 0,
             },
             ssh_terminal: None,
+            ssh_open_generation: 0,
             monitors_open: false,
             monitors_cursor: 0,
             monitors_stop_armed: None,
@@ -6225,7 +6442,21 @@ impl Default for AppModel {
             sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
             selection: None,
+            selection_owner: None,
             mouse_down: None,
+            mouse_press_owner: None,
+            mouse_press_hit: None,
+            mouse_press_rect: None,
+            mouse_press_epoch: None,
+            mouse_press_dwell_ready: false,
+            painted_input: std::cell::RefCell::new(None),
+            painted_epoch: std::cell::Cell::new(0),
+            input_rebase: None,
+            input_refused: false,
+            discarded_edit_at: None,
+            composer_replacement_epoch: 0,
+            pointer_presentation: std::cell::RefCell::new(None),
+            text_question_presentation: std::cell::RefCell::new(None),
             composer_drag: false,
             should_quit: false,
             dirty: true,
@@ -6481,12 +6712,17 @@ impl AppModel {
     /// The terminal consumes its own paste gesture OR forwards input to us;
     /// when forwarded, text must be inserted here as well as images.
     pub fn request_clipboard_paste(&mut self) {
-        let text_field = self.login.is_some()
-            || self.talk_setup.is_some()
-            || self.custom_add.is_some()
-            || self.ssh_form.is_some()
-            || self.ssh_terminal.is_some();
-        if !text_field && !self.clipboard_composer_visible() {
+        if !matches!(
+            self.input_owner(),
+            InputOwner::Composer(_)
+                | InputOwner::Search
+                | InputOwner::ModelPicker
+                | InputOwner::Login
+                | InputOwner::TalkSetup
+                | InputOwner::CustomProviderForm
+                | InputOwner::SshForm
+                | InputOwner::SshTerminal
+        ) {
             return;
         }
         self.requests.push(AppRequest::ClipboardRead);
@@ -6629,14 +6865,9 @@ impl AppModel {
             self.close_login_card();
             self.flash = Some("· /login cancelled — the surface changed".to_owned());
         }
-        // T2: talk is surface-local exactly like the login card — a live
-        // session (or the setup card) dies with the surface it borrowed
-        // the band from. Cancel is DISCARD by contract (Esc law), and the
-        // generation bump makes every late runtime event stale.
-        if self.talk.engaged() {
-            self.talk_cancel();
-            self.flash = Some("· ◉ talk cancelled — the surface changed".to_owned());
-        }
+        // A login card borrows this same Session draft through this seam.
+        // Moving it into a card must not cancel dictation; identity-changing
+        // callers retire talk explicitly before they stash.
         if self.talk_setup.is_some() {
             self.talk_setup = None;
             self.flash = Some("· /talk setup closed — the surface changed".to_owned());
@@ -6692,6 +6923,7 @@ impl AppModel {
     /// sites outside this function are enumerated on the `screen` field's
     /// doc (the founding donation and the two identity-flip split seams).
     pub(crate) fn switch_surface(&mut self, to: Screen) {
+        self.composer_drag = false;
         self.close_backtrack();
         self.retire_surface_overlays();
         let from = self.screen;
@@ -6708,13 +6940,19 @@ impl AppModel {
             self.restore_child_session_notes();
         }
         if self.surface_key() == from_key {
+            self.deliver_pending_dictation();
             return;
         }
         // Keys differ: rewind, then swap with the REAL key on each side.
         self.screen = from;
+        if self.talk.engaged() {
+            self.talk_cancel();
+            self.flash = Some("· ◉ talk cancelled — the surface changed".to_owned());
+        }
         self.stash_draft();
         self.screen = to;
         self.restore_draft();
+        self.deliver_pending_dictation();
     }
 
     /// The session's display name — the slug (sim `session.name`), never
@@ -6988,7 +7226,8 @@ impl AppModel {
     /// `\n`, tui.js:235).
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        if !self.composer.text().starts_with('/')
+        if !self.composer_owns_input()
+            || !self.composer.text().starts_with('/')
             || self.composer.text().contains('\n')
             || self.palette_dismissed
             || self.help_open
@@ -7169,6 +7408,151 @@ impl AppModel {
     /// W-C M2: seed the notification toggle from persisted settings.
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
         self.notifications_enabled = enabled;
+    }
+
+    /// 973-activity-icons: set the activity display mode from `/icons`,
+    /// bumping the commit counter the runtime watches to persist it.
+    /// `None` cycles emoji → text → off → emoji.
+    pub fn set_activity_display(
+        &mut self,
+        mode: Option<haider_protocol::activity::ActivityDisplay>,
+    ) {
+        use haider_protocol::activity::ActivityDisplay as D;
+        let next = mode.unwrap_or(match self.activity_display {
+            D::Emoji => D::Text,
+            D::Text => D::Off,
+            D::Off => D::Emoji,
+        });
+        self.activity_display = next;
+        self.activity_display_choice = Some(next);
+        self.activity_display_commits += 1;
+        self.flash = Some(format!("· activity icons {} (saving…)", next.name()));
+        self.dirty = true;
+    }
+
+    /// 973-activity-icons: one chip's CURRENT activity at the model clock.
+    /// Terminal and closing chips show none; a chip with live children is
+    /// orchestrating when otherwise quiet.
+    #[must_use]
+    pub fn chip_activity(
+        &self,
+        chip: &ChipModel,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        self.chip_activity_with(chip, false)
+    }
+
+    /// [`Self::chip_activity`] with extra live-children knowledge (a fleet
+    /// snapshot can see grandchildren the chip tree does not hold).
+    fn chip_activity_with(
+        &self,
+        chip: &ChipModel,
+        known_live_children: bool,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use crate::script::ChipDisplayState as S;
+        if chip.closed || matches!(chip.display_state(), S::Done | S::Error) {
+            return None;
+        }
+        let live_children = known_live_children
+            || chip
+                .children
+                .iter()
+                .any(|child| !child.closed && !matches!(child.display_state(), S::Done | S::Error));
+        if !chip.activity.is_empty() {
+            return chip.activity.current(self.clock_ms, live_children);
+        }
+        // Live mode: the child's typed tool items live in ITS session; the
+        // daemon publishes their activity state inside the child's agent
+        // metrics (session summaries), evaluated here on our clock.
+        self.chip_metrics(chip)
+            .and_then(|metrics| metrics.activity.as_ref())
+            .map(haider_protocol::activity::ActivityTracker::from_state)
+            .map_or_else(
+                || live_children.then_some(haider_protocol::activity::ActivityKind::Orchestrate),
+                |tracker| tracker.current(self.clock_ms, live_children),
+            )
+    }
+
+    /// 973-activity-icons: a fleet node's current activity — the local chip's
+    /// live tracker when this session holds the chip (fresher than any
+    /// snapshot), else the daemon snapshot's figure.
+    #[must_use]
+    pub fn node_activity(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return None;
+        }
+        use haider_rpc::FleetAgentStateWire as F;
+        if matches!(node.state, F::Done | F::Failed | F::Cancelled) {
+            return None;
+        }
+        let live_children = node
+            .children
+            .iter()
+            .any(|child| !matches!(child.state, F::Done | F::Failed | F::Cancelled));
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            return self.chip_activity_with(chip, live_children);
+        }
+        // A deeper member has no chip; its own session summary carries the
+        // live activity state (fresher than the snapshot's instant).
+        // Freshest of the two daemon projections (replace-by-head law):
+        // the session summary and the fleet snapshot's own metrics.
+        let freshest = [
+            self.session_metrics.get(&node.session_id),
+            node.metrics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|metrics| metrics.activity.is_some())
+        .max_by_key(|metrics| metrics.head_seq);
+        match freshest.and_then(|metrics| metrics.activity.as_ref()) {
+            Some(state) => haider_protocol::activity::ActivityTracker::from_state(state)
+                .current(self.clock_ms, live_children),
+            None => node.activity,
+        }
+    }
+
+    /// 973-activity-icons: every activity a node used so far (detail view),
+    /// merging the snapshot history with the local chip tracker.
+    #[must_use]
+    pub fn node_activities(
+        &self,
+        node: &haider_rpc::FleetNodeWire,
+    ) -> Vec<haider_protocol::activity::ActivityKind> {
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_ACTIVITY_V1) {
+            return Vec::new();
+        }
+        let mut used = node.activities.clone();
+        if let Some(chip) = crate::app::find_chip(&self.chips, node.agent_id.as_str()) {
+            used.extend(chip.activity.used());
+            if !chip.children.is_empty() {
+                used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+            }
+            if let Some(state) = self
+                .chip_metrics(chip)
+                .and_then(|metrics| metrics.activity.as_ref())
+            {
+                used.extend(state.touched.iter().map(|touch| touch.kind));
+            }
+        }
+        if let Some(state) = self
+            .session_metrics
+            .get(&node.session_id)
+            .and_then(|metrics| metrics.activity.as_ref())
+        {
+            used.extend(state.touched.iter().map(|touch| touch.kind));
+        }
+        if !node.children.is_empty() || node.folded_children > 0 {
+            used.push(haider_protocol::activity::ActivityKind::Orchestrate);
+        }
+        used.retain(|kind| *kind != haider_protocol::activity::ActivityKind::Unknown);
+        used.sort_by_key(|kind| kind.rank());
+        used.dedup();
+        used
     }
 
     /// W-C M2: flip (or set) the desktop-notification toggle and bump the
@@ -7433,6 +7817,7 @@ impl AppModel {
     }
 
     fn open_transcript_search(&mut self) {
+        self.composer_drag = false;
         self.transcript_search = Some(TranscriptSearch::default());
         self.dirty = true;
     }
@@ -7618,6 +8003,26 @@ impl AppModel {
 
     /// Deterministic clock seam for rapid Esc backtracking laws.
     pub fn handle_at(&mut self, event: AppEvent, now: std::time::Instant) {
+        if matches!(&event, AppEvent::Envelope(_)) {
+            self.invalidate_queued_input();
+        }
+        let previous_owner = self.presented_input();
+        let focus_move = matches!(
+            &event,
+            AppEvent::Key(key)
+                if matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right)
+        );
+        self.handle_at_inner(event, now);
+        if focus_move || self.presented_input() != previous_owner {
+            self.clear_mouse_press();
+        }
+        self.deliver_pending_dictation();
+    }
+
+    fn handle_at_inner(&mut self, event: AppEvent, now: std::time::Instant) {
+        if !self.composer_owns_input() {
+            self.composer_drag = false;
+        }
         match event {
             AppEvent::Key(key) => {
                 self.dirty = true;
@@ -7627,18 +8032,96 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
-                // If the terminal forwards its paste chord, fetch the OS
-                // clipboard before a modal can ignore it or type a literal
-                // 'v'. Text re-enters the existing zeroizing Paste route,
-                // including masked fields. Loom retains Ctrl+V validation.
-                if matches!(key.code, KeyCode::Char('v' | 'V'))
-                    && (key.modifiers == KeyModifiers::CONTROL
-                        || key.modifiers == KeyModifiers::SUPER
-                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                        || key.modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT))
-                    && self.screen != Screen::Loom
-                {
+                // Clipboard paste is the one shortcut interpreted before
+                // text-field dispatch. Its result still re-enters the
+                // owner's zeroizing Paste route.
+                if self.clipboard_paste_key(&key) {
                     self.request_clipboard_paste();
+                    return;
+                }
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                {
+                    if self.selection_is_visible() {
+                        self.requests.push(AppRequest::CopySelection);
+                    } else if self.composer_owns_input() {
+                        self.selection_key(&key);
+                    }
+                    return;
+                }
+                // Text-field owners see their chords before globals. The
+                // terminal forwards control bytes to its remote PTY.
+                match self.input_owner() {
+                    InputOwner::SshTerminal => {
+                        self.handle_ssh_terminal_key(key);
+                        return;
+                    }
+                    InputOwner::SshForm => {
+                        self.handle_ssh_form_key(key);
+                        return;
+                    }
+                    InputOwner::TalkSetup
+                        if key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        self.talk_setup_key(&key);
+                        return;
+                    }
+                    InputOwner::CustomProviderForm
+                        if key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        if key.modifiers == KeyModifiers::CONTROL
+                            && matches!(key.code, KeyCode::Char('c' | 'C'))
+                        {
+                            self.cancel_custom_add();
+                        }
+                        return;
+                    }
+                    InputOwner::Login
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c' | 'C')) =>
+                    {
+                        self.close_login_card();
+                        return;
+                    }
+                    _ => {}
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('t' | 'T') => {
+                            self.cycle_theme();
+                            return;
+                        }
+                        KeyCode::Char('c' | 'C')
+                            if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            if self.composer_owns_input() && self.selection_key(&key) {
+                                return;
+                            }
+                            self.selection = None;
+                            match self.screen {
+                                Screen::Launcher | Screen::Boot => {
+                                    self.retire_surface_overlays();
+                                    self.close_login_card();
+                                    self.should_quit = true;
+                                }
+                                _ => self.back_to_launcher(),
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // Chords without an owner-specific text action never fall
+                // through to the parked composer or to a covered chooser.
+                if key.modifiers == KeyModifiers::CONTROL
+                    && !self.composer_owns_input()
+                    && !(self.input_owner() == InputOwner::ToolDetail
+                        && key.code == KeyCode::Char('o'))
+                {
                     return;
                 }
                 // 971 F1(a), verify round 1 (Astra: PageDown and the wheel
@@ -7648,7 +8131,16 @@ impl AppModel {
                 // the paging pair is taken — Home/End are caret keys inside
                 // the custom card's fields, and every printable key stays
                 // private to the form that is holding it.
-                if self.accounts_scroll_gesture(key.code) {
+                if self.screen == Screen::Accounts
+                    && matches!(
+                        self.input_owner(),
+                        InputOwner::Screen(Screen::Accounts)
+                            | InputOwner::AccountsReplace
+                            | InputOwner::Login
+                            | InputOwner::CustomProviderForm
+                    )
+                    && self.accounts_scroll_gesture(key.code)
+                {
                     return;
                 }
                 // 971 F1(b): the one-line "replace the pending form?"
@@ -7656,7 +8148,7 @@ impl AppModel {
                 // it answers a gesture the user just made on that card's
                 // own surface, so the card must not read ⏎ as a commit of
                 // the secret it is still holding.
-                if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
+                if self.input_owner() == InputOwner::AccountsReplace {
                     self.accounts_replace_key(key.code);
                     return;
                 }
@@ -7664,14 +8156,14 @@ impl AppModel {
                 // (W3c3 M3): a key must never reach the composer, the
                 // palette, the input ring or a selection gate, because
                 // every one of those would keep a copy of it.
-                if self.login.is_some() {
+                if self.input_owner() == InputOwner::Login {
                     self.login_key(&key);
                     return;
                 }
                 // The `/talk` setup card owns the keyboard while open
                 // (same modality: the Deepgram key must never reach the
                 // composer, the palette or the input ring).
-                if self.talk_setup.is_some() {
+                if self.input_owner() == InputOwner::TalkSetup {
                     self.talk_setup_key(&key);
                     return;
                 }
@@ -7679,8 +8171,11 @@ impl AppModel {
                 // the state machine owns Esc (cancel), Enter (commit +
                 // submit) and plain typing (commit into the composer and
                 // keep editing — `talk_key` settles the session and
-                // returns false so the char flows the NORMAL path).
-                if self.talk.engaged() && self.talk_key(&key) {
+                // returns false so the char flows the NORMAL path). An open
+                // tool detail view outranks it: Esc/⏎ close the view and a
+                // typed key must not commit the transcript into the hidden
+                // draft (973-tui-toolview-fixes).
+                if self.composer_owns_input() && self.talk.engaged() && self.talk_key(&key) {
                     return;
                 }
                 // Windows/Linux copy chord. Handle both case spellings
@@ -7689,9 +8184,11 @@ impl AppModel {
                 if matches!(key.code, KeyCode::Char('c' | 'C'))
                     && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                 {
-                    if self.selection.is_some() {
+                    // A screen-space selection from a covered frame is not
+                    // an invitation to copy what the modal painted over it.
+                    if self.selection.is_some() && self.selection_is_visible() {
                         self.requests.push(AppRequest::CopySelection);
-                    } else if self.clipboard_composer_visible() {
+                    } else if self.composer_owns_input() {
                         self.selection_key(&key);
                     }
                     return;
@@ -7716,53 +8213,78 @@ impl AppModel {
                 // draft content by intent, retained exactly as long as
                 // the draft itself.
                 let text = text.as_str();
-                if self.ssh_terminal.is_some() {
-                    if let Some(id) = self
-                        .ssh_terminal
-                        .as_ref()
-                        .and_then(|terminal| terminal.shell_id.clone())
-                    {
-                        self.queue_ssh_terminal_input(&id, text.as_bytes());
-                    }
-                    return;
-                }
-                if self.ssh_form.is_some() {
-                    self.ssh_form_paste(text);
-                    return;
-                }
-                // Keys are pasted more often than typed; the paste lands in
-                // the masked buffer and NOWHERE else (no pill token, no
-                // draft, no ring).
-                if let Some(card) = self.login.as_mut() {
-                    card.push_str(text);
-                    return;
-                }
-                // The custom-provider card owns paste exactly as it owns
-                // typing. Insert at its character-indexed caret; demo cards
-                // remain the sim's non-editable fabrication menu.
-                if let Some(card) = self.custom_add.as_mut() {
-                    if !self.mode.fabricates_locally() {
-                        for character in text.chars() {
-                            insert_custom_card_character(card, character);
+                match self.input_owner() {
+                    InputOwner::SshTerminal => {
+                        if let Some(id) = self
+                            .ssh_terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.shell_id.clone())
+                        {
+                            self.queue_ssh_terminal_input(&id, text.as_bytes());
                         }
+                        return;
                     }
-                    return;
-                }
-                // The `/talk` setup card: paste lands in the FOCUSED field
-                // (the key buffer or the language field) and nowhere else.
-                if let Some(card) = self.talk_setup.as_mut() {
-                    match card.stage {
-                        crate::talk::SetupStage::DeepgramKey => card.key_push_str(text),
-                        crate::talk::SetupStage::Language => {
-                            for c in text.trim().chars() {
-                                if c.is_ascii_alphanumeric() || c == '-' {
-                                    card.language.push(c);
-                                }
+                    InputOwner::SshForm => {
+                        self.ssh_form_paste(text);
+                        return;
+                    }
+                    InputOwner::Login => {
+                        if let Some(card) = self.login.as_mut() {
+                            card.push_str(text);
+                        }
+                        return;
+                    }
+                    InputOwner::CustomProviderForm => {
+                        if !self.mode.fabricates_locally()
+                            && let Some(card) = self.custom_add.as_mut()
+                        {
+                            for character in text.chars() {
+                                insert_custom_card_character(card, character);
                             }
                         }
-                        _ => {}
+                        return;
                     }
-                    return;
+                    InputOwner::TalkSetup => {
+                        if let Some(card) = self.talk_setup.as_mut() {
+                            match card.stage {
+                                crate::talk::SetupStage::DeepgramKey => card.key_push_str(text),
+                                crate::talk::SetupStage::Language => {
+                                    for c in text.trim().chars() {
+                                        if c.is_ascii_alphanumeric() || c == '-' {
+                                            card.language.push(c);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                    InputOwner::Search => {
+                        if let Some(search) = self.transcript_search.as_mut() {
+                            search.query.push_str(text);
+                            search.selected = 0;
+                        }
+                        self.refresh_transcript_search();
+                        return;
+                    }
+                    InputOwner::ModelPicker => {
+                        if let Some(picker) = self.model_picker.as_mut() {
+                            picker.query.push_str(text);
+                            picker.selection = 0;
+                        }
+                        return;
+                    }
+                    owner if owner.accepts_composer_edits() => {}
+                    owner => {
+                        self.flash = Some(if owner == InputOwner::ToolDetail {
+                            "· paste ignored — the detail view is read-only (esc to return)"
+                                .to_owned()
+                        } else {
+                            "· paste ignored — this view has no text field".to_owned()
+                        });
+                        return;
+                    }
                 }
                 // T2: pasting while a talk session is engaged COMMITS the
                 // partial transcript first (the typing-commits law), then
@@ -7771,16 +8293,6 @@ impl AppModel {
                     self.talk_commit_to_composer();
                 }
                 self.close_backtrack();
-                // While a blocking menu replaces the composer, paste has no
-                // target (r2 P2).
-                if self.screen == Screen::Session
-                    && self
-                        .projection
-                        .open_menu()
-                        .is_some_and(|menu| !menu.options.is_empty())
-                {
-                    return;
-                }
                 if self.screen == Screen::Loom {
                     if self
                         .loom_authoring
@@ -7819,11 +8331,10 @@ impl AppModel {
             AppEvent::SurfaceInputReplace { text } => {
                 // The Loom editor is a dedicated local surface. A volatile
                 // session-input mirror must never replace its bytes.
-                if self.screen == Screen::Loom {
+                if !self.accepts_injected_edits() {
                     return;
                 }
-                self.composer.set_text(text);
-                self.dirty = true;
+                self.edit_composer_from_outside(|composer| composer.set_text(text));
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
@@ -7921,6 +8432,11 @@ impl AppModel {
         revision: u64,
         epoch: u64,
     ) {
+        // The detail view covers the composer; a one-frame-stale composer
+        // hit must not move the parked draft's caret or selection.
+        if !self.composer_owns_input() {
+            return;
+        }
         // TUI6.1 fix 1: the epoch gate joins the surface/revision gates —
         // a hit stamped before a resize (or an older frame) is stale
         // GEOMETRY even when the text never changed.
@@ -7944,7 +8460,7 @@ impl AppModel {
     /// Drag with the button held after a composer press: the caret (the
     /// selection's active end) follows the pointer.
     pub fn composer_drag_to(&mut self, byte: usize) {
-        if !self.composer_drag {
+        if !self.composer_drag || !self.composer_owns_input() {
             return;
         }
         self.composer.drag_to(byte);
@@ -7959,6 +8475,9 @@ impl AppModel {
             return;
         }
         self.composer_drag = false;
+        if !self.composer_owns_input() {
+            return;
+        }
         if let Some(text) = self.composer.selected_text() {
             self.requests.push(AppRequest::CopyText(text.to_owned()));
         }
@@ -8212,8 +8731,10 @@ impl AppModel {
                     self.dirty = true;
                 } else if self.fleet.stack.pop().is_none() {
                     self.switch_surface(Screen::Session);
+                    self.fleet.sel = 0;
+                } else {
+                    self.fleet.sel = 0;
                 }
-                self.fleet.sel = 0;
             }
             KeyCode::Enter => {
                 // From a member's detail frame, ⏎ opens the FULL transcript
@@ -8234,14 +8755,18 @@ impl AppModel {
             }
             // The destroy step — detail-frame only, always two presses.
             KeyCode::Char('d') => self.fleet_kill_step(),
-            KeyCode::Up | KeyCode::Char('k') => self.fleet_move(-stride),
-            KeyCode::Down | KeyCode::Char('j') => self.fleet_move(stride),
-            KeyCode::Left if grid => self.fleet_move(-1),
-            KeyCode::Right if grid => self.fleet_move(1),
-            KeyCode::PageUp => self.fleet_move(-(page * stride)),
-            KeyCode::PageDown => self.fleet_move(page * stride),
-            KeyCode::Home => self.fleet.sel = 0,
-            KeyCode::End => {
+            KeyCode::Up | KeyCode::Char('k') if self.fleet.detail.is_none() => {
+                self.fleet_move(-stride)
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.fleet.detail.is_none() => {
+                self.fleet_move(stride)
+            }
+            KeyCode::Left if grid && self.fleet.detail.is_none() => self.fleet_move(-1),
+            KeyCode::Right if grid && self.fleet.detail.is_none() => self.fleet_move(1),
+            KeyCode::PageUp if self.fleet.detail.is_none() => self.fleet_move(-(page * stride)),
+            KeyCode::PageDown if self.fleet.detail.is_none() => self.fleet_move(page * stride),
+            KeyCode::Home if self.fleet.detail.is_none() => self.fleet.sel = 0,
+            KeyCode::End if self.fleet.detail.is_none() => {
                 if let Some((count, _)) = self.fleet_nav() {
                     self.fleet.sel = count.saturating_sub(1);
                 }
@@ -8588,23 +9113,15 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
-        if self.ssh_terminal.is_some() {
-            self.handle_ssh_terminal_key(key);
-            return;
-        }
-        if self.ssh_form.is_some() {
-            self.handle_ssh_form_key(key);
-            return;
-        }
-        if self.lockdown_overlay {
+        if self.input_owner() == InputOwner::Lockdown {
             self.lockdown_overlay = false;
             self.dirty = true;
             return;
         }
-        if self.tool_detail_key(key) {
+        if self.input_owner() == InputOwner::ToolDetail && self.tool_detail_key(key) {
             return;
         }
-        if self.screen == Screen::Loom
+        if self.input_owner() == InputOwner::Composer(Screen::Loom)
             && self
                 .loom_authoring
                 .as_ref()
@@ -8614,18 +9131,18 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.screen == Screen::Tools {
+        if self.input_owner() == InputOwner::Screen(Screen::Tools) {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.switch_surface(Screen::Session);
                 self.dirty = true;
             }
             return;
         }
-        if self.screen == Screen::Hooks {
+        if self.input_owner() == InputOwner::Screen(Screen::Hooks) {
             self.handle_hooks_key(key.code);
             return;
         }
-        if self.screen == Screen::Tree {
+        if self.input_owner() == InputOwner::Screen(Screen::Tree) {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.tree_sel = self.tree_sel.saturating_sub(1);
@@ -8756,11 +9273,11 @@ impl AppModel {
             }
             return;
         }
-        if self.screen == Screen::Sessions {
+        if self.input_owner() == InputOwner::Screen(Screen::Sessions) {
             self.handle_sessions_key(key);
             return;
         }
-        if self.inbox_open {
+        if self.input_owner() == InputOwner::Inbox {
             let last = self.inbox_rows().len().saturating_sub(1);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.inbox_open = false,
@@ -8778,7 +9295,7 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.transcript_search.is_some() {
+        if self.input_owner() == InputOwner::Search {
             match key.code {
                 KeyCode::Esc => self.close_transcript_search(),
                 KeyCode::Enter | KeyCode::Down => self.search_move(true),
@@ -8791,7 +9308,7 @@ impl AppModel {
                     self.refresh_transcript_search();
                     self.dirty = true;
                 }
-                KeyCode::Char(character) if !character.is_control() => {
+                KeyCode::Char(character) if !character.is_control() && key.modifiers.is_empty() => {
                     if let Some(search) = self.transcript_search.as_mut() {
                         search.query.push(character);
                         search.selected = 0;
@@ -8805,17 +9322,17 @@ impl AppModel {
         }
         // Boot renders no composer — hidden input must not accumulate or
         // start turns (review r1 P2).
-        if self.screen == Screen::Boot {
+        if self.input_owner() == InputOwner::Screen(Screen::Boot) {
             return;
         }
-        if self.help_open {
+        if self.input_owner() == InputOwner::Help {
             // esc/enter/q close help; everything else is swallowed.
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.help_open = false;
             }
             return;
         }
-        if self.shells_open {
+        if self.input_owner() == InputOwner::Shells {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.shells_open = false,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -8840,7 +9357,7 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        if self.ssh_open {
+        if self.input_owner() == InputOwner::SshList {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.ssh_open = false;
@@ -8908,7 +9425,7 @@ impl AppModel {
         // resumes by the row's own state, t triggers, e hands the edit to
         // the agent, y copies the id. The overlay owns every key while it
         // is showing, exactly as `/ssh` and `/shells` do.
-        if self.monitors_open {
+        if self.input_owner() == InputOwner::Monitors {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.monitors_open = false;
@@ -8968,64 +9485,20 @@ impl AppModel {
         }
         // The `/model` picker owns EVERY key while it is showing (F2a —
         // heeded history: ⏎ selects the HIGHLIGHTED row, never an
-        // exact-match jump; esc closes without selecting). A daemon menu
-        // outranks it: local chrome never shadows a live ask.
-        if self.model_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if menu_owns {
-                self.model_picker = None;
-                self.dirty = true;
-            } else {
-                self.handle_model_picker_key(key.code);
-                return;
-            }
+        // exact-match jump; esc closes without selecting).
+        if self.input_owner() == InputOwner::ModelPicker {
+            self.handle_model_picker_key(key.code);
+            return;
         }
         // The `/effort` picker owns the keys while it is showing (G3) —
-        // the same input-replacement law as `/theme`; a daemon card
-        // outranks it and closes it.
-        if self.effort_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns && matches!(self.screen, Screen::Session | Screen::Subagent) {
-                self.handle_effort_picker_key(key.code);
-                return;
-            }
-            self.effort_picker = None;
-            self.dirty = true;
+        // the same input-replacement law as `/theme`.
+        if self.input_owner() == InputOwner::EffortPicker {
+            self.handle_effort_picker_key(key.code);
+            return;
         }
-        // The `/theme` picker owns the keys while it is showing. A daemon
-        // card or a navigation away from its surfaces outranks it: the
-        // picker then closes (reverting any preview) and the key proceeds
-        // to its normal owner — local chrome never shadows a live ask.
-        if self.theme_picker.is_some() {
-            let menu_owns = (self.screen == Screen::Session
-                && self.projection.open_menu().is_some())
-                || (self.screen == Screen::Subagent
-                    && self
-                        .viewed_chip()
-                        .is_some_and(|chip| chip.question_menu().is_some()));
-            if !menu_owns
-                && matches!(
-                    self.screen,
-                    Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
-                )
-            {
-                self.handle_theme_picker_key(key.code);
-                return;
-            }
-            if let Some(picker) = self.theme_picker.take() {
-                self.theme = picker.prior.resolve(self.detected_system);
-                self.dirty = true;
-            }
+        if self.input_owner() == InputOwner::ThemePicker {
+            self.handle_theme_picker_key(key.code);
+            return;
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
         // parent is not blocked); the chip's question menu replaces the
@@ -9039,10 +9512,10 @@ impl AppModel {
                 self.scroll_back.set(0);
                 return;
             }
-            if self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some())
-            {
+            if self.viewed_chip().is_some_and(|chip| {
+                chip.question_menu()
+                    .is_some_and(|menu| !menu.options.is_empty())
+            }) {
                 self.handle_chip_menu_key(key.code);
                 return;
             }
@@ -9308,7 +9781,17 @@ impl AppModel {
                     self.retry_permission();
                     return;
                 }
-                _ => {}
+                _ => {
+                    // The standalone card never feeds the parked composer.
+                    // A paired menu may handle its ordinary choice keys.
+                    if !self.projection.permission_card().is_some_and(|card| {
+                        self.projection
+                            .open_menu()
+                            .is_some_and(|menu| menu.id == card.menu_id)
+                    }) {
+                        return;
+                    }
+                }
             }
         }
         // Edit/Write review keeps the ordinary permission-menu answer path.
@@ -9862,64 +10345,807 @@ impl AppModel {
         }
     }
 
-    /// The composer is the live input target: no boot screen, no help
-    /// overlay, no blocking menu owning the keys (session card or the
-    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
-    /// menu can never eat a hidden draft.
+    /// The visible input target. This order is also used by the renderer for
+    /// its covering layers; stale hits and delayed input are checked again
+    /// against the current value before they can change state.
     #[must_use]
-    /// rev933d finding 4: injection from an embedding client applies only
-    /// when the PLAIN session composer is the live Enter target — no card
-    /// (login, `/talk` setup, an engaged talk session), no menu, no help,
-    /// and never the subagent view (whose composer messages the child).
-    /// This mirrors the key-dispatch precedence exactly, so a synthesized
-    /// Submit can never activate a card row or answer a question.
-    pub fn accepts_injected_input(&self) -> bool {
-        self.screen == Screen::Session
-            && self.login.is_none()
-            && self.talk_setup.is_none()
-            && !self.talk.engaged()
-            && self.composer_owns_input()
+    pub fn input_owner(&self) -> InputOwner {
+        self.primary_input_owner()
     }
 
-    /// Clipboard gestures can arrive before screen-specific key handlers.
-    /// Do not let them read/copy the parked draft behind a read-only view
-    /// or a modal; modal text paste has its own AppEvent::Paste targets.
+    fn primary_input_owner(&self) -> InputOwner {
+        if self.lockdown_overlay {
+            return InputOwner::Lockdown;
+        }
+        if self.tool_detail.is_some() {
+            return InputOwner::ToolDetail;
+        }
+        if self.inbox_open {
+            return InputOwner::Inbox;
+        }
+        if self.help_open {
+            return InputOwner::Help;
+        }
+        if self.shells_open {
+            return InputOwner::Shells;
+        }
+        if self.ssh_open {
+            return if self.ssh_form.is_some() {
+                InputOwner::SshForm
+            } else {
+                InputOwner::SshList
+            };
+        }
+        if self.monitors_open {
+            return InputOwner::Monitors;
+        }
+        if self.ssh_terminal.is_some() {
+            return InputOwner::SshTerminal;
+        }
+        if self.model_picker.is_some() {
+            return InputOwner::ModelPicker;
+        }
+        if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
+            return InputOwner::AccountsReplace;
+        }
+        if self.login.is_some() {
+            return InputOwner::Login;
+        }
+        if self.talk_setup.is_some() {
+            return InputOwner::TalkSetup;
+        }
+        // The native permission grant card paints over the answer band even
+        // when its paired menu has not arrived yet.
+        if self.screen == Screen::Session && self.projection.permission_card().is_some() {
+            return InputOwner::SessionMenu;
+        }
+        match self.screen {
+            Screen::Accounts | Screen::Providers if self.custom_add.is_some() => {
+                InputOwner::CustomProviderForm
+            }
+            Screen::Session => {
+                if let Some(menu) = self.projection.open_menu() {
+                    if menu.options.is_empty() {
+                        // A free-text ask paints an answer line, even if a
+                        // local picker or search was open when it arrived.
+                        return InputOwner::Composer(Screen::Session);
+                    }
+                    if menu.origin == "plan" {
+                        return InputOwner::PlanDoc;
+                    }
+                    if crate::app::menu_file_review(menu).is_some() {
+                        return InputOwner::FileReviewDoc;
+                    }
+                    return InputOwner::SessionMenu;
+                }
+                if self.transcript_search.is_some() {
+                    return InputOwner::Search;
+                }
+                if self.effort_picker.is_some() {
+                    return InputOwner::EffortPicker;
+                }
+                if self.theme_picker.is_some() {
+                    return InputOwner::ThemePicker;
+                }
+                if self.backtrack.is_some() {
+                    return InputOwner::HistoryChooser;
+                }
+                InputOwner::Composer(Screen::Session)
+            }
+            Screen::Subagent => {
+                if let Some(menu) = self.viewed_chip().and_then(ChipModel::question_menu) {
+                    // The visible answer line owns input, just as it does on
+                    // the session screen. Local pickers yield while it is up.
+                    if menu.options.is_empty() {
+                        return InputOwner::Composer(Screen::Subagent);
+                    }
+                    return InputOwner::SubagentQuestion;
+                }
+                if self.effort_picker.is_some() {
+                    InputOwner::EffortPicker
+                } else if self.theme_picker.is_some() {
+                    InputOwner::ThemePicker
+                } else {
+                    InputOwner::Composer(Screen::Subagent)
+                }
+            }
+            Screen::Fleet if self.fleet.detail.is_some() => InputOwner::FleetMemberDetail,
+            Screen::Launcher | Screen::Aura | Screen::Loom => {
+                if self.theme_picker.is_some() {
+                    InputOwner::ThemePicker
+                } else {
+                    InputOwner::Composer(self.screen)
+                }
+            }
+            screen => InputOwner::Screen(screen),
+        }
+    }
+
+    /// Deferred-decision plug-in seam. The usage projection supplies the
+    /// current spend-menu id; this runtime supplies visibility and precedence.
+    /// Ordinary blocking menus continue to use `input_owner()`.
+    #[must_use]
+    pub fn spend_card_input_owner(&self, card: &MenuId) -> InputOwner {
+        // The deferred-card extension can call this from input_owner()
+        // without recursively asking that extension to route itself.
+        let owner = self.primary_input_owner();
+        let menu = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        let permission_cover = match self.screen {
+            Screen::Session => self.projection.permission_card().is_some(),
+            Screen::Subagent => self
+                .viewed_chip()
+                .is_some_and(|chip| chip.transcript.permission_card().is_some()),
+            _ => false,
+        };
+        let card_visible = !permission_cover && menu.is_some_and(|menu| &menu.id == card);
+        if !card_visible
+            || !matches!(
+                owner,
+                InputOwner::SessionMenu | InputOwner::SpendCard | InputOwner::SubagentQuestion
+            )
+        {
+            return owner;
+        }
+        if self.transcript_search.is_some() {
+            InputOwner::Search
+        } else if self.effort_picker.is_some() {
+            InputOwner::EffortPicker
+        } else if self.theme_picker.is_some() {
+            InputOwner::ThemePicker
+        } else if self.backtrack.is_some() {
+            InputOwner::HistoryChooser
+        } else if !self.composer.is_empty()
+            || !self.mirrored_input_attachments().is_empty()
+            || self.talk.engaged()
+        {
+            InputOwner::Composer(self.screen)
+        } else {
+            InputOwner::SpendCard
+        }
+    }
+
+    /// Popup identity uses the revision, never the composer's text bytes.
+    fn composer_popup_identity(&self) -> Option<String> {
+        if self.palette_open() {
+            Some(format!(
+                "palette:{}:{}",
+                self.composer.revision(),
+                self.palette_selection
+            ))
+        } else {
+            self.mention_completion.as_ref().map(|completion| {
+                format!(
+                    "mentions:{}:{}:{}",
+                    self.composer.revision(),
+                    completion.start,
+                    completion.selected
+                )
+            })
+        }
+    }
+
+    /// Stable identity for the topmost input target, independent of cadence
+    /// redraws and geometry epochs.
+    #[must_use]
+    pub fn presented_input(&self) -> PresentedInput {
+        let owner = self.input_owner();
+        let instance = match owner {
+            InputOwner::SpendCard => self
+                .decision_identity()
+                .map(|identity| format!("{identity}:{}", self.menu_selection)),
+            InputOwner::SessionMenu => Some(format!(
+                "{}:{}:{}",
+                self.projection
+                    .open_menu()
+                    .map(|menu| format!("{}:{}", menu.id, self.projection.menu_instance()))
+                    .unwrap_or_default(),
+                self.projection
+                    .permission_card()
+                    .map(|card| format!(
+                        "{}:{}",
+                        card.request_id,
+                        self.projection.permission_instance()
+                    ))
+                    .unwrap_or_default(),
+                self.menu_selection
+            )),
+            InputOwner::PlanDoc | InputOwner::FileReviewDoc => {
+                self.projection.open_menu().map(|menu| {
+                    format!(
+                        "{}:{}:{}",
+                        menu.id,
+                        self.projection.menu_instance(),
+                        self.menu_selection
+                    )
+                })
+            }
+            InputOwner::Composer(Screen::Session) => {
+                let answer = self
+                    .projection
+                    .open_menu()
+                    .filter(|menu| menu.options.is_empty())
+                    .map(|menu| format!("answer:{}:{}", menu.id, self.projection.menu_instance()));
+                match (answer, self.composer_popup_identity()) {
+                    (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                    (answer, popup) => answer.or(popup),
+                }
+            }
+            InputOwner::Composer(Screen::Subagent) => {
+                let answer = self.viewed_chip().and_then(|chip| {
+                    chip.question_menu()
+                        .filter(|menu| menu.options.is_empty())
+                        .map(|menu| {
+                            format!(
+                                "answer:{}:{}:{}",
+                                chip.agent,
+                                menu.id,
+                                chip.transcript.menu_instance()
+                            )
+                        })
+                });
+                match (answer, self.composer_popup_identity()) {
+                    (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                    (answer, popup) => answer.or(popup),
+                }
+            }
+            InputOwner::Composer(_) => self.composer_popup_identity(),
+            InputOwner::SubagentQuestion => self.viewed_chip().map(|chip| {
+                format!(
+                    "{}:{}:{}",
+                    chip.agent,
+                    chip.question_menu()
+                        .map(|menu| format!("{}:{}", menu.id, chip.transcript.menu_instance()))
+                        .unwrap_or_default(),
+                    self.menu_selection
+                )
+            }),
+            InputOwner::CustomProviderForm => self.custom_add.as_ref().map(|card| {
+                format!(
+                    "{}:{:?}:{:?}",
+                    card.attempt,
+                    card.focus,
+                    std::mem::discriminant(&card.phase)
+                )
+            }),
+            InputOwner::Login => self.login.as_ref().map(|card| {
+                format!(
+                    "{}:{:?}:{:?}",
+                    card.attempt,
+                    card.focus,
+                    std::mem::discriminant(&card.stage)
+                )
+            }),
+            InputOwner::TalkSetup => self
+                .talk_setup
+                .as_ref()
+                .map(|card| format!("{:?}:{:?}:{}", card.stage, card.key_stage, card.selection)),
+            InputOwner::SshForm => self
+                .ssh_form
+                .as_ref()
+                .map(|form| format!("{:?}:{}", form.original, form.focus)),
+            InputOwner::ToolDetail => self.tool_detail.as_ref().map(|view| view.item_id.clone()),
+            InputOwner::FleetMemberDetail => self.fleet.detail.as_ref().map(ToString::to_string),
+            InputOwner::Inbox => Some(format!(
+                "{}:{:?}:{}",
+                self.inbox_cursor,
+                self.inbox_rows()
+                    .get(self.inbox_cursor)
+                    .map(|row| &row.target),
+                self.projection
+                    .open_menu()
+                    .map(|menu| menu.id.to_string())
+                    .unwrap_or_default()
+            )),
+            InputOwner::SshList => Some(format!(
+                "{}:{}",
+                self.ssh_cursor,
+                self.ssh_profiles
+                    .get(self.ssh_cursor)
+                    .map(|profile| profile.name.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Shells => Some(format!(
+                "{}:{}",
+                self.shells_cursor,
+                self.shells
+                    .get(self.shells_cursor)
+                    .map(|shell| shell.id.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Monitors => Some(format!(
+                "{}:{}",
+                self.monitors_cursor,
+                self.monitors
+                    .get(self.monitors_cursor)
+                    .map(|monitor| monitor.monitor_id.as_str())
+                    .unwrap_or_default()
+            )),
+            InputOwner::ModelPicker => self.model_picker.as_ref().map(|picker| {
+                let row = self.model_picker_rows().get(picker.selection).cloned();
+                format!(
+                    "{}:{}:{:?}",
+                    picker.provider_stage.is_some(),
+                    picker.selection,
+                    row.map(|row| (row.provider, row.model))
+                )
+            }),
+            InputOwner::AccountsReplace => self
+                .accounts
+                .pending_replace
+                .map(|kind| format!("{kind:?}")),
+            InputOwner::ThemePicker => self
+                .theme_picker
+                .as_ref()
+                .map(|picker| picker.selection.to_string()),
+            InputOwner::EffortPicker => self.effort_picker.as_ref().map(|picker| {
+                format!(
+                    "{}:{:?}",
+                    picker.selection,
+                    self.effort_picker_rows()
+                        .get(picker.selection)
+                        .map(|row| &row.effort)
+                )
+            }),
+            InputOwner::HistoryChooser => self.backtrack.as_ref().map(|chooser| {
+                format!(
+                    "{}:{:?}",
+                    chooser.selection,
+                    self.prompt_history
+                        .get(chooser.selection)
+                        .and_then(|prompt| prompt.seq)
+                )
+            }),
+            InputOwner::SshTerminal => self.ssh_terminal.as_ref().map(|terminal| {
+                format!(
+                    "{}:{}:{:?}",
+                    terminal.attempt_id, terminal.profile, terminal.shell_id
+                )
+            }),
+            InputOwner::Screen(Screen::Usage) => self.usage.report.as_ref().map(|report| {
+                let groups = self.usage.groups();
+                let alias = groups
+                    .get(self.usage.cursor)
+                    .and_then(|group| group.accounts.get(self.usage.selected_tab(group)))
+                    .and_then(|slot| report.accounts.get(*slot))
+                    .map(|account| account.alias.to_string())
+                    .unwrap_or_default();
+                format!("{}:{:?}:{alias}", report.generated_at_ms, self.usage.scope)
+            }),
+            InputOwner::Screen(Screen::Sessions) => Some(format!(
+                "{}:{}",
+                self.session_browser_sel,
+                self.session_browser_rows()
+                    .get(self.session_browser_sel)
+                    .map(|row| row.id.to_string())
+                    .unwrap_or_default()
+            )),
+            InputOwner::Screen(Screen::Accounts) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.accounts.cursor,
+                self.accounts
+                    .rows
+                    .get(self.accounts.cursor)
+                    .map(|row| &row.alias),
+                self.accounts.pending_remove
+            )),
+            InputOwner::Screen(Screen::Providers) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.providers.cursor,
+                self.providers
+                    .providers
+                    .get(self.providers.cursor)
+                    .map(|row| &row.provider),
+                self.providers.pending_remove
+            )),
+            InputOwner::Screen(Screen::Hooks) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.hooks.cursor,
+                self.hooks
+                    .rows
+                    .as_ref()
+                    .and_then(|rows| rows.get(self.hooks.cursor))
+                    .map(|row| &row.digest),
+                self.hooks
+                    .confirm
+                    .as_ref()
+                    .map(|confirm| (&confirm.digest, confirm.grant))
+            )),
+            InputOwner::Screen(Screen::Fleet) => Some(format!(
+                "{}:{:?}:{:?}",
+                self.fleet.sel,
+                self.fleet_selected_agent().map(|(agent, _, _)| agent),
+                self.fleet.kill_armed
+            )),
+            _ => None,
+        };
+        let instance = self.composer_replacement_identity(owner, instance);
+        PresentedInput {
+            owner,
+            surface: self.ui_generation(),
+            instance,
+        }
+    }
+
+    /// The input owner of the last completed render, which may differ from
+    /// the logical owner while a new card awaits presentation.
+    #[must_use]
+    pub fn painted_input(&self) -> Option<PresentedInput> {
+        self.painted_input.borrow().clone()
+    }
+
+    #[must_use]
+    pub(crate) fn painted_stamp(&self) -> Option<(PresentedInput, u64)> {
+        self.painted_input()
+            .map(|owner| (owner, self.painted_epoch.get()))
+    }
+
+    pub(crate) fn clear_mouse_press(&mut self) {
+        self.mouse_down = None;
+        self.mouse_press_owner = None;
+        self.mouse_press_hit = None;
+        self.mouse_press_rect = None;
+        self.mouse_press_epoch = None;
+        self.mouse_press_dwell_ready = false;
+        self.composer_drag = false;
+        if let Some(selection) = &mut self.selection {
+            selection.dragging = false;
+        }
+    }
+
+    pub(crate) fn retire_stale_press(&mut self) {
+        if self
+            .mouse_press_owner
+            .as_ref()
+            .is_some_and(|owner| owner != &self.presented_input())
+            || self
+                .mouse_press_epoch
+                .is_some_and(|epoch| epoch != self.painted_epoch.get())
+            || (self.composer_drag && !self.composer_owns_input())
+        {
+            self.clear_mouse_press();
+        }
+    }
+
+    pub(crate) fn input_rows(&self) -> Option<InputRows> {
+        Some(match self.input_owner() {
+            InputOwner::ModelPicker => InputRows::Models(self.model_picker_rows()),
+            InputOwner::Screen(Screen::Sessions) => {
+                InputRows::Sessions(self.session_browser_rows())
+            }
+            InputOwner::Inbox => InputRows::Inbox(self.inbox_rows()),
+            InputOwner::EffortPicker => InputRows::Efforts(self.effort_picker_rows()),
+            InputOwner::SshList => InputRows::Ssh(self.ssh_profiles.clone()),
+            InputOwner::Composer(_) if self.palette_open() => {
+                InputRows::Palette(self.palette_items())
+            }
+            InputOwner::Composer(_) => {
+                InputRows::Mentions(self.mention_completion.as_ref()?.candidates.clone())
+            }
+            _ => return None,
+        })
+    }
+
+    /// Outside content cannot lend any queue-produced frame its authority.
+    pub(crate) fn invalidate_queued_input(&mut self) {
+        self.input_rebase = None;
+        // Retire reader/pointer stamps while preserving the last painted
+        // owner: raw input still must refuse an unpainted replacement.
+        self.painted_epoch
+            .set(self.painted_epoch.get().wrapping_add(1));
+        self.dirty = true;
+    }
+
+    pub(crate) fn record_painted_input(&self) {
+        self.record_painted_input_at(std::time::Instant::now());
+    }
+
+    pub(crate) fn record_painted_input_at(&self, now: std::time::Instant) {
+        let next = self.presented_input();
+        let pointer_owner = self.pointer_input_owner();
+        let mut pointer = self.pointer_presentation.borrow_mut();
+        if pointer
+            .as_ref()
+            .is_none_or(|(owner, _)| owner != &pointer_owner)
+        {
+            *pointer = Some((pointer_owner, now));
+        }
+        let mut question = self.text_question_presentation.borrow_mut();
+        match self.free_text_question_owner() {
+            Some(owner) => {
+                if question.as_ref().is_none_or(|(prior, _)| prior != &owner) {
+                    *question = Some((owner, now));
+                }
+            }
+            None => *question = None,
+        }
+        let mut painted = self.painted_input.borrow_mut();
+        if painted.as_ref() != Some(&next) {
+            self.painted_epoch
+                .set(self.painted_epoch.get().wrapping_add(1));
+        }
+        *painted = Some(next);
+    }
+
+    /// Stable identity of the visible free-text decision, independent of
+    /// its completion popup or answer edits. Covers retire this identity.
+    pub(crate) fn free_text_question_owner(&self) -> Option<PresentedInput> {
+        let owner = self.input_owner();
+        let (origin, projection, menu) = match owner {
+            InputOwner::Composer(Screen::Session) => {
+                ("session", &self.projection, self.projection.open_menu()?)
+            }
+            InputOwner::Composer(Screen::Subagent) => {
+                let chip = self.viewed_chip()?;
+                (chip.agent.as_str(), &chip.transcript, chip.question_menu()?)
+            }
+            _ => return None,
+        };
+        if !menu.options.is_empty() {
+            return None;
+        }
+        Some(PresentedInput {
+            owner,
+            surface: self.ui_generation(),
+            instance: Some(format!(
+                "answer:{origin}:{}:{}",
+                menu.id,
+                projection.menu_instance()
+            )),
+        })
+    }
+
+    fn decision_identity(&self) -> Option<String> {
+        if !self.input_owner().confirms_decision() {
+            return None;
+        }
+        let (origin, projection) = if self.screen == Screen::Subagent {
+            let chip = self.viewed_chip()?;
+            (chip.agent.as_str(), &chip.transcript)
+        } else {
+            ("session", &self.projection)
+        };
+        Some(format!(
+            "{}:{}:{}:{:?}",
+            origin,
+            projection
+                .open_menu()
+                .map(|menu| menu.id.as_str())
+                .unwrap_or_default(),
+            projection.menu_instance(),
+            projection
+                .permission_card()
+                .map(|_| projection.permission_instance())
+        ))
+    }
+
+    /// Cursor, hover and field focus do not replace a pointer surface.
+    /// Card incarnations and form/picker stages do.
+    pub(crate) fn pointer_input_owner(&self) -> PresentedInput {
+        let mut owner = self.presented_input();
+        owner.instance =
+            match owner.owner {
+                InputOwner::CustomProviderForm => self.custom_add.as_ref().map(|card| {
+                    format!("{}:{:?}", card.attempt, std::mem::discriminant(&card.phase))
+                }),
+                InputOwner::Login => self.login.as_ref().map(|card| {
+                    format!("{}:{:?}", card.attempt, std::mem::discriminant(&card.stage))
+                }),
+                InputOwner::TalkSetup => self
+                    .talk_setup
+                    .as_ref()
+                    .map(|card| format!("{:?}:{:?}", card.stage, card.key_stage)),
+                InputOwner::ModelPicker => self.model_picker.as_ref().map(|picker| {
+                    format!(
+                        "{:?}",
+                        picker.provider_stage.as_ref().map(|stage| &stage.model)
+                    )
+                }),
+                InputOwner::SshForm => self
+                    .ssh_form
+                    .as_ref()
+                    .map(|form| format!("{:?}", form.original)),
+                InputOwner::Composer(_) => {
+                    let answer = self
+                        .free_text_question_owner()
+                        .and_then(|owner| owner.instance);
+                    let popup = if self.palette_open() {
+                        Some("palette")
+                    } else if self.mention_completion.is_some() {
+                        Some("mentions")
+                    } else {
+                        None
+                    };
+                    match (answer, popup) {
+                        (Some(answer), Some(popup)) => Some(format!("{answer}:{popup}")),
+                        (answer, popup) => answer.or_else(|| popup.map(str::to_owned)),
+                    }
+                }
+                InputOwner::ToolDetail
+                | InputOwner::FleetMemberDetail
+                | InputOwner::SshTerminal
+                | InputOwner::AccountsReplace => owner.instance.clone(),
+                _ => self.decision_identity(),
+            };
+        owner.instance = self.composer_replacement_identity(owner.owner, owner.instance);
+        owner
+    }
+
+    fn composer_replacement_identity(
+        &self,
+        owner: InputOwner,
+        instance: Option<String>,
+    ) -> Option<String> {
+        if matches!(owner, InputOwner::Composer(_)) && self.composer_replacement_epoch != 0 {
+            Some(format!(
+                "replaced:{}:{}",
+                self.composer_replacement_epoch,
+                instance.unwrap_or_default()
+            ))
+        } else {
+            instance
+        }
+    }
+
+    /// All committing devices share the same new/restored-card dwell.
+    pub(crate) const DECISION_DWELL: std::time::Duration = std::time::Duration::from_millis(400);
+
+    fn clipboard_paste_key(&self, key: &KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('v' | 'V'))
+            && [
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            ]
+            .contains(&key.modifiers)
+            && self.screen != Screen::Loom
+    }
+
+    pub(crate) fn decision_key_commits(&self, key: &KeyEvent) -> bool {
+        // Modified Ctrl+Enter reaches the inline replacement confirmation
+        // before handle_key's control-chord return. Bare Ctrl+Enter is swallowed
+        // by the earlier non-composer gate; other menus never commit Ctrl chords.
+        let replace_enter = self.input_owner() == InputOwner::AccountsReplace
+            && key.code == KeyCode::Enter
+            && key.modifiers != KeyModifiers::CONTROL;
+        if (key.modifiers.contains(KeyModifiers::CONTROL) && !replace_enter)
+            || self.clipboard_paste_key(key)
+        {
+            return false;
+        }
+        // The review document reserves these letters for hunk navigation,
+        // before its ordinary menu shortcuts see the key.
+        if self.screen == Screen::Session
+            && matches!(key.code, KeyCode::Char('n' | 'p' | '[' | ']'))
+            && self
+                .projection
+                .open_menu()
+                .is_some_and(|menu| !menu.options.is_empty() && menu_file_review(menu).is_some())
+        {
+            return false;
+        }
+        if matches!(self.input_owner(), InputOwner::Composer(_))
+            && key.code == KeyCode::Enter
+            && (key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                || self
+                    .mention_completion
+                    .as_ref()
+                    .is_some_and(|completion| !completion.candidates.is_empty())
+                || self.palette_open())
+        {
+            return false;
+        }
+        let menu = match self.input_owner() {
+            InputOwner::AccountsReplace => return key.code == KeyCode::Enter,
+            InputOwner::SessionMenu
+            | InputOwner::SpendCard
+            | InputOwner::PlanDoc
+            | InputOwner::FileReviewDoc => {
+                if self.projection.permission_card().is_some()
+                    && matches!(
+                        key.code,
+                        KeyCode::Enter | KeyCode::Char('r' | 'R' | 'o' | 'O')
+                    )
+                {
+                    return true;
+                }
+                self.projection.open_menu()
+            }
+            InputOwner::SubagentQuestion | InputOwner::Composer(Screen::Subagent) => {
+                self.viewed_chip().and_then(ChipModel::question_menu)
+            }
+            InputOwner::Composer(Screen::Session) => self
+                .projection
+                .open_menu()
+                .filter(|menu| menu.options.is_empty()),
+            _ => None,
+        };
+        menu.is_some_and(|menu| match key.code {
+            KeyCode::Enter => true,
+            KeyCode::Char(c) if !menu.options.is_empty() => menu_shortcut_index(menu, c).is_some(),
+            _ => false,
+        })
+    }
+
+    pub(crate) fn decision_key_commit_ready(&self, now: std::time::Instant) -> bool {
+        if let Some(owner) = self.free_text_question_owner() {
+            self.text_question_presentation
+                .borrow()
+                .as_ref()
+                .is_some_and(|(presented, shown)| {
+                    *presented == owner
+                        && now.saturating_duration_since(*shown) >= Self::DECISION_DWELL
+                })
+        } else {
+            self.pointer_commit_ready(now)
+        }
+    }
+
+    pub(crate) fn pointer_commit_ready(&self, now: std::time::Instant) -> bool {
+        self.pointer_presentation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(presented, shown)| {
+                *presented == self.pointer_input_owner()
+                    && now.saturating_duration_since(*shown) >= Self::DECISION_DWELL
+            })
+    }
+
+    /// Whether the visible Session answer line accepts an external edit.
+    /// A future card that shares the answer line extends this predicate.
+    #[must_use]
+    pub fn accepts_injected_edits(&self) -> bool {
+        self.input_owner().accepts_session_edits() && !self.talk.engaged()
+    }
+
+    /// Whether an external Submit may use the visible Enter target.
+    #[must_use]
+    pub fn accepts_injected_submit(&self) -> bool {
+        self.input_owner() == InputOwner::Composer(Screen::Session) && !self.talk.engaged()
+    }
+
+    /// Selection belongs to the currently painted surface, including an
+    /// overlay selection made after that surface opened.
+    pub(crate) fn selection_is_visible(&self) -> bool {
+        self.selection.is_some()
+            && match self.selection_owner {
+                Some(owner) => owner == self.input_owner(),
+                None => matches!(
+                    self.input_owner(),
+                    InputOwner::Composer(_) | InputOwner::Screen(_) | InputOwner::ToolDetail
+                ),
+            }
+    }
+
+    /// Whether the current owner can accept a composer image or selection.
     fn clipboard_composer_visible(&self) -> bool {
-        matches!(
-            self.screen,
-            Screen::Launcher | Screen::Session | Screen::Subagent | Screen::Aura | Screen::Loom
-        ) && self.composer_owns_input()
-            && !self.lockdown_overlay
-            && self.login.is_none()
-            && self.talk_setup.is_none()
-            && self.custom_add.is_none()
-            && self.ssh_form.is_none()
-            && self.ssh_terminal.is_none()
+        self.input_owner().accepts_composer_edits()
             && !self
                 .loom_authoring
                 .as_ref()
                 .is_some_and(|authoring| self.screen == Screen::Loom && authoring.pending)
     }
 
+    /// The only authority for editing and selecting the visible composer.
     fn composer_owns_input(&self) -> bool {
-        if self.screen == Screen::Boot || self.help_open {
-            return false;
-        }
-        if self.screen == Screen::Session
-            && self
-                .projection
-                .open_menu()
-                .is_some_and(|menu| !menu.options.is_empty())
-        {
-            // A SELECT menu replaces the composer; a zero-option free-text
-            // ask KEEPS it — the composer is the answer line (owner
-            // report: the resistor question rendered unanswerable).
-            return false;
-        }
-        !(self.screen == Screen::Subagent
-            && self
-                .viewed_chip()
-                .is_some_and(|chip| chip.question_menu().is_some()))
+        self.input_owner().accepts_composer_edits()
+    }
+
+    /// Retire input read for the previous draft before accepting an outside
+    /// write, including an equal-value write. Local typing keeps its queue.
+    pub(crate) fn edit_composer_from_outside(
+        &mut self,
+        edit: impl FnOnce(&mut crate::composer::Composer),
+    ) {
+        self.composer_replacement_epoch = self.composer_replacement_epoch.wrapping_add(1);
+        edit(&mut self.composer);
+        self.dirty = true;
     }
 
     /// The composer-edit epilogue every text-changing key shares (the sim
@@ -10239,10 +11465,12 @@ impl AppModel {
         // free-text ask — the composer text IS the answer (value rides
         // the wire's input; empty key + index 0 satisfy the option-less
         // validation arm).
-        if self.screen == Screen::Session
-            && let Some(menu) = self.projection.open_menu()
-            && menu.options.is_empty()
-        {
+        let question = match self.screen {
+            Screen::Session => self.projection.open_menu(),
+            Screen::Subagent => self.viewed_chip().and_then(ChipModel::question_menu),
+            _ => None,
+        };
+        if let Some(menu) = question.filter(|menu| menu.options.is_empty()) {
             let answer = MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: None,
@@ -10766,6 +11994,12 @@ impl AppModel {
                 self.requests.push(AppRequest::TranscriptionSecretRead);
             }
         }
+        if self.talk.engaged() {
+            self.talk_origin = self
+                .active_session
+                .clone()
+                .map(|session| (session, self.ui_generation(), self.talk.generation));
+        }
     }
 
     /// Esc law: DISCARD. Settles the machine (the generation bump makes
@@ -10895,6 +12129,71 @@ impl AppModel {
         }
     }
 
+    fn insert_or_retain_dictation(&mut self, text: &str, generation: u64, submit: bool) {
+        let Some(session) = self.active_session.clone() else {
+            return;
+        };
+        let ui_generation = self.ui_generation();
+        if self.talk_origin.as_ref().is_some_and(|(origin, ui, talk)| {
+            origin != &session || *ui != ui_generation || *talk != generation
+        }) {
+            return;
+        }
+        let text = crate::talk::clamp_realized(text.trim());
+        if text.is_empty() {
+            return;
+        }
+        let mut realized = zeroize::Zeroizing::new(text.to_owned());
+        realized.push(' ');
+        if self.input_owner().accepts_session_edits() && !self.mirror_waiting_for_owner {
+            self.composer.insert_str(&realized);
+            if submit && self.accepts_injected_submit() {
+                self.submit_composer();
+            } else if submit {
+                self.flash = Some(
+                    "· dictation added to your draft — auto-send paused while away".to_owned(),
+                );
+            }
+        } else {
+            self.pending_dictation = Some(PendingDictation {
+                session,
+                ui_generation,
+                talk_generation: generation,
+                text: realized,
+                downgraded_submit: submit,
+            });
+        }
+    }
+
+    pub(crate) fn deliver_pending_dictation(&mut self) {
+        if self.mirror_waiting_for_owner {
+            return;
+        }
+        let Some(pending) = self.pending_dictation.take() else {
+            return;
+        };
+        if !self.input_owner().accepts_session_edits() {
+            self.pending_dictation = Some(pending);
+            return;
+        }
+        if self.active_session.as_ref() != Some(&pending.session)
+            || self.ui_generation() != pending.ui_generation
+            || self
+                .talk_origin
+                .as_ref()
+                .is_some_and(|(_, _, generation)| *generation != pending.talk_generation)
+        {
+            return;
+        }
+        self.composer.insert_str(&pending.text);
+        self.flash = Some(if pending.downgraded_submit {
+            "· dictation added to your draft — auto-send paused while away".to_owned()
+        } else {
+            "· dictation added to your draft".to_owned()
+        });
+        self.dirty = true;
+    }
+
     /// Route a typed engine/setup error: model/runtime gaps open the
     /// setup card (the reinstall surface); everything else is an honest
     /// flash.
@@ -10928,8 +12227,7 @@ impl AppModel {
             TalkEvent::SupervisorFailed { reason } => {
                 let ghost = self.talk.ghost.trim().to_owned();
                 if !ghost.is_empty() {
-                    self.composer
-                        .insert_str(crate::talk::clamp_realized(&ghost));
+                    self.insert_or_retain_dictation(&ghost, self.talk.generation, false);
                 }
                 self.talk.settle();
                 self.listening = false;
@@ -10976,8 +12274,7 @@ impl AppModel {
                         haider_stt::capture::CaptureHealth::Failed { error } => {
                             let ghost = self.talk.ghost.trim().to_owned();
                             if !ghost.is_empty() {
-                                self.composer
-                                    .insert_str(crate::talk::clamp_realized(&ghost));
+                                self.insert_or_retain_dictation(&ghost, generation, false);
                             }
                             self.talk.settle();
                             self.listening = false;
@@ -11029,11 +12326,13 @@ impl AppModel {
                             // ordinary flow and the two transcripts must not
                             // fuse into one word. `submit_composer` trims, so
                             // the space costs the auto-send path nothing.
-                            let mut realized = crate::talk::clamp_realized(&text).to_owned();
-                            realized.push(' ');
-                            self.composer.insert_str(&realized);
+                            self.insert_or_retain_dictation(
+                                &text,
+                                generation,
+                                intent == CommitIntent::Submit,
+                            );
                             match intent {
-                                CommitIntent::Submit => self.submit_composer(),
+                                CommitIntent::Submit => {}
                                 CommitIntent::Insert => {
                                     self.flash = Some("· ◉ transcribed — ⏎ to send".to_owned());
                                 }
@@ -11044,9 +12343,7 @@ impl AppModel {
                         // Best-effort honesty: the words the ghost showed
                         // were watched landing — keep them; say what broke.
                         if !ghost.is_empty() {
-                            let mut text = crate::talk::clamp_realized(&ghost).to_owned();
-                            text.push(' ');
-                            self.composer.insert_str(&text);
+                            self.insert_or_retain_dictation(&ghost, generation, false);
                         }
                         self.talk_error(error);
                     }
@@ -11324,9 +12621,9 @@ impl AppModel {
         });
     }
 
-    /// Open the `/talk` setup card (engine picker first). Cancels any
-    /// engaged session; loads the world snapshot and the vaulted-key
-    /// presence.
+    /// Open the `/talk` setup card (engine picker first). An engaged capture
+    /// continues, with its result retained until the composer is visible.
+    /// Load the world snapshot and the vaulted-key presence.
     pub fn open_talk_setup(&mut self) {
         if self.mode.fabricates_locally() {
             self.flash = Some("· /talk setup — live only".to_owned());
@@ -11336,9 +12633,7 @@ impl AppModel {
             self.flash = Some("· /talk — session only".to_owned());
             return;
         }
-        if self.talk.engaged() {
-            self.talk_cancel();
-        }
+        self.composer_drag = false;
         let vault_supported = self
             .daemon_features
             .contains(haider_rpc::FEATURE_TRANSCRIPTION_V1);
@@ -11375,6 +12670,18 @@ impl AppModel {
     /// Keyboard while the setup card owns the band.
     pub fn talk_setup_key(&mut self, key: &KeyEvent) {
         use crate::talk::{KeyStage, SetupStage};
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            if key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('c' | 'C'))
+            {
+                self.talk_setup = None;
+                self.flash = Some("· /talk setup closed".to_owned());
+            }
+            return;
+        }
         enum Action {
             None,
             Activate,
@@ -14102,7 +15409,7 @@ impl AppModel {
         field: CustomField,
         character: usize,
     ) {
-        if !matches!(self.screen, Screen::Accounts | Screen::Providers) {
+        if self.input_owner() != InputOwner::CustomProviderForm {
             return;
         }
         if let Some(card) = self.custom_add.as_mut()
@@ -14436,18 +15743,59 @@ impl AppModel {
     #[must_use]
     pub fn inbox_counts(&self) -> InboxCounts {
         let mut counts = InboxCounts::default();
+        let mut counted_sessions = std::collections::HashSet::new();
         for row in self.inbox_rows() {
             match row.kind {
-                InboxKind::Ask => counts.asks += 1,
+                InboxKind::Ask => {
+                    counts.asks += 1;
+                    if let InboxTarget::Session(session) = row.target {
+                        counted_sessions.insert(session);
+                    }
+                }
                 InboxKind::Agent => counts.agents += 1,
                 InboxKind::StalledTask => counts.stalled += 1,
                 InboxKind::Unseen => counts.unseen += 1,
             }
         }
+        let current_counted = self.projection.open_menu().is_some()
+            || self.active_session.as_ref().is_some_and(|active| {
+                self.session_rows_for_query("")
+                    .iter()
+                    .any(|row| &row.id == active && row.needs_input.is_some())
+            });
+        counts.asks += self
+            .projection
+            .pending_menu_count()
+            .saturating_sub(usize::from(current_counted));
+        // Roster rows count a session once; its cached projection can have
+        // more pending decisions. The active slot and child-session mirrors
+        // have their own counting authorities.
+        for entry in &self.sessions {
+            if self.active_session.as_ref() == Some(&entry.id)
+                || self.session_kinds.get(&entry.id) == Some(&haider_rpc::SessionKindWire::Subagent)
+            {
+                continue;
+            }
+            let cached_seq = entry.projection.last_applied().unwrap_or(0);
+            if self.session_attention.contains_key(&entry.id)
+                && self
+                    .session_cache_rates
+                    .get(&entry.id)
+                    .is_some_and(|summary| summary.head_seq > cached_seq)
+            {
+                // Until replay catches up, the newer daemon roster wins.
+                continue;
+            }
+            counts.asks += entry
+                .projection
+                .pending_menu_count()
+                .saturating_sub(usize::from(counted_sessions.contains(&entry.id)));
+        }
         counts
     }
 
     fn open_inbox(&mut self) {
+        self.composer_drag = false;
         self.inbox_open = true;
         self.inbox_cursor = 0;
         self.dirty = true;
@@ -15525,16 +16873,15 @@ impl AppModel {
         };
         let option_count = menu.options.len();
         match code {
-            KeyCode::Up if option_count > 0 => {
+            KeyCode::Up | KeyCode::BackTab if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
             }
-            KeyCode::Down if option_count > 0 => {
+            KeyCode::Down | KeyCode::Tab if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if index < option_count {
+            KeyCode::Char(c) => {
+                if let Some(index) = menu_shortcut_index(&menu, c) {
                     self.menu_selection = index;
                     self.answer_chip_menu(&menu);
                 }
@@ -15698,6 +17045,19 @@ impl AppModel {
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
             // the change to the TUI settings file.
+            // 973-activity-icons: subagent activity glyphs — `/icons emoji`,
+            // `/icons text` (bracketed labels for terminals without emoji
+            // fonts / screen readers), `/icons off`; bare cycles. Display
+            // preference only; the runtime persists it.
+            "icons" | "activity-icons" => match arg.as_deref() {
+                None | Some("toggle") => self.set_activity_display(None),
+                Some(value) => match haider_protocol::activity::ActivityDisplay::parse(value) {
+                    Some(mode) => self.set_activity_display(Some(mode)),
+                    None => {
+                        self.flash = Some(format!("· /icons {value} — try emoji · text · off"));
+                    }
+                },
+            },
             "notifications" | "notify" => match arg.as_deref() {
                 Some("on") => self.toggle_notifications(Some(true)),
                 Some("off") => self.toggle_notifications(Some(false)),
@@ -16601,15 +17961,8 @@ impl AppModel {
 
     /// Only advertise Enter when this surface will hand it to the pager.
     pub(crate) fn task_pager_enter_available(&self) -> bool {
-        matches!(self.screen, Screen::Session | Screen::Subagent)
-            && self.clipboard_composer_visible()
-            && !self.shells_open
-            && !self.ssh_open
-            && !self.monitors_open
-            && self.model_picker.is_none()
-            && self.effort_picker.is_none()
-            && self.theme_picker.is_none()
-            && self.backtrack.is_none()
+        (self.accepts_injected_submit()
+            || self.input_owner() == InputOwner::Composer(Screen::Subagent))
             && self.projection.permission_card().is_none()
             && self.composer.is_empty()
             && self.composer.attachments().is_empty()
@@ -16959,6 +18312,7 @@ impl AppModel {
             return_to,
             ..ToolDetailView::default()
         });
+        self.composer_drag = false;
         self.dirty = true;
         true
     }
@@ -16977,6 +18331,7 @@ impl AppModel {
             });
             self.dirty = true;
         }
+        self.deliver_pending_dictation();
     }
 
     /// Scroll the open full-detail view by `delta` display rows, clamped to
@@ -17009,7 +18364,19 @@ impl AppModel {
     }
 
     /// Keys while the full-detail view is open. Answers `true` when the key
-    /// was the view's; chords it does not own (⌃C, ⌃T, …) fall through.
+    /// was the view's. The view owns the keyboard like a modal: every key
+    /// is consumed except the deliberately supported global chords, which
+    /// fall through to their usual meaning:
+    ///
+    /// - ⌃C — navigation/quit (walks back to the launcher, retiring the
+    ///   view with the surface's other overlays);
+    /// - ⌃T — theme cycle (the view repaints in the new theme).
+    ///
+    /// Outside this function, ⌃⇧C still copies a mouse selection, and the
+    /// terminal resize/wheel keep their meanings. Composer editing, the
+    /// composer selection gate, paste (bracketed, ⌃V, right-click) and the
+    /// clipboard are gated by [`Self::composer_owns_input`] and the paste
+    /// arm, not here (973-tui-toolview-fixes).
     fn tool_detail_key(&mut self, key: KeyEvent) -> bool {
         if self.tool_detail.is_none() {
             return false;
@@ -17022,7 +18389,8 @@ impl AppModel {
         let page = isize::try_from(page).unwrap_or(1);
         match key.code {
             KeyCode::Char('o') if control => self.close_tool_detail(),
-            _ if control => return false,
+            KeyCode::Char('c' | 't') if control => return false,
+            _ if control => {}
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_tool_detail(),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_tool_detail(-1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_tool_detail(1),
@@ -17362,8 +18730,13 @@ impl AppModel {
 
     fn open_ssh_terminal(&mut self, profile: String) {
         self.ssh_open = false;
-        let terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
+        self.ssh_open_generation += 1;
+        let mut terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
+        terminal.attempt_id = self.ssh_open_generation;
+        terminal.typed_setup_errors =
+            self.daemon_serves(haider_rpc::FEATURE_SSH_TYPED_SETUP_ERRORS_V1);
         self.requests.push(AppRequest::SshShellOpen {
+            attempt_id: terminal.attempt_id,
             profile,
             size: terminal.size,
         });
@@ -17452,29 +18825,107 @@ impl AppModel {
         self.dirty = true;
     }
 
-    pub(crate) fn apply_ssh_shell_opened(&mut self, shell: haider_rpc::ShellWire) {
+    pub(crate) fn apply_ssh_shell_opened(&mut self, attempt_id: u64, shell: haider_rpc::ShellWire) {
         if let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.attempt_id == attempt_id
             && matches!(
                 &shell.kind,
                 haider_rpc::ShellKindWire::Ssh { profile } if profile == &terminal.profile
             )
         {
-            terminal.shell_id = Some(shell.id);
-            self.flash = Some("· remote terminal connected · ⌃] close".into());
+            terminal.observe_shell(&shell);
+            terminal.observed_shells.retain(|s| s.id == shell.id);
+            for (id, output) in std::mem::take(&mut terminal.pending_output) {
+                if id == shell.id {
+                    terminal.push_output(&output);
+                }
+            }
+            terminal.connecting =
+                shell.status == haider_rpc::ShellStatusWire::Starting && terminal.output.is_empty();
+            terminal.reported_running = terminal.observed_running_shells.contains(&shell.id);
+            terminal.observed_running_shells.clear();
+            terminal.shell_id = Some(shell.id.clone());
+            self.flash = Some(
+                if terminal.connecting {
+                    "· opening remote terminal…"
+                } else {
+                    "· remote terminal connected · ⌃] close"
+                }
+                .into(),
+            );
             self.dirty = true;
+            self.apply_ssh_shell_terminal_state(&shell);
+        } else {
+            // The user closed the connecting pane before the open reply.
+            self.requests.push(AppRequest::ShellClose { id: shell.id });
         }
     }
 
     pub(crate) fn apply_ssh_shell_output(&mut self, id: &str, bytes: &[u8]) {
         if let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.shell_id.is_none()
+        {
+            // The reply has not identified the shell yet. Bound all provisional
+            // output together, and display only the admitted shell's bytes.
+            let used: usize = terminal
+                .pending_output
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .sum();
+            let keep = bytes
+                .len()
+                .min(SshTerminalPane::OUTPUT_CAPACITY.saturating_sub(used));
+            if keep > 0 {
+                let index = terminal
+                    .pending_output
+                    .iter()
+                    .position(|(shell, _)| shell == id)
+                    .unwrap_or_else(|| {
+                        terminal
+                            .pending_output
+                            .push((id.into(), zeroize::Zeroizing::new(Vec::new())));
+                        terminal.pending_output.len() - 1
+                    });
+                terminal.pending_output[index]
+                    .1
+                    .extend_from_slice(&bytes[..keep]);
+            }
+        }
+        if let Some(terminal) = self.ssh_terminal.as_mut()
             && terminal.shell_id.as_deref() == Some(id)
         {
+            // Owned PTY output also proves setup finished if the event queue
+            // dropped Running. Ctrl+C must then remain remote input.
+            if terminal.connecting {
+                terminal.connecting = false;
+                self.flash = Some("· remote terminal connected · ⌃] close".into());
+            }
             terminal.push_output(bytes);
             self.dirty = true;
         }
     }
 
     pub(crate) fn apply_ssh_shell_terminal_state(&mut self, shell: &haider_rpc::ShellWire) {
+        let Some(terminal) = self.ssh_terminal.as_mut() else {
+            return;
+        };
+        terminal.observe_shell(shell);
+        let Some(shell) = terminal
+            .observed_shells
+            .iter()
+            .find(|s| terminal.shell_id.as_deref() == Some(s.id.as_str()) && s.id == shell.id)
+            .cloned()
+        else {
+            return;
+        };
+        if shell.status == haider_rpc::ShellStatusWire::Running
+            && let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.shell_id.as_deref() == Some(shell.id.as_str())
+        {
+            terminal.connecting = false;
+            terminal.reported_running = true;
+            self.flash = Some("· remote terminal connected · ⌃] close".into());
+        }
         let closes = self
             .ssh_terminal
             .as_ref()
@@ -17485,9 +18936,34 @@ impl AppModel {
                 haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed
             );
         if closes {
-            self.ssh_terminal = None;
-            self.flash = Some(match &shell.status {
-                haider_rpc::ShellStatusWire::Exited { code } => code.map_or_else(
+            let terminal = self.ssh_terminal.take();
+            let setup_error = shell
+                .setup_error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.code, error.message))
+                .or_else(|| {
+                    // Only legacy peers report setup failure as terminal output.
+                    // Current peers also have uncoded ordinary command exits.
+                    terminal
+                        // Legacy setup failures end without an exit code.
+                        // A coded command exit must never relabel its ordinary
+                        // output as a failed connection after a dropped Running.
+                        .filter(|_| {
+                            matches!(
+                                shell.status,
+                                haider_rpc::ShellStatusWire::Exited { code: None }
+                            )
+                        })
+                        .filter(|pane| !pane.typed_setup_errors && !pane.reported_running)
+                        .map(|pane| pane.display_text())
+                })
+                .map(|text| text.chars().filter(|c| !c.is_control()).collect::<String>())
+                .filter(|text| !text.is_empty());
+            self.flash = Some(match (&shell.status, setup_error) {
+                (haider_rpc::ShellStatusWire::Exited { .. }, Some(error)) => {
+                    format!("· remote terminal failed: {error}")
+                }
+                (haider_rpc::ShellStatusWire::Exited { code }, None) => code.map_or_else(
                     || "· remote terminal exited".into(),
                     |code| format!("· remote terminal exited {code}"),
                 ),
@@ -17498,6 +18974,22 @@ impl AppModel {
     }
 
     fn handle_ssh_terminal_key(&mut self, key: KeyEvent) {
+        let connected = self
+            .ssh_terminal
+            .as_ref()
+            .is_some_and(|pane| !pane.connecting);
+        let close = crate::ssh_terminal::cancels_terminal(key, connected);
+        if close
+            && self
+                .ssh_terminal
+                .as_ref()
+                .is_some_and(|pane| pane.shell_id.is_none())
+        {
+            self.ssh_terminal = None;
+            self.flash = Some("· remote terminal connection cancelled".into());
+            self.dirty = true;
+            return;
+        }
         let Some(id) = self
             .ssh_terminal
             .as_ref()
@@ -17505,9 +18997,18 @@ impl AppModel {
         else {
             return;
         };
-        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if close {
             self.requests.push(AppRequest::ShellClose { id });
-            self.flash = Some("· closing remote terminal…".into());
+            if self
+                .ssh_terminal
+                .as_ref()
+                .is_some_and(|pane| pane.connecting)
+            {
+                self.ssh_terminal = None;
+                self.flash = Some("· remote terminal connection cancelled".into());
+            } else {
+                self.flash = Some("· closing remote terminal…".into());
+            }
             return;
         }
         if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -17530,9 +19031,15 @@ impl AppModel {
     }
 
     pub(crate) fn apply_shell_list(&mut self, shells: Vec<haider_rpc::ShellWire>) {
+        // Background resynchronization must not erase a connection result.
+        if self.flash.as_deref() == Some("· reading terminal registry…") {
+            self.flash = None;
+        }
+        for shell in &shells {
+            self.apply_ssh_shell_terminal_state(shell);
+        }
         self.shells = shells;
         self.shells_cursor = self.shells_cursor.min(self.shells.len().saturating_sub(1));
-        self.flash = None;
         self.dirty = true;
     }
 
@@ -17776,16 +19283,15 @@ impl AppModel {
         }
         match code {
             // Selection wraps around (sim, tui.js:2441-2449).
-            KeyCode::Up if option_count > 0 => {
+            KeyCode::Up | KeyCode::BackTab if option_count > 0 => {
                 self.menu_selection =
                     (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
             }
-            KeyCode::Down if option_count > 0 => {
+            KeyCode::Down | KeyCode::Tab if option_count > 0 => {
                 self.menu_selection = (self.menu_selection + 1) % option_count;
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = (c as usize) - ('1' as usize);
-                if index < option_count {
+            KeyCode::Char(c) => {
+                if let Some(index) = menu_shortcut_index(menu, c) {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -17957,6 +19463,24 @@ impl AppModel {
         };
         match outcome {
             RawOutcome::Applied => {
+                // A wheel may acknowledge already-presented activity. Its
+                // nonvisual journal echo is not an outside input change.
+                // The daemon sets render.ui even on this bookkeeping fact;
+                // the typed payload, rather than that flag, identifies it.
+                // Agent/background facts and real content keep the barrier.
+                let seen_ack = self.active_session.as_ref() == Some(&envelope.session_id)
+                    && envelope.branch_id.is_none()
+                    && envelope.run_id.is_none()
+                    && envelope.agent_id.is_none()
+                    && matches!(
+                        envelope
+                            .payload
+                            .decode::<haider_protocol::session::SessionConfigEventPayload>(),
+                        Ok(haider_protocol::session::SessionConfigEventPayload::SessionSeen { .. })
+                    );
+                if !seen_ack {
+                    self.invalidate_queued_input();
+                }
                 self.dirty = true;
                 // A journal diagnostic describes a former connection. It
                 // cannot establish compatibility of this Hello/Welcome pair.
@@ -17973,7 +19497,7 @@ impl AppModel {
                     .get("type")
                     .and_then(|value| value.as_str())
                     != Some("session_launch_origin_selected");
-                if moves_attention {
+                if moves_attention && !seen_ack {
                     self.note_session_activity_at(&envelope.session_id, envelope.committed_at_ms);
                 }
                 // M10: a BACKGROUND session's terminal/park transition also
@@ -18102,12 +19626,7 @@ impl AppModel {
                                 ));
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -18152,13 +19671,8 @@ impl AppModel {
     /// branch-stamped envelope they land session-global), then branch
     /// (outer), then agent. `SessionState::route_admitted` is the
     /// background twin.
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -18180,17 +19694,17 @@ impl AppModel {
                 // aggregate never lands in a chip transcript.
                 self.handle_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -18494,20 +20008,22 @@ impl AppModel {
 
     /// The attached path's scope router — the same [`crate::session::classify`]
     /// decision the background path takes, applied to the live fields.
-    fn absorb_scoped(
-        &mut self,
-        payload: &EventPayload,
-        agent: Option<&haider_protocol::ids::AgentId>,
-        at_ms: u64,
-    ) {
+    fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         use crate::session::Destination;
         match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => {
                 crate::session::apply_agent_payload(&mut self.chips, payload, at_ms);
             }
             Destination::Chip(target) => {
+                if matches!(payload, EventPayload::MenuOpened(_))
+                    && self.view_path.last() == Some(&target)
+                {
+                    self.menu_selection = 0;
+                }
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    crate::session::chip_apply(chip, payload, at_ms);
+                    crate::session::chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => {
@@ -18937,6 +20453,9 @@ impl AppModel {
         // TUI5 item 9: park the departing surface's draft BEFORE identity
         // flips (checkin() itself is draft-free — exactly one stash and
         // one restore per transition).
+        if self.talk.engaged() {
+            self.talk_cancel();
+        }
         self.stash_draft();
         self.checkin();
         let Some(index) = self.sessions.iter().position(|entry| &entry.id == id) else {
@@ -19232,6 +20751,9 @@ impl AppModel {
         // TUI5 item 9: park the departing surface's draft (session, aura,
         // or the scratch surface — which shares the launcher key, so its
         // stash/restore is an exact round-trip).
+        if self.talk.engaged() {
+            self.talk_cancel();
+        }
         self.stash_draft();
         // TUI4c: leaving DETACHES (sim `setActiveId(null)`, tui.js:1956) —
         // the session's state checks into its slot, its scripts keep
@@ -19806,28 +21328,67 @@ impl AppModel {
     /// one frame stale (review r2 P2-2): hits carry values and every
     /// context-sensitive hit re-checks its context — activate exactly what
     /// was clicked, or drop the click.
-    pub fn handle_hit(&mut self, hit: Hit) {
-        self.dirty = true;
-        self.flash = None;
-        // A visible overlay owns the screen; hits from the covered frame
-        // must not act through it.
-        if self.help_open {
-            return;
-        }
-        if self.tool_detail.is_some() {
-            if hit == Hit::ToolDetailClose {
-                self.close_tool_detail();
-            }
-            return;
-        }
-        if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
-            return;
-        }
-        if self.ssh_open {
-            return;
-        }
-        if self.monitors_open
-            && !matches!(
+    pub(crate) fn hit_owned(&self, hit: &Hit) -> bool {
+        let chrome = matches!(hit, Hit::BackChip | Hit::HelpHint | Hit::LockdownStatus);
+        let session = matches!(
+            hit,
+            Hit::InboxBand
+                | Hit::GraphStrip
+                | Hit::SessionHome
+                | Hit::RevealPath(_)
+                | Hit::RetryRun
+                | Hit::TalkChip
+                | Hit::ShellStatus
+                | Hit::MonitorStatus
+                | Hit::ChipRow(_)
+                | Hit::SubTreeToggle
+                | Hit::TodosToggle
+                | Hit::ToolRowToggle(_)
+                | Hit::ToolFoldToggle(_)
+                | Hit::ToolShowAll(_)
+                | Hit::ToolDetail(_)
+                | Hit::TaskLineToggle
+                | Hit::TaskLineMore
+                | Hit::TodoRow(_)
+                | Hit::FleetSummary
+                | Hit::StickyJump(_)
+                | Hit::JumpToBottom
+                | Hit::QueueRowSteer(_)
+                | Hit::QueueRowToggle(_)
+        );
+        // Ordinary cards leave these transcript and panel rows painted.
+        // Keep their clicks without admitting a stale composer or header hit.
+        let transcript = matches!(
+            hit,
+            Hit::RevealPath(_)
+                | Hit::ChipRow(_)
+                | Hit::SubTreeToggle
+                | Hit::TodosToggle
+                | Hit::ToolRowToggle(_)
+                | Hit::ToolFoldToggle(_)
+                | Hit::ToolShowAll(_)
+                | Hit::ToolDetail(_)
+                | Hit::TaskLineToggle
+                | Hit::TaskLineMore
+                | Hit::TodoRow(_)
+                | Hit::StickyJump(_)
+                | Hit::JumpToBottom
+                | Hit::QueueRowSteer(_)
+                | Hit::QueueRowToggle(_)
+        );
+        match self.input_owner() {
+            InputOwner::Lockdown
+            | InputOwner::Help
+            | InputOwner::SshList
+            | InputOwner::SshForm
+            | InputOwner::SshTerminal
+            | InputOwner::TalkSetup => false,
+            InputOwner::HistoryChooser => transcript || chrome,
+            InputOwner::AccountsReplace => matches!(hit, Hit::AccountAdd(_)),
+            InputOwner::ToolDetail => matches!(hit, Hit::ToolDetailClose),
+            InputOwner::Inbox => false,
+            InputOwner::Shells => matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus),
+            InputOwner::Monitors => matches!(
                 hit,
                 Hit::MonitorStatus
                     | Hit::MonitorRow(_)
@@ -19836,30 +21397,120 @@ impl AppModel {
                     | Hit::MonitorTrigger(_)
                     | Hit::MonitorEdit(_)
                     | Hit::MonitorCopyId(_)
-            )
-        {
+            ),
+            InputOwner::ModelPicker => matches!(hit, Hit::BackChip | Hit::ModelPickerRow { .. }),
+            InputOwner::Login => {
+                self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_))
+            }
+            InputOwner::CustomProviderForm => {
+                matches!(hit, Hit::CustomProviderField { .. } | Hit::AccountAdd(_))
+            }
+            InputOwner::SessionMenu | InputOwner::SpendCard => {
+                transcript
+                    || matches!(
+                        hit,
+                        Hit::BackChip
+                            | Hit::MenuOption { .. }
+                            | Hit::PermissionOpenSettings
+                            | Hit::PermissionRetry
+                            | Hit::InboxBand
+                    )
+            }
+            InputOwner::PlanDoc | InputOwner::FileReviewDoc => matches!(
+                hit,
+                Hit::BackChip
+                    | Hit::MenuOption { .. }
+                    | Hit::PermissionOpenSettings
+                    | Hit::PermissionRetry
+                    | Hit::InboxBand
+            ),
+            InputOwner::SubagentQuestion => {
+                transcript
+                    || matches!(
+                        hit,
+                        Hit::BackChip
+                            | Hit::SessionHome
+                            | Hit::ChipCloseBtn(_)
+                            | Hit::ChipCrumb(_)
+                            | Hit::MenuOption { .. }
+                    )
+            }
+            InputOwner::EffortPicker => transcript || matches!(hit, Hit::EffortOption(_)),
+            InputOwner::ThemePicker => transcript || matches!(hit, Hit::ThemeOption(_)),
+            InputOwner::FleetMemberDetail => {
+                matches!(
+                    hit,
+                    Hit::BackChip | Hit::FleetTranscript(_) | Hit::FleetKill(_)
+                )
+            }
+            InputOwner::Search => chrome || session,
+            InputOwner::Screen(screen) => {
+                // A screen switch can race one mouse frame. Its previous
+                // screen's hits are never controls on the new full-screen
+                // owner, even when both screens share the Session draft.
+                (screen != Screen::Boot
+                    && matches!(hit, Hit::BackChip | Hit::HelpHint | Hit::LockdownStatus))
+                    || match screen {
+                        Screen::Boot | Screen::Graph | Screen::Tools => false,
+                        Screen::Sessions => matches!(hit, Hit::AttachSession(_)),
+                        Screen::Accounts => matches!(hit, Hit::AccountRow(_) | Hit::AccountAdd(_)),
+                        Screen::Providers => matches!(
+                            hit,
+                            Hit::ProviderModel { .. } | Hit::ProviderAccounts | Hit::AccountAdd(_)
+                        ),
+                        Screen::Usage => {
+                            matches!(hit, Hit::UsageScope(_) | Hit::UsageAccountTab { .. })
+                        }
+                        Screen::Fleet => matches!(hit, Hit::FleetNode(_)),
+                        Screen::Tree => matches!(hit, Hit::TreeRow(_)),
+                        Screen::Hooks => matches!(hit, Hit::HookRow(_) | Hit::HookFiring(_)),
+                        Screen::Launcher
+                        | Screen::Session
+                        | Screen::Subagent
+                        | Screen::Aura
+                        | Screen::Loom => false,
+                    }
+            }
+            InputOwner::Composer(screen) => {
+                chrome
+                    || matches!(hit, Hit::ComposerText { .. } | Hit::PaletteRow(_))
+                    || match screen {
+                        Screen::Session => session,
+                        Screen::Subagent => {
+                            session
+                                || matches!(
+                                    hit,
+                                    Hit::SessionHome | Hit::ChipCloseBtn(_) | Hit::ChipCrumb(_)
+                                )
+                        }
+                        Screen::Launcher => {
+                            matches!(
+                                hit,
+                                Hit::AttachSession(_) | Hit::ExtraRow(_) | Hit::TalkChip
+                            )
+                        }
+                        Screen::Aura => matches!(
+                            hit,
+                            Hit::AuraEngine | Hit::AuraMute | Hit::AuraExit | Hit::AuraTalkBtn
+                        ),
+                        Screen::Loom => matches!(hit, Hit::LoomNew),
+                        _ => false,
+                    }
+            }
+        }
+    }
+
+    pub fn handle_hit(&mut self, hit: Hit) {
+        if !self.hit_owned(&hit) {
             return;
         }
-        if self.lockdown_overlay {
-            self.lockdown_overlay = false;
-            return;
-        }
-        // TUI6.2b: the login card is MODAL against hits exactly as it is
-        // against keys (login_key owns the keyboard) — the frame beneath
-        // it still lists clickable rows, and a click that fell through
-        // ran open_session mid-login: its stash overwrote the
-        // login-parked draft (ring destroyed), the screen flipped under
-        // the open card, and the card's Esc-restore later clobbered the
-        // session draft. The card has no hit targets of its own, so the
-        // gate is total — with ONE exception since 971 F1(b): the `[+ …]`
-        // provider grid on `/accounts`, whose entire effect is "replace this
-        // card". That is precisely the gesture the owner is refused today (a
-        // pending key card silently swallows the click on another provider),
-        // and it runs the card's OWN close path — the parked draft is
-        // restored, the attempt retired, and the screen never flips.
-        if self.login.is_some()
-            && !(self.screen == Screen::Accounts && matches!(hit, Hit::AccountAdd(_)))
-        {
+        self.dirty = true;
+        self.flash = None;
+        // The owner check above is also the stale-frame guard. Detail has
+        // one close target; all other overlays fall through only to their
+        // own hit variants below.
+        if self.input_owner() == InputOwner::ToolDetail {
+            self.close_tool_detail();
             return;
         }
         if self.screen == Screen::Loom
@@ -19956,13 +21607,22 @@ impl AppModel {
             // U2: a click on an account tab chip selects exactly the
             // account the rect was rendered for (value-carrying) and moves
             // the cursor to its group.
-            Hit::UsageAccountTab { provider, index } if self.screen == Screen::Usage => {
+            Hit::UsageAccountTab {
+                provider,
+                index,
+                alias,
+            } if self.screen == Screen::Usage => {
                 let groups = self.usage.groups();
                 let Some(position) = groups.iter().position(|group| group.provider == provider)
                 else {
                     return;
                 };
-                if index < groups[position].accounts.len() {
+                if groups[position]
+                    .accounts
+                    .get(index)
+                    .and_then(|slot| self.usage.report.as_ref()?.accounts.get(*slot))
+                    .is_some_and(|account| account.alias == alias)
+                {
                     self.usage.cursor = position;
                     self.usage.tabs.insert(provider, index);
                     self.dirty = true;
@@ -20038,6 +21698,9 @@ impl AppModel {
             }
             Hit::BackChip if self.screen == Screen::Session => {
                 self.back_to_launcher();
+            }
+            Hit::BackChip if self.input_owner() == InputOwner::FleetMemberDetail => {
+                self.handle_fleet_key(KeyCode::Esc);
             }
             // ◉ talk (sim `speak`, tui.js:2044-2049): the mic RENDERS on the
             // launcher, but pressing it there does nothing — `speak` returns
@@ -20374,12 +22037,46 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
-        // 971 F1(a), verify round 1: the `/accounts` roster scrolls under
-        // the wheel even while an add-form is open — the wheel is never form
-        // input, and the card stays pinned in view above the offset it moves
-        // (Astra: the DeepSeek card swallowed the wheel at both sizes). It
-        // therefore runs BEFORE the modal gate below.
-        if self.screen == Screen::Accounts && !self.help_open {
+        match self.input_owner() {
+            InputOwner::ToolDetail => {
+                self.scroll_tool_detail(if up { -3 } else { 3 });
+                return;
+            }
+            InputOwner::PlanDoc => {
+                let current = self.plan_scroll.get().min(self.plan_scroll_max.get());
+                self.plan_scroll.set(if up {
+                    current.saturating_sub(3)
+                } else {
+                    current.saturating_add(3).min(self.plan_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::FileReviewDoc => {
+                let current = self
+                    .file_review_scroll
+                    .get()
+                    .min(self.file_review_scroll_max.get());
+                self.file_review_scroll.set(if up {
+                    current.saturating_sub(3)
+                } else {
+                    current
+                        .saturating_add(3)
+                        .min(self.file_review_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            owner if owner.scrolls_transcript() || matches!(owner, InputOwner::Screen(_)) => {}
+            // Accounts cards are pinned above a still-visible roster. The
+            // wheel belongs to that screen's scroll state, as before.
+            InputOwner::Login if self.screen == Screen::Accounts => {}
+            InputOwner::CustomProviderForm
+                if matches!(self.screen, Screen::Accounts | Screen::Providers) => {}
+            _ => return,
+        }
+        // The accounts roster remains visible beneath its pinned form.
+        if self.screen == Screen::Accounts {
             let max = self.accounts.scroll_max.get();
             let current = self.accounts.scroll.get().min(max);
             let next = if up {
@@ -20389,16 +22086,6 @@ impl AppModel {
             };
             self.accounts.scroll.set(next);
             self.dirty = true;
-            return;
-        }
-        // The login gate joins the help gate (TUI6.2c finding 7 —
-        // consistency: nothing scrolls beneath a modal).
-        if self.help_open || self.login.is_some() {
-            return;
-        }
-        // The full-detail view scrolls itself, never the transcript under it.
-        if self.tool_detail.is_some() {
-            self.scroll_tool_detail(if up { -3 } else { 3 });
             return;
         }
         // The all-sessions browser scrolls under the wheel: it is a long
@@ -20474,6 +22161,39 @@ impl AppModel {
     /// while the content slides beneath it and the copy-on-release reads
     /// the final frame.
     pub fn drag_autoscroll(&mut self, up: bool) {
+        match self.input_owner() {
+            InputOwner::ToolDetail => {
+                self.scroll_tool_detail(if up { -1 } else { 1 });
+                return;
+            }
+            InputOwner::PlanDoc => {
+                let current = self.plan_scroll.get().min(self.plan_scroll_max.get());
+                self.plan_scroll.set(if up {
+                    current.saturating_sub(1)
+                } else {
+                    current.saturating_add(1).min(self.plan_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            InputOwner::FileReviewDoc => {
+                let current = self
+                    .file_review_scroll
+                    .get()
+                    .min(self.file_review_scroll_max.get());
+                self.file_review_scroll.set(if up {
+                    current.saturating_sub(1)
+                } else {
+                    current
+                        .saturating_add(1)
+                        .min(self.file_review_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
+            owner if owner.scrolls_transcript() => {}
+            _ => return,
+        }
         if !matches!(self.screen, Screen::Session | Screen::Subagent) {
             return;
         }
@@ -20543,10 +22263,7 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
-        // TUI6.2c (verifier finding 4): modals own hover exactly as they
-        // own hits and keys — with the help overlay or the login card up,
-        // hover must not move palette/menu selections beneath the modal.
-        if self.help_open || self.login.is_some() {
+        if hit.as_ref().is_some_and(|hit| !self.hit_owned(hit)) {
             return;
         }
         if self.hovered == hit {
@@ -20651,6 +22368,7 @@ impl AppModel {
     /// Pushes a registry refresh so the roster is as fresh as the daemon
     /// serves; rows render from the snapshot in hand meanwhile.
     pub fn open_model_picker(&mut self, query: String) {
+        self.composer_drag = false;
         self.model_picker = Some(ModelPicker {
             query,
             ..ModelPicker::default()
@@ -21629,18 +23347,41 @@ impl AppModel {
         provider: &str,
         epoch: Option<u64>,
     ) {
+        self.note_parked_provider_rebound_budget_at(session, provider, epoch, None);
+    }
+
+    pub(crate) fn note_parked_provider_rebound_budget_at(
+        &mut self,
+        session: &SessionId,
+        provider: &str,
+        epoch: Option<u64>,
+        budget: Option<&haider_protocol::output_budget::SessionOutputBudgetV1>,
+    ) -> bool {
         let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) else {
-            return;
+            return false;
         };
-        if let Some((previous, model)) = entry.meter_epoch.pair.clone()
-            && entry
-                .meter_epoch
-                .admit((provider.to_owned(), model), epoch, None, None)
-        {
-            if previous != provider {
+        let previous = entry.meter_epoch.provider().map(str::to_owned);
+        if entry.meter_epoch.admit_rebound(
+            provider,
+            epoch,
+            budget.map(|budget| budget.max_tokens),
+            budget.map(|budget| {
+                matches!(
+                    budget.source,
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }
+                )
+            }),
+        ) {
+            if previous
+                .as_deref()
+                .is_some_and(|previous| previous != provider)
+            {
                 entry.reset_account_route(provider, epoch);
             }
             self.dirty = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -21661,12 +23402,7 @@ impl AppModel {
         } else {
             &row.meter_epoch
         };
-        if meter.selection_epoch != epoch
-            || meter
-                .pair
-                .as_ref()
-                .is_none_or(|pair| pair.0 != rebound.provider)
-        {
+        if meter.selection_epoch != epoch || meter.provider() != Some(rebound.provider.as_str()) {
             return;
         }
         // Budget/model epochs can advance without changing route choices.

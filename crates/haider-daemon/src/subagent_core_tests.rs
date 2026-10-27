@@ -1068,6 +1068,7 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
         started_at_ms: 100,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: None,
     };
@@ -1339,11 +1340,11 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -1690,9 +1691,12 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         .expect("delegation lookup")
         .expect("delegation row");
     delegation.launch(&established).await.expect("launch child");
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("first child request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("first child request");
     let first_request = provider.requests().remove(0);
     let handoff_line = format!(
         "Ephemeral parent handoff directory: {manifest_handoff} (EPHEMERAL; use it for shared specs, never durable storage)."
@@ -1749,7 +1753,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     assert!(conflict.1.contains("different semantics"));
     provider.release_gate.notify_one();
 
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -2023,9 +2027,12 @@ async fn message_subagent_starts_an_idle_child_immediately() {
         serde_json::from_str(&tool_result.preview).expect("decode tool delivery receipt");
     assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredQueued);
     assert_ne!(receipt.child_run_id, child_record.child_run_id);
-    timeout(Duration::from_secs(5), provider.gate_started.notified())
-        .await
-        .expect("idle child starts second request");
+    timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        provider.gate_started.notified(),
+    )
+    .await
+    .expect("idle child starts second request");
     let running_tool_result = dispatcher
         .execute(
             &parent_run,
@@ -2051,7 +2058,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     );
     assert_eq!(running_receipt.child_run_id, receipt.child_run_id);
     provider.release_gate.notify_one();
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while provider.requests().len() < 3 {
             tokio::task::yield_now().await;
         }
@@ -2629,7 +2636,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .await
         .expect("submit parent worker");
 
-    timeout(Duration::from_secs(10), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 512)
@@ -2820,6 +2827,28 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .expect("child metadata present");
     assert_eq!(child_metadata.provider, "fake");
     assert_eq!(child_metadata.model, "fake-model");
+    let child_pair = store
+        .session_output_pair_at(
+            delegation.child_session_id.clone(),
+            child_events.last().expect("child journal").seq,
+        )
+        .await
+        .expect("child pair snapshot")
+        .expect("typed delegated creation receipt");
+    assert_eq!(
+        (
+            child_pair.provider.as_str(),
+            child_pair.model.as_str(),
+            child_pair.max_tokens,
+            child_pair.source
+        ),
+        (
+            child_metadata.provider.as_str(),
+            child_metadata.model.as_str(),
+            child_metadata.max_tokens,
+            child_metadata.max_tokens_source
+        )
+    );
     let overrides = child_metadata
         .permission_overrides
         .expect("child overrides present");
@@ -2964,7 +2993,7 @@ async fn wait_for_state(
     session_id: &SessionId,
     expected: impl Fn(&RunState) -> bool,
 ) {
-    let observed = timeout(Duration::from_secs(5), async {
+    let observed = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
@@ -3141,7 +3170,7 @@ async fn autonomous_parent_keeps_delegated_request_input_answerable() {
         .submit(accepted)
         .await
         .expect("submit parent");
-    let child = timeout(Duration::from_secs(5), async {
+    let child = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if let Some(child) = hub
                 .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
@@ -3262,6 +3291,7 @@ async fn start_parked_child(
         stall_deadline,
         Duration::from_secs(241),
         Duration::from_secs(1),
+        None,
     )
     .await
 }
@@ -3273,6 +3303,7 @@ async fn start_parked_child_with_wait_budgets(
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    stall_clock: Option<Arc<StallDeadlineTestClock>>,
 ) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -3334,12 +3365,21 @@ async fn start_parked_child_with_wait_budgets(
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: Some(DelegationHandle::with_wait_budgets(
-                hub.clone(),
-                stall_deadline,
-                run_wait_timeout,
-                settlement_tail_timeout,
-            )),
+            delegation: Some(match stall_clock {
+                Some(clock) => DelegationHandle::with_wait_budgets_and_stall_clock(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                    clock,
+                ),
+                None => DelegationHandle::with_wait_budgets(
+                    hub.clone(),
+                    stall_deadline,
+                    run_wait_timeout,
+                    settlement_tail_timeout,
+                ),
+            }),
             web_search: None,
         },
         false,
@@ -3410,7 +3450,7 @@ async fn wait_for_parent_delegated_menu(
     parent_session: &SessionId,
     agent: &AgentId,
 ) -> (Menu, u64, u64) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(parent_session, 0, 1024)
@@ -3499,6 +3539,7 @@ impl UdsControlClient {
                     Capability::View,
                     Capability::Control,
                 ]),
+                features_requested: Default::default(),
                 max_receive_frame: u32::try_from(haider_rpc::DEFAULT_FRAME_LIMIT)
                     .expect("test frame limit fits u32"),
                 encodings: Vec::new(),
@@ -3675,11 +3716,11 @@ impl UdsControlClient {
         drop(drain_sender);
         let _ = stream.shutdown().await;
         drop(stream);
-        timeout(Duration::from_secs(5), serve_task)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, serve_task)
             .await
             .expect("UDS serve task stops")
             .expect("UDS serve task joins");
-        timeout(Duration::from_secs(5), writer_owner)
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, writer_owner)
             .await
             .expect("UDS writer owner stops")
             .expect("UDS writer owner joins");
@@ -3693,7 +3734,7 @@ async fn wait_for_chip(
     agent: &haider_protocol::ids::AgentId,
     expected: ChipState,
 ) {
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let payloads = typed_payloads(
                 &store
@@ -3749,17 +3790,26 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 #[tokio::test]
 #[cfg(unix)]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
-    // 300ms: under parallel suite load the child's first round can
-    // exceed a 35ms stall deadline BEFORE the park commits — a legal
-    // pre-park nudge that the parked-silence law must not miss-read
-    // (5/5 standalone, flaky in-suite at 35ms).
-    let harness = start_parked_child(
+    // Freeze the stall clock throughout child startup. No amount of executor
+    // delay can consume a stall interval before the durable human-input park.
+    let stall_clock = Arc::new(StallDeadlineTestClock::default());
+    let harness = start_parked_child_with_wait_budgets(
         "permission-stall",
         ParkedChildMode::StallAfterApproval,
         Duration::from_millis(300),
+        Duration::from_secs(241),
+        Duration::from_secs(1),
+        Some(Arc::clone(&stall_clock)),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(160)).await;
+    stall_clock.set_now_ms(u64::MAX);
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while stall_clock.parked_checks_at(u64::MAX) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("collector observes the park after the stall clock expires");
     let parked_payloads = typed_payloads(
         &harness
             .store
@@ -3845,19 +3895,23 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
         harness.hub.clone(),
         Duration::from_millis(75),
     );
-    // Registry #94 test arithmetic: the outer 250ms observer contains the
-    // production 75ms mirror bound plus 175ms of executor scheduling margin.
-    let first_wait_timed_out = timeout(
-        Duration::from_millis(250),
-        terminal_mirror
-            .terminal_mirror_times_out_for_test(&harness.child, Duration::from_millis(75)),
+    // The 75ms mirror deadline is policy input. The outer watchdog only
+    // detects a stuck fixture; the returned timeout outcome is the assertion.
+    let first_wait_timeout = timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        terminal_mirror.terminal_mirror_timeout_for_test(&harness.child, Duration::from_millis(75)),
     )
     .await
-    .expect("terminal mirror first wait honors its production bound")
-    .expect("terminal mirror reads child journal");
+    .expect("terminal mirror returns its timeout outcome")
+    .expect("terminal mirror reads child journal")
+    .expect("an InputRequired child is not terminal completion evidence");
+    assert_eq!(
+        first_wait_timeout.operation(),
+        "delegated child terminal mirror"
+    );
     assert!(
-        first_wait_timed_out,
-        "an InputRequired child is not terminal completion evidence"
+        first_wait_timeout.limit() <= Duration::from_millis(75),
+        "the production wait must use the requested mirror budget: {first_wait_timeout}"
     );
     let mut control = UdsControlClient::connect(harness.hub.clone()).await;
     let replayed = control.attach_control(harness.parent_session.clone()).await;
@@ -4285,18 +4339,27 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
 }
 
 /// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the outer five-second state observer times out
-/// because the parent remains Waiting(LocalChild). Returning token/tool
+/// Expected RUNTIME failure: the external fixture watchdog catches a parent
+/// that remains Waiting(LocalChild). Returning token/tool
 /// counters as completion also fails because the typed timeout disappears.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[cfg(unix)]
 async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
+    // Real store work must not consume the policy clock during startup or
+    // delivery. The external test runner bounds a genuinely stuck fixture.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let wait_clock = Arc::new(StallDeadlineTestClock::for_paused_wait_deadline());
     let harness = start_parked_child_with_wait_budgets(
         "unanswered-bound",
         ParkedChildMode::Complete,
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
+        Some(wait_clock),
     )
     .await;
     let _ = wait_for_parent_delegated_menu(
@@ -4306,6 +4369,10 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     )
     .await;
 
+    // Expire the absolute active wait only after the parked child and its
+    // forwarded parent menu are durable, independent of host scheduling.
+    tokio::time::advance(Duration::from_millis(2_250)).await;
+
     wait_for_state(&harness.store, &harness.parent_session, |state| {
         *state == RunState::Errored
     })
@@ -4314,7 +4381,7 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4364,6 +4431,8 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
+    clock_guard.abort();
+    let _ = clock_guard.await;
 }
 
 /// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
@@ -4384,10 +4453,9 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         manifest: harness.child.manifest.clone(),
     };
     timeout(
-        // Registry #94: the production run deadline is already zero. The
-        // outer 250ms covers only one local journal append and nonblocking
-        // actor enqueue; it grants no extra child-wait budget.
-        Duration::from_millis(250),
+        // The production run deadline is already zero. This watchdog bounds
+        // the durable handoff receipt without extending the child-wait budget.
+        haider_platform::TEST_WAIT_TIMEOUT,
         DelegationHandle::new(harness.hub.clone())
             .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
     )
@@ -4399,7 +4467,7 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = harness
                 .store
@@ -4644,10 +4712,9 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 #[cfg(unix)]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
-    // Outer observation bound: twenty complete supervision cycles, each
-    // initial deadline + grace deadline + two 25ms collector polls:
-    // 20 * (100ms + 100ms + 25ms + 25ms) = 5_000ms.
-    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    // The injected stall clock and durable progress receipts define the
+    // semantic boundaries. This outer watchdog only catches a stuck fixture.
+    const OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
@@ -4955,9 +5022,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .to_string();
     timeout(
-        // Registry #94 test arithmetic: the cancellation path owns no wait
-        // beyond the 1s mirror tail; the extra 1s contains actor scheduling.
-        Duration::from_secs(2),
+        // Observe cancellation completion independently of scheduler delay;
+        // the configured one-second terminal-mirror tail remains unchanged.
+        haider_platform::TEST_WAIT_TIMEOUT,
         hub.cancel_internal_turn(TurnCancelCommand {
             command_id: "cancel-w6c-parent".into(),
             request_digest: blake3::hash(cancel_json.as_bytes()).to_hex().to_string(),
@@ -4973,9 +5040,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     .expect("parent cancellation completes inside the terminal-mirror bound")
     .expect("cancel parent");
     timeout(
-        // Registry #94: the production cleanup fallback journals and owns a
-        // 1s terminal tail; 250ms contains executor/store scheduling only.
-        Duration::from_millis(1_250),
+        // The production cleanup fallback keeps its one-second terminal
+        // tail. Observe its durable completion independently of scheduling.
+        haider_platform::TEST_WAIT_TIMEOUT,
         async {
             loop {
                 let events = store
@@ -5024,7 +5091,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
         *state == RunState::Cancelled
     })
     .await;
-    let child_head = timeout(Duration::from_secs(5), async {
+    let child_head = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&child.child_session_id, 0, 1024)
@@ -5070,7 +5137,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .await
     .expect("child reaches durable idle fence");
-    let terminal_metrics = timeout(Duration::from_secs(5), async {
+    let terminal_metrics = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let events = store
                 .read(&parent_session, 0, 1024)
@@ -6093,11 +6160,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let bounded =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let collected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         bounded.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -6129,11 +6196,11 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
     let restarted =
         DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
     let recollected = timeout(
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
         restarted.collect(
             &first.ticket,
             &CancelToken::new(),
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT),
         ),
     )
     .await
@@ -6248,4 +6315,567 @@ async fn activity_typed_spawn_freezes_display_identity_in_the_replayed_manifest(
     drop(delegation);
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
+}
+// Review-only fixture: exact pre-b444 child receipt JSON omits max_tokens_source.
+#[tokio::test]
+async fn astra_legacy_child_receipt_replay_is_compatible() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("astra-legacy-parent");
+    let run = RunId::new("astra-legacy-run");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &run,
+        "astra-legacy",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let mut metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    metadata.model = "fake-other".into();
+    metadata.max_tokens = 20_000;
+    metadata.max_tokens_source = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+    );
+    let coordinates = || SpawnCoordinates {
+        parent_session_id: parent.clone(),
+        parent_run_id: run.clone(),
+        parent_branch_id: None,
+        parent_agent_id: None,
+        tool_item_id: haider_protocol::ids::ItemId::new("astra-legacy-tool"),
+        call_id: "astra-legacy-call".into(),
+        metadata: metadata.clone(),
+        agent_type: None,
+        lockdown: false,
+        auto_hermetic: false,
+    };
+    let request=SpawnSubagent::from_tool_args(serde_json::json!({"task":"legacy","prompt":"fixture","provider":"fake","model":"fake-other"})).expect("spawn args");
+    let delegation = DelegationHandle::new(hub.clone());
+    let first = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("first establishment");
+    let child = first
+        .ticket
+        .manifest
+        .coordinates
+        .as_ref()
+        .expect("coordinates")["child_session_id"]
+        .as_str()
+        .expect("child id")
+        .to_owned();
+    let control = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("current-format replay control");
+    println!("ASTRA current-format child receipt replay succeeds");
+    drop(control);
+    drop(first);
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    drop(hub);
+    store.close().await.expect("close");
+    let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture db");
+    let (command,json):(String,String)=db.query_row("SELECT command_id, request_json FROM command_receipts WHERE session_id=?1 AND method='session.create'",[&child],|r|Ok((r.get(0)?,r.get(1)?))).expect("child receipt");
+    let mut json: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let removed = json
+        .as_object_mut()
+        .expect("object")
+        .remove("max_tokens_source");
+    assert!(removed.is_some());
+    let old_json = serde_json::to_string(&json).expect("old receipt JSON");
+    let old_digest = blake3::hash(old_json.as_bytes()).to_hex().to_string();
+    db.execute(
+        "UPDATE command_receipts SET request_json=?1,request_digest=?2 WHERE command_id=?3",
+        rusqlite::params![old_json, old_digest, command],
+    )
+    .expect("install old-format receipt");
+    drop(db);
+    let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopened hub");
+    let delegation = DelegationHandle::new(hub.clone());
+    let replay = delegation.establish(coordinates(), request).await;
+    println!(
+        "ASTRA old-child receipt same pair/budget/request replay error={:?}",
+        replay.as_ref().err()
+    );
+    let okay = replay.is_ok();
+    drop(replay);
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
+    assert!(
+        okay,
+        "pre-b444 child receipt must replay without semantic change"
+    );
+}
+
+/// Historical receipt shapes, retained routes and catalog drift are replay
+/// coordinates. Changed caller intent must still be refused.
+#[tokio::test]
+async fn child_budget_replay_uses_original_admission_across_legacy_shapes_and_catalog_edits() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    for (variant, selector_pin, omitted_route) in [
+        ("absent_source", false, 0_u8),
+        ("absent_clamp_display", false, 0_u8),
+        ("changed_catalog", false, 0_u8),
+        ("pre_route_digest", false, 0_u8),
+        ("pre_classified_source", false, 0_u8),
+        ("absent_source", true, 0_u8),
+        ("absent_clamp_display", true, 0_u8),
+        ("pre_route_digest", true, 0_u8),
+        ("pre_classified_source", true, 0_u8),
+        ("pre_witness_digest", true, 0_u8),
+        ("pre_witness_reply_missing_route", true, 1_u8),
+        ("pre_witness_reply_missing_route", true, 2_u8),
+        ("pre_witness_reply_missing_route", true, 3_u8),
+        ("pre_witness_reply_missing_route", true, 4_u8),
+        ("pre_witness_reply_missing_route", true, 5_u8),
+        ("pre_witness_reply_missing_route", true, 6_u8),
+        ("pre_witness_reply_missing_route", true, 7_u8),
+        ("ce9_current_receipt_same_provider", true, 0_u8),
+        ("ce9_current_receipt_same_provider", false, 0_u8),
+        ("ce9_current_receipt_same_provider", true, 1_u8),
+        ("ce9_current_receipt_same_provider", true, 2_u8),
+        ("ce9_current_receipt_same_provider", true, 3_u8),
+        ("ce9_current_receipt_same_provider", true, 4_u8),
+        ("ce9_current_receipt_same_provider", true, 5_u8),
+        ("ce9_current_receipt_same_provider", true, 6_u8),
+        ("ce9_current_receipt_same_provider", true, 7_u8),
+        ("ce9_current_receipt_changed_model", true, 0_u8),
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let parent = SessionId::new(format!("parent-{variant}"));
+        let run = RunId::new(format!("run-{variant}"));
+        accept_parent_with_interaction_mode(
+            &hub,
+            &parent,
+            &run,
+            variant,
+            haider_protocol::session::SessionInteractionModeV1::Autonomous,
+        )
+        .await;
+        let mut child_metadata = hub
+            .session_metadata(&parent)
+            .await
+            .expect("metadata")
+            .expect("parent");
+        child_metadata.model = "small".into();
+        child_metadata.max_tokens = if matches!(variant, "absent_source" | "pre_classified_source")
+        {
+            4096
+        } else {
+            8192
+        };
+        child_metadata.max_tokens_source =
+            if matches!(variant, "absent_source" | "pre_classified_source") {
+                None
+            } else {
+                Some(SessionOutputBudgetSourceV1::UserSet { requested: 20_000 })
+            };
+        if selector_pin {
+            let route_mask = if variant == "ce9_current_receipt_same_provider" && omitted_route != 0
+            {
+                omitted_route
+            } else {
+                7
+            };
+            child_metadata.account_alias = (route_mask & 1 != 0).then(|| "legacy-pin".into());
+            child_metadata.provider_base_url =
+                (route_mask & 2 != 0).then(|| "http://127.0.0.1:8011/v1".into());
+            child_metadata.provider_rebind_id =
+                (route_mask & 4 != 0).then(|| "legacy-rebind".into());
+        }
+        let original_metadata = child_metadata.clone();
+        let args = serde_json::json!({
+            "task":"replay", "prompt":"same call", "provider":" fake ", "model":"small"
+        });
+        let request = SpawnSubagent::from_tool_args(args).expect("spawn args");
+        let coordinates = |metadata| SpawnCoordinates {
+            parent_session_id: parent.clone(),
+            parent_run_id: run.clone(),
+            parent_branch_id: None,
+            parent_agent_id: None,
+            tool_item_id: haider_protocol::ids::ItemId::new("tool"),
+            call_id: "same-call".into(),
+            metadata,
+            agent_type: None,
+            lockdown: false,
+            auto_hermetic: false,
+        };
+        let delegation = DelegationHandle::new(hub.clone());
+        let first = delegation
+            .establish(coordinates(child_metadata.clone()), request.clone())
+            .await
+            .expect("first establishment");
+        let child = first
+            .ticket
+            .manifest
+            .coordinates
+            .as_ref()
+            .expect("coordinates")["child_session_id"]
+            .as_str()
+            .expect("child id")
+            .to_owned();
+        drop(first);
+        drop(delegation);
+        hub.shutdown().await.expect("shutdown");
+        drop(hub);
+        store.close().await.expect("close");
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture db");
+        if matches!(
+            variant,
+            "absent_source"
+                | "pre_route_digest"
+                | "pre_classified_source"
+                | "pre_witness_digest"
+                | "pre_witness_reply_missing_route"
+        ) || (selector_pin && variant == "absent_clamp_display")
+        {
+            let (command, request_json): (String, String) = db.query_row(
+                "SELECT command_id, request_json FROM command_receipts WHERE session_id=?1 AND method='session.create'",
+                [&child], |row| Ok((row.get(0)?, row.get(1)?))).expect("receipt");
+            let mut json: serde_json::Value = serde_json::from_str(&request_json).expect("json");
+            let fields = json.as_object_mut().expect("object");
+            if variant == "absent_source" {
+                fields.remove("max_tokens_source");
+            } else if variant == "pre_classified_source" {
+                fields.insert(
+                    "max_tokens_source".into(),
+                    serde_json::json!(original_metadata.max_tokens_source),
+                );
+            }
+            if matches!(variant, "pre_route_digest" | "pre_classified_source")
+                || (selector_pin && matches!(variant, "absent_source" | "absent_clamp_display"))
+            {
+                for key in [
+                    "inheritance_parent_session_id",
+                    "inherited_account_alias",
+                    "inherited_provider_base_url",
+                    "inherited_provider_rebind_id",
+                ] {
+                    fields.remove(key);
+                }
+            } else if matches!(
+                variant,
+                "pre_witness_digest" | "pre_witness_reply_missing_route"
+            ) {
+                fields.remove("inheritance_parent_session_id");
+            }
+            let old = serde_json::to_string(&json).expect("canonical");
+            db.execute("UPDATE command_receipts SET request_json=?1, request_digest=?2 WHERE command_id=?3",
+                rusqlite::params![old, blake3::hash(old.as_bytes()).to_hex().to_string(), command])
+                .expect("old-format receipt");
+            if variant == "pre_witness_reply_missing_route" {
+                let response: String = db
+                    .query_row(
+                        "SELECT response_json FROM command_receipts WHERE command_id=?1",
+                        [&command],
+                        |row| row.get(0),
+                    )
+                    .expect("original reply");
+                let mut response: serde_json::Value =
+                    serde_json::from_str(&response).expect("reply json");
+                // Every nonempty subset can be omitted by old replies. The
+                // digest must retain all three original choices on replay.
+                for (bit, key) in ["account_alias", "provider_base_url", "provider_rebind_id"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if omitted_route & (1 << bit) == 0 {
+                        continue;
+                    }
+                    assert!(
+                        response["metadata"]
+                            .as_object_mut()
+                            .expect("metadata")
+                            .remove(key)
+                            .is_some()
+                    );
+                }
+                db.execute(
+                    "UPDATE command_receipts SET response_json=?1 WHERE command_id=?2",
+                    rusqlite::params![serde_json::to_string(&response).expect("reply"), command],
+                )
+                .expect("old reply missing route fields");
+            }
+        }
+        if variant == "absent_clamp_display" {
+            let manifest: String = db
+                .query_row(
+                    "SELECT manifest_json FROM delegations WHERE child_session_id=?1",
+                    [&child],
+                    |row| row.get(0),
+                )
+                .expect("manifest");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&manifest).expect("manifest json");
+            assert!(
+                json["coordinates"]
+                    .as_object_mut()
+                    .expect("coordinates")
+                    .remove("output_budget")
+                    .is_some(),
+                "first spawn has a clamp display"
+            );
+            db.execute(
+                "UPDATE delegations SET manifest_json=?1 WHERE child_session_id=?2",
+                rusqlite::params![serde_json::to_string(&json).expect("manifest"), child],
+            )
+            .expect("legacy absent display");
+        }
+        drop(db);
+        let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        if variant == "changed_catalog" {
+            child_metadata.max_tokens = 16_384;
+        }
+        let delegation = DelegationHandle::new(hub.clone());
+        if selector_pin {
+            // The current selector clears the old route and a catalog edit
+            // re-derives 16384. Both derived changes must keep the original
+            // admission, including ce9d0976's current-schema receipt.
+            install_child_selection_test_catalog(&hub, 16_384);
+            let mut parent_metadata = child_metadata.clone();
+            if variant == "ce9_current_receipt_changed_model" {
+                parent_metadata.model = "wide".into();
+            }
+            child_metadata = delegation
+                .resolve_child_metadata(&parent_metadata, &request)
+                .expect("resolve current selector")
+                .expect("selected metadata");
+            assert_eq!(child_metadata.model, "small");
+            assert_eq!(child_metadata.max_tokens, 16_384);
+            assert_eq!(child_metadata.account_alias, None);
+            assert_eq!(child_metadata.provider_base_url, None);
+            assert_eq!(child_metadata.provider_rebind_id, None);
+            for change in [
+                "budget", "provider", "model", "alias", "endpoint", "rebind", "task", "prompt",
+            ] {
+                let mut changed = child_metadata.clone();
+                let mut changed_request = request.clone();
+                match change {
+                    "budget" => {
+                        changed.max_tokens_source =
+                            Some(SessionOutputBudgetSourceV1::UserSet { requested: 10_000 })
+                    }
+                    "provider" => {
+                        changed.provider = "fake-next".into();
+                        changed_request.provider = Some("fake-next".into());
+                    }
+                    "model" => {
+                        changed.model = "changed-model".into();
+                        changed_request.model = Some("changed-model".into());
+                    }
+                    "alias" => changed.account_alias = Some("changed-pin".into()),
+                    "endpoint" => {
+                        changed.provider_base_url = Some("http://127.0.0.1:8022/v1".into())
+                    }
+                    "rebind" => changed.provider_rebind_id = Some("changed-rebind".into()),
+                    "task" => changed_request.task = "changed-task".into(),
+                    "prompt" => changed_request.prompt = "changed-prompt".into(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    delegation
+                        .establish(coordinates(changed), changed_request)
+                        .await
+                        .is_err(),
+                    "{variant}: changed {change} must not borrow the original admission"
+                );
+            }
+        }
+        let replay = delegation
+            .establish(coordinates(child_metadata), request.clone())
+            .await
+            .expect("unchanged child request replays");
+        assert_eq!(
+            replay.ticket.manifest.budget_tokens,
+            Some(original_metadata.max_tokens)
+        );
+        if selector_pin {
+            let admitted = hub
+                .session_metadata(&SessionId::new(child.clone()))
+                .await
+                .expect("child metadata")
+                .expect("child");
+            assert_eq!(admitted.account_alias, original_metadata.account_alias);
+            assert_eq!(
+                admitted.provider_base_url,
+                original_metadata.provider_base_url
+            );
+            assert_eq!(
+                admitted.provider_rebind_id,
+                original_metadata.provider_rebind_id
+            );
+            assert_eq!(admitted.max_tokens, original_metadata.max_tokens);
+        }
+        if variant == "absent_clamp_display" {
+            assert!(
+                replay
+                    .ticket
+                    .manifest
+                    .coordinates
+                    .as_ref()
+                    .expect("coordinates")
+                    .get("output_budget")
+                    .is_none()
+            );
+        }
+        if variant == "changed_catalog" {
+            let mut changed = original_metadata.clone();
+            changed.max_tokens_source =
+                Some(SessionOutputBudgetSourceV1::UserSet { requested: 10_000 });
+            assert!(
+                delegation
+                    .establish(coordinates(changed), request.clone())
+                    .await
+                    .is_err(),
+                "a changed requested budget must not borrow the old receipt"
+            );
+        }
+        drop(replay);
+        drop(delegation);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}
+
+fn install_child_selection_test_catalog(hub: &SessionHub, limit: u64) {
+    hub.install_creatable_providers(std::collections::BTreeSet::from([
+        "fake".into(),
+        "fake-next".into(),
+    ]))
+    .expect("providers");
+    let profiles = ["fake", "fake-next"].into_iter().map(|provider| {
+        serde_json::from_value::<haider_rpc::ProviderSummaryWire>(serde_json::json!({
+            "provider": provider, "api_family":"openai_responses", "availability":"available",
+            "enabled":true, "trust":"full", "inventory":{"state":"static"},
+            "models":["small"], "model_details":[{"name":"small","context_window":1048576,"max_output_tokens":limit}]
+        })).expect("summary")
+    }).collect();
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), profiles),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+        vault: None,
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+    .expect("accounts");
+}
+
+#[tokio::test]
+async fn explicit_child_provider_pick_clears_inherited_route_and_reapplies_budget() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("child-route-parent");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &RunId::new("child-route-run"),
+        "route",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    install_child_selection_test_catalog(&hub, 8192);
+    let mut metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    metadata.account_alias = Some("parent-pin".into());
+    metadata.provider_base_url = Some("http://127.0.0.1:8011/v1".into());
+    metadata.provider_rebind_id = Some("parent-route".into());
+    metadata.resolved_route_alias = Some("parent-resolved".into());
+    metadata.resolved_route_seen = true;
+    metadata.max_tokens = 20_000;
+    let delegation = DelegationHandle::new(hub.clone());
+    for source in [
+        SessionOutputBudgetSourceV1::Derived,
+        SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+    ] {
+        metadata.max_tokens_source = Some(source);
+        for parent_model in [metadata.model.as_str(), "small"] {
+            for provider in ["fake", " fake ", "fake-next", " fake-next "] {
+                let mut routed_parent = metadata.clone();
+                routed_parent.model = parent_model.into();
+                let request = SpawnSubagent::from_tool_args(serde_json::json!({
+                    "task":"route", "prompt":"fake", "provider":provider, "model":"small"
+                }))
+                .expect("args");
+                let child = delegation
+                    .resolve_child_metadata(&routed_parent, &request)
+                    .expect("resolve")
+                    .expect("selection");
+                assert_eq!(
+                    child.max_tokens, 8192,
+                    "an explicit unchanged pair reapplies the budget"
+                );
+                assert_eq!(child.max_tokens_source, Some(source));
+                assert_eq!(child.account_alias, None);
+                assert_eq!(child.provider_base_url, None);
+                assert_eq!(child.provider_rebind_id, None);
+                assert_eq!(child.resolved_route_alias, None);
+                assert!(!child.resolved_route_seen);
+                assert_eq!(child.provider, provider.trim());
+            }
+        }
+        let request = SpawnSubagent::from_tool_args(serde_json::json!({
+            "task":"inherit", "prompt":"fake",
+        }))
+        .expect("args");
+        let inherited = delegation
+            .resolve_child_metadata(&metadata, &request)
+            .expect("resolve")
+            .expect("inheritance");
+        assert_eq!(
+            inherited, metadata,
+            "an absent selector inherits the admitted route and budget"
+        );
+        for provider in ["", "   "] {
+            assert!(
+                SpawnSubagent::from_tool_args(serde_json::json!({
+                    "task":"invalid", "prompt":"fake", "provider":provider,
+                }))
+                .is_err(),
+                "the public parser rejects an empty provider instead of selecting a route"
+            );
+        }
+        assert!(
+            SpawnSubagent::from_tool_args(serde_json::json!({
+                "task":"invalid", "prompt":"fake", "provider":"fake",
+            }))
+            .is_err(),
+            "a provider selector must disambiguate an explicit model"
+        );
+        let request = SpawnSubagent::from_tool_args(
+            serde_json::json!({"task":"route", "prompt":"fake", "model":"small"}),
+        )
+        .expect("args");
+        let inherited = delegation
+            .resolve_child_metadata(&metadata, &request)
+            .expect("resolve")
+            .expect("selection");
+        assert_eq!(
+            inherited.account_alias, metadata.account_alias,
+            "same-provider model pick keeps route"
+        );
+        assert_eq!(inherited.max_tokens, 8192);
+    }
+    drop(delegation);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }

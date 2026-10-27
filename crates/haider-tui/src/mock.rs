@@ -147,6 +147,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
             name: "fs_read".to_owned(),
             args: serde_json::json!({"path": "crates/haider-store/src/event_store.rs"}),
             status: ToolStatus::InProgress,
+            activity: None,
         },
     }));
     script.push(EventPayload::Item(ItemEvent::Completed {
@@ -156,6 +157,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
             name: "fs_read".to_owned(),
             args: serde_json::json!({"path": "crates/haider-store/src/event_store.rs"}),
             status: ToolStatus::Completed,
+            activity: None,
         },
     }));
 
@@ -397,6 +399,7 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
                 display_name: None,
                 context_window: None,
                 max_output_tokens: Some(30_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),

@@ -3,7 +3,7 @@
 //! (research rec 3/6). Alternate screen for v0.1 (rec 1); native-scrollback
 //! insertion is explicitly deferred (rec 19).
 
-use crate::app::{AppEvent, AppModel, AppRequest, DemoRequest};
+use crate::app::{AppEvent, AppModel, AppRequest, DemoRequest, PresentedInput};
 use crate::identity::UiGeneration;
 use crate::mock::demo_script;
 use crate::render::render;
@@ -11,12 +11,12 @@ use crate::script::{
     AUTO_TITLE_MS, Beat, COMPACT_IDLE_GAP_MS, DemoEvent, TALK_HOLD_MS, compaction_beats,
     respond_preamble, title_note,
 };
+use crate::terminal_backend::CellBackend;
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
@@ -28,10 +28,288 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{event, execute};
 use std::io::{IsTerminal, Stdout, Write, stderr, stdin, stdout};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+struct QueuedInput {
+    event: Event,
+    presented: Option<(PresentedInput, u64)>,
+    received_at: Instant,
+}
+
+type PresentedFrame = Mutex<std::collections::VecDeque<((PresentedInput, u64), Instant)>>;
+const INPUT_FRAME_HISTORY: usize = 128;
+const DISCARDED_EDIT_LIFETIME: Duration = Duration::from_secs(10);
+
+/// Retain every frame produced by accepted queued input. The expected stamp
+/// includes the paint epoch; outside changes retire the whole history, even
+/// when they return to the same owner.
+#[derive(Clone, Debug)]
+pub(crate) struct InputRebase {
+    sources: std::collections::VecDeque<Option<(PresentedInput, u64)>>,
+    expected: Option<(PresentedInput, u64)>,
+    pointer_sources: std::collections::VecDeque<Option<(PresentedInput, u64)>>,
+}
+
+fn input_stamp(frame: &PresentedFrame, received_at: Instant) -> Option<(PresentedInput, u64)> {
+    frame
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .rev()
+        .find_map(|(owner, painted_at)| (*painted_at <= received_at).then(|| owner.clone()))
+}
+
+fn dispatch_queued_input(
+    model: &mut AppModel,
+    hits: &[(ratatui::layout::Rect, crate::app::Hit)],
+    input: QueuedInput,
+) -> bool {
+    let current = model.painted_stamp();
+    let rebased = model.input_rebase.as_ref().is_some_and(|chain| {
+        chain.expected == current
+            && (input.presented == current || chain.sources.contains(&input.presented))
+    });
+    let pointer_rebased = rebased
+        && model.input_rebase.as_ref().is_some_and(|chain| {
+            input.presented == current || chain.pointer_sources.contains(&input.presented)
+        });
+    if matches!(
+        &input.event,
+        Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
+    ) && (input.presented.is_none()
+        || (input.presented != current
+            && (!rebased || (matches!(&input.event, Event::Mouse(_)) && !pointer_rebased)))
+        || model.painted_input().as_ref() != Some(&model.presented_input()))
+    {
+        if matches!(&input.event, Event::Mouse(_)) {
+            model.clear_mouse_press();
+        }
+        refuse_stale_input(model, &input);
+        return false;
+    }
+    // Navigation is lossless, but a decision may only confirm the option
+    // presented when this key arrived. Painting after Down does not turn
+    // an already queued Enter into informed confirmation.
+    if matches!(&input.event, Event::Key(key) if key.code == KeyCode::Enter)
+        && model.input_owner().confirms_decision()
+        && input.presented != current
+    {
+        model.flash = Some("· Selection changed: press Enter again to confirm".to_owned());
+        model.input_refused = true;
+        model.dirty = true;
+        return false;
+    }
+    // Focus and resize reports are external events, even though they share
+    // the terminal queue. They must not turn a stale ingress stamp into a
+    // valid chain for keys following an outside owner change.
+    if !matches!(
+        &input.event,
+        Event::Key(_) | Event::Paste(_) | Event::Mouse(_)
+    ) {
+        model.input_rebase = None;
+        dispatch_input(model, hits, input.event);
+        return true;
+    }
+    let pointer_before = model.pointer_input_owner();
+    let (mut sources, mut pointer_sources) = if rebased {
+        model
+            .input_rebase
+            .take()
+            .map(|chain| (chain.sources, chain.pointer_sources))
+            .unwrap_or_default()
+    } else {
+        let sources = std::collections::VecDeque::from([input.presented.clone()]);
+        (sources.clone(), sources)
+    };
+    dispatch_input_at(model, hits, input.event, input.received_at);
+    // A transition retires only older pointer frames. A later read stamped
+    // by the new surface may still rebase across its own stable frames.
+    if pointer_before != model.pointer_input_owner() {
+        pointer_sources.clear();
+    }
+    let next = model.presented_input();
+    let expected = current.map(|(owner, epoch)| {
+        let epoch = if owner == next {
+            epoch
+        } else {
+            epoch.wrapping_add(1)
+        };
+        (next, epoch)
+    });
+    // A reader may wait behind a long retained cohort after stamping an
+    // intermediate frame. Its channel bound does not bound this history.
+    // Only an outside change ends the self-produced frame chain.
+    if sources.back() != Some(&expected) {
+        sources.push_back(expected.clone());
+    }
+    if pointer_sources.back() != Some(&expected) {
+        pointer_sources.push_back(expected.clone());
+    }
+    model.input_rebase = Some(InputRebase {
+        sources,
+        expected,
+        pointer_sources,
+    });
+    true
+}
+
+fn passive_mouse(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Moved
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    )
+}
+
+fn new_request_feedback(discarded_edit: bool) -> &'static str {
+    if discarded_edit {
+        "· New request — input discarded, type again"
+    } else {
+        "· New request — press again"
+    }
+}
+
+fn has_discarded_edit(model: &mut AppModel, now: Instant) -> bool {
+    // Ingress timestamps govern decision dwell, but a delayed queue cannot
+    // extend this presentation marker beyond ten seconds of real time.
+    let now = now.max(Instant::now());
+    if model
+        .discarded_edit_at
+        .is_some_and(|at| now.saturating_duration_since(at) >= DISCARDED_EDIT_LIFETIME)
+    {
+        model.discarded_edit_at = None;
+    }
+    model.discarded_edit_at.is_some()
+}
+
+/// Motion and wheel reports have no action for the user to retry.
+fn refuse_stale_input(model: &mut AppModel, input: &QueuedInput) {
+    let event = &input.event;
+    let now = input.received_at;
+    if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+        return;
+    }
+    if matches!(event, Event::Mouse(mouse) if passive_mouse(mouse.kind)) {
+        return;
+    }
+    // Outside events can retire the reader's stamp before or after the
+    // successor paints. Its commits still deserve the same dwell feedback;
+    // identity-aware readiness never borrows the predecessor's mature clock.
+    // This changes only the explanation, never the stale-input refusal.
+    // Unstamped startup input predates presentation, even if the card is
+    // painted by dispatch time. It cannot carry a fresh-card confirmation.
+    if matches!(event, Event::Paste(text) if !text.is_empty())
+        || matches!(event, Event::Key(key) if matches!(key.code, KeyCode::Char(_))
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && !model.decision_key_commits(key))
+    {
+        model.discarded_edit_at = Some(now);
+    }
+    let discarded_edit = has_discarded_edit(model, now);
+    let stamped = input.presented.is_some();
+    let message = if stamped {
+        match event {
+            Event::Key(key)
+                if model.decision_key_commits(key)
+                    && (discarded_edit || !model.decision_key_commit_ready(now)) =>
+            {
+                new_request_feedback(discarded_edit)
+            }
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                ) && (model.input_owner().confirms_decision()
+                    || model.free_text_question_owner().is_some()
+                    || model.input_owner() == crate::app::InputOwner::AccountsReplace)
+                    && !model.pointer_commit_ready(now) =>
+            {
+                "· New surface: click again to confirm"
+            }
+            _ => "· Input changed: please try again",
+        }
+    } else {
+        "· Input changed: please try again"
+    };
+    model.flash = Some(message.to_owned());
+    model.input_refused = true;
+    model.dirty = true;
+}
+
+fn owner_needs_presentation(model: &AppModel) -> bool {
+    model.painted_input().as_ref() != Some(&model.presented_input()) || model.input_refused
+}
+
 const SYSTEM_THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(20);
+static STARTUP_INPUT: Mutex<std::collections::VecDeque<(Event, Instant)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+fn take_startup_input() -> std::collections::VecDeque<(Event, Instant)> {
+    std::mem::take(
+        &mut *STARTUP_INPUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+fn read_input(
+    startup: &mut std::collections::VecDeque<(Event, Instant)>,
+) -> std::io::Result<(Event, Instant, bool)> {
+    if let Some((event, received_at)) = startup.pop_front() {
+        Ok((event, received_at, true))
+    } else {
+        event::read().map(|event| (event, Instant::now(), false))
+    }
+}
+
+/// A free-text question shares the composer owner, but still needs a
+/// presented decision target. Only an ordinary draft gets startup rebasing.
+fn startup_input_presentation(model: &AppModel) -> Option<(PresentedInput, u64)> {
+    let menu = match model.input_owner() {
+        crate::app::InputOwner::Composer(crate::app::Screen::Session) => {
+            model.projection.open_menu()
+        }
+        crate::app::InputOwner::Composer(crate::app::Screen::Subagent) => model
+            .viewed_chip()
+            .and_then(crate::app::ChipModel::question_menu),
+        _ => None,
+    };
+    if menu.is_some_and(|menu| menu.options.is_empty()) {
+        return None;
+    }
+    model.painted_stamp()
+}
+
+fn stamped_input(
+    frame: &PresentedFrame,
+    event: Event,
+    received_at: Instant,
+    from_startup: bool,
+    initial_presentation: Option<&(PresentedInput, u64)>,
+) -> QueuedInput {
+    // Preserve typing collected before the first frame. Pointer reports and
+    // decision keys still need a target that existed when they were received.
+    let presented = if from_startup
+        && matches!(&event, Event::Key(_) | Event::Paste(_))
+        && initial_presentation
+            .is_some_and(|(owner, _)| matches!(owner.owner, crate::app::InputOwner::Composer(_)))
+    {
+        initial_presentation.cloned()
+    } else {
+        input_stamp(frame, received_at)
+    };
+    QueuedInput {
+        event,
+        presented,
+        received_at,
+    }
+}
 
 /// OSC 11 sequence setting the terminal's own background — the emulator's
 /// window padding around the cell grid then matches the theme ground, so the
@@ -111,11 +389,9 @@ fn sync_terminal_bg(theme: ThemeKey) {
 /// terminals that set it but stay silent on OSC (e.g. rxvt lineage,
 /// some tmux setups). Call BEFORE entering raw mode/alt screen.
 ///
-/// Known residual (review TUI1 P2): the probe owns the tty for its bounded
-/// window, so a keystroke typed in that pre-UI instant is consumed, not
-/// forwarded. The window is kept tiny (20ms) and runs before any UI invites
-/// input. The loss-free design — parsing the OSC reply inside the sole input
-/// reader — lands with the daemon-era input stack (see OPTIMIZATIONS.md).
+/// The bounded probe retains every event except a complete OSC colour
+/// response. The sole input pump drains those retained events after the
+/// first frame, so typing during detection survives startup.
 #[must_use]
 pub fn detect_system_theme() -> ThemeKey {
     let osc = probe_terminal_theme(SYSTEM_THEME_PROBE_TIMEOUT);
@@ -175,9 +451,24 @@ fn probe_terminal_theme(timeout: Duration) -> Option<termbg::Theme> {
         disable_on_drop: !raw_before,
     };
     let mut events = CrosstermThemeEventReader;
-    query_terminal_theme(terminal, timeout, &mut events, &mut stderr())
-        .ok()
-        .flatten()
+    let mut retained = Vec::new();
+    let result = query_terminal_theme(terminal, timeout, &mut events, &mut stderr(), &mut retained);
+    // All retained events precede this instant and the first paint. Keeping
+    // that boundary prevents a startup pointer report becoming a fresh click.
+    let received_at = Instant::now();
+    retain_startup_input(&STARTUP_INPUT, retained, received_at);
+    result.ok().flatten()
+}
+
+fn retain_startup_input(
+    queue: &Mutex<std::collections::VecDeque<(Event, Instant)>>,
+    retained: Vec<Event>,
+    received_at: Instant,
+) {
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(retained.into_iter().map(|event| (event, received_at)));
 }
 
 fn query_terminal_theme(
@@ -185,6 +476,7 @@ fn query_terminal_theme(
     timeout: Duration,
     events: &mut dyn ThemeEventReader,
     output: &mut dyn Write,
+    retained: &mut Vec<Event>,
 ) -> std::io::Result<Option<termbg::Theme>> {
     let query = match terminal {
         termbg::Terminal::Tmux => "\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\",
@@ -196,30 +488,55 @@ fn query_terminal_theme(
     output.flush()?;
 
     let deadline = Instant::now() + timeout;
-    let mut response = String::new();
+    // Crossterm parses OSC's ESC ] as Alt+]. Only consume a complete,
+    // recognized colour response; every other event remains user input.
+    let mut response: Option<(usize, String)> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || !events.poll(remaining)? {
-            return Ok(terminal_appearance_from_response(&response));
+            return Ok(None);
         }
-        let Event::Key(key) = events.read()? else {
+        retained.push(events.read()?);
+        let Some(Event::Key(key)) = retained.last() else {
+            response = None;
             continue;
         };
+        let key = *key;
         if key.kind == KeyEventKind::Release {
+            response = None;
             continue;
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char(']'), KeyModifiers::ALT) => {
+                response = Some((retained.len() - 1, String::new()));
+            }
             (KeyCode::Char('\\'), KeyModifiers::ALT | KeyModifiers::NONE)
             | (KeyCode::Char('g'), KeyModifiers::CONTROL)
             | (KeyCode::Char('\u{0007}'), KeyModifiers::NONE) => {
-                return Ok(terminal_appearance_from_response(&response));
+                if let Some((start, text)) = response.take()
+                    && text.strip_prefix("11;rgb:").is_some_and(|rgb| {
+                        let parts: Vec<_> = rgb.split('/').collect();
+                        parts.len() == 3
+                            && parts.iter().all(|part| {
+                                !part.is_empty()
+                                    && part.len() <= 4
+                                    && part.chars().all(|c| c.is_ascii_hexdigit())
+                            })
+                    })
+                    && let Some(appearance) = terminal_appearance_from_response(&text)
+                {
+                    retained.truncate(start);
+                    return Ok(Some(appearance));
+                }
             }
             (KeyCode::Char(character), modifiers)
                 if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
             {
-                response.push(character);
+                if let Some((_, text)) = &mut response {
+                    text.push(character);
+                }
             }
-            _ => {}
+            _ => response = None,
         }
     }
 }
@@ -317,6 +634,77 @@ mod theme_probe_tests {
     }
 
     #[test]
+    fn startup_probe_retains_typing_paste_focus_and_incomplete_answers() {
+        for mut input in [
+            "/theme"
+                .chars()
+                .map(|c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)))
+                .collect::<Vec<_>>(),
+            vec![
+                Event::Paste("@path".into()),
+                Event::FocusLost,
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ],
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT)),
+                Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            ],
+        ] {
+            let expected = input.clone();
+            let mut events = AnswerEvents {
+                events: input.drain(..).collect(),
+            };
+            let mut retained = Vec::new();
+            assert_eq!(
+                query_terminal_theme(
+                    termbg::Terminal::XtermCompatible,
+                    SYSTEM_THEME_PROBE_TIMEOUT,
+                    &mut events,
+                    &mut Vec::new(),
+                    &mut retained
+                )
+                .expect("query"),
+                None
+            );
+            assert_eq!(
+                retained, expected,
+                "the first frame must receive every user event"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_answer_only_consumes_its_own_events_between_startup_keys() {
+        let key = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let mut input = std::collections::VecDeque::from([key('a')]);
+        input.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )));
+        input.extend("11;rgb:ffff/ffff/ffff".chars().map(key));
+        input.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        input.push_back(key('b'));
+        let mut events = AnswerEvents { events: input };
+        let mut retained = Vec::new();
+        assert_eq!(
+            query_terminal_theme(
+                termbg::Terminal::XtermCompatible,
+                SYSTEM_THEME_PROBE_TIMEOUT,
+                &mut events,
+                &mut Vec::new(),
+                &mut retained
+            )
+            .expect("query"),
+            Some(termbg::Theme::Light)
+        );
+        assert_eq!(retained, [key('a')]);
+        assert_eq!(events.events, VecDeque::from([key('b')]));
+    }
+
+    #[test]
     fn silent_osc_probe_uses_only_the_short_bounded_poll() {
         let mut events = SilentEvents::default();
         let mut output = Vec::new();
@@ -325,6 +713,7 @@ mod theme_probe_tests {
             SYSTEM_THEME_PROBE_TIMEOUT,
             &mut events,
             &mut output,
+            &mut Vec::new(),
         )
         .expect("silent query");
 
@@ -337,12 +726,16 @@ mod theme_probe_tests {
 
     #[test]
     fn prompt_osc_answer_is_parsed_before_the_deadline() {
-        let mut input: VecDeque<_> = "]11;rgb:ffff/ffff/ffff"
+        let mut input: VecDeque<_> = "11;rgb:ffff/ffff/ffff"
             .chars()
             .map(|character| {
                 Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
             })
             .collect();
+        input.push_front(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )));
         input.push_back(Event::Key(KeyEvent::new(
             KeyCode::Char('g'),
             KeyModifiers::CONTROL,
@@ -356,6 +749,7 @@ mod theme_probe_tests {
                 SYSTEM_THEME_PROBE_TIMEOUT,
                 &mut events,
                 &mut output,
+                &mut Vec::new(),
             )
             .expect("answered query"),
             Some(termbg::Theme::Light)
@@ -417,6 +811,54 @@ pub fn sync_notification_persistence(
     *seen_commits = model.notification_commits;
     if let Some(store) = settings.as_mut() {
         store.save_notifications_if_changed(model.theme_choice, model.notifications_enabled);
+    }
+}
+
+/// 973-activity-icons: persist an `/icons` choice (mirrors the notification
+/// sync).
+pub fn sync_activity_icons_persistence(
+    model: &mut crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.activity_display_commits == *seen_commits
+        || model.activity_display_commits == model.activity_display_attempted_commits
+    {
+        return;
+    }
+    let Some(choice) = model.activity_display_choice else {
+        return;
+    };
+    model.activity_display_attempted_commits = model.activity_display_commits;
+    if settings
+        .as_mut()
+        .is_some_and(|store| store.save_activity_icons_if_changed(model.theme_choice, choice))
+    {
+        *seen_commits = model.activity_display_commits;
+        model.flash = Some(format!("· activity icons {} saved", choice.name()));
+    } else {
+        model.flash = Some(format!(
+            "! Could not save activity icons; retry /icons {}",
+            choice.name()
+        ));
+    }
+    model.dirty = true;
+}
+
+/// 973-activity-icons: boot-time activity display — the persisted `/icons`
+/// choice, overridden by `HAIDER_ACTIVITY_ICONS`, else `NO_COLOR`/`TERM`
+/// heuristics. Mirrors the explicit choice into the store.
+pub fn seed_activity_display(
+    model: &mut crate::app::AppModel,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    let chosen = settings
+        .as_ref()
+        .and_then(crate::settings::SettingsStore::load_activity_icons);
+    model.activity_display_choice = chosen;
+    model.activity_display = haider_client::fleet::activity_display_from_env(chosen);
+    if let Some(store) = settings.as_mut() {
+        store.set_activity_icons(chosen);
     }
 }
 
@@ -671,7 +1113,7 @@ pub async fn run_demo(
 ) -> std::io::Result<()> {
     seed_footprint_replay(&mut model);
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut terminal = Terminal::new(CellBackend::new(stdout()))?;
     let initial_size = terminal.size()?;
     model.handle_terminal_resize(initial_size.width, initial_size.height);
     // Sync the emulator's own background (window padding) to the theme
@@ -685,6 +1127,8 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -732,34 +1176,17 @@ pub async fn run_demo(
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
-    // Query the terminal for a graphics protocol and build the wordmark image
-    // NOW — after raw mode, before the input pump claims stdin — so the
-    // capability response is not eaten by the pump. Degrades to None (the
-    // half-block art) on a non-graphics or non-answering terminal; never hangs.
+    // Resolve the terminal graphics hint and build the wordmark image
+    // without reading stdin. Unknown protocols use the crafted half-block art.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Pin the truecolor capability once (read by render for the Thinking
     // shimmer's fidelity); the default is true, so this only downgrades a
     // proven 16-color terminal.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
-
-    // Input pump: crossterm's blocking read on a dedicated thread, forwarded
-    // into the async loop (no event-stream feature needed).
-    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(item) => {
-                    if input_tx.blocking_send(item).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
 
     // The demo driver owns the generation-tagged envelope channel and the
     // script/decay timers — the SAME production seams the tests drive
@@ -804,27 +1231,61 @@ pub async fn run_demo(
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
+    // Input pump: crossterm's blocking read on a dedicated thread, forwarded
+    // into the async loop (no event-stream feature needed).
+    let presented = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
+    let input_presentation = Arc::clone(&presented);
+    let initial_presentation = startup_input_presentation(&model);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
+    let mut startup = take_startup_input();
+    std::thread::spawn(move || {
+        loop {
+            match read_input(&mut startup) {
+                Ok((item, received_at, from_startup)) => {
+                    let input = stamped_input(
+                        &input_presentation,
+                        item,
+                        received_at,
+                        from_startup,
+                        initial_presentation.as_ref(),
+                    );
+                    if input_tx.blocking_send(input).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
 
     while !model.should_quit {
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => {
-                    match &event {
+                Some(input) => {
+                    let event = &input.event;
+                    let next_pointer = match event {
                         // The pre-resize map describes a frame that no
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
-                        Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
-                            pointer = Some((mouse.column, mouse.row));
+                        Event::Resize(..) => {
+                            hit_map.clear();
+                            None
                         }
-                        _ => {}
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => Some((mouse.column, mouse.row)),
+                        _ => None,
+                    };
+                    if dispatch_queued_input(&mut model, &hit_map, input)
+                        && let Some(cell) = next_pointer
+                    {
+                        pointer = Some(cell);
                     }
-                    dispatch_input(&mut model, &hit_map, event);
                 }
                 None => break,
             },
             tagged = envelope_rx.recv(), if stream_open => match tagged {
                 Some((generation, event)) => {
+                    model.invalidate_queued_input();
                     driver.consume(&mut model, generation, event);
                 }
                 None => {
@@ -850,7 +1311,7 @@ pub async fn run_demo(
             // it and the overdue tick fires immediately, keeping the 30fps
             // coalescing behavior.
             _ = frame_tick.tick(), if model.dirty => {
-                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
                 // Demo persistence (TUI4c-13b): a drawn frame means state
                 // changed — save here, coalesced to the frame cadence
                 // (hash-skipped when nothing persisted moved). This is the
@@ -859,6 +1320,10 @@ pub async fn run_demo(
                     store.save(&model);
                 }
             }
+        }
+        model.retire_stale_press();
+        if owner_needs_presentation(&model) {
+            present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
         }
         // Reducer-requested side effects.
         let requests: Vec<AppRequest> = model.requests.drain(..).collect();
@@ -910,6 +1375,7 @@ pub async fn run_demo(
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&mut model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: observe tool start/finish against the shared
         // clock, so a collapsed row can carry an honest duration (the
@@ -1092,15 +1558,65 @@ pub fn dispatch_input(
     hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
     event: Event,
 ) {
+    dispatch_input_at(model, hit_map, event, Instant::now());
+}
+
+/// Clock seam for pointer dwell and reducer deadline regressions.
+#[doc(hidden)]
+pub fn dispatch_input_at(
+    model: &mut AppModel,
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    event: Event,
+    now: Instant,
+) {
+    model.retire_stale_press();
+    // The completed render records its owner separately from logical state.
+    // A queued key or mouse report cannot migrate to a newly opened owner.
+    if matches!(&event, Event::Key(_) | Event::Paste(_) | Event::Mouse(_))
+        && model
+            .painted_input()
+            .is_some_and(|owner| owner != model.presented_input())
+    {
+        if matches!(&event, Event::Mouse(_)) {
+            model.clear_mouse_press();
+        }
+        refuse_stale_input(
+            model,
+            &QueuedInput {
+                event,
+                presented: None,
+                received_at: now,
+            },
+        );
+        return;
+    }
+    let preserve_discarded_edit = match &event {
+        Event::Key(key) if key.kind == KeyEventKind::Release => true,
+        Event::Key(key) => model.decision_key_commits(key) && !model.decision_key_commit_ready(now),
+        Event::Mouse(mouse) => passive_mouse(mouse.kind),
+        Event::Paste(text) => text.is_empty(),
+        _ => true,
+    };
+    if !preserve_discarded_edit {
+        model.discarded_edit_at = None;
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
-            model.handle(AppEvent::Key(key));
+            if model.decision_key_commits(&key) && !model.decision_key_commit_ready(now) {
+                let discarded_edit = has_discarded_edit(model, now);
+                model.flash = Some(new_request_feedback(discarded_edit).to_owned());
+                model.input_refused = true;
+                model.dirty = true;
+                return;
+            }
+            model.handle_at(AppEvent::Key(key), now);
         }
         // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
         // buffer takes the same allocation, so our one owned copy wipes
         // on drop and Debug-prints redacted.
         Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
         Event::Resize(cols, rows) => {
+            model.invalidate_queued_input();
             // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
             // budget is a pure function of the NEW width, so apply it
             // here — before any queued key can walk the previous width's
@@ -1113,6 +1629,7 @@ pub fn dispatch_input(
             model
                 .composer
                 .set_wrap_budget(crate::render::composer_text_budget(cols));
+            model.clear_mouse_press();
             model.handle_terminal_resize(cols, rows);
         }
         Event::Mouse(mouse) => {
@@ -1121,11 +1638,7 @@ pub fn dispatch_input(
             // scroll, paste, or move hover in the app. This is not a way to
             // replay an already delivered report into the terminal.
             if terminal_owned_mouse(&mouse) {
-                model.mouse_down = None;
-                model.composer_drag = false;
-                if let Some(selection) = &mut model.selection {
-                    selection.dragging = false;
-                }
+                model.clear_mouse_press();
                 return;
             }
             let hit_at = |column: u16, row: u16| {
@@ -1143,7 +1656,10 @@ pub fn dispatch_input(
                 // A terminal-owned right-click sends paste input instead
                 // of this report. Under capture, service a delivered right
                 // press ourselves; release/drag never paste a second time.
-                MouseEventKind::Down(MouseButton::Right) => model.request_clipboard_paste(),
+                MouseEventKind::Down(MouseButton::Right) => {
+                    model.clear_mouse_press();
+                    model.request_clipboard_paste();
+                }
                 // Owner item 9: Down is only a POTENTIAL anchor — the click
                 // dispatches on Up, because only Up knows whether the press
                 // was a click or a drag-selection. A previous selection's
@@ -1154,9 +1670,11 @@ pub fn dispatch_input(
                 // disambiguation by drag START). The composer press never
                 // arms `mouse_down`, so the transcript path stays silent.
                 MouseEventKind::Down(MouseButton::Left) => {
+                    model.clear_mouse_press();
                     if model.selection.take().is_some() {
                         model.dirty = true;
                     }
+                    model.selection_owner = Some(model.input_owner());
                     if let Some((
                         rect,
                         crate::app::Hit::ComposerText {
@@ -1179,7 +1697,16 @@ pub fn dispatch_input(
                         model.custom_provider_field_press(attempt, field, character);
                         return;
                     }
+                    // The target is resolved now, while this frame owns
+                    // input. Release may only confirm this same target.
                     model.mouse_down = Some((mouse.column, mouse.row));
+                    model.mouse_press_owner = Some(model.presented_input());
+                    model.mouse_press_epoch = Some(model.painted_epoch.get());
+                    model.mouse_press_dwell_ready = model.pointer_commit_ready(now);
+                    if let Some((rect, hit)) = hit_rect_at(hit_map, mouse.column, mouse.row) {
+                        model.mouse_press_rect = Some(rect);
+                        model.mouse_press_hit = Some(hit);
+                    }
                 }
                 // Movement with the button held: meaningful movement (a
                 // different cell than the anchor) enters selection mode
@@ -1213,6 +1740,7 @@ pub fn dispatch_input(
                                     head,
                                     dragging: true,
                                 });
+                                // Selection ownership was captured at press.
                                 model.dirty = true;
                             }
                             _ => {}
@@ -1253,6 +1781,11 @@ pub fn dispatch_input(
                         return;
                     }
                     let down = model.mouse_down.take();
+                    let press_owner = model.mouse_press_owner.take();
+                    let press_hit = model.mouse_press_hit.take();
+                    let press_rect = model.mouse_press_rect.take();
+                    let press_epoch = model.mouse_press_epoch.take();
+                    let press_dwell_ready = std::mem::take(&mut model.mouse_press_dwell_ready);
                     if let Some(selection) = &mut model.selection
                         && down.is_some()
                     {
@@ -1260,9 +1793,45 @@ pub fn dispatch_input(
                         model.requests.push(crate::app::AppRequest::CopySelection);
                         model.dirty = true;
                     } else if let Some((column, row)) = down
-                        && let Some(action) = hit_at(column, row)
+                        && press_owner.as_ref() == Some(&model.presented_input())
+                        && press_epoch == Some(model.painted_epoch.get())
+                        && let Some(action) = press_hit
+                        && let Some(rect) = press_rect
+                        && hit_rect_at(hit_map, column, row).as_ref()
+                            == Some(&(rect, action.clone()))
                     {
-                        model.handle_hit(action);
+                        if !matches!(
+                            action,
+                            crate::app::Hit::MenuOption { .. }
+                                | crate::app::Hit::PermissionRetry
+                                | crate::app::Hit::PermissionOpenSettings
+                                | crate::app::Hit::PaletteRow(_)
+                                | crate::app::Hit::ThemeOption(_)
+                                | crate::app::Hit::EffortOption(_)
+                                | crate::app::Hit::ModelPickerRow { .. }
+                                | crate::app::Hit::AccountRow(_)
+                                | crate::app::Hit::ProviderModel { .. }
+                                | crate::app::Hit::RetryRun
+                                | crate::app::Hit::ShellClose(_)
+                                | crate::app::Hit::MonitorStop(_)
+                                | crate::app::Hit::MonitorPause(_)
+                                | crate::app::Hit::MonitorTrigger(_)
+                                | crate::app::Hit::FleetKill(_)
+                                | crate::app::Hit::QueueRowSteer(_)
+                                | crate::app::Hit::QueueRowToggle(_)
+                                | crate::app::Hit::TalkChip
+                                | crate::app::Hit::AuraTalkBtn
+                        ) || (press_dwell_ready && model.pointer_commit_ready(now))
+                        {
+                            model.handle_hit(action);
+                        } else {
+                            // A premature click may still hover/select the
+                            // target; it cannot activate that new surface.
+                            model.handle_hover(Some(action));
+                            model.input_refused = true;
+                            model.flash = Some("· New surface: click again to confirm".to_owned());
+                            model.dirty = true;
+                        }
                     }
                 }
                 // Hover (owner ask, TUI3a item 6): motion events flood —
@@ -1282,7 +1851,10 @@ pub fn dispatch_input(
         // ANY focus event also flips the "focus is reported" latch, so the
         // fire-anyway fallback only holds on emulators that never report it.
         Event::FocusGained => model.set_focus(true),
-        Event::FocusLost => model.set_focus(false),
+        Event::FocusLost => {
+            model.clear_mouse_press();
+            model.set_focus(false);
+        }
         _ => {}
     }
 }
@@ -2569,7 +3141,9 @@ impl DemoDriver {
             }
             DemoEvent::ChipEmit { agent, payload } => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut model.chips, &agent) {
-                    chip.note_event_at(now_epoch_ms());
+                    let now = now_epoch_ms();
+                    chip.note_event_at(now);
+                    chip.activity.observe(&payload, now);
                     chip.transcript.apply(&payload);
                     model.dirty = true;
                 }
@@ -2822,7 +3396,9 @@ pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEv
         }
         DemoEvent::ChipEmit { agent, payload } => {
             if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
-                chip.note_event_at(now_epoch_ms());
+                let now = now_epoch_ms();
+                chip.note_event_at(now);
+                chip.activity.observe(&payload, now);
                 chip.transcript.apply(&payload);
             }
         }
@@ -3060,7 +3636,7 @@ impl Player {
 }
 
 fn draw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CellBackend<Stdout>>,
     model: &AppModel,
 ) -> std::io::Result<Vec<(ratatui::layout::Rect, crate::app::Hit)>> {
     let mut hits = Vec::new();
@@ -3069,13 +3645,41 @@ fn draw(
 }
 
 fn present_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CellBackend<Stdout>>,
     model: &mut AppModel,
     hit_map: &mut Vec<(ratatui::layout::Rect, crate::app::Hit)>,
     pointer: Option<(u16, u16)>,
+    presented: &Arc<PresentedFrame>,
 ) -> std::io::Result<()> {
+    model.retire_stale_press();
+    let pointer_before = model
+        .pointer_presentation
+        .borrow()
+        .as_ref()
+        .map(|(owner, _)| owner.clone());
     *hit_map = draw(terminal, model)?;
+    let completed_at = Instant::now();
+    if pointer_before.as_ref() != Some(&model.pointer_input_owner()) {
+        *model.pointer_presentation.borrow_mut() =
+            Some((model.pointer_input_owner(), completed_at));
+    }
+    // Retain transition history across the reader/publication race. A key
+    // read just before this draw completed still belongs to the prior frame.
+    let mut frames = presented
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(stamp) = model.painted_stamp()
+        && frames.back().is_none_or(|(shown, _)| shown != &stamp)
+    {
+        frames.push_back((stamp, completed_at));
+        // More than the 64 queued reports plus the reader and active dispatch.
+        if frames.len() > INPUT_FRAME_HISTORY {
+            frames.pop_front();
+        }
+    }
+    drop(frames);
     model.dirty = false;
+    model.input_refused = false;
     // W5g-7: hover survives a redraw only while the pointer still resolves
     // to it; this applies identically to cadence and semantic-edge frames.
     settle_hover_after_draw(model, hit_map, pointer);
@@ -3106,7 +3710,14 @@ pub fn rendered_selection_text(
     let backend = ratatui::backend::TestBackend::new(size.width, size.height);
     // TestBackend construction is infallible (uninhabited error type).
     let Ok(mut scratch) = Terminal::new(backend);
-    if scratch.draw(|frame| drop(render(model, frame))).is_err() {
+    let prior_presentation = model.painted_input();
+    let prior_epoch = model.painted_epoch.get();
+    let prior_pointer = model.pointer_presentation.borrow().clone();
+    let drawn = scratch.draw(|frame| drop(render(model, frame)));
+    *model.painted_input.borrow_mut() = prior_presentation;
+    model.painted_epoch.set(prior_epoch);
+    *model.pointer_presentation.borrow_mut() = prior_pointer;
+    if drawn.is_err() {
         return String::new();
     }
     crate::select::selection_text(scratch.backend().buffer(), selection)
@@ -3803,7 +4414,7 @@ pub async fn run_live(
     let talk_runtime = crate::stt_runtime::TalkRuntime::spawn(talk_tx, store_dir);
 
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut terminal = Terminal::new(CellBackend::new(stdout()))?;
     let initial_size = terminal.size()?;
     model.handle_terminal_resize(initial_size.width, initial_size.height);
     sync_terminal_bg(model.theme);
@@ -3813,6 +4424,8 @@ pub async fn run_live(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 973-activity-icons: persisted `/icons` choice, env override, NO_COLOR.
+    seed_activity_display(&mut model, &mut settings);
     // 971-tui-collapse: seed the tool-output verbosity from the persisted
     // setting (default `normal`) so a prior ⌥V survives a restart, and
     // mirror it into the store so a later theme save never drops it. The
@@ -3876,28 +4489,15 @@ pub async fn run_live(
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
     let mut seen_verbosity_commits = model.verbosity_commits;
+    let mut seen_activity_commits = model.activity_display_commits;
     let mut seen_tool_rows_commits = model.toolfold.revision();
     let mut active_title = model.window_title();
 
-    // Graphics wordmark query — after raw mode, before the input pump (see the
-    // run_demo note); None on non-graphics terminals falls back to `crate::mark`.
+    // Graphics wordmark detection uses environment hints and terminal geometry;
+    // it never reads stdin. Unknown terminals use the crafted `crate::mark`.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Truecolor capability (see run_demo) — pinned once for render's shimmer.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());
-
-    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(item) => {
-                    if input_tx.blocking_send(item).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
 
     // Entering live mode boots on the ready Welcome (already negotiated by
     // the caller) and LISTS sessions. It attaches only on selection — a
@@ -3936,6 +4536,31 @@ pub async fn run_live(
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
+    let presented = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
+    let input_presentation = Arc::clone(&presented);
+    let initial_presentation = startup_input_presentation(&model);
+    let (input_tx, mut input_rx) = mpsc::channel::<QueuedInput>(64);
+    let mut startup = take_startup_input();
+    std::thread::spawn(move || {
+        loop {
+            match read_input(&mut startup) {
+                Ok((item, received_at, from_startup)) => {
+                    let input = stamped_input(
+                        &input_presentation,
+                        item,
+                        received_at,
+                        from_startup,
+                        initial_presentation.as_ref(),
+                    );
+                    if input_tx.blocking_send(input).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
     let mut update_events_open = true;
     let mut update_in_progress = false;
     // Finding 5 (rev933): the update transaction RESTARTS the daemon, and
@@ -3979,17 +4604,19 @@ pub async fn run_live(
         let mut immediate_presentation = ImmediatePresentation::default();
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => {
-                    match &event {
+                Some(input) => {
+                    let event = &input.event;
+                    let next_pointer = match event {
                         // The pre-resize map describes a frame that no
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
-                        Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
-                            pointer = Some((mouse.column, mouse.row));
+                        Event::Resize(..) => {
+                            hit_map.clear();
+                            None
                         }
-                        _ => {}
-                    }
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => Some((mouse.column, mouse.row)),
+                        _ => None,
+                    };
                     // rev933b finding 3: while the update transaction holds
                     // a dead link, a keystroke would type into a void and a
                     // submit would be silently lost across the restart.
@@ -4005,7 +4632,11 @@ pub async fn run_live(
                         || quit_key
                         || !matches!(event, Event::Key(_) | Event::Paste(_))
                     {
-                        dispatch_input(&mut model, &hit_map, event);
+                        if dispatch_queued_input(&mut model, &hit_map, input)
+                            && let Some(cell) = next_pointer
+                        {
+                            pointer = Some(cell);
+                        }
                     } else {
                         model.flash =
                             Some("· updating — input held until the restart".to_owned());
@@ -4053,6 +4684,7 @@ pub async fn run_live(
                         "talk supervisor stopped unexpectedly after bounded recovery",
                     ));
                 };
+                model.invalidate_queued_input();
                 model.handle_talk(event);
             }
             update_event = updates.events.recv(), if update_events_open => {
@@ -4110,10 +4742,11 @@ pub async fn run_live(
             }
             () = wait_until(deadline) => {}
             _ = frame_tick.tick(), if model.dirty => {
-                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
             }
         }
         let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());
+        model.retire_stale_press();
         // A catch-up tail gap (or any other driver-side continuity failure)
         // returns a Detach in this same pass. Retire its presentation cursor
         // before any later frame from that dead route can accelerate a draw.
@@ -4122,8 +4755,8 @@ pub async fn run_live(
         // perceived latency edges. They move the pending cadence draw here;
         // all continuing deltas and animation still ride the guarded 33 ms
         // tick, and a clean model still draws nothing.
-        if immediate_presentation.required() && model.dirty {
-            present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+        if owner_needs_presentation(&model) || (model.dirty && immediate_presentation.required()) {
+            present_frame(&mut terminal, &mut model, &mut hit_map, pointer, &presented)?;
         }
         pending.extend(pass.commands);
         // Exhaustive over the CLOSED shell vocabulary — adding a variant
@@ -4171,6 +4804,7 @@ pub async fn run_live(
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);
         sync_model_persistence(&model, &mut seen_model_commits, &mut settings);
         sync_verbosity_persistence(&model, &mut seen_verbosity_commits, &mut settings);
+        sync_activity_icons_persistence(&mut model, &mut seen_activity_commits, &mut settings);
         sync_tool_rows_persistence(&model, &mut seen_tool_rows_commits, &mut settings);
         // 971-tui-collapse: see the demo loop.
         model.note_tool_timings();
@@ -4203,6 +4837,7 @@ pub async fn run_live(
         pending.extend(driver.sync_resident_binding(&model));
         // W-INP: watch and publish the active per-surface composer through
         // the driver's shared revision fence. Nothing is journaled.
+        driver.apply_pending_input(&mut model);
         pending.extend(driver.sync_input_mirror(&model));
         // The status half (status_segment_v1): the bar's bottom-left strip
         // mirrors under the same dedup discipline, through the one
@@ -4222,3 +4857,19 @@ pub async fn run_live(
 #[cfg(test)]
 #[path = "runtime_presentation_tests.rs"]
 mod runtime_presentation_tests;
+
+#[cfg(test)]
+#[path = "input_typeahead_tests.rs"]
+pub(crate) mod input_typeahead_tests;
+
+#[cfg(test)]
+#[path = "runtime_pointer_tests.rs"]
+mod runtime_pointer_tests;
+
+#[cfg(test)]
+#[path = "input_split_dwell_tests.rs"]
+mod input_split_dwell_tests;
+
+#[cfg(test)]
+#[path = "terminal_input_reply_tests.rs"]
+mod terminal_input_reply_tests;
