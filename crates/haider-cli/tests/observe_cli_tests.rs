@@ -1060,3 +1060,66 @@ fn selected_task_outcome_is_forwarded_to_cli_json_and_not_reassigned_by_roster()
     assert!(view.json().get("task_outcome").is_none());
     assert!(view.json().get("task_outcome_version").is_none());
 }
+
+/// Recovered own-origin truth is independent of a missing or stale metadata
+/// projection. CLI readers must get the same revision as attach, not zero or
+/// an inherited parent's revision.
+#[test]
+fn sessions_json_preserves_recovered_origin_without_metadata_projection() {
+    let origin = serde_json::json!({
+        "subject_session_id": "session-origin",
+        "open_id": "own-open", "revision": 4,
+        "path": {"kind": "home_relative", "display": "~/fork"},
+        "recorded_at_ms": 40, "selected_seq": 7,
+    });
+    for foreign_projection in [false, true] {
+        let mut observed = digest("session-origin", ObserveRunStateWire::Idle, None);
+        if foreign_projection {
+            let mut foreign = origin.clone();
+            foreign["subject_session_id"] = "session-parent".into();
+            foreign["revision"] = 900.into();
+            observed
+                .metadata
+                .as_mut()
+                .expect("typed fixture")
+                .launch_origin = Some(serde_json::from_value(foreign).expect("foreign projection"));
+        } else {
+            observed.metadata = None;
+        }
+        let roster: SessionSummary = serde_json::from_value(serde_json::json!({
+            "session_id": "session-origin", "head_seq": 12,
+            "worker_generation": 7, "launch_origin": origin,
+            "metadata": observed.metadata,
+        }))
+        .expect("recovered roster");
+        let mut view = summary_view(observed);
+        merge_roster_summary(&mut view, &roster);
+        let json = view.json();
+        assert_eq!(
+            json["launch_origin"], origin,
+            "foreign={foreign_projection}"
+        );
+        assert!(json.get("owner_agent_id").is_none());
+    }
+}
+
+/// Root/legacy absence must stay absent, while delegated and nested owners
+/// are published even without agent metrics or a typed metadata projection.
+#[test]
+fn sessions_json_preserves_owning_agent_scope_and_legacy_absence() {
+    for owner in [None, Some("delegated-owner"), Some("nested-owner")] {
+        let roster: SessionSummary = serde_json::from_value(serde_json::json!({
+            "session_id": "session-scope", "head_seq": 12,
+            "worker_generation": 7, "owner_agent_id": owner,
+        }))
+        .expect("owning roster");
+        let mut view = summary_view(digest("session-scope", ObserveRunStateWire::Idle, None));
+        merge_roster_summary(&mut view, &roster);
+        let json = view.json();
+        match owner {
+            Some(owner) => assert_eq!(json["owner_agent_id"], owner),
+            None => assert!(json.get("owner_agent_id").is_none()),
+        }
+        assert!(json.get("launch_origin").is_none());
+    }
+}
