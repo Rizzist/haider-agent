@@ -180,6 +180,52 @@ async fn supervise_link(
     }
 }
 
+/// Child journals can advance without a parent envelope (for example a
+/// monitor starts a later child run). Subscribe once per socket so those
+/// heads reach the same single-flight fleet reconciliation as parent facts.
+async fn watch_roster(client: &Arc<RpcClient>, replies: &mpsc::Sender<LiveReply>) {
+    if !client
+        .welcome()
+        .features
+        .contains(haider_rpc::FEATURE_SESSION_LIST_WATCH_V1)
+    {
+        return;
+    }
+    let pending = match client.begin_request(RequestBody::SessionListWatch {}).await {
+        Ok(pending) => pending,
+        Err(ClientError::Disconnected(_)) => return,
+        Err(error) => {
+            let _ = replies
+                .send(LiveReply::Failed {
+                    command_id: None,
+                    code: "roster_watch_failed".into(),
+                    message: error.to_string(),
+                    retryable: false,
+                    presentation: None,
+                })
+                .await;
+            return;
+        }
+    };
+    let replies = replies.clone();
+    tokio::spawn(async move {
+        match pending.wait().await {
+            Ok(ResponseBody::SessionListWatch { .. }) | Err(ClientError::Disconnected(_)) => {}
+            other => {
+                let _ = replies
+                    .send(LiveReply::Failed {
+                        command_id: None,
+                        code: "roster_watch_failed".into(),
+                        message: format!("session roster watch failed: {other:?}"),
+                        retryable: false,
+                        presentation: None,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
 async fn run_link(
     mut client: Arc<RpcClient>,
     profile: ResolvedProfile,
@@ -212,6 +258,7 @@ async fn run_link(
     // envelope — the one with no later sequence to expose its hole — was
     // pure silence (review W3c3 P1-2).
     let mut lost_baseline = client.lost_events();
+    watch_roster(&client, &replies).await;
     loop {
         let lost = client.lost_events();
         if lost > lost_baseline {
@@ -361,6 +408,7 @@ async fn run_link(
                     if replies.send(handshake).await.is_err() {
                         return;
                     }
+                    watch_roster(&client, &replies).await;
                     if replies.send(LiveReply::Reconnected).await.is_err() {
                         return;
                     }
@@ -509,10 +557,15 @@ async fn issue(
         .copied()
         .find(|feature| !client.welcome().features.contains(*feature));
     if let Some(feature) = missing_feature {
-        let message = format!("connected daemon does not advertise {feature}");
+        let message = if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+            haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned()
+        } else {
+            format!("connected daemon does not advertise {feature}")
+        };
         if matches!(
             command,
-            LiveCommand::CheckpointList { .. }
+            LiveCommand::Cancel { .. } | LiveCommand::AgentCancel { .. }
+                | LiveCommand::CheckpointList { .. }
                 | LiveCommand::CheckpointUndo { .. }
                 | LiveCommand::CheckpointRedo { .. }
                 | LiveCommand::CheckpointRollbackTurn { .. }
@@ -529,7 +582,12 @@ async fn issue(
             let _ = replies
                 .send(LiveReply::Failed {
                     command_id: context.command_id.clone(),
-                    code: "feature_missing".into(),
+                    code: if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+                        "protocol_mismatch"
+                    } else {
+                        "feature_missing"
+                    }
+                    .into(),
                     message,
                     retryable: false,
                     presentation: None,
@@ -647,8 +705,15 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
         }
         LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
-        LiveCommand::AgentCancel { .. } => &[haider_rpc::FEATURE_AGENT_CANCEL_V1],
-        LiveCommand::Retract { .. } => &[haider_rpc::FEATURE_TURN_RETRACT_V1],
+        LiveCommand::AgentCancel { .. } => &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_AGENT_CANCEL_V1,
+        ],
+        LiveCommand::Cancel { .. } => &[haider_rpc::FEATURE_HELPER_STOP_V1],
+        LiveCommand::Retract { .. } => &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_TURN_RETRACT_V1,
+        ],
         LiveCommand::CheckpointList { .. }
         | LiveCommand::CheckpointUndo { .. }
         | LiveCommand::CheckpointRedo { .. }
@@ -2946,6 +3011,9 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             session: session_id,
             op,
         }],
+        WireFrame::SessionRosterDelta { summaries } => vec![LiveReply::RosterUpdated {
+            sessions: summaries,
+        }],
         WireFrame::PeerMessageReceived { message } => vec![LiveReply::PeerReceived { message }],
         WireFrame::PeerDeliveryChanged { receipt } => {
             vec![LiveReply::PeerDeliveryChanged { receipt }]
@@ -3008,7 +3076,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Welcome(_)
         | WireFrame::Request { .. }
         | WireFrame::Response { .. }
-        | WireFrame::SessionRosterDelta { .. }
         | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }

@@ -89,6 +89,14 @@
 #[path = "../session_hub_private_tests.rs"]
 mod session_hub_private_tests;
 
+#[cfg(all(test, unix))]
+#[path = "../stop_successor_tests.rs"]
+mod stop_successor_tests;
+
+#[cfg(all(test, unix))]
+#[path = "../stop_descendant_tests.rs"]
+mod stop_descendant_tests;
+
 #[cfg(test)]
 #[path = "../session_hub_ssh_tests.rs"]
 mod session_hub_ssh_tests;
@@ -1064,6 +1072,8 @@ struct HubInner {
     /// resume and a concurrent registration from both executing the same
     /// already-Installing item before either reaches its post-effect CAS.
     typed_install_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes public stop claims and execution across all connections.
+    stop_operations: tokio::sync::Mutex<()>,
     /// Orders native workflow selection against every run admission. RPC pin
     /// and switch hold this through their idle check and commit; turn, retry,
     /// shell, and manual-compaction admission hold it until the nonterminal
@@ -1819,9 +1829,10 @@ struct RegisteredWorker {
 ///
 /// This type IS the append-exclusivity seal ([`SessionHub::append`] states
 /// the law): a worker can reach committed reads, append-through-actor, CAS
-/// artifacts, and the idle settle — nothing else. SQLite and cross-session
-/// access are structurally unavailable, every append is identity-checked
-/// against the lease's session and generation before it reaches the actor,
+/// artifacts, owned drain cancellation, and the idle settle — nothing else.
+/// SQLite and cross-session access are structurally unavailable. Every append
+/// is identity-checked against the lease's session and generation before it
+/// reaches the actor,
 /// and the actor rejects the lease token itself once a successor supersedes
 /// it (actor.rs charter). Cloning shares the one lease; it does not mint
 /// authority.
@@ -2055,6 +2066,7 @@ enum ActorCommand {
         completed: oneshot::Sender<Result<ShellExecAcceptOutcome, HaiderError>>,
     },
     CancelTurn {
+        worker_lease: Option<WorkerLeaseId>,
         command: TurnCancelCommand,
         completed: oneshot::Sender<Result<TurnCancelOutcome, HaiderError>>,
     },
@@ -2615,6 +2627,7 @@ impl SessionHub {
             actor_tasks: Mutex::new(Vec::new()),
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
+            stop_operations: tokio::sync::Mutex::new(()),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_selection_budget_pauses: tokio::sync::Mutex::new(HashMap::new()),
@@ -4522,10 +4535,11 @@ impl SessionHub {
                 )
             })?;
         let (completed, _response) = oneshot::channel();
-        match actor
-            .commands
-            .try_send(ActorCommand::CancelTurn { command, completed })
-        {
+        match actor.commands.try_send(ActorCommand::CancelTurn {
+            worker_lease: None,
+            command,
+            completed,
+        }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(command)) => {
                 // The parent may not wait beyond its exhausted deadline. Keep
@@ -4617,6 +4631,16 @@ impl SessionHub {
         self.inner
             .store
             .delegations_for_parent_run(session_id, run_id)
+            .await
+    }
+
+    pub(crate) async fn delegations_for_parent_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<haider_core::DelegationRecord>, HaiderError> {
+        self.inner
+            .store
+            .delegations_for_parent_session(session_id)
             .await
     }
 
@@ -6270,7 +6294,11 @@ impl SessionHub {
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::CancelTurn { command, completed })
+            .send(ActorCommand::CancelTurn {
+                worker_lease: None,
+                command,
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
@@ -6718,6 +6746,10 @@ impl SessionHub {
             Ok(()) => {
                 // Retire the durable projection before reconciliation can pass
                 // the monitor fence again. A failed delete must retain it.
+                self.inner
+                    .monitors
+                    .stop_fences()
+                    .forget_deleted_session(session_id);
                 self.inner
                     .monitors
                     .completion_cache()
@@ -9160,6 +9192,55 @@ impl HubStoreHandle {
             .await
             .map_err(|_| hub_closed_store_error())?;
         response.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    /// Cancel already owned work even after public admission closes. The actor
+    /// still checks this worker's lease, and the ordinary cancellation
+    /// transaction reserves every foreground result before publishing intent.
+    pub(crate) async fn begin_owned_cancellation(
+        &self,
+        run_id: &RunId,
+        device_id: &DeviceId,
+    ) -> Result<CancelledTurn, HaiderError> {
+        let command_id = format!(
+            "worker-cancel-{}-{}-{}",
+            self.session_id, self.worker_generation, run_id
+        );
+        let request_json = serde_json::json!({
+            "session_id": self.session_id,
+            "run_id": run_id,
+            "reason": "worker_cancellation"
+        })
+        .to_string();
+        let command = TurnCancelCommand {
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            cancelling_event_id: EventId::new(format!("{command_id}-cancelling")),
+            command_id,
+            session_id: self.session_id.clone(),
+            worker_generation: self.worker_generation,
+            run_id: run_id.clone(),
+            device_id: device_id.clone(),
+        };
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::CancelTurn {
+                worker_lease: Some(self.lease_id.clone()),
+                command,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        match result.await.map_err(|_| hub_closed_store_error())?? {
+            TurnCancelOutcome::Committed { cancelled, .. }
+            | TurnCancelOutcome::IdempotentReplay { cancelled } => Ok(cancelled),
+        }
     }
 
     pub(crate) async fn consume_queued_turn(

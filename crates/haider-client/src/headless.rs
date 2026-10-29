@@ -946,6 +946,12 @@ pub struct HeadlessRunStopResult {
     pub run_id: RunId,
     pub status: CancelStatus,
     pub terminal_seq: Option<u64>,
+    /// Non-default stop scope echoed by the daemon (`main`/`subagents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<haider_rpc::RunStopScopeWire>,
+    /// What happened to the run's subagents; absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<haider_rpc::SubagentStopSummaryWire>,
 }
 
 /// Failure before a correlated final result could be produced.
@@ -2486,18 +2492,41 @@ pub async fn headless_run_status(
     }
 }
 
-/// Idempotently requests durable cancellation by run id.
+/// Every stop requires the daemon's helper-stop semantic capability. Scoped
+/// requests additionally require scope decoding; refusal precedes mutation.
+#[must_use]
+pub fn stop_scope_ensure_options(
+    mut ensure: EnsureOptions,
+    scope: haider_rpc::RunStopScopeWire,
+) -> EnsureOptions {
+    ensure
+        .required_features
+        .insert(haider_rpc::FEATURE_HELPER_STOP_V1.to_owned());
+    if !scope.is_all() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned());
+    }
+    ensure
+}
+
+/// Idempotently requests durable cancellation by run id. `scope` `All`
+/// (`haider run --stop`) stops the run and every subagent in its tree;
+/// `Main` stops only the run; `Subagents` stops only its subagents.
 pub async fn stop_headless_run(
     profile: &ResolvedProfile,
     ensure: EnsureOptions,
     run_id: RunId,
+    scope: haider_rpc::RunStopScopeWire,
 ) -> Result<HeadlessRunStopResult, HeadlessRunError> {
+    let ensure = stop_scope_ensure_options(ensure, scope);
     match lifecycle_request(
         profile,
         ensure,
         RequestBody::HeadlessRunStop {
             command_id: CommandId::new(command_id("headless-stop")),
             run_id,
+            scope,
         },
         "headless.run.stop",
     )
@@ -2508,11 +2537,15 @@ pub async fn stop_headless_run(
             run_id,
             status,
             terminal_seq,
+            scope,
+            subagents,
         } => Ok(HeadlessRunStopResult {
             session_id,
             run_id,
             status,
             terminal_seq,
+            scope,
+            subagents,
         }),
         ResponseBody::Error {
             code,
