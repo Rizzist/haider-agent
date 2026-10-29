@@ -73,10 +73,7 @@ pub(crate) async fn load(
         }
         for envelope in page {
             journal.cursor = envelope.seq;
-            if envelope.payload.get("type").and_then(|v| v.as_str())
-                == Some("monitor_report_pending")
-                && let Some(value) = envelope.payload.pointer("/pending/report")
-                && let Ok(report) = serde_json::from_value::<MonitorReport>(value.clone())
+            if let Some(report) = crate::monitor::pending_monitor_report(&envelope.payload)
                 && report.session_id == *session
             {
                 journal
@@ -207,20 +204,53 @@ pub(crate) async fn wake_monitor(
     report: MonitorReport,
 ) -> Result<MonitorDeliveryReceipt, MonitorError> {
     let service = hub.inner_monitor();
+    let stop_epoch = service
+        .stop_fences()
+        .epoch(&report.session_id, &report.monitor_id);
     let _guard = service.completion_lock().await;
     if service.completion_retired(&report.session_id) {
         return Ok(retained_receipt());
     }
     let journal = load(hub, &report.session_id).await.map_err(store_error)?;
     let id = format!("monitor:{}", report.report_id);
+    // An explicit stop owns captured watches. Their reports must not wake
+    // the ended work (Astra 13-final B1): dismiss them without retrying later.
+    // Independent watches in the same session remain admissible.
+    let stopping = service
+        .stop_fences()
+        .report_fenced(&report.session_id, &report.monitor_id);
     let Some(obligation) = journal.projection.pending.get(&id) else {
         // Direct transport seam callers predate the outbox. Settled reports
         // must never reach this fallback; their durable source proves ownership.
         if journal.projection.is_settled(&id) {
             return Ok(retained_receipt());
         }
-        return hub.admit_monitor_report(report, None).await;
+        if stopping {
+            hub.dismiss_unobserved_monitor_report(&report).await?;
+            return Ok(retained_receipt());
+        }
+        #[cfg(test)]
+        astra22_boundary_hook::after_attempt(&report.session_id).await;
+        return admit_current_monitor_report(hub, report, None, stop_epoch).await;
     };
+    if stopping {
+        if matches!(
+            obligation.status,
+            CompletionStatus::Pending | CompletionStatus::Admitting
+        ) {
+            append(
+                hub,
+                obligation,
+                CompletionEvent::CompletionDismissed {
+                    obligation_id: id,
+                    attempt: obligation.attempt,
+                },
+            )
+            .await
+            .map_err(store_error)?;
+        }
+        return Ok(retained_receipt());
+    }
     if !matches!(
         obligation.status,
         CompletionStatus::Pending | CompletionStatus::Admitting
@@ -258,7 +288,71 @@ pub(crate) async fn wake_monitor(
         .map_err(store_error)?;
         attempt
     };
-    hub.admit_monitor_report(report, Some(attempt)).await
+    #[cfg(test)]
+    astra22_boundary_hook::after_attempt(&report.session_id).await;
+    admit_current_monitor_report(hub, report, Some(attempt), stop_epoch).await
+}
+
+async fn admit_current_monitor_report(
+    hub: &SessionHub,
+    report: MonitorReport,
+    attempt: Option<u32>,
+    stop_epoch: u64,
+) -> Result<MonitorDeliveryReceipt, MonitorError> {
+    let service = hub.inner_monitor();
+    let _admission = service.admission_lock().await;
+    // The persisted attempt snapshot can be obsolete even when a stop's
+    // temporary fence has already dropped. Removal settles the obligation;
+    // re-read that durable truth under the same mutex as the actual admission.
+    let journal = load(hub, &report.session_id).await.map_err(store_error)?;
+    let id = format!("monitor:{}", report.report_id);
+    if service
+        .stop_fences()
+        .epoch(&report.session_id, &report.monitor_id)
+        != stop_epoch
+    {
+        if !journal.projection.is_settled(&id) {
+            if let Some(obligation) = journal.projection.pending.get(&id) {
+                if matches!(
+                    obligation.status,
+                    CompletionStatus::Pending | CompletionStatus::Admitting
+                ) {
+                    append(
+                        hub,
+                        obligation,
+                        CompletionEvent::CompletionDismissed {
+                            obligation_id: id,
+                            attempt: obligation.attempt,
+                        },
+                    )
+                    .await
+                    .map_err(store_error)?;
+                }
+            } else {
+                hub.dismiss_unobserved_monitor_report(&report).await?;
+            }
+        }
+        return Ok(retained_receipt());
+    }
+    let valid = attempt.is_none_or(|attempt| {
+        journal
+            .projection
+            .pending
+            .get(&id)
+            .is_some_and(|obligation| {
+                obligation.status == CompletionStatus::Admitting && obligation.attempt == attempt
+            })
+    });
+    if service.completion_retired(&report.session_id)
+        || service
+            .stop_fences()
+            .report_fenced(&report.session_id, &report.monitor_id)
+        || journal.projection.is_settled(&id)
+        || !valid
+    {
+        return Ok(retained_receipt());
+    }
+    hub.admit_monitor_report(report, attempt).await
 }
 
 fn retained_receipt() -> MonitorDeliveryReceipt {
@@ -604,3 +698,7 @@ pub(crate) fn needs_reconcile(envelope: &RawEnvelope) -> bool {
         || (kind == "run_state"
             && matches!(envelope.payload.decode_event(), Ok(EventPayload::RunState(state)) if state.is_terminal()))
 }
+
+#[cfg(test)]
+#[path = "completion_boundary_hook_tests.rs"]
+pub(crate) mod astra22_boundary_hook;

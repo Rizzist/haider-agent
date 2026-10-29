@@ -70,6 +70,7 @@ impl DeferredDispatcher {
                             workspace_revision: None,
                         },
                         chip: ChipState::Done,
+                        data: None,
                         truncated: false,
                         truncation: None,
                     },
@@ -84,6 +85,7 @@ impl DeferredDispatcher {
                             workspace_revision: None,
                         },
                         chip: ChipState::Done,
+                        data: None,
                         truncated: false,
                         truncation: None,
                     },
@@ -308,6 +310,7 @@ async fn errored_child_is_a_red_report_and_parent_tool_result() {
                 workspace_revision: None,
             },
             chip: ChipState::Error,
+            data: None,
             truncated: false,
             truncation: None,
         },
@@ -347,6 +350,79 @@ async fn errored_child_is_a_red_report_and_parent_tool_result() {
 }
 
 #[tokio::test]
+async fn still_running_data_survives_unparseable_summary() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "call-a".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"a","prompt":"continue"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut dispatcher = DeferredDispatcher::two();
+    dispatcher.completions.insert(
+        "call-a".into(),
+        DeferredToolResult {
+            report: ChildReport {
+                agent: AgentId::new("agent-a"),
+                summary: "human prose, not JSON".into(),
+                verified: ReportVerification::Unverified,
+                workspace_revision: None,
+            },
+            chip: ChipState::Waiting,
+            data: Some(haider_protocol::tool::ToolResultData::ChildStillRunning {
+                agent: AgentId::new("agent-a"),
+                parent_session_id: SessionId::new("running-parent"),
+                child_session_id: SessionId::new("running-child"),
+                child_run_id: RunId::new("running-child-run"),
+                progress: None,
+                latest_progress_at_ms: 10,
+                wait_limit_ms: 20,
+                collect: "haider agent wait running-parent agent-a --json".into(),
+            }),
+            truncated: false,
+            truncation: None,
+        },
+    );
+    let dispatcher = Arc::new(dispatcher);
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        HarnessConfig::for_session(
+            SessionId::new("running-parent"),
+            DeviceId::new("test-device"),
+            1,
+            1,
+        ),
+        provider,
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("delegate"))
+        .await
+        .expect("turn accepted");
+    tokio::task::yield_now().await;
+    dispatcher.release("call-a");
+    assert_eq!(
+        turn.wait().await.expect("turn outcome").state,
+        RunState::Done
+    );
+    let events = store.events(&SessionId::new("running-parent")).await;
+    assert!(events.iter().any(|event| matches!(typed(event),
+        EventPayload::ToolResult { result, .. }
+            if matches!(result.data, Some(haider_protocol::tool::ToolResultData::ChildStillRunning { .. }))
+    )));
+    drop(handle);
+    actor_task.await.expect("actor exits");
+}
+
+#[tokio::test]
 async fn toolshape_deferred_report_carries_original_digest_to_durable_result_and_model() {
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitToolCall {
@@ -375,6 +451,7 @@ async fn toolshape_deferred_report_carries_original_digest_to_durable_result_and
                 workspace_revision: None,
             },
             chip: ChipState::Error,
+            data: None,
             truncated: true,
             truncation: Some(marker.clone()),
         },

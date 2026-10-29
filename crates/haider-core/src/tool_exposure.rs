@@ -110,11 +110,18 @@ fn default_delegation_definition(tool: &ToolDefinition) -> Option<ToolDefinition
         return None;
     }
     let mut definition = tool.clone();
-    definition.description = "Delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report. Inherits the current model/provider. Call list_tools(filter=\"spawn_subagent\") for optional model/provider, workflow, specialist, and request-budget controls.".into();
-    definition.input_schema["properties"] = serde_json::json!({
+    definition.description = "Delegate a child under AgentSpawn policy; waits for its report by default. Set background=true for an immediate handle or wait_ms for a bounded observation that leaves the child running. Use haider agent wait/list/message/cancel on the handle. Call list_tools(filter=\"spawn_subagent\") to expose optional model/provider and workflow controls.".into();
+    let mut initial_properties = serde_json::json!({
         "task": task,
         "prompt": prompt,
     });
+    if let Some(background) = properties.get("background") {
+        initial_properties["background"] = background.clone();
+    }
+    if let Some(wait_ms) = properties.get("wait_ms") {
+        initial_properties["wait_ms"] = wait_ms.clone();
+    }
+    definition.input_schema["properties"] = initial_properties;
     Some(definition)
 }
 

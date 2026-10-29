@@ -208,7 +208,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  [--json|--output print|json|jsonl] [--timeout <dur>] \
                  [--max-tokens <n>] [--max-output-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
                  [--request-tranche <n>] [--max-requests <n>] [--resume <run-id>] \
-                 [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
+                 [--start] | run --status <run-id> | run --stop|--stop-main|--stop-subagents <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--read-only] [--allow-writes] [--allow-exec] [--auto-allow] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], daemon stop [--json] [--timeout <duration>], \
