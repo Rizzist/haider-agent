@@ -126,6 +126,18 @@ impl CompletionProjection {
     }
 
     pub fn apply(&mut self, envelope: &RawEnvelope) {
+        // Unsupported monitor replacements carry an old-readable removal
+        // fence. Only new readers project the additive replacement fact.
+        let replacement;
+        let envelope = if let Some(fact) = envelope.payload.get("monitor_v2") {
+            replacement = RawEnvelope {
+                payload: fact.clone().into(),
+                ..envelope.clone()
+            };
+            &replacement
+        } else {
+            envelope
+        };
         let value = &envelope.payload;
         // Copied history is never authority to wake an independent fork.
         if value.get("type").and_then(|v| v.as_str()) == Some("session_forked") {

@@ -511,8 +511,8 @@ force selector.
 | `turn.submit`, `turn.submit_from_cli`, `turn.submit_with_hook_trust` | `TurnSubmit` or `TurnSubmitOnBranch` | durable receipt |
 | `headless.run.start` | `HeadlessRunStart` | durable receipt with a run-scoped execution pin |
 | `headless.run.status` | `HeadlessRunStatus` | journal-derived lifecycle snapshot by run id |
-| `headless.run.stop` | `HeadlessRunStop` | idempotent durable cancellation by run id |
-| `turn.cancel` | `TurnCancel` | durable receipt |
+| `headless.run.stop` | `HeadlessRunStop` | idempotent durable cancellation by run id; optional `scope` `all` (default: run plus its whole subagent tree), `main` (run only) or `subagents` (tree only) |
+| `turn.cancel` | `TurnCancel` | durable receipt; stops the main thread only — its subagents keep running |
 | `queue.remove` | `QueueRemove` | revision-fenced durable mutation |
 | `queue.promote_steer` | `QueuePromoteSteer` | revision-fenced durable mutation followed by Steer delivery |
 | `run.retry` | `RunRetry` | durable receipt |
@@ -527,6 +527,8 @@ force selector.
 | `session.select_fast` | `SessionSelectFast` | durable receipt |
 | `session.diagnostic` | `SessionDiagnostic` | durable receipt |
 | `agent.message` | `AgentMessage` | durable receipt |
+| `agent.cancel` | `AgentCancel` | durable receipt; stops the named subagent only (original and later runs, its own monitors) |
+| `agent.cancel_all` | `AgentCancelAll` | durable per-run receipts; stops every subagent in the session's tree and removes their monitors |
 | `shell.exec` | `ShellExec` | durable acceptance; terminal bytes/status are item events |
 | `tools.inventory` | `ToolsInventory` | snapshot |
 | `monitor.list` | `MonitorList` | typed snapshot receipt |
@@ -2992,6 +2994,62 @@ daemon; disconnect does not cancel the run.
 so terminal runs remain addressable after the starting process exits. Stop is
 idempotent and distinguishes accepted cancellation from already-terminal.
 
+Subagent stop semantics (owner decision 2026-09-25):
+
+- `turn.cancel` (the TUI's Esc) and `headless.run.stop` with `scope: "main"`
+  (`haider run --stop-main`) stop only the main thread. Subagents keep
+  running. A foreground subagent the stopped turn was waiting on continues in
+  the background; when it finishes its result is delivered to the session
+  (steered into an active run, otherwise journalled as a prompt-visible
+  `detached_child_result_v1` note that never starts provider work), with the
+  ordinary `child_result` item so `agent wait` resolves. The stop journals a
+  `subagents_still_running_v1` marker ("main thread stopped — N subagents
+  still running") whenever subagents live on. That marker's agent list is
+  bounded for display; each owed result is also a durable
+  `detached_delivery_v1` obligation that startup recovery honours for every
+  owed child. A blocking spawn whose `wait_ms` observation ended is owed its
+  child's result the same way, so its returned `haider agent wait` command
+  collects the result after both parent and child finished.
+- `headless.run.stop` with the default scope `all` (`haider run --stop`)
+  stops the run and every subagent in its tree, however deep. The tree is
+  walked by session, so children started by a subagent's later runs (a
+  messaged `run-child-message-*` run or a monitor-woken subturn) are reached;
+  every live run of each descendant session is cancelled, their monitors are
+  removed, and the walk repeats until a pass finds nothing live. `scope:
+  "subagents"` (`--stop-subagents`) does the same without stopping the run.
+  The response's `subagents` object reports `cancelled_runs`, `sessions`,
+  `monitors_removed` and `still_running`.
+- `agent.cancel` stops the named subagent only: its original run, any later
+  live run and its own monitors. Its children keep running.
+- Every stop fences the stopped subagents' monitor registration and wakes
+  until their runs settled and a final monitor drain ran, so a monitor
+  registered during the stop cannot restart stopped work. `agent.cancel` and
+  `agent.cancel_all` validate `worker_generation` and the command identity
+  before any removal or cancel (a stale or conflicting request changes
+  nothing); committed commands replay their responses.
+  `agent.cancel_all` (`haider agent cancel <session> --all`) is the explicit
+  whole-tree stop for a session. It deliberately leaves the session's own
+  (main) runs alone; a main run that is still going may spawn new subagents
+  afterwards. Use `headless.run.stop` (default scope) to stop a run together
+  with its subagents.
+- A stop converges: every subagent run it cancels reaches a terminal state,
+  including a child that was accepted but never launched. A spawn whose parent
+  run is already cancelling is never launched; its child is finalized as
+  cancelled. `subagents.cancelled_runs` counts runs confirmed `cancelled`;
+  `still_running` counts subagent runs still non-terminal when the response
+  was built.
+- A non-default `scope` requires the `run_stop_scope_v1` feature. The CLI
+  refuses `--stop-main`/`--stop-subagents` against a daemon without it (an
+  older daemon would ignore the field and stop everything).
+- Daemon lifetime: an auto-spawned daemon with a finite idle TTL never retires
+  while work is live. Any non-terminal run — a main run, a detached subagent —
+  or an owed detached-result delivery extends the linger; the daemon exits
+  only after everything is terminal and a full TTL has elapsed with no client.
+- An explicit graceful `haider daemon stop` is still a user stop of
+  everything: it cancels live runs, including subagents. A detached result
+  that was owed is delivered as `cancelled` when the daemon next starts, so a
+  foreground `agent wait` still resolves.
+
 Token and cost accounting is last-snapshot-wins per physical request ordinal.
 All request kinds, including compaction/cache-lifecycle traffic, participate.
 Logical input already includes cache reads; cache read/write counters are
@@ -3871,8 +3929,10 @@ confirmation nodes are rejected rather than dropping those gates. `workflow list
 List reads `session.fleet`; message/cancel retain their existing Control
 attachment, direct-child ownership and receipt rules. Wait uses bounded
 `session.read` pages and the sole `RawEnvelope.seq` cursor. A successful
-initial wait requires both the exact child's terminal and the parent's
-completed `ChildResult`; fleet state alone is insufficient. Negotiated
+initial foreground wait for an operator-authored child requires both the exact
+child's terminal and the parent's completed `ChildResult`. Background and follow-up
+waits collect the report from the child journal without requiring a parent
+`ChildResult`; fleet state alone is insufficient. Negotiated
 connections continue servicing keepalive during observation. Command timeout
 or disconnect does not transfer daemon work ownership to the client.
 

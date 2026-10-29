@@ -92,9 +92,9 @@ fn default_spawn_preserves_required_contract_and_full_discovery() {
             .as_object()
             .expect("required properties")
             .len(),
-        2
+        4
     );
-    for name in ["task", "prompt"] {
+    for name in ["task", "prompt", "background", "wait_ms"] {
         assert_eq!(
             default.input_schema["properties"][name],
             full.input_schema["properties"][name]
@@ -104,12 +104,11 @@ fn default_spawn_preserves_required_contract_and_full_discovery() {
         assert_eq!(default.input_schema[key], full.input_schema[key]);
     }
     for guidance in [
-        "depth-capped",
         "AgentSpawn policy",
-        "waits for child report",
-        "Inherits the current model/provider",
+        "waits for its report by default",
+        "background=true",
         "list_tools(filter=\"spawn_subagent\")",
-        "workflow, specialist, and request-budget controls",
+        "workflow controls",
     ] {
         assert!(default.description.contains(guidance));
     }

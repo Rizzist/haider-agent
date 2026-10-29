@@ -15,9 +15,9 @@
 //! record and the template remains a derived artifact.
 
 use crate::graph::{
-    GRAPH_MAX_ATTEMPTS, GRAPH_MAX_EVIDENCE_PER_ATTEMPT, GRAPH_TEMPLATE_VERSION, GraphExecutorShape,
-    GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec, graph_template,
-    validate_graph_template,
+    GRAPH_DEFAULT_MAX_ATTEMPTS, GRAPH_MAX_EVIDENCE_PER_ATTEMPT, GRAPH_TEMPLATE_VERSION,
+    GraphExecutorShape, GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec,
+    graph_template, validate_graph_template,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -30,10 +30,13 @@ pub const LOOM_SOURCE_MAX_BYTES: usize = 16 * 1024;
 pub const LOOM_AUTHOR_TEXT_MAX_BYTES: usize = 64 * 1024;
 /// A node's quoted task line is display material; keep it terse.
 pub const LOOM_TASK_MAX_BYTES: usize = 200;
-/// Non-human nodes retry within the node this many times before settling red.
-pub const LOOM_WORK_MAX_ATTEMPTS: u32 = 4;
-/// Fan-out gates get a tighter in-node retry budget.
-pub const LOOM_FANOUT_MAX_ATTEMPTS: u32 = 3;
+/// Attempt bound of compiled non-human work nodes. Owner rule (2026-09-23):
+/// no default cap stops a productive repair loop, so this is the effectively
+/// unbounded graph default; the repeated-red-fingerprint `NoProgress` guard
+/// still stops a genuinely stuck node.
+pub const LOOM_WORK_MAX_ATTEMPTS: u32 = GRAPH_DEFAULT_MAX_ATTEMPTS;
+/// Attempt bound of compiled fan-out gates (same unbounded default).
+pub const LOOM_FANOUT_MAX_ATTEMPTS: u32 = GRAPH_DEFAULT_MAX_ATTEMPTS;
 
 /// One registered capability-scoped specialist. The registry (haider-store)
 /// persists these; the compiler only reads the typed signature.
@@ -2308,7 +2311,7 @@ pub fn compile_pipe(
             LoomGate::Human => (
                 GraphGateKind::HumanConfirm,
                 GraphExecutorShape::Human,
-                GRAPH_MAX_ATTEMPTS,
+                GRAPH_DEFAULT_MAX_ATTEMPTS,
             ),
         };
         // The store's evidence path REQUIRES a round bound on every

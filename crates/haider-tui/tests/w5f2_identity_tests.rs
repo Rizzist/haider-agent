@@ -3867,3 +3867,122 @@ fn c5_creation_literal_binds_the_recorded_coordinate_for_tui_capabilities() {
         "C5 effort capability comes from the admitted row"
     );
 }
+
+// Both summary sources share catalog-owner and selection-version admission.
+fn catalog_order_roster_case(parked: bool, stale_unowned: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-roster-other");
+    model.upsert_live_session(&other);
+    if parked {
+        model.open_session(&other);
+    }
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let summary = |epoch, key: Option<&str>| {
+        serde_json::from_value(serde_json::json!({
+            "session_id":session, "head_seq":epoch, "worker_generation":1,
+            "metadata":{"cwd":"/tmp", "provider":"custom", "model":"SHARED_MODEL",
+                "resolved_model":"shared-model",
+                "max_tokens":4096, "created_at_ms":1, "selection_epoch":epoch,
+                "model_catalog_key":key}
+        }))
+        .expect("synthetic roster metadata")
+    };
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![summary(30, Some("synthetic-producer-43"))],
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a newer roster must install its catalog owner"
+    );
+    if parked {
+        model.open_session(&other);
+    }
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![summary(
+                10,
+                if stale_unowned {
+                    None
+                } else {
+                    Some("synthetic-producer-41")
+                },
+            )],
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a stale roster cannot replace or erase the newer catalog selection"
+    );
+    account.incarnation = 44;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(4),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(44, "replacement-model")],
+            revision: 4,
+        },
+    );
+    catalog_order_render(&model);
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "the roster's admitted owner must retire when its account changes"
+    );
+}
+
+#[test]
+fn catalog_order_stale_owned_roster_active() {
+    catalog_order_roster_case(false, false);
+}
+#[test]
+fn catalog_order_stale_owned_roster_parked() {
+    catalog_order_roster_case(true, false);
+}
+#[test]
+fn catalog_order_stale_unowned_roster_active() {
+    catalog_order_roster_case(false, true);
+}
+#[test]
+fn catalog_order_stale_unowned_roster_parked() {
+    catalog_order_roster_case(true, true);
+}

@@ -47,6 +47,10 @@ full authorized catalog. Neither setting grants a tool or an effect.
 
 `list_tools` without a filter lists authorized names. A name or keyword filter
 describes and promotes up to eight matches after the discovery receipt commits.
+Any tool whose schema is already present in the current provider request can be
+called immediately. A name returned by the unfiltered catalog has no schema
+until `list_tools(filter="name")` promotes it. This is the deliberate context
+saving boundary; discovery never adds permission.
 Those discoveries survive subsequent requests, turns, compaction, provider
 refresh and workspace selection, subject to the current grant; forks retain the
 existing new-session consent boundary. Catalog order determines schema order,

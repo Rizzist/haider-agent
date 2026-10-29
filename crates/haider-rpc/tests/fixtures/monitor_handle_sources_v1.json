@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {"kind":"task","task_id":"task-fixture"},
+    {"kind":"agent","agent_id":"agent-fixture"}
+  ],
+  "events": [
+    {"kind":"task","payload":"{\"output_digest\":\"ok\"}"},
+    {"kind":"agent","payload":"{\"report\":\"done\"}"}
+  ]
+}

@@ -1217,6 +1217,11 @@ async fn run_inner(
                     .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                     .await
             }
+            RecoveredWork::DetachedChildren(recovered) => {
+                crate::delegation::DelegationHandle::new(hub.clone())
+                    .rearm_detached_deliveries(&recovered.agents)
+                    .await
+            }
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;
@@ -1902,6 +1907,11 @@ impl ConnectionRuntime {
                             .hub
                             .daemon_is_durably_quiescent_with_monitors()
                             .await
+                            .map(|quiescent| {
+                                // An owed detached-result delivery is live work.
+                                quiescent
+                                    && !crate::delegation::DelegationHandle::detached_deliveries_pending()
+                            })
                         {
                             Ok(true) => {
                                 eprintln!(
@@ -1959,7 +1969,10 @@ impl ConnectionRuntime {
                                 .daemon_is_durably_quiescent_with_monitors()
                                 .await
                             {
-                                Ok(quiescent) => Some(quiescent),
+                                Ok(quiescent) => Some(
+                                    quiescent
+                                        && !crate::delegation::DelegationHandle::detached_deliveries_pending(),
+                                ),
                                 Err(error) => {
                                     tracing::warn!(
                                         %error,
@@ -1968,6 +1981,26 @@ impl ConnectionRuntime {
                                     None
                                 }
                             };
+                            // Orchestrator ruling O-1 (2026-09-25, no default
+                            // caps; "subagents keep running"): live work —
+                            // any non-terminal run, including detached
+                            // subagents, or an owed detached-result delivery
+                            // — EXTENDS the linger. The daemon retires only
+                            // once everything is terminal AND a full linger
+                            // has elapsed. An unreadable journal also cannot
+                            // authorize retirement. A degraded endpoint keeps
+                            // its immediate reap below.
+                            let degraded_reap =
+                                endpoint_degraded && !recovery_policy.disable_degraded_idle_reap;
+                            if durable_quiescent != Some(true) && !degraded_reap {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_linger_deadline attached_clients=0 durable_quiescent={} decision=extend_linger idle_linger_ms={}",
+                                    durable_quiescent.map_or("unknown", |_| "false"),
+                                    duration_ms(idle_ttl),
+                                );
+                                idle_linger_deadline = Some(tokio::time::Instant::now() + idle_ttl);
+                                continue;
+                            }
                             if endpoint_degraded && !recovery_policy.disable_degraded_idle_reap {
                                 eprintln!(
                                     "haiderd: ephemeral-lifecycle event=shutdown_decision reason=degraded_endpoint_idle_deadline attached_clients=0 durable_quiescent={} decision=shutdown idle_linger_ms={}",
@@ -2003,10 +2036,10 @@ impl ConnectionRuntime {
                                     "launcher linger reached its absolute deadline"
                                 );
                             }
-                            // The configured linger is the one grace period.
-                            // Durable quiescence can authorize earlier idle
-                            // retirement elsewhere, but neither a live run nor
-                            // a failed quiescence read may extend this deadline.
+                            // Reached only when durably quiescent (or on a
+                            // degraded endpoint): everything is terminal and
+                            // the full linger has elapsed since the last
+                            // extension, so retiring cancels nothing.
                             break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
                         }
                     } else {

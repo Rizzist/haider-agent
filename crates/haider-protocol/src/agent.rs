@@ -163,6 +163,18 @@ pub enum ReportVerification {
     Unverified,
 }
 
+impl ReportVerification {
+    /// Verification of a terminal child run without a workflow graph. A
+    /// completed run needs separate verification; a failed run is red.
+    pub fn from_terminal_run_state(state: &RunState) -> Self {
+        match state {
+            RunState::Done => Self::Unverified,
+            RunState::Errored | RunState::Cancelled => Self::Red,
+            _ => unreachable!("terminal child state required"),
+        }
+    }
+}
+
 /// How one parent-authored child message crossed the worker boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -835,32 +835,34 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
     root.path().join("pipe").join(format!("{session_id}.pipe"))
 }
 
-/// Sidecar maintenance runs off the publish path. An unchanged predecessor
-/// is not a completion barrier: wait for the committed batch's coverage marker
-/// before requiring two matching snapshots. A row cursor alone can still be
-/// waiting for its batch's trailing coverage marker.
-async fn sidecar_through(path: &std::path::Path, through_seq: u64) -> String {
-    let mut prev: Option<String> = None;
-    for _ in 0..300 {
-        if let Ok(cur) = std::fs::read_to_string(path) {
-            let coverage = cur
-                .lines()
-                .last()
-                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .and_then(|tail| tail.get("coverage").and_then(serde_json::Value::as_u64));
-            if coverage.is_some_and(|coverage| coverage >= through_seq)
-                && prev.as_deref() == Some(cur.as_str())
-            {
-                return cur;
+/// Sidecar maintenance runs on a queued writer, so even repeated equal reads
+/// can precede a pending append. Wait for its complete coverage tail to reach
+/// the expected journal head; callers still assert the actual rows and generation.
+async fn sidecar_at_coverage(path: &std::path::Path, expected_coverage: u64) -> String {
+    let mut last_read = None;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                let coverage = body
+                    .lines()
+                    .last()
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|tail| tail.get("coverage").and_then(serde_json::Value::as_u64));
+                if body.ends_with('\n') && coverage == Some(expected_coverage) {
+                    return body;
+                }
+                last_read = Some(body);
             }
-            prev = Some(cur);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "sidecar {} did not settle through sequence {through_seq}: {prev:?}",
-        path.display()
-    );
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "sidecar {} did not reach coverage {expected_coverage}: {last_read:?}",
+            path.display()
+        )
+    })
 }
 
 #[tokio::test]
@@ -882,7 +884,7 @@ async fn sidecar_wait_requires_committed_coverage_before_returning() {
         if let Some(predecessor) = predecessor {
             std::fs::write(&path, predecessor).expect("predecessor writes");
         }
-        let wait = sidecar_through(&path, 3);
+        let wait = sidecar_at_coverage(&path, 3);
         tokio::pin!(wait);
         // The producer is deliberately held. Biased polling observes an early
         // return before the control timer even when both wake under load.
@@ -897,10 +899,67 @@ async fn sidecar_wait_requires_committed_coverage_before_returning() {
     let path = root.path().join("already-current.pipe");
     std::fs::write(&path, settled).expect("current sidecar writes");
     assert_eq!(
-        sidecar_through(&path, 3).await,
+        sidecar_at_coverage(&path, 3).await,
         settled,
         "an unchanged current file is a valid positive control"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_waits_for_delayed_writer_from_unsettled_tails() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    for initial in [
+        None,
+        Some(""),
+        Some("{\"coverage\":1,\"generation\":7}\n"),
+        Some("{\"role\":\"user\",\"seq\":2}\n"),
+        Some("{\"coverage\":"),
+        Some("{\"coverage\":2,\"generation\":7}"),
+        Some("{\"coverage\":3,\"generation\":7}\n"),
+    ] {
+        if let Some(body) = initial {
+            std::fs::write(&path, body).expect("initial tail");
+        }
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            // Longer than the old helper's two equal reads, without wall-clock timing.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let temporary = writer_path.with_extension("tmp");
+            std::fs::write(&temporary, expected).expect("queued batch");
+            std::fs::rename(temporary, writer_path).expect("publish batch");
+        });
+        assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+        writer.await.expect("writer joins");
+        std::fs::remove_file(&path).expect("fixture resets");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_returns_ready_content_without_waiting_or_rewriting() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    std::fs::write(&path, expected).expect("ready sidecar");
+    let start = tokio::time::Instant::now();
+    assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged file"),
+        expected
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "did not reach coverage 2")]
+async fn sidecar_coverage_deadline_rejects_a_stalled_writer() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    std::fs::write(&path, "{\"coverage\":1,\"generation\":7}\n").expect("stale tail");
+    sidecar_at_coverage(&path, 2).await;
 }
 
 /// Warm the live writer with a complete seed projection, including coverage.
@@ -3931,6 +3990,19 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
 
     append_one(&hub, &session_id, generation, "fills-one-slot-buffer").await;
     append_one(&hub, &session_id, generation, "overflows-one-slot-buffer").await;
+    // Append acknowledges durability before synchronous fanout. Keep replay
+    // parked until publication really filled/overflowed the one-slot receiver;
+    // otherwise it can drain seq 3 before seq 4 is published and never need a
+    // re-registration (so waiting specifically for AttachCaughtUp(4) hangs).
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if matches!(control.observed.recv().await,
+                Some(HubObservation::Published { session_id: ref published, through_seq: 4 }) if published == &session_id)
+            {
+                break;
+            }
+        }
+    }).await.expect("overflow publication observed before releasing replay");
     control.release();
 
     let mut delivered = Vec::new();
@@ -10498,13 +10570,8 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .await
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    append_delta(&hub, &session_id, generation, "resume-trigger").await;
-    hub.shutdown()
-        .await
-        .expect("second hub joins sidecar writer");
-
-    let sidecar =
-        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
+    let head = append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    let sidecar = sidecar_at_coverage(&sidecar_path(&root, &session_id), head).await;
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10514,6 +10581,15 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         serde_json::from_str(sidecar.lines().last().expect("tail")).expect("tail JSON");
     assert_eq!(tail["coverage"], missed[0].seq + 1);
     assert_eq!(tail["generation"], 1);
+
+    hub.shutdown()
+        .await
+        .expect("second hub joins sidecar writer");
+    assert_eq!(
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads"),
+        sidecar,
+        "joining the writer preserves the observed complete coverage"
+    );
 }
 
 #[tokio::test]

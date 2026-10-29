@@ -1357,10 +1357,9 @@ impl SessionProjection {
                     self.graph_epoch = opened.attempt;
                     if opened.attempt > 1 {
                         self.push_note(format!(
-                            "{} attempt {}/{} — earlier greens are stale",
+                            "{} attempt {} — earlier greens are stale",
                             opened.node.label(),
                             opened.attempt,
-                            haider_protocol::graph::GRAPH_MAX_ATTEMPTS
                         ));
                     }
                 }
