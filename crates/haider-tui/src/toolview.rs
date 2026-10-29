@@ -278,16 +278,19 @@ fn mark_pattern_content(scopes: &mut [PatternScope]) {
     }
 }
 
-fn close_pattern_scope(scopes: &mut Vec<PatternScope>) -> bool {
+fn close_pattern_scope(scopes: &mut Vec<PatternScope>) -> (bool, bool) {
     let Some(scope) = scopes.pop() else {
-        return false;
+        return (false, false);
     };
     if !scope.only_empty_alternatives {
         mark_pattern_content(scopes);
     }
     // The matcher drops a brace expression made entirely of empty alternatives.
     // A following absolute spelling therefore still starts the same branch.
-    scope.rooted && scope.only_empty_alternatives
+    let boundary = scope.rooted && scope.only_empty_alternatives;
+    // A relative suffix cannot turn following whitespace into a new root.
+    let closed_expression = scope.rooted && scopes.is_empty();
+    (boundary, closed_expression)
 }
 
 pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> String {
@@ -388,8 +391,7 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
             }
             match ch {
                 '\'' | '"' if opener == Some(ch) => {
-                    boundary = close_pattern_scope(&mut enclosing);
-                    closed_expression = enclosing.is_empty();
+                    (boundary, closed_expression) = close_pattern_scope(&mut enclosing);
                 }
                 '{' => {
                     enclosing.push(PatternScope::new(ch, boundary));
@@ -400,12 +402,10 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
                     closed_expression = false;
                 }
                 '}' if opener == Some('{') => {
-                    boundary = close_pattern_scope(&mut enclosing);
-                    closed_expression = enclosing.is_empty();
+                    (boundary, closed_expression) = close_pattern_scope(&mut enclosing);
                 }
                 ')' if opener == Some('(') => {
-                    boundary = close_pattern_scope(&mut enclosing);
-                    closed_expression = enclosing.is_empty();
+                    (boundary, closed_expression) = close_pattern_scope(&mut enclosing);
                 }
                 ',' if opener == Some('{') => {
                     boundary = enclosing.last().is_some_and(|scope| scope.rooted);

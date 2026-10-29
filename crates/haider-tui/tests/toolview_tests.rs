@@ -2048,6 +2048,17 @@ fn glob_relative_literals_keep_their_enclosures() {
             "{src/{a,b},lib}/Users/bob/**",
             "{src/{a,b},lib}/Users/bob/**",
         ),
+        ("{a,b}src{c,d} /Users/bob/**", "{a,b}src{c,d} /Users/bob/**"),
+        ("{}src{} /Users/bob/**", "{}src{} /Users/bob/**"),
+        ("{}src{} /home/carol/**", "{}src{} /home/carol/**"),
+        (
+            "@(a|b)src@(c|d) /Users/bob/**",
+            "@(a|b)src@(c|d) /Users/bob/**",
+        ),
+        (
+            "{src,/Users/bob/**} /home/carol/**",
+            "{src,/Users/<user>/**} /home/<user>/**",
+        ),
     ] {
         assert_context_pattern(pattern, expected, &paths);
     }
