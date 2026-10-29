@@ -2070,6 +2070,20 @@ fn empty_glob_prefixes_keep_context_labels() {
 #[test]
 fn glob_enclosure_labels_do_not_depend_on_hidden_account_names() {
     let paths = PathContext::default();
+    let outputs = |pattern: &str| {
+        [
+            ("fs_search", json!({"query":"x", "glob":pattern})),
+            ("fs_search", json!({"query":"x", "include":pattern})),
+            ("glob", json!({"pattern":pattern})),
+            ("fs_glob", json!({"query":pattern})),
+        ]
+        .map(|(tool, args)| {
+            (
+                tv::header_args(tool, &args, &paths),
+                pattern_context_plain(tool, &args, &paths),
+            )
+        })
+    };
     for template in [
         "{}/Users/{account}/src/**",
         "{{},}C:/Users/{account}/src/**",
@@ -2084,9 +2098,11 @@ fn glob_enclosure_labels_do_not_depend_on_hidden_account_names() {
         let expected =
             haider_tui::toolfold::arg_summary_with_context(&json!({"glob": reference}), &paths);
         assert!(!expected.contains("/bob/"), "{expected}");
+        let reference_outputs = outputs(&reference);
         for account in ["bob", "robertson", "δοκιμή"] {
             let pattern = template.replace("{account}", account);
             assert_context_pattern(&pattern, &expected, &paths);
+            assert_eq!(outputs(&pattern), reference_outputs, "{pattern}");
         }
     }
 }
