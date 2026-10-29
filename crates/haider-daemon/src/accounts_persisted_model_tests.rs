@@ -178,6 +178,8 @@ async fn persisted_model_retry_checks_current_catalog_before_waiting_or_rebuildi
         2,
         view.descriptors,
         vec![summary(ModelInventoryWire::Fetched { fetched_at_ms: 2 })],
+        HashMap::new(),
+        HashMap::new(),
     );
     let resolver =
         AccountsAttemptResolver::new(factory, metadata, ProviderTuning::default(), None, false);
@@ -270,4 +272,18 @@ async fn persisted_remote_model_cannot_use_empty_catalog_or_implicit_alias() {
         assert_eq!(provider.requests().len(), 0);
         assert_reselection(&result.err().expect("explicit reselection required"));
     }
+}
+
+#[tokio::test]
+async fn catalog_control_public_refusal_precedes_missing_vault() {
+    let (mut factory, provider, _) =
+        factory(summary(ModelInventoryWire::Fetched { fetched_at_ms: 1 }));
+    factory.vault = VaultProvision::Unsupported;
+    let result = factory.resolve_for_turn(&old_metadata()).await;
+    assert_reselection(
+        &result
+            .err()
+            .expect("obsolete public model must refuse before credentials"),
+    );
+    assert!(provider.requests().is_empty());
 }

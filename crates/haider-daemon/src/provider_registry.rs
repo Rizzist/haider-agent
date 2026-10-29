@@ -375,10 +375,12 @@ pub(crate) enum ProviderInventory {
     #[default]
     NeverFetched,
     Fetched {
+        owner: Option<haider_store::ProviderModelCacheKey>,
         models: Vec<DiscoveredModel>,
         fetched_at_ms: u64,
     },
     Stale {
+        owner: Option<haider_store::ProviderModelCacheKey>,
         models: Vec<DiscoveredModel>,
         fetched_at_ms: u64,
         reason: String,
@@ -453,6 +455,7 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             .cloned()
             .unwrap_or_default();
         if let ProviderInventory::Fetched {
+            owner,
             models,
             fetched_at_ms,
         } = &inventory
@@ -464,6 +467,7 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
                 });
             if now.saturating_sub(*fetched_at_ms) >= haider_rpc::MODEL_INVENTORY_TTL_MS {
                 inventory = ProviderInventory::Stale {
+                    owner: owner.clone(),
                     models: models.clone(),
                     fetched_at_ms: *fetched_at_ms,
                     reason: "catalog refresh due".to_owned(),
@@ -487,14 +491,17 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let inventory = match inventories.remove(provider).unwrap_or_default() {
             ProviderInventory::Fetched {
+                owner,
                 models,
                 fetched_at_ms,
             }
             | ProviderInventory::Stale {
+                owner,
                 models,
                 fetched_at_ms,
                 ..
             } if !models.is_empty() => ProviderInventory::Stale {
+                owner,
                 models,
                 fetched_at_ms,
                 reason,
@@ -650,19 +657,52 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|profile| self.summary_profile(profile, has_credential))
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_discovered_models(
         &self,
         provider: String,
         models: Vec<DiscoveredModel>,
         fetched_at_ms: u64,
     ) {
+        self.replace_owned_discovered_models(provider, models, fetched_at_ms, None);
+    }
+
+    pub(crate) fn replace_owned_discovered_models(
+        &self,
+        provider: String,
+        models: Vec<DiscoveredModel>,
+        fetched_at_ms: u64,
+        owner: Option<haider_store::ProviderModelCacheKey>,
+    ) {
         self.model_source.replace(
             provider,
             ProviderInventory::Fetched {
+                owner,
                 models,
                 fetched_at_ms,
             },
         );
+    }
+
+    pub(crate) fn catalog_profiles(&self) -> HashMap<String, ProviderProfileV1> {
+        self.profiles
+            .iter()
+            .map(|profile| (profile.provider_id.clone(), profile.clone()))
+            .collect()
+    }
+
+    pub(crate) fn catalog_owners(&self) -> HashMap<String, haider_store::ProviderModelCacheKey> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                let owner = match self.model_source.inventory(&profile.provider_id) {
+                    ProviderInventory::Fetched { owner, .. }
+                    | ProviderInventory::Stale { owner, .. } => owner,
+                    _ => None,
+                }?;
+                Some((profile.provider_id.clone(), owner))
+            })
+            .collect()
     }
 
     pub(crate) fn clear_discovered_models(&self, provider: &str) {
@@ -1116,36 +1156,55 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         profile: &ProviderProfileV1,
         has_credential: &dyn Fn(&str) -> bool,
     ) -> ProviderSummaryWire {
-        let inventory = self.model_source.inventory(&profile.provider_id);
-        let never_fetched = matches!(inventory, ProviderInventory::NeverFetched);
-        // Offline catalogs are authoritative without a network request.
-        // An empty remote result never falls back to configured rows.
-        let offline_catalog = never_fetched && offline_inventory(profile);
-        let rows = if offline_catalog {
-            configured_rows(profile)
-        } else {
-            merged_catalog_rows(&profile.provider_id, inventory.models().as_deref())
-        };
-        let model_details = rows
-            .into_iter()
-            .map(|row| model_detail_wire(&profile.provider_id, row.model, row.source))
-            .collect();
-        let inventory_wire = if offline_catalog
-            || (never_fetched
-                && haider_provider::has_subscription_static_catalog(&profile.provider_id))
-        {
-            haider_rpc::ModelInventoryWire::Static
-        } else {
-            inventory.provenance()
-        };
-        provider_summary(
+        project_inventory_summary(
             profile,
-            model_details,
-            offline_catalog,
+            self.model_source.inventory(&profile.provider_id),
             has_credential(&profile.provider_id),
-            inventory_wire,
         )
     }
+}
+
+/// Rebuild all inventory-derived fields from registry configuration alone.
+/// This includes defaults and availability as well as rows and model limits.
+pub(crate) fn summary_without_discovery(
+    profile: &ProviderProfileV1,
+    has_credential: bool,
+) -> ProviderSummaryWire {
+    project_inventory_summary(profile, ProviderInventory::NeverFetched, has_credential)
+}
+
+fn project_inventory_summary(
+    profile: &ProviderProfileV1,
+    inventory: ProviderInventory,
+    has_credential: bool,
+) -> ProviderSummaryWire {
+    let never_fetched = matches!(inventory, ProviderInventory::NeverFetched);
+    // Offline catalogs are authoritative without a network request.
+    // An empty remote result never falls back to configured rows.
+    let offline_catalog = never_fetched && offline_inventory(profile);
+    let rows = if offline_catalog {
+        configured_rows(profile)
+    } else {
+        merged_catalog_rows(&profile.provider_id, inventory.models().as_deref())
+    };
+    let model_details = rows
+        .into_iter()
+        .map(|row| model_detail_wire(&profile.provider_id, row.model, row.source))
+        .collect();
+    let inventory_wire = if offline_catalog
+        || (never_fetched && haider_provider::has_subscription_static_catalog(&profile.provider_id))
+    {
+        haider_rpc::ModelInventoryWire::Static
+    } else {
+        inventory.provenance()
+    };
+    provider_summary(
+        profile,
+        model_details,
+        offline_catalog,
+        has_credential,
+        inventory_wire,
+    )
 }
 
 /// One pickable model and where it came from.
@@ -1198,6 +1257,14 @@ fn merged_catalog_rows(provider: &str, remote: Option<&[DiscoveredModel]>) -> Ve
             .then_with(|| left.model.display_name.cmp(&right.model.display_name))
     });
     rows
+}
+
+/// Account-independent rows rebuilt without any remote metadata overrides.
+pub(crate) fn maintained_model_details(provider: &str) -> Vec<ModelDetailWire> {
+    merged_catalog_rows(provider, None)
+        .into_iter()
+        .map(|row| model_detail_wire(provider, row.model, row.source))
+        .collect()
 }
 
 /// An offline or configured profile's own rows, in profile order.

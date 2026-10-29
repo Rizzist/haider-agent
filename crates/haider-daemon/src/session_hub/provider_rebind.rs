@@ -66,7 +66,7 @@ impl HubConnection {
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read());
-        let Some(view) = view else {
+        let Some(mut view) = view else {
             return self.respond_error(
                 request_id,
                 "provider_unknown",
@@ -75,6 +75,7 @@ impl HubConnection {
                 None,
             );
         };
+        view.scope_catalog_for_account(&provider, account.as_deref());
         let Some(profile) = view.providers.iter().find(|p| p.provider == provider) else {
             return self.respond_error(
                 request_id,

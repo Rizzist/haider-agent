@@ -94,7 +94,8 @@ pub(crate) enum RunAction {
     Execute,
     Start,
     Status(RunId),
-    Stop(RunId),
+    /// `--stop` (all), `--stop-main` or `--stop-subagents`.
+    Stop(RunId, haider_rpc::RunStopScopeWire),
     Replay(RunId),
 }
 
@@ -172,14 +173,23 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 action = RunAction::Status(parse_run_id(value, "--status")?);
             }
             "--status" => return Err("only one lifecycle action may be requested".into()),
-            "--stop" if action == RunAction::Execute => {
+            flag @ ("--stop" | "--stop-main" | "--stop-subagents")
+                if action == RunAction::Execute =>
+            {
                 index += 1;
                 let value = rest
                     .get(index)
-                    .ok_or_else(|| "--stop requires a run id".to_owned())?;
-                action = RunAction::Stop(parse_run_id(value, "--stop")?);
+                    .ok_or_else(|| format!("{flag} requires a run id"))?;
+                let scope = match flag {
+                    "--stop-main" => haider_rpc::RunStopScopeWire::Main,
+                    "--stop-subagents" => haider_rpc::RunStopScopeWire::Subagents,
+                    _ => haider_rpc::RunStopScopeWire::All,
+                };
+                action = RunAction::Stop(parse_run_id(value, flag)?, scope);
             }
-            "--stop" => return Err("only one lifecycle action may be requested".into()),
+            "--stop" | "--stop-main" | "--stop-subagents" => {
+                return Err("only one lifecycle action may be requested".into());
+            }
             "--replay" if action == RunAction::Execute => {
                 index += 1;
                 let value = rest
@@ -468,7 +478,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     if !prompt_required && prompt.is_some() {
         return Err("status, stop, and replay do not accept a prompt".into());
     }
-    if matches!(&action, RunAction::Status(_) | RunAction::Stop(_)) && timeout.is_some() {
+    if matches!(&action, RunAction::Status(_) | RunAction::Stop(..)) && timeout.is_some() {
         return Err("status and stop do not accept --timeout".into());
     }
     if !prompt_required
@@ -742,8 +752,8 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 }
             };
         }
-        RunAction::Stop(run_id) => {
-            return match stop_headless_run(&profile, lifecycle_ensure, run_id).await {
+        RunAction::Stop(run_id, scope) => {
+            return match stop_headless_run(&profile, lifecycle_ensure, run_id, scope).await {
                 Ok(stopped) => match write_lifecycle_value(
                     io::stdout().lock(),
                     options.output,
@@ -756,7 +766,17 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                         ExitCode::from(EX_IOERR)
                     }
                 },
-                Err(error) => report_lifecycle_error(options.output, "haider.run.stop.v1", &error),
+                Err(error) => {
+                    // S-1: the precise refusal is both the stderr line and
+                    // the JSON `error.message`.
+                    let message = stop_scope_unsupported_message(scope, &error);
+                    report_lifecycle_error_with(
+                        options.output,
+                        "haider.run.stop.v1",
+                        &error,
+                        message.as_deref(),
+                    )
+                }
             };
         }
         RunAction::Execute | RunAction::Start | RunAction::Replay(_) => {}
@@ -1162,7 +1182,17 @@ Request limits are opt-in: --max-requests N uses tranche min(32, N);\n\
 --request-tranche N alone uses hard cap 64. Supplying neither flag leaves requests unbounded.\n\
 \n\
 Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
---timeout <duration>, --start, --status, --stop, and --replay.\n\
+--timeout <duration>, --start, --status, --stop, --stop-main, --stop-subagents,\n\
+and --replay.\n\
+\n\
+Stopping a run:\n\
+  --stop RUN             Stop the run AND every subagent in its tree, however deep\n\
+                         (including subagents started by messaged or monitor-woken\n\
+                         child turns); their monitors are removed\n\
+  --stop-main RUN        Stop only the run; its subagents keep running and a\n\
+                         subagent it was waiting on delivers its result later\n\
+  --stop-subagents RUN   Stop only the subagents in the run's tree; the run continues\n\
+\n\
 Budgets: --max-tokens N caps the run's cumulative token usage (exit 77 when\n\
 exhausted); --max-output-tokens N sets the per-response output limit.";
 
@@ -1218,15 +1248,31 @@ fn write_lifecycle_value(
 }
 
 fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunError) -> ExitCode {
+    report_lifecycle_error_with(mode, schema, error, None)
+}
+
+/// One lifecycle error document. `message` replaces the error's own text
+/// when the caller has a more precise explanation (S-1 stop-scope refusal).
+fn lifecycle_error_line(schema: &str, error: &HeadlessRunError, message: Option<&str>) -> String {
+    let failure = classify_headless_error(error);
+    let schema = serde_json::to_string(schema).unwrap_or_else(|_| "null".into());
+    let code = serde_json::to_string(&failure.code).unwrap_or_else(|_| "null".into());
+    let message = serde_json::to_string(message.unwrap_or(&failure.message))
+        .unwrap_or_else(|_| "null".into());
+    format!(
+        "{{\"schema\":{schema},\"result\":null,\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{}}}}}\n",
+        failure.retryable
+    )
+}
+
+fn report_lifecycle_error_with(
+    mode: RunOutput,
+    schema: &str,
+    error: &HeadlessRunError,
+    message: Option<&str>,
+) -> ExitCode {
     if mode != RunOutput::Print {
-        let failure = classify_headless_error(error);
-        let schema = serde_json::to_string(schema).unwrap_or_else(|_| "null".into());
-        let code = serde_json::to_string(&failure.code).unwrap_or_else(|_| "null".into());
-        let message = serde_json::to_string(&failure.message).unwrap_or_else(|_| "null".into());
-        let line = format!(
-            "{{\"schema\":{schema},\"result\":null,\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{}}}}}\n",
-            failure.retryable
-        );
+        let line = lifecycle_error_line(schema, error, message);
         let mut stdout = io::stdout().lock();
         if let Err(io_error) = stdout
             .write_all(line.as_bytes())
@@ -1236,7 +1282,10 @@ fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunErro
             return ExitCode::from(EX_IOERR);
         }
     }
-    eprintln!("haider: {error}");
+    match message {
+        Some(message) => eprintln!("haider: {message}"),
+        None => eprintln!("haider: {error}"),
+    }
     ExitCode::from(exit_code_for_error(error))
 }
 
@@ -1710,6 +1759,42 @@ impl ClassifiedRunError {
     }
 }
 
+/// S-1: an older daemon lacks `run_stop_scope_v1` and would treat a scoped
+/// stop as a full stop. The ensure step refuses first; say so plainly.
+fn stop_scope_unsupported_message(
+    scope: haider_rpc::RunStopScopeWire,
+    error: &HeadlessRunError,
+) -> Option<String> {
+    if let HeadlessRunError::Ensure(EnsureError::MissingFeatures { missing, .. }) = error
+        && missing.contains(haider_rpc::FEATURE_HELPER_STOP_V1)
+    {
+        return Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned());
+    }
+    let flag = match scope {
+        haider_rpc::RunStopScopeWire::Main => "--stop-main",
+        haider_rpc::RunStopScopeWire::Subagents => "--stop-subagents",
+        _ => return None,
+    };
+    let HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+        missing,
+        daemon_version,
+    }) = error
+    else {
+        return None;
+    };
+    missing
+        .contains(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1)
+        .then(|| {
+            format!(
+                "the running daemon (version {daemon_version}) does not support {flag} \
+                 (missing {}); nothing was stopped. Restart it with this haider version \
+                 (`haider daemon stop`) and retry, or use --stop to stop the run and all \
+                 of its subagents.",
+                haider_rpc::FEATURE_RUN_STOP_SCOPE_V1
+            )
+        })
+}
+
 fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
     let (outcome, code, retryable) = match error {
         HeadlessRunError::Attachment { code, .. } => ("errored", code.clone(), false),
@@ -1728,6 +1813,11 @@ fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
         HeadlessRunError::Bootstrap {
             code, retryable, ..
         } => ("errored", (*code).to_owned(), *retryable),
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { missing, .. })
+            if missing.contains(haider_rpc::FEATURE_HELPER_STOP_V1) =>
+        {
+            ("errored", "protocol_mismatch".to_owned(), false)
+        }
         HeadlessRunError::Ensure(EnsureError::MissingFeatures { .. }) => {
             ("errored", "missing_feature".to_owned(), false)
         }
@@ -3326,5 +3416,85 @@ mod tests {
             })
         );
         assert!(stderr.is_empty());
+    }
+
+    /// S-1 (9-verify3): a scoped stop against a daemon without
+    /// `run_stop_scope_v1` is refused with a clear, flag-specific message;
+    /// the client also requires the feature before sending the request.
+    ///
+    /// MUTATION CHECK: drop the requirement in `stop_scope_ensure_options`
+    /// or the message mapping. Expected runtime failure: the feature is not
+    /// required, or no message names the flag.
+    #[test]
+    fn scoped_stop_requires_the_stop_scope_feature_and_explains_refusal() {
+        use haider_rpc::RunStopScopeWire as Scope;
+        let base = haider_client::EnsureOptions::default();
+        for (scope, required) in [
+            (Scope::All, false),
+            (Scope::Main, true),
+            (Scope::Subagents, true),
+        ] {
+            let options = haider_client::stop_scope_ensure_options(base.clone(), scope);
+            assert_eq!(
+                options
+                    .required_features
+                    .contains(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1),
+                required,
+                "{scope:?}"
+            );
+        }
+        let unsupported = HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+            missing: std::collections::BTreeSet::from([
+                haider_rpc::FEATURE_HELPER_STOP_V1.to_owned()
+            ]),
+            daemon_version: "old".into(),
+        });
+        for scope in [Scope::All, Scope::Main, Scope::Subagents] {
+            assert!(
+                haider_client::stop_scope_ensure_options(base.clone(), scope)
+                    .required_features
+                    .contains(haider_rpc::FEATURE_HELPER_STOP_V1)
+            );
+            assert_eq!(
+                super::stop_scope_unsupported_message(scope, &unsupported).as_deref(),
+                Some(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE)
+            );
+            let line = super::lifecycle_error_line(
+                "haider.run.stop.v1",
+                &unsupported,
+                super::stop_scope_unsupported_message(scope, &unsupported).as_deref(),
+            );
+            let document: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
+            assert_eq!(document["error"]["code"], "protocol_mismatch");
+            assert_eq!(
+                document["error"]["message"],
+                haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE
+            );
+        }
+        let missing = HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+            missing: std::collections::BTreeSet::from([
+                haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned()
+            ]),
+            daemon_version: "0.0.972".into(),
+        });
+        let main = super::stop_scope_unsupported_message(Scope::Main, &missing)
+            .expect("--stop-main refusal is explained");
+        assert!(
+            main.contains("--stop-main") && main.contains("nothing was stopped"),
+            "{main}"
+        );
+        assert!(
+            super::stop_scope_unsupported_message(Scope::Subagents, &missing)
+                .is_some_and(|message| message.contains("--stop-subagents"))
+        );
+        assert!(super::stop_scope_unsupported_message(Scope::All, &missing).is_none());
+        // S-1 (12-final2): the JSON document carries the same precise text.
+        let line = super::lifecycle_error_line("haider.run.stop.v1", &missing, Some(main.as_str()));
+        let document: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
+        assert_eq!(document["error"]["message"], main.as_str(), "{document}");
+        assert_eq!(document["error"]["code"], "missing_feature", "{document}");
+        let plain = super::lifecycle_error_line("haider.run.stop.v1", &missing, None);
+        let plain: serde_json::Value = serde_json::from_str(&plain).expect("one JSON line");
+        assert_eq!(plain["error"]["message"], missing.to_string());
     }
 }

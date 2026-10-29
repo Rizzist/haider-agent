@@ -745,6 +745,17 @@ enum InventoryRefreshError {
     Provider(crate::accounts::ProviderModelsRefreshFailure),
 }
 
+impl InventoryRefreshError {
+    fn catalog_owner_changed() -> Self {
+        Self::Provider(crate::accounts::ProviderModelsRefreshFailure {
+            code: ERROR_CODE_BUSY.to_owned(),
+            message: "catalog account changed during model discovery".to_owned(),
+            retryable: true,
+            data: None,
+        })
+    }
+}
+
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
 /// `transcription.secret_get`/`transcription.secret_set` — the alias never
@@ -1050,7 +1061,7 @@ struct FleetChildTruth {
     activity: haider_protocol::activity::ActivityTracker,
 }
 
-/// Reduces one child's exact durable run and direct metrics from the same
+/// Reduces one child's current durable run and direct metrics from the same
 /// sealed journal head. Delegation bookkeeping is only the fallback for the
 /// launch-crash window; it cannot distinguish failed from cancelled.
 async fn fleet_child_truth(
@@ -1060,7 +1071,7 @@ async fn fleet_child_truth(
     initial_model: &str,
 ) -> Result<FleetChildTruth, HaiderError> {
     let mut folder = crate::usage_report::SessionFolder::new(initial_model);
-    let mut latest_state = None;
+    let mut runs = HashMap::<RunId, (u64, RunState)>::new();
     let mut activity = haider_protocol::activity::ActivityTracker::new();
     let mut since_seq = 0;
     while since_seq < through_seq {
@@ -1082,10 +1093,12 @@ async fn fleet_child_truth(
             }
             since_seq = envelope.seq;
             advanced = true;
-            if envelope.run_id.as_ref() == Some(&record.child_run_id)
+            if let Some(run) = &envelope.run_id
                 && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
             {
-                latest_state = Some(state);
+                runs.entry(run.clone())
+                    .and_modify(|(_, current)| *current = state.clone())
+                    .or_insert((envelope.seq, state));
             }
             // Only the child's OWN facts: grandchild mirrors carry their
             // own agent id and show on their own fleet node.
@@ -1102,7 +1115,13 @@ async fn fleet_child_truth(
             break;
         }
     }
-    let state = fleet_agent_state(record, latest_state.as_ref());
+    let latest_state = runs
+        .values()
+        .filter(|(_, state)| !state.is_terminal())
+        .max_by_key(|(first_seq, _)| first_seq)
+        .or_else(|| runs.values().max_by_key(|(first_seq, _)| first_seq))
+        .map(|(_, state)| state);
+    let state = fleet_agent_state(record, latest_state);
     let metrics = folder.agent_snapshot(
         &record.child_session_id,
         Some(&record.agent_id),
@@ -4980,6 +4999,35 @@ impl HubConnection {
                 self.agent_cancel(request_id, command_id, session_id, worker_generation, agent)
                     .await
             }
+            RequestBody::AgentCancelAll {
+                command_id,
+                session_id,
+                worker_generation,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "stopping all subagents requires a control attachment to the parent session",
+                        false,
+                        None,
+                    );
+                }
+                self.agent_cancel_all(request_id, command_id, session_id, worker_generation)
+                    .await
+            }
             RequestBody::TurnSubmitWithBranch {
                 command_id,
                 session_id,
@@ -6937,7 +6985,11 @@ impl HubConnection {
                 }
                 self.headless_run_status(request_id, run_id).await
             }
-            RequestBody::HeadlessRunStop { command_id, run_id } => {
+            RequestBody::HeadlessRunStop {
+                command_id,
+                run_id,
+                scope,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
@@ -6947,7 +6999,8 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.headless_run_stop(request_id, command_id, run_id).await
+                self.headless_run_stop(request_id, command_id, run_id, scope)
+                    .await
             }
             RequestBody::WorkflowGraphState {
                 session_id,
@@ -9045,7 +9098,15 @@ impl HubConnection {
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
+            .map(|mut view| {
+                if let Some(metadata) = metadata.as_ref() {
+                    view.scope_catalogs_for_session(
+                        &metadata.provider,
+                        metadata.account_alias.as_deref(),
+                    );
+                }
+                view.providers
+            })
             .unwrap_or_default();
         let (kind, title, body, options) = match command {
             "rename" => (
@@ -10748,16 +10809,25 @@ impl HubConnection {
 
     async fn refresh_inventory_if_needed(
         &self,
-        summaries: &mut Vec<ProviderSummaryWire>,
+        view: &mut crate::accounts::ManagementView,
         provider: &str,
         model: &str,
         account_alias: Option<&str>,
         session_id: Option<&SessionId>,
     ) -> Result<(), InventoryRefreshError> {
+        let requested_account_alias = account_alias;
+        let expected_owner = view.catalog_key_for_account(provider, requested_account_alias);
+        let discovery_alias = view.scope_catalog_for_account(provider, account_alias);
+        let account_alias = discovery_alias.as_ref().map(CredentialAlias::as_str);
+        let summaries = &mut view.providers;
         let cached_serves_model = summaries
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| summary.models.iter().any(|known| known == model));
+        let has_live_catalog = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| summary.catalog.supports_discovery());
         let advisory_inventory = summaries
             .iter()
             .find(|summary| summary.provider == provider)
@@ -10832,13 +10902,20 @@ impl HubConnection {
         } else if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
             probes.retain(|(probe_provider, _), _| probe_provider != provider);
         }
-        let refreshed = match facade
+        let result = facade
             .refresh_provider_models(
                 provider.to_owned(),
                 account_alias.map(|alias| CredentialAlias::new(alias.to_owned())),
             )
-            .await
-        {
+            .await;
+        let current_owner = facade
+            .management
+            .read()
+            .and_then(|view| view.catalog_key_for_account(provider, requested_account_alias));
+        if current_owner != expected_owner {
+            return Err(InventoryRefreshError::catalog_owner_changed());
+        }
+        let refreshed = match result {
             Ok(refreshed) => refreshed,
             // A custom compatible catalog is advisory. Refresh-on-miss still
             // probes exactly once, but discovery failure cannot veto a
@@ -10848,15 +10925,20 @@ impl HubConnection {
             // TTL is a freshness policy, not an availability outage: a
             // transient refresh failure may keep serving a cached requested
             // model. A cache MISS still surfaces the typed discovery failure.
-            Err(error) if cached_serves_model && error.retryable => return Ok(()),
+            Err(error)
+                if cached_serves_model && error.retryable && error.code != ERROR_CODE_BUSY =>
+            {
+                return Ok(());
+            }
             // Seeded/manual inventories have no live catalog. The attempted
             // refresh satisfies refresh-on-miss; validation below then emits
             // ModelUnknown against that unchanged known inventory.
             Err(error)
-                if matches!(
-                    &error.data,
-                    Some(ErrorData::ProviderModelsUnavailable { .. })
-                ) =>
+                if !has_live_catalog
+                    && matches!(
+                        &error.data,
+                        Some(ErrorData::ProviderModelsUnavailable { .. })
+                    ) =>
             {
                 return Ok(());
             }
@@ -10872,6 +10954,9 @@ impl HubConnection {
             *summary = refreshed;
         } else {
             summaries.push(refreshed);
+        }
+        if let Some(owner) = expected_owner {
+            view.catalog_owners.insert(provider.to_owned(), owner);
         }
         Ok(())
     }
@@ -12427,27 +12512,26 @@ impl HubConnection {
                     None,
                 );
             };
-            let (mut summaries, descriptors) = self
+            let mut view = self
                 .hub
                 .accounts()?
                 .and_then(|facade| facade.management.read())
-                .map_or_else(
-                    || (Vec::new(), Vec::new()),
-                    |view| (view.providers, view.descriptors),
-                );
+                .unwrap_or_default();
             let selected_provider = provider
                 .as_deref()
                 .map(str::trim)
                 .filter(|provider| !provider.is_empty())
                 .unwrap_or(&before.provider);
+            let selected_account = (selected_provider == before.provider)
+                .then_some(before.account_alias.as_deref())
+                .flatten();
+            let catalog_key = view.catalog_key_for_account(selected_provider, selected_account);
             let refresh = self
                 .refresh_inventory_if_needed(
-                    &mut summaries,
+                    &mut view,
                     selected_provider,
                     model.trim(),
-                    (selected_provider == before.provider)
-                        .then_some(before.account_alias.as_deref())
-                        .flatten(),
+                    selected_account,
                     Some(&session_id),
                 )
                 .await;
@@ -12464,6 +12548,18 @@ impl HubConnection {
                     None,
                 );
             };
+            let current_catalog_key = self
+                .hub
+                .accounts()?
+                .and_then(|facade| facade.management.read())
+                .and_then(|view| {
+                    view.catalog_key_for_account(
+                        selected_provider,
+                        (selected_provider == current.provider)
+                            .then_some(current.account_alias.as_deref())
+                            .flatten(),
+                    )
+                });
             if (
                 before.provider.as_str(),
                 before.model.as_str(),
@@ -12484,6 +12580,15 @@ impl HubConnection {
                 drop(selection);
                 continue;
             }
+            if catalog_key != current_catalog_key {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_BUSY,
+                    "catalog account changed while selecting the model",
+                    true,
+                    None,
+                );
+            }
             match refresh {
                 Ok(()) => {}
                 Err(InventoryRefreshError::Hub(error)) => return Err(error),
@@ -12497,7 +12602,7 @@ impl HubConnection {
                     );
                 }
             }
-            break (selection, current, summaries, descriptors);
+            break (selection, current, view.providers, view.descriptors);
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
@@ -14842,7 +14947,8 @@ impl HubConnection {
                 None,
             );
         };
-        let authority = self.tuning_authority()?;
+        let authority =
+            self.tuning_authority(&current.provider, current.account_alias.as_deref())?;
         if let Err(refusal) =
             authority.validate_effort(&current.provider, &current.model, effort.as_deref())
         {
@@ -15054,7 +15160,8 @@ impl HubConnection {
                 None,
             );
         };
-        let authority = self.tuning_authority()?;
+        let authority =
+            self.tuning_authority(&current.provider, current.account_alias.as_deref())?;
         if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
@@ -15106,12 +15213,17 @@ impl HubConnection {
     /// `session.select_model` consults.
     fn tuning_authority(
         &self,
+        provider: &str,
+        account_alias: Option<&str>,
     ) -> Result<crate::model_select::ModelSelectionAuthority, SessionHubError> {
         let summaries = self
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
+            .map(|mut view| {
+                view.scope_catalog_for_account(provider, account_alias);
+                view.providers
+            })
             .unwrap_or_default();
         Ok(crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
@@ -15328,71 +15440,92 @@ impl HubConnection {
             );
         }
 
-        let mut pending = vec![record.clone()];
-        let mut subtree = Vec::new();
-        while let Some(current) = pending.pop() {
-            match self
-                .hub
-                .delegations_for_parent_run(
-                    current.child_session_id.clone(),
-                    current.child_run_id.clone(),
-                )
-                .await
-            {
-                Ok(children) => pending.extend(children),
-                Err(error) => return self.respond_turn_error(request_id, error),
-            }
-            subtree.push(current);
+        let _operation = self.hub.inner.stop_operations.lock().await;
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "operation": "agent.cancel", "session_id": &session_id, "agent": &agent,
+        }))
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+        {
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
         }
-
-        let target_command = match agent_cancel_command(
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let intent = serde_json::to_value(
+            delegation
+                .delegation_stop_incarnation(&record, &admission)
+                .await
+                .map_err(SessionHubError::Store)?,
+        )
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
+            .hub
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
+                worker_generation,
+                digest.clone(),
+                request_json.clone(),
+                intent,
+            )
+            .await
+        {
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
+            }
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let incarnation =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let _fence = monitor
+            .fence_stop_incarnation(&self.hub, &incarnation, &admission)
+            .await
+            .map_err(SessionHubError::Store)?;
+        drop(admission);
+        let prefix = format!(
+            "agent-cancel-{}",
+            &crate::delegation::stable_digest(&[command_id.as_str(), record.agent_id.as_str()])
+                [..24]
+        );
+        let primary = match agent_cancel_command(
             &record,
-            command_id.as_str(),
+            &format!("{prefix}-primary"),
             "manual",
-            worker_generation,
+            self.hub.worker_generation(),
             self.hub.device_id(),
         ) {
             Ok(command) => command,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-        let cancelled = match self.hub.cancel_internal_turn(target_command).await {
+        let cancelled = match delegation
+            .cancel_single_subagent_incarnation(&record, primary, &prefix, incarnation)
+            .await
+        {
             Ok(cancelled) => cancelled,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-
-        if cancelled.status == TurnCancellationStatus::Accepted {
-            for descendant in subtree.into_iter().rev() {
-                if descendant.agent_id == record.agent_id {
-                    continue;
-                }
-                let descendant_command_id = format!(
-                    "{}-ancestor-{}",
-                    command_id.as_str(),
-                    descendant.agent_id.as_str()
-                );
-                let command = match agent_cancel_command(
-                    &descendant,
-                    &descendant_command_id,
-                    "manual_ancestor",
-                    worker_generation,
-                    self.hub.device_id(),
-                ) {
-                    Ok(command) => command,
-                    Err(error) => return self.respond_turn_error(request_id, error),
-                };
-                if let Err(error) = self.hub.cancel_internal_turn(command).await {
-                    tracing::warn!(
-                        agent = %descendant.agent_id,
-                        ?error,
-                        "manual child cancellation descendant sweep will be reconciled by the cancelled parent"
-                    );
-                }
-            }
-        }
-
-        self.send(WireFrame::Response {
+        self.commit_stop_operation(
             request_id,
-            body: ResponseBody::AgentCancel {
+            &command_id,
+            &session_id,
+            &digest,
+            &request_json,
+            ResponseBody::AgentCancel {
                 agent: record.agent_id,
                 child_session_id: cancelled.session_id,
                 child_run_id: cancelled.run_id,
@@ -15402,7 +15535,152 @@ impl HubConnection {
                 },
                 terminal_seq: cancelled.terminal_seq,
             },
-        })
+        )
+        .await
+    }
+
+    fn respond_stop_operation(
+        &self,
+        request_id: RequestId,
+        response: serde_json::Value,
+    ) -> Result<(), SessionHubError> {
+        let body = serde_json::from_value(response)
+            .map_err(|e| SessionHubError::Task(format!("invalid helper-stop receipt: {e}")))?;
+        self.send(WireFrame::Response { request_id, body })
+    }
+
+    async fn commit_stop_operation(
+        &self,
+        request_id: RequestId,
+        command: &CommandId,
+        session: &SessionId,
+        digest: &str,
+        json: &str,
+        body: ResponseBody,
+    ) -> Result<(), SessionHubError> {
+        let response =
+            serde_json::to_value(body).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let response = self
+            .hub
+            .inner
+            .store
+            .finalize_stop_operation(
+                command.as_str().to_owned(),
+                session.clone(),
+                digest.to_owned(),
+                json.to_owned(),
+                response,
+            )
+            .await
+            .map_err(SessionHubError::Store)?;
+        self.respond_stop_operation(request_id, response)
+    }
+
+    /// `agent.cancel_all`: stops every subagent in the session's delegation
+    /// tree, however deep and through later child runs, and removes those
+    /// subagents' monitors. The session's own runs are untouched.
+    async fn agent_cancel_all(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        let _operation = self.hub.inner.stop_operations.lock().await;
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "agent-cancel-all command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "operation": "agent.cancel_all", "session_id": &session_id,
+        }))
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+        {
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let root = crate::delegation::SubagentTreeRoot::Session(session_id.clone());
+        let monitor = self.hub.inner_monitor();
+        let admission = monitor.admission_lock().await;
+        let intent = serde_json::to_value(
+            delegation
+                .stop_incarnations(&root, &admission)
+                .await
+                .map_err(SessionHubError::Store)?,
+        )
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
+            .hub
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
+                worker_generation,
+                digest.clone(),
+                request_json.clone(),
+                intent,
+            )
+            .await
+        {
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
+            }
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let targets: Vec<crate::delegation::StopIncarnation> =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let mut fences = Vec::new();
+        for target in targets
+            .iter()
+            .filter(|target| target.session_id != session_id)
+        {
+            fences.push(
+                monitor
+                    .fence_stop_incarnation(&self.hub, target, &admission)
+                    .await
+                    .map_err(SessionHubError::Store)?,
+            );
+        }
+        drop(admission);
+        let prefix = format!(
+            "agent-cancel-all-{}",
+            &crate::delegation::stable_digest(&[command_id.as_str(), session_id.as_str()])[..24]
+        );
+        let stopped = delegation
+            .stop_subagent_tree_incarnations(root, &prefix, &targets)
+            .await
+            .map_err(SessionHubError::Store)?;
+        self.commit_stop_operation(
+            request_id,
+            &command_id,
+            &session_id,
+            &digest,
+            &request_json,
+            ResponseBody::AgentCancelAll {
+                session_id: session_id.clone(),
+                stopped: stopped.wire(),
+            },
+        )
+        .await
     }
 
     async fn queue_list(
@@ -16299,6 +16577,9 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
+        // Owner decision 2026-09-25: turn.cancel (TUI Esc) stops only the
+        // main thread. Its subagents keep running; the worker's cancellation
+        // cleanup detaches them and records the still-running marker.
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::TurnCancel {
@@ -16494,17 +16775,33 @@ impl HubConnection {
         })
     }
 
+    /// `headless.run.stop` (owner decision 2026-09-25): the default `all`
+    /// scope stops the run and every subagent in its tree, however deep and
+    /// through later child runs; `main` stops only the run (its subagents keep
+    /// running and a waited-on child's result is delivered later);
+    /// `subagents` stops only the tree and leaves the run going.
     async fn headless_run_stop(
         &self,
         request_id: RequestId,
         command_id: CommandId,
         run_id: haider_protocol::ids::RunId,
+        scope: haider_rpc::RunStopScopeWire,
     ) -> Result<(), SessionHubError> {
+        use haider_rpc::RunStopScopeWire as Scope;
         if command_id.as_str().is_empty() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
                 "headless stop command id must not be empty",
+                false,
+                None,
+            );
+        }
+        if matches!(scope, Scope::Unknown) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "headless stop scope must be all, main or subagents",
                 false,
                 None,
             );
@@ -16518,69 +16815,169 @@ impl HubConnection {
                 None,
             );
         };
-        if found.state.is_terminal() {
-            return self.send(WireFrame::Response {
-                request_id,
-                body: ResponseBody::HeadlessRunStop {
-                    session_id: found.session_id,
-                    run_id,
-                    status: CancelStatus::AlreadyTerminal,
-                    terminal_seq: Some(found.state_seq),
-                },
-            });
-        }
+        #[cfg(test)]
+        stop_boundary_hook::after_at(
+            stop_boundary_hook::Boundary::StopOperation,
+            &found.session_id,
+        )
+        .await;
+        let _operation = self.hub.inner.stop_operations.lock().await;
+        let delegation = crate::delegation::DelegationHandle::new(self.hub.clone());
+        let tree = crate::delegation::SubagentTreeRoot::Run {
+            session_id: found.session_id.clone(),
+            run_id: run_id.clone(),
+        };
+        let prefix = format!(
+            "run-stop-{}",
+            &crate::delegation::stable_digest(&[command_id.as_str(), run_id.as_str()])[..24]
+        );
+        let echo_scope = (!scope.is_all()).then_some(scope);
         let request_json = serde_json::to_string(&serde_json::json!({
-            "session_id": &found.session_id,
-            "worker_generation": self.hub.worker_generation(),
-            "run_id": &run_id,
+            "operation": "headless.run.stop", "session_id": &found.session_id,
+            "run_id": &run_id, "scope": scope,
         }))
-        .map_err(|error| {
-            SessionHubError::Task(format!("cannot encode headless stop coordinates: {error}"))
-        })?;
-        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        let cancelled = match self
+        .map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
             .hub
-            .turn_cancel_receipt(&command_id, &request_digest, &request_json)
+            .inner
+            .store
+            .stop_operation_receipt(
+                command_id.as_str().to_owned(),
+                digest.clone(),
+                request_json.clone(),
+            )
             .await
         {
-            Ok(Some(cancelled)) => cancelled,
-            Ok(None) => {
+            Ok(Some(response)) => return self.respond_stop_operation(request_id, response),
+            Ok(None) => {}
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+        let monitor = self.hub.inner_monitor();
+        #[cfg(test)]
+        stop_boundary_hook::after_at(
+            stop_boundary_hook::Boundary::StopAdmission,
+            &found.session_id,
+        )
+        .await;
+        let admission = monitor.admission_lock().await;
+        let targets = delegation
+            .stop_incarnations(&tree, &admission)
+            .await
+            .map_err(SessionHubError::Store)?;
+        let intent =
+            serde_json::to_value(targets).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let intent = match self
+            .hub
+            .inner
+            .store
+            .claim_stop_operation(
+                command_id.as_str().to_owned(),
+                self.hub.worker_generation(),
+                digest.clone(),
+                request_json.clone(),
+                intent,
+            )
+            .await
+        {
+            Ok(haider_core::StopOperationClaim::Committed(response)) => {
+                return self.respond_stop_operation(request_id, response);
+            }
+            Ok(haider_core::StopOperationClaim::Pending(intent)) => intent,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let targets: Vec<crate::delegation::StopIncarnation> =
+            serde_json::from_value(intent).map_err(|e| SessionHubError::Task(e.to_string()))?;
+        let mut fences = Vec::new();
+        for target in &targets {
+            let owned = if target.session_id == found.session_id {
+                matches!(scope, Scope::All) && !found.state.is_terminal()
+            } else {
+                matches!(scope, Scope::All | Scope::Subagents)
+            };
+            if owned {
+                fences.push(
+                    monitor
+                        .fence_stop_incarnation(&self.hub, target, &admission)
+                        .await
+                        .map_err(SessionHubError::Store)?,
+                );
+            }
+        }
+        drop(admission);
+        let (status, terminal_seq) =
+            if matches!(scope, Scope::Subagents) || found.state.is_terminal() {
+                (
+                    if found.state.is_terminal() {
+                        CancelStatus::AlreadyTerminal
+                    } else {
+                        CancelStatus::Accepted
+                    },
+                    found.state.is_terminal().then_some(found.state_seq),
+                )
+            } else {
+                let inner_json = serde_json::to_string(&serde_json::json!({
+                    "session_id": &found.session_id, "run_id": &run_id,
+                }))
+                .map_err(|e| SessionHubError::Task(e.to_string()))?;
                 let command = TurnCancelCommand {
-                    command_id: command_id.0,
-                    request_digest,
-                    request_json,
+                    command_id: format!("{prefix}-main"),
+                    request_digest: blake3::hash(inner_json.as_bytes()).to_hex().to_string(),
+                    request_json: inner_json,
                     session_id: found.session_id.clone(),
                     worker_generation: self.hub.worker_generation(),
                     run_id: run_id.clone(),
-                    cancelling_event_id: EventId::new(random_id("headless-cancelling")?),
-                    device_id: self.hub.inner.device_id.clone(),
+                    cancelling_event_id: EventId::new(format!("{prefix}-cancelling")),
+                    device_id: self.hub.device_id(),
                 };
-                match self.hub.cancel_turn(command).await {
+                let cancelled = match self.hub.cancel_turn(command).await {
                     Ok(TurnCancelOutcome::Committed { cancelled, .. })
                     | Ok(TurnCancelOutcome::IdempotentReplay { cancelled }) => cancelled,
                     Err(SessionHubError::Store(error)) => {
                         return self.respond_turn_error(request_id, error);
                     }
                     Err(error) => return Err(error),
-                }
-            }
-            Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
-            }
-            Err(error) => return Err(error),
-        };
-        self.send(WireFrame::Response {
+                };
+                (
+                    match cancelled.status {
+                        TurnCancellationStatus::Accepted => CancelStatus::Accepted,
+                        TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
+                    },
+                    cancelled.terminal_seq,
+                )
+            };
+        // Cancel the claimed main run before child cancellation can unblock a
+        // foreground wait and admit another provider request. Keep all fences
+        // through descendant settlement and the durable outer receipt commit.
+        let mut subagents = crate::delegation::SubagentStopSummary::default();
+        if matches!(scope, Scope::All | Scope::Subagents) {
+            subagents = delegation
+                .stop_subagent_tree_incarnations(tree.clone(), &prefix, &targets)
+                .await
+                .map_err(SessionHubError::Store)?;
+        }
+        if matches!(scope, Scope::Main) {
+            subagents.still_running = delegation
+                .live_subagent_count(&tree)
+                .await
+                .map_err(SessionHubError::Store)?;
+        }
+        self.commit_stop_operation(
             request_id,
-            body: ResponseBody::HeadlessRunStop {
-                session_id: cancelled.session_id,
-                run_id: cancelled.run_id,
-                status: match cancelled.status {
-                    TurnCancellationStatus::Accepted => CancelStatus::Accepted,
-                    TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
-                },
-                terminal_seq: cancelled.terminal_seq,
+            &command_id,
+            &found.session_id,
+            &digest,
+            &request_json,
+            ResponseBody::HeadlessRunStop {
+                session_id: found.session_id.clone(),
+                run_id,
+                status,
+                terminal_seq,
+                scope: echo_scope,
+                subagents: Some(subagents.wire()),
             },
-        })
+        )
+        .await
     }
 
     async fn run_retry(
@@ -17068,44 +17465,6 @@ impl HubConnection {
                 None,
             );
         }
-        if resolve_model {
-            if !model.is_empty() {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_INVALID_ARGUMENT,
-                    "session-create model must be empty when daemon resolution is requested",
-                    false,
-                    None,
-                );
-            }
-            let provider_default = match self.hub.accounts()? {
-                Some(facade) => {
-                    let Some(provider_default) = facade.management.inspect(|view| {
-                        view.providers
-                            .iter()
-                            .find(|summary| summary.provider == provider)
-                            .map(|summary| summary.default_model.clone())
-                    }) else {
-                        return self.respond_error(
-                            request_id,
-                            ERROR_CODE_DRAINING,
-                            "management snapshot is unavailable",
-                            true,
-                            None,
-                        );
-                    };
-                    provider_default
-                }
-                None => None,
-            };
-            if let Some(Some(default_model)) = provider_default {
-                model = default_model;
-            } else if provider_default.is_some() || resolve_provider {
-                let message = format!("provider `{provider}` publishes no default model");
-                return self.respond_error(request_id, "no_default_model", &message, false, None);
-            }
-        }
-
         // D3-5: the dependency configuration is the ONE authority on
         // creatable providers. Production answers the built-in adapter set;
         // "fake" exists only under injected test configurations. Since
@@ -17141,6 +17500,93 @@ impl HubConnection {
                 None,
             );
         }
+        let facade = self.hub.accounts()?;
+        let mut view = match facade.as_ref() {
+            Some(facade) => match facade.management.read() {
+                Some(view) => view,
+                None => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_DRAINING,
+                        "management snapshot is unavailable",
+                        true,
+                        None,
+                    );
+                }
+            },
+            None => crate::accounts::ManagementView::default(),
+        };
+        let mut inventory_prepared = false;
+        if resolve_model {
+            if !model.is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "session-create model must be empty when daemon resolution is requested",
+                    false,
+                    None,
+                );
+            }
+            let provider_default = if facade.is_some() {
+                view.scope_catalog_for_account(
+                    &provider,
+                    account_alias.as_ref().map(CredentialAlias::as_str),
+                );
+                let hint = view
+                    .providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .and_then(|summary| summary.default_model.clone())
+                    .unwrap_or_default();
+                let probe = !hint.is_empty()
+                    || view.providers.iter().any(|summary| {
+                        summary.provider == provider
+                            && (summary.inventory.needs_refresh()
+                                || matches!(
+                                    summary.inventory,
+                                    haider_rpc::ModelInventoryWire::Unavailable { .. }
+                                ))
+                    });
+                if probe {
+                    inventory_prepared = true;
+                    match self
+                        .refresh_inventory_if_needed(
+                            &mut view,
+                            &provider,
+                            &hint,
+                            account_alias.as_ref().map(CredentialAlias::as_str),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                        Err(InventoryRefreshError::Provider(error)) => {
+                            return self.respond_error(
+                                request_id,
+                                &error.code,
+                                &error.message,
+                                error.retryable,
+                                error.data,
+                            );
+                        }
+                    }
+                }
+                view.providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .map(|summary| summary.default_model.clone())
+            } else {
+                None
+            };
+            if let Some(Some(default_model)) = provider_default {
+                model = default_model;
+            } else if provider_default.is_some() || resolve_provider {
+                let message = format!("provider `{provider}` publishes no default model");
+                return self.respond_error(request_id, "no_default_model", &message, false, None);
+            }
+        }
+
         if model.trim().is_empty() {
             return self.respond_error(
                 request_id,
@@ -17150,34 +17596,32 @@ impl HubConnection {
                 None,
             );
         }
-        let mut summaries = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map_or_else(Vec::new, |view| view.providers);
-        match self
-            .refresh_inventory_if_needed(
-                &mut summaries,
-                &provider,
-                model.trim(),
-                account_alias.as_ref().map(CredentialAlias::as_str),
-                None,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(InventoryRefreshError::Hub(error)) => return Err(error),
-            Err(InventoryRefreshError::Provider(error)) => {
-                return self.respond_error(
-                    request_id,
-                    &error.code,
-                    &error.message,
-                    error.retryable,
-                    error.data,
-                );
+        if !inventory_prepared {
+            match self
+                .refresh_inventory_if_needed(
+                    &mut view,
+                    &provider,
+                    model.trim(),
+                    account_alias.as_ref().map(CredentialAlias::as_str),
+                    None,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                Err(InventoryRefreshError::Provider(error)) => {
+                    return self.respond_error(
+                        request_id,
+                        &error.code,
+                        &error.message,
+                        error.retryable,
+                        error.data,
+                    );
+                }
             }
         }
-        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(creatable, view.providers);
         let validated = match authority.validate_selection_with_status(&provider, None, &model) {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
@@ -20948,7 +21392,6 @@ fn agent_cancel_command(
         "agent": record.agent_id,
         "child_session_id": record.child_session_id,
         "child_run_id": record.child_run_id,
-        "worker_generation": worker_generation,
         "reason": reason,
     }))
     .map_err(|error| {
@@ -21588,3 +22031,6 @@ mod run_identity_tests {
 
 #[path = "provider_rebind.rs"]
 mod provider_rebind;
+
+#[cfg(test)]
+pub(super) use crate::completion::astra22_boundary_hook as stop_boundary_hook;

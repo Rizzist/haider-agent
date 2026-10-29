@@ -117,6 +117,7 @@ mod manual_retry_tests;
 mod mobile_transport;
 mod model_select;
 mod monitor;
+mod monitor_stop_fence;
 mod native_process;
 mod oauth;
 mod orchestration;

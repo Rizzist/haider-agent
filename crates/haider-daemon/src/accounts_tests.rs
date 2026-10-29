@@ -2813,7 +2813,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
     assert_eq!(resolved.account_incarnation, Some(42));
     assert_eq!(resolved.context_window, Some(131_072));
     assert_eq!(
-        factory.model_context_window(provider, "not-in-the-catalog"),
+        factory.model_context_window(provider, "not-in-the-catalog", Some(alias.as_str())),
         None,
         "context windows are exact provider/model catalog facts, never fallbacks"
     );
@@ -2869,12 +2869,32 @@ async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() 
             1_000_000,
         ),
     ];
-    for provider in [
+    let descriptors = [
         ANTHROPIC_OAUTH_PROVIDER_NAME,
         ANTHROPIC_PROVIDER_NAME,
         haider_provider::GEMINI_PROVIDER_NAME,
         haider_provider::DEEPSEEK_PROVIDER_NAME,
-    ] {
+    ]
+    .into_iter()
+    .map(|provider| CredentialDescriptor {
+        alias: CredentialAlias::new(format!("window-{provider}")),
+        provider: provider.to_owned(),
+        base_url: None,
+        auth_method: if provider == ANTHROPIC_OAUTH_PROVIDER_NAME {
+            AuthMethod::OAuth
+        } else {
+            AuthMethod::ApiKey
+        },
+        identity: "window-fixture".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    })
+    .collect::<Vec<_>>();
+    for descriptor in &descriptors {
+        let provider = descriptor.provider.as_str();
         let models = cases
             .iter()
             // anthropic-oauth sonnet-4-6 stays a static-only row.
@@ -2887,6 +2907,7 @@ async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() 
         model_source.replace(
             provider.to_owned(),
             ProviderInventory::Fetched {
+                owner: Some(ProviderModelCacheKey::for_account(provider, descriptor)),
                 models,
                 fetched_at_ms: 1,
             },
@@ -2905,14 +2926,22 @@ async fn undeclared_catalog_windows_still_yield_a_daemon_compaction_threshold() 
     )
     .expect("provider registry");
     let summaries = registry.summaries(&|_| true);
+    let management = ManagementSnapshot::new(0, descriptors.clone(), Vec::new());
+    management.publish(
+        0,
+        descriptors.clone(),
+        summaries,
+        registry.catalog_owners(),
+        registry.catalog_profiles(),
+    );
     let factory = AccountsProviderFactory::new_with_management(
-        Arc::new(StdMutex::new(Vec::new())),
-        ManagementSnapshot::new(0, Vec::new(), summaries),
+        Arc::new(StdMutex::new(descriptors)),
+        management,
         VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
         Arc::new(ProductionAccountBuilder::default()),
     );
     for (provider, model, expected_window) in cases {
-        let window = factory.model_context_window(provider, model);
+        let window = factory.model_context_window(provider, model, None);
         assert_eq!(
             window,
             Some(expected_window),
@@ -15475,7 +15504,7 @@ async fn management_publications_notify_watchers_with_the_new_revision() {
     assert_eq!(*watcher.borrow_and_update(), 8);
 
     // A full publication (descriptors + providers) notifies too.
-    snapshot.publish(9, Vec::new(), Vec::new());
+    snapshot.publish(9, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
     watcher.changed().await.expect("full publication notifies");
     assert_eq!(*watcher.borrow_and_update(), 9);
 
@@ -21331,3 +21360,6 @@ async fn run_route_recovery_tests_fallback_honors_explicit_selectors() {
         }
     }
 }
+
+#[path = "accounts_catalog_ownership_tests.rs"]
+mod catalog_ownership;

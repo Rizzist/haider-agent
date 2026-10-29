@@ -1,12 +1,30 @@
 //! Shared spawn argument validation for CLI and tool callers.
 
 use crate::graph::{ChildWorkflowSelector, ChildWorkflowTrigger};
+use crate::ids::{AgentId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const MAX_TASK_BYTES: usize = 80;
 pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
 pub const MAX_SELECTOR_BYTES: usize = 128;
+/// Upper bound on a blocking spawn's `wait_ms` observation window: one day.
+pub const MAX_WAIT_MS: u64 = 86_400_000;
+
+/// CLI command that collects a delegated child's report by its handle.
+pub fn agent_wait_command(parent_session_id: &SessionId, agent: &AgentId) -> String {
+    format!("haider agent wait {parent_session_id} {agent} --json")
+}
+
+/// CLI command that lists a parent session's delegated-child handles.
+pub fn agent_list_command(parent_session_id: &SessionId) -> String {
+    format!("haider agent list {parent_session_id} --json")
+}
+
+/// CLI command that cancels a delegated child by its handle.
+pub fn agent_cancel_command(parent_session_id: &SessionId, agent: &AgentId) -> String {
+    format!("haider agent cancel {parent_session_id} {agent} --json")
+}
 
 /// Validated arguments for the depth-capped local-subagent tool.
 ///
@@ -21,6 +39,12 @@ pub const MAX_SELECTOR_BYTES: usize = 128;
 pub struct SpawnSubagent {
     pub task: String,
     pub prompt: String,
+    /// Return the durable child handle immediately instead of waiting for its report.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    /// Optional bound on this parent's observation, never on the child's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
     /// Per-turn request tranche and hard ceiling pinned for this child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_budget: Option<crate::request_budget::RequestBudgetV1>,
@@ -92,9 +116,22 @@ impl SpawnSubagent {
         if let Some(budget) = request.request_budget {
             budget.validate()?;
         }
+        if request
+            .wait_ms
+            .is_some_and(|wait_ms| wait_ms == 0 || wait_ms > MAX_WAIT_MS)
+        {
+            return Err(format!(
+                "spawn_subagent wait_ms must be in 1..={MAX_WAIT_MS}"
+            ));
+        }
+        if request.background && request.wait_ms.is_some() {
+            return Err("spawn_subagent wait_ms is only valid for a blocking spawn".into());
+        }
         Ok(Self {
             task: task.to_owned(),
             prompt: prompt.to_owned(),
+            background: request.background,
+            wait_ms: request.wait_ms,
             request_budget: request.request_budget,
             model,
             provider,

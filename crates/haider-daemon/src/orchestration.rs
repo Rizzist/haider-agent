@@ -23,6 +23,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+/// Persisted operation deadline meaning "no wall": no explicit
+/// `script_wall_ms`/`child_wall_ms` and no explicit parent run budget.
+pub(crate) const ORCHESTRATION_NO_DEADLINE_MS: u64 = u64::MAX;
+
 const REF_SCAN_PAGE: usize = 1_024;
 const REF_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
 
@@ -92,6 +96,11 @@ pub(crate) struct PendingCallV1 {
     pub(crate) started: bool,
     #[serde(default)]
     pub(crate) approval_waiting: bool,
+    /// Absolute end of the ask's permission-answer window. It bounds only the
+    /// wait for approval; absent on checkpoints written before it existed
+    /// (their `deadline_ms` already folded the ask window in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

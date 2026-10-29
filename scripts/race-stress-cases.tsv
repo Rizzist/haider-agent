@@ -113,3 +113,8 @@ lock-background-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer
 lock-content-budget-watchdog	linux	haider-tools	lib	observed_length_content_budget_is_explicitly_elided	crates/haider-tools/src/workspace_receipt_tests.rs
 lock-cancellation-receipt-nonblocking-reader	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_waits_for_an_inherited_nonblocking_reader	crates/haider-cli/tests/autospawn_tests.rs
 lock-cancellation-receipt-eof-control	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_preserves_eof_failure	crates/haider-cli/tests/autospawn_tests.rs
+catalog-owner-paused-account-rebind	linux	haider-daemon	lib	catalog_owner_paused_a_rebind_b	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-inactive-removed-success	linux	haider-daemon	lib	catalog_owner_inactive_removed_success	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-inactive-removed-304	linux	haider-daemon	lib	catalog_owner_inactive_removed_304	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-stale-cache-removal	linux	haider-daemon	lib	catalog_owner_removed_alias_cannot_serve_a_stale_cached_model	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-active-identity-busy	linux	haider-daemon	lib	catalog_control_active_identity_change_rejects_inflight_a	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs

@@ -126,6 +126,7 @@ fn fresh_subscription_and_failed_catalog_keep_static_rows_selectable() {
     source.replace(
         "anthropic-oauth".into(),
         ProviderInventory::Fetched {
+            owner: None,
             models: vec![
                 discovered_with_context("claude-fable-5-1", true, None, Some(123_456)),
                 discovered("claude-new", true, None),
@@ -2113,6 +2114,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: Vec::new(),
             fetched_at_ms: 1,
         },
@@ -2132,6 +2134,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: vec![discovered("deepseek-v4-flash", true, None)],
             fetched_at_ms: now,
         },
@@ -2159,6 +2162,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: Vec::new(),
             fetched_at_ms: now,
         },

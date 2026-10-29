@@ -409,6 +409,46 @@ async fn toolshape_task_output_original_hash_survives_completion_eviction_and_ad
         terminal.push(result);
     }
     registry.remove_session(&session);
+    // Hold the exact recovery state between claiming adoption and restoring
+    // this completed entry. A concurrent monitor request must still accept
+    // the owned durable handle, rather than mistake an empty cache for denial.
+    assert!(registry.begin_adoption(&session));
+    assert!(registry.get(&session, &task).is_none());
+    hub.inner_monitor().activate(hub.downgrade());
+    let receipt = hub
+        .inner_monitor()
+        .client_register(
+            &hub,
+            crate::monitor::MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("completed-task-monitor"),
+                session_id: session.clone(),
+                worker_generation: hub.worker_generation(),
+                source: haider_rpc::MonitorSourceWire::Task {
+                    task_id: task.to_string(),
+                },
+                filter: Some(haider_rpc::MonitorFilterWire {
+                    field: haider_rpc::MonitorFilterFieldWire::Payload,
+                    operator: haider_rpc::MonitorFilterOperatorWire::Contains,
+                    value: "NEVER_MATCH_RECOVERY_TEST".into(),
+                    case_sensitive: true,
+                }),
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Once,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            receipt.outcome,
+            haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+        ),
+        "completed owned task during adoption: {receipt:?}"
+    );
+    registry.remove_session(&session);
     for (cursor, expected) in [None, Some(0), Some(8)].into_iter().zip(terminal) {
         assert_eq!(
             facade
