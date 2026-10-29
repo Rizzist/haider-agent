@@ -1860,3 +1860,233 @@ fn escaped_posix_delimiters_do_not_close_a_pattern_branch() {
     }
     assert_pattern_routes(r"'C:\Users\bob\'", "'C:/Users/<user>'", &context);
 }
+
+fn pattern_context_plain(tool: &str, args: &serde_json::Value, paths: &PathContext) -> String {
+    use haider_protocol::{
+        EventPayload,
+        ids::ItemId,
+        item::{ItemEvent, ToolStatus, TurnItem},
+    };
+    use haider_tui::{plain::render_plain_with_context, projection::SessionProjection};
+
+    let mut projection = SessionProjection::new();
+    projection.apply(&EventPayload::Item(ItemEvent::Started {
+        item_id: ItemId::new("sol-r6-exact"),
+        item: TurnItem::ToolCall {
+            call_id: "sol-r6-exact".into(),
+            name: tool.into(),
+            args: args.clone(),
+            status: ToolStatus::InProgress,
+            activity: None,
+        },
+    }));
+    render_plain_with_context(&projection, 0, None, paths)
+}
+
+fn assert_context_pattern(pattern: &str, expected: &str, paths: &PathContext) {
+    use haider_tui::toolfold::arg_summary_with_context;
+    for key in ["glob", "include"] {
+        assert_eq!(
+            arg_summary_with_context(&json!({key: pattern}), paths),
+            expected,
+            "{pattern}"
+        );
+    }
+    for (tool, args) in [
+        ("fs_search", json!({"query":"x", "glob":pattern})),
+        ("fs_search", json!({"query":"x", "include":pattern})),
+        ("glob", json!({"pattern":pattern})),
+        ("fs_glob", json!({"query":pattern})),
+    ] {
+        let header = tv::header_args(tool, &args, paths);
+        let plain = pattern_context_plain(tool, &args, paths);
+        assert!(
+            header.contains(&tv::one_line(expected)),
+            "{tool} {pattern}: {header}"
+        );
+        assert!(plain.contains(expected), "{tool} {pattern}: {plain}");
+        println!(
+            "SOL_GLOB_SCOPE {tool} pattern={pattern:?} expected={expected:?} header={header:?} plain={plain:?}"
+        );
+    }
+}
+
+#[test]
+fn glob_prefixes_with_only_empty_alternatives_keep_rooted_labels() {
+    let paths = PathContext::default();
+    for prefix in [
+        "{}", "{,}", "{{},}", "{,{,}}", "{}{}", "{{},{,}}", "{{}{,}}",
+    ] {
+        for (path, masked) in [
+            ("/Users/bob/src/**", "/Users/<user>/src/**"),
+            ("C:/Users/bob/src/**", "C:/Users/<user>/src/**"),
+            ("//srv/Users/bob/src/**", "//srv/Users/<user>/src/**"),
+        ] {
+            assert_context_pattern(
+                &format!("{prefix}{path}"),
+                &format!("{prefix}{masked}"),
+                &paths,
+            );
+        }
+    }
+    for (pattern, expected) in [
+        ("!!{}/Users/bob/**", "!!{}/Users/<user>/**"),
+        (" {,}/Users/bob/**", " {,}/Users/<user>/**"),
+        ("'{{},}/Users/bob/**'", "'{{},}/Users/<user>/**'"),
+        ("{a,}/Users/bob/**", "{a,}/Users/bob/**"),
+        ("{,a}/Users/bob/**", "{,a}/Users/bob/**"),
+        ("{{},a}/Users/bob/**", "{{},a}/Users/bob/**"),
+        ("src{}/Users/bob/**", "src{}/Users/bob/**"),
+        ("src/{,}/Users/bob/**", "src/{,}/Users/bob/**"),
+        (r"\{\}/Users/bob/**", r"\{\}/Users/bob/**"),
+        (r"{\{\},}/Users/bob/**", r"{\{\},}/Users/bob/**"),
+        ("{''}/Users/bob/**", "{''}/Users/bob/**"),
+        ("{}", "{}"),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn nested_glob_enclosures_preserve_branch_rooting() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        ("{src/{a,b},/Users/bob/**}", "{src/{a,b},/Users/<user>/**}"),
+        (
+            "{{src/{a,b},lib},/home/carol/**}",
+            "{{src/{a,b},lib},/home/<user>/**}",
+        ),
+        (
+            "{src/{/Users/bob,lib},/home/carol/**}",
+            "{src/{/Users/bob,lib},/home/<user>/**}",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+    for operator in ['@', '!', '?', '+', '*'] {
+        assert_context_pattern(
+            &format!("{operator}(src/@(a|b)|/Users/bob/**)"),
+            &format!("{operator}(src/@(a|b)|/Users/<user>/**)"),
+            &paths,
+        );
+        assert_context_pattern(
+            &format!("{operator}(src/@(/Users/bob|lib)|/home/carol/**)"),
+            &format!("{operator}(src/@(/Users/bob|lib)|/home/<user>/**)"),
+            &paths,
+        );
+    }
+}
+
+#[test]
+fn glob_character_classes_own_their_literal_delimiters() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        (
+            "{/Volumes/A[,]B/Users/bob/**,src}",
+            "{/Volumes/A[,]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[}]B/Users/bob/**,src}",
+            "{/Volumes/A[}]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[]},]B/Users/bob/**,src}",
+            "{/Volumes/A[]},]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[!},]B/Users/bob/**,src}",
+            "{/Volumes/A[!},]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[^},]B/Users/bob/**,src}",
+            "{/Volumes/A[^},]B/Users/<user>/**,src}",
+        ),
+        (
+            "@(/Volumes/A[|)]B/Users/bob/**|src)",
+            "@(/Volumes/A[|)]B/Users/<user>/**|src)",
+        ),
+        (
+            "'/Volumes/Bob[']s/Users/bob/**'",
+            "'/Volumes/Bob[']s/Users/<user>/**'",
+        ),
+        (
+            r#""/Volumes/A["]B/Users/carol/**""#,
+            r#""/Volumes/A["]B/Users/<user>/**""#,
+        ),
+        (r"{C:\Users\bob\a[,]b,src}", "{C:/Users/<user>/a[,]b,src}"),
+        (
+            r"{\\?\Volume{abc}\A[},]B\Users\bob\**,src}",
+            "{//device/Volume{abc}/A[},]B/Users/<user>/**,src}",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn glob_relative_literals_keep_their_enclosures() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        (r"{src/\},/Users/bob/**}", r"{src/\},/Users/<user>/**}"),
+        (r"{src/\{,/Users/bob/**}", r"{src/\{,/Users/<user>/**}"),
+        (r"@(src/\)|/Users/bob/**)", r"@(src/\)|/Users/<user>/**)"),
+        (r"@(src/\(|/Users/bob/**)", r"@(src/\(|/Users/<user>/**)"),
+        (
+            "{src/[}]/lib,/Users/bob/**}",
+            "{src/[}]/lib,/Users/<user>/**}",
+        ),
+        (
+            "{src/[,]/lib,/Users/bob/**}",
+            "{src/[,]/lib,/Users/<user>/**}",
+        ),
+        (
+            "@(src/[)]/lib|/Users/bob/**)",
+            "@(src/[)]/lib|/Users/<user>/**)",
+        ),
+        (r"{src\,/Users/bob/**}", r"{src\,/Users/bob/**}"),
+        (
+            "{src/{a,b},lib}/Users/bob/**",
+            "{src/{a,b},lib}/Users/bob/**",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn empty_glob_prefixes_keep_context_labels() {
+    let paths = paths();
+    for (pattern, expected) in [
+        ("{}C:/Users/alice/dev/haider/src/lib.rs", "{}src/lib.rs"),
+        ("{,{,}}C:/Users/alice/notes.md", "{,{,}}~/notes.md"),
+        ("'{}C:/Users/alice/notes.md'", "'{}~/notes.md'"),
+        ("{}~/notes.md", "{}~/notes.md"),
+        ("{}~bob/notes.md", "{}~<user>/notes.md"),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn glob_enclosure_labels_do_not_depend_on_hidden_account_names() {
+    let paths = PathContext::default();
+    for template in [
+        "{}/Users/{account}/src/**",
+        "{{},}C:/Users/{account}/src/**",
+        "{src/{a,b},/Users/{account}/src/**}",
+        "@(src/@(a|b)|/Users/{account}/src/**)",
+        "{/Volumes/Backup[,]2024/Users/{account}/src/**,src}",
+        "'/Volumes/Bob[']s/Users/{account}/src/**'",
+        "{src/[}]/lib,/Users/{account}/src/**}",
+        r"{src/\},/Users/{account}/src/**}",
+    ] {
+        let reference = template.replace("{account}", "bob");
+        let expected =
+            haider_tui::toolfold::arg_summary_with_context(&json!({"glob": reference}), &paths);
+        assert!(!expected.contains("/bob/"), "{expected}");
+        for account in ["bob", "robertson", "δοκιμή"] {
+            let pattern = template.replace("{account}", account);
+            assert_context_pattern(&pattern, &expected, &paths);
+        }
+    }
+}

@@ -256,6 +256,40 @@ fn is_absolute_pattern(pattern: &str) -> bool {
         || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2).copied(), Some(b'/' | b'\\')))
 }
 
+struct PatternScope {
+    opener: char,
+    rooted: bool,
+    only_empty_alternatives: bool,
+}
+
+impl PatternScope {
+    fn new(opener: char, rooted: bool) -> Self {
+        Self {
+            opener,
+            rooted,
+            only_empty_alternatives: opener == '{',
+        }
+    }
+}
+
+fn mark_pattern_content(scopes: &mut [PatternScope]) {
+    if let Some(scope) = scopes.last_mut() {
+        scope.only_empty_alternatives = false;
+    }
+}
+
+fn close_pattern_scope(scopes: &mut Vec<PatternScope>) -> bool {
+    let Some(scope) = scopes.pop() else {
+        return false;
+    };
+    if !scope.only_empty_alternatives {
+        mark_pattern_content(scopes);
+    }
+    // The matcher drops a brace expression made entirely of empty alternatives.
+    // A following absolute spelling therefore still starts the same branch.
+    scope.rooted && scope.only_empty_alternatives
+}
+
 pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> String {
     let mut prefix = pattern.trim_start();
     while let Some(tail) = prefix.strip_prefix('!') {
@@ -272,9 +306,8 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
     {
         return pattern.to_owned();
     }
-    // Only syntax opened BEFORE a path can end that path. At top level,
-    // punctuation and whitespace belong to the whole absolute pattern.
-    // A slash inside a relative pattern is not a branch boundary.
+    // Relative branches keep their spelling, but still own their nested syntax.
+    // Each enclosure remembers whether its alternatives start at the path root.
     let mut output = String::new();
     let mut rest = pattern;
     let mut boundary = true;
@@ -282,12 +315,13 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
     let mut closed_expression = false;
     while !rest.is_empty() {
         if boundary && (is_absolute_pattern(rest) || rest.starts_with('~')) {
-            let end = pattern_branch_end(rest, enclosing.last().copied());
+            mark_pattern_content(&mut enclosing);
+            let end = pattern_branch_end(rest, enclosing.last().map(|scope| scope.opener));
             let branch = &rest[..end];
             if let Some(user) = branch.strip_prefix('~') {
                 let quote = enclosing
                     .last()
-                    .copied()
+                    .map(|scope| scope.opener)
                     .filter(|ch| matches!(ch, '\'' | '"'));
                 let name_end = user
                     .char_indices()
@@ -310,47 +344,75 @@ pub(crate) fn project_pattern_in_context(pattern: &str, paths: &PathContext) -> 
             rest = &rest[end..];
             boundary = false;
             closed_expression = false;
-        } else if boundary
-            && ["@(", "!(", "?(", "+(", "*("]
-                .iter()
-                .any(|syntax| rest.starts_with(syntax))
+        } else if ["@(", "!(", "?(", "+(", "*("]
+            .iter()
+            .any(|syntax| rest.starts_with(syntax))
         {
+            mark_pattern_content(&mut enclosing);
             output.push_str(&rest[..2]);
             rest = &rest[2..];
-            enclosing.push('(');
+            enclosing.push(PatternScope::new('(', boundary));
             closed_expression = false;
         } else {
+            // In relative glob text, escapes and character classes are literal
+            // content. Their punctuation cannot close an enclosing expression.
+            if rest.starts_with('\\') {
+                output.push('\\');
+                rest = &rest[1..];
+                if let Some(ch) = rest.chars().next() {
+                    output.push(ch);
+                    rest = &rest[ch.len_utf8()..];
+                }
+                mark_pattern_content(&mut enclosing);
+                boundary = false;
+                closed_expression = false;
+                continue;
+            }
+            if rest.starts_with('[') {
+                let end = pattern_class_end(rest).unwrap_or(rest.len());
+                output.push_str(&rest[..end]);
+                rest = &rest[end..];
+                mark_pattern_content(&mut enclosing);
+                boundary = false;
+                closed_expression = false;
+                continue;
+            }
             let Some(ch) = rest.chars().next() else {
                 break;
             };
             output.push(ch);
             rest = &rest[ch.len_utf8()..];
+            let opener = enclosing.last().map(|scope| scope.opener);
+            if ch != '{' && !matches!((ch, opener), ('}' | ',', Some('{'))) {
+                mark_pattern_content(&mut enclosing);
+            }
             match ch {
-                '\'' | '"' if enclosing.last() == Some(&ch) => {
-                    enclosing.pop();
-                    boundary = false;
+                '\'' | '"' if opener == Some(ch) => {
+                    boundary = close_pattern_scope(&mut enclosing);
                     closed_expression = enclosing.is_empty();
                 }
-                '{' | '\'' | '"' if boundary => {
-                    enclosing.push(ch);
+                '{' => {
+                    enclosing.push(PatternScope::new(ch, boundary));
                     closed_expression = false;
                 }
-                '}' if enclosing.last() == Some(&'{') => {
-                    enclosing.pop();
-                    boundary = false;
-                    closed_expression = enclosing.is_empty();
-                }
-                ')' if enclosing.last() == Some(&'(') => {
-                    enclosing.pop();
-                    boundary = false;
-                    closed_expression = enclosing.is_empty();
-                }
-                ',' if enclosing.last() == Some(&'{') => {
-                    boundary = true;
+                '\'' | '"' if boundary => {
+                    enclosing.push(PatternScope::new(ch, boundary));
                     closed_expression = false;
                 }
-                '|' if enclosing.last() == Some(&'(') => {
-                    boundary = true;
+                '}' if opener == Some('{') => {
+                    boundary = close_pattern_scope(&mut enclosing);
+                    closed_expression = enclosing.is_empty();
+                }
+                ')' if opener == Some('(') => {
+                    boundary = close_pattern_scope(&mut enclosing);
+                    closed_expression = enclosing.is_empty();
+                }
+                ',' if opener == Some('{') => {
+                    boundary = enclosing.last().is_some_and(|scope| scope.rooted);
+                    closed_expression = false;
+                }
+                '|' if opener == Some('(') => {
+                    boundary = enclosing.last().is_some_and(|scope| scope.rooted);
                     closed_expression = false;
                 }
                 '!' if boundary => {}
@@ -466,6 +528,23 @@ fn preserve_pattern_escapes(decoded: &str, display: &str, escapes: &[usize]) -> 
     output
 }
 
+// Match the glob matcher's class delimiters: optional negation, a literal
+// first ']', then the closing ']'. Backslashes are literal inside a class.
+fn pattern_class_end(pattern: &str) -> Option<usize> {
+    let mut chars = pattern.strip_prefix('[')?.char_indices().peekable();
+    if chars.peek().is_some_and(|&(_, ch)| matches!(ch, '!' | '^')) {
+        chars.next();
+    }
+    let mut first = true;
+    for (index, ch) in chars {
+        if ch == ']' && !first {
+            return Some(1 + index + ch.len_utf8());
+        }
+        first = false;
+    }
+    None
+}
+
 fn pattern_branch_end(pattern: &str, enclosing: Option<char>) -> usize {
     let Some(enclosing) = enclosing else {
         return pattern.len();
@@ -479,13 +558,24 @@ fn pattern_branch_end(pattern: &str, enclosing: Option<char>) -> usize {
         && (pattern.starts_with('/') || pattern.starts_with(r"\/") || pattern.starts_with('~'))
         && !pattern.starts_with("//");
     let mut escaped = false;
+    let mut class_end = 0;
     for (index, ch) in pattern.char_indices() {
+        if index < class_end {
+            continue;
+        }
         if escaped {
             escaped = false;
             continue;
         }
         if escapes && ch == '\\' {
             escaped = true;
+            continue;
+        }
+        if ch == '[' {
+            let Some(end) = pattern_class_end(&pattern[index..]) else {
+                return pattern.len();
+            };
+            class_end = index + end;
             continue;
         }
         if matches!(enclosing, '\'' | '"') {
