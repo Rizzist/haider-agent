@@ -282,6 +282,7 @@ pub fn chip_fleet_state(chip: &crate::app::ChipModel) -> FleetAgentStateWire {
         S::InputRequired | S::Waiting => FleetAgentStateWire::Waiting,
         S::Done => FleetAgentStateWire::Done,
         S::Error => FleetAgentStateWire::Failed,
+        S::Cancelled => FleetAgentStateWire::Cancelled,
     }
 }
 
@@ -327,7 +328,7 @@ pub fn entry_summary(roll: &ViewRollup) -> String {
         out.push_str(&format!(" · {} queued", roll.queued));
     }
     if roll.cancelled > 0 {
-        out.push_str(&format!(" · {} closing", roll.cancelled));
+        out.push_str(&format!(" · {} cancelled", roll.cancelled));
     }
     out.push_str(" · ⌥F fleet");
     out

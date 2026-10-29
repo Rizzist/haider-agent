@@ -704,7 +704,7 @@ impl<K: Ord + Clone> PresenceMachine<K> {
 
 /// Where to stop when a freedesktop notification server offers no action
 /// buttons (Linux fallback helper).
-pub const LINUX_FALLBACK_STOP_HINT: &str = "To stop: press Esc in the Haider TUI session, or for a headless run use `haider run --stop <run-id>`.";
+pub const LINUX_FALLBACK_STOP_HINT: &str = "For a configured headless run, stop it and all its subagents with `haider run --stop <run-id>`. In the TUI, press Esc if its main thread is controlling the screen. For a subagent, use `haider agent cancel <parent-session> <agent>`.";
 
 /// The Linux notification helper's decision from the server's
 /// `GetCapabilities` reply. Pure so it is unit-tested on every platform.

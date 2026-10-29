@@ -47,7 +47,7 @@ use crate::projection::RawOutcome;
 
 fn replace_loom_author_text(model: &mut AppModel, text: &str) {
     if model.screen == crate::app::Screen::Loom {
-        model.composer.set_text(text);
+        model.edit_composer_from_outside(|composer| composer.set_text(text));
     } else {
         model
             .drafts
@@ -422,6 +422,7 @@ pub enum LiveCommand {
         changes: haider_rpc::SshProfileUpdateWire,
     },
     SshShellOpen {
+        attempt_id: u64,
         profile: String,
         session: Option<SessionId>,
         size: haider_rpc::SshPtySizeWire,
@@ -1001,6 +1002,19 @@ impl LiveDriver {
             }];
         }
 
+        // A covered composer must never re-publish its parked bytes. A
+        // retained foreign edit is applied by the mutable-model seam before
+        // this comparison, so OLD cannot overwrite NEW on the first frame.
+        if !model.accepts_injected_edits()
+            || self
+                .input_mirror
+                .sessions
+                .get(&session)
+                .is_some_and(|state| state.pending.is_some())
+        {
+            return Vec::new();
+        }
+
         let text = model.composer.text();
         let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
             model
@@ -1128,19 +1142,65 @@ impl LiveDriver {
         if floor.is_some_and(|floor| input.revision <= floor) {
             return;
         }
-        state.foreign_floors.insert(input.owner, input.revision);
-        // The mirror now equals the surface: block an immediate republish.
+        if !model.accepts_injected_edits() {
+            if state.pending.as_ref().is_none_or(|pending| {
+                pending.input.owner != input.owner || input.revision > pending.input.revision
+            }) {
+                state.pending = Some(PendingForeignInput {
+                    input,
+                    epoch: self.connection_epoch,
+                    composer_revision: model.composer.revision(),
+                    local_attachments: model.composer.attachments().to_vec(),
+                });
+            }
+            model.mirror_waiting_for_owner = true;
+            return;
+        }
+        if state.pending.as_ref().is_some_and(|pending| {
+            pending.input.owner == input.owner && input.revision < pending.input.revision
+        }) {
+            return;
+        }
+        state.pending = None;
+        state
+            .foreign_floors
+            .insert(input.owner.clone(), input.revision);
         state.published = Some(PublishedSurfaceInput {
             text: input.text.clone(),
             attachments: attachments.clone(),
         });
-        // rev934 P3-5: the same predicate that gates injected ops gates a
-        // remote replace — an in-progress modal answer is never overwritten.
-        if !model.accepts_injected_input() {
-            return;
-        }
+        model.mirror_waiting_for_owner = false;
         model.set_mirrored_input_attachments(session, attachments);
         model.handle(crate::app::AppEvent::SurfaceInputReplace { text: input.text });
+    }
+
+    /// Deliver a queued replacement only when the visible Session input
+    /// accepts edits and its local content still matches the queue point.
+    /// A later local edit refuses and drops it. Reconnects and closed
+    /// sessions also drop the slot.
+    pub fn apply_pending_input(&mut self, model: &mut AppModel) {
+        if !model.accepts_injected_edits() {
+            return;
+        }
+        let Some(session) = model.active_session.clone() else {
+            model.mirror_waiting_for_owner = false;
+            return;
+        };
+        let pending = self
+            .input_mirror
+            .sessions
+            .get_mut(&session)
+            .and_then(|state| state.pending.take());
+        if let Some(pending) = pending
+            && pending.epoch == self.connection_epoch
+            && self.input_mirror.epoch == pending.epoch
+            && model.composer.revision() == pending.composer_revision
+            && model.composer.attachments() == pending.local_attachments.as_slice()
+        {
+            self.apply_surface_input(model, session, pending.input);
+        }
+        model.mirror_waiting_for_owner = false;
+        model.deliver_pending_dictation();
     }
 }
 
@@ -1351,6 +1411,10 @@ pub enum LiveReply {
     Listed {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
+    },
+    /// Incremental roster heads; never a claim that a paged list is complete.
+    RosterUpdated {
+        sessions: Vec<SessionSummary>,
     },
     ListedAt {
         sessions: Vec<SessionSummary>,
@@ -1601,6 +1665,7 @@ pub enum LiveReply {
         message: String,
     },
     SshShellOpened {
+        attempt_id: u64,
         shell: haider_rpc::ShellWire,
     },
     SshShellOutput {
@@ -1608,6 +1673,7 @@ pub enum LiveReply {
         chunk_b64: haider_rpc::TerminalOutputWire,
     },
     SshShellFailed {
+        attempt_id: u64,
         code: String,
         message: String,
     },
@@ -2140,6 +2206,9 @@ pub struct MenuCoordinates {
     /// Minted at the FIRST answer attempt and reused on every retry, so a
     /// resend after a lost response resolves the same menu once.
     command_id: Option<CommandId>,
+    /// Whether the committed opening has choices. Option-less answers use
+    /// an empty wire key; choice menus retain the ordinal fallback.
+    has_options: bool,
 }
 
 /// A live session row the launcher knows about but is not attached to.
@@ -2177,6 +2246,17 @@ struct InputMirrorSession {
     /// compare only within one owner — never against our own publish counter
     /// (rev934 P1-1).
     foreign_floors: HashMap<String, u64>,
+    /// Latest queued foreign edit. It has not advanced any applied floor.
+    pending: Option<PendingForeignInput>,
+}
+
+#[derive(Debug)]
+struct PendingForeignInput {
+    input: haider_rpc::SurfaceInputWire,
+    epoch: u64,
+    /// A later local edit supersedes this queued replacement.
+    composer_revision: u64,
+    local_attachments: Vec<crate::composer::PendingAttachment>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3177,8 +3257,20 @@ impl LiveDriver {
 
     /// Reduce one inbound fact, mutating the model, and return the RPCs the
     /// shell must now issue.
-    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
+        let before = model.input_rows();
+        let commands = self.apply_reply(model, reply);
+        // A replaced neighbor or changed binding is an outside change even
+        // when the selected row still has the same identity. Unchanged and
+        // irrelevant bootstrap replies do not retire type-ahead.
+        if before != model.input_rows() {
+            model.invalidate_queued_input();
+        }
+        commands
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_reply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         let reply = match reply {
             LiveReply::ListedAt {
                 sessions,
@@ -3577,163 +3669,9 @@ impl LiveDriver {
             LiveReply::Listed {
                 sessions,
                 next_cursor,
-            } => {
-                if next_cursor.is_none() {
-                    self.meter_list_pending = false;
-                    self.meter_list_retry_at = None;
-                    self.meter_list_retry_delay = METER_LIST_RETRY_INITIAL;
-                }
-                for summary in sessions {
-                    if self
-                        .generations
-                        .get(&summary.session_id)
-                        .is_some_and(|known| summary.worker_generation < *known)
-                    {
-                        continue;
-                    }
-                    let workspace_display = summary
-                        .workspace_cwd
-                        .as_deref()
-                        .or_else(|| {
-                            summary
-                                .metadata
-                                .as_ref()
-                                .map(|metadata| metadata.cwd.as_str())
-                        })
-                        .map(workspace_display_path);
-                    model.upsert_live_session(&summary.session_id);
-                    if summary.metadata.is_none()
-                        && let Some(row) = model
-                            .sessions
-                            .iter_mut()
-                            .find(|row| row.id == summary.session_id)
-                    {
-                        let current = if model.active_session.as_ref() == Some(&summary.session_id)
-                        {
-                            model.meter_epoch.selection_epoch
-                        } else {
-                            row.meter_epoch.selection_epoch
-                        };
-                        if current
-                            .max(row.route_reset_epoch)
-                            .max(row.account_request_epoch)
-                            .max(row.account_metadata_epoch)
-                            .is_none_or(|epoch| summary.head_seq >= epoch)
-                        {
-                            row.account_default_epoch = None;
-                        }
-                    }
-                    if let Some(metadata) = summary.metadata.as_ref() {
-                        // Forks copy the source's current configuration, but
-                        // only their selected history prefix. Its selection
-                        // epoch can exceed the child's local journal head.
-                        // Epoch and pair admission order the configuration;
-                        // the summary watermark orders the history counts.
-                        model.note_session_metadata_at(
-                            &summary.session_id,
-                            &metadata.provider,
-                            &metadata.model,
-                            metadata.max_tokens,
-                            metadata.selection_epoch,
-                            metadata.max_tokens_source,
-                        );
-                        model.note_session_account(&summary.session_id, metadata);
-                        model.note_session_budget_clamp(&summary.session_id, metadata);
-                        self.workspace_paths
-                            .insert(summary.session_id.clone(), metadata.cwd.clone());
-                        if metadata.workspace_allocation.is_some() {
-                            self.dated_sessions.insert(summary.session_id.clone());
-                        }
-                        if let Some(origin) = metadata.launch_origin.as_ref() {
-                            self.origin_revisions
-                                .insert(summary.session_id.clone(), origin.revision);
-                        }
-                    } else if let (Some(provider), Some(model_name)) =
-                        (summary.provider.as_deref(), summary.last_model.as_deref())
-                    {
-                        // Legacy rows may have only the session's own folded
-                        // pair. It is useful for projection, never proof that
-                        // an epochless footprint is current.
-                        model.note_session_metadata_at(
-                            &summary.session_id,
-                            provider,
-                            model_name,
-                            0,
-                            None,
-                            None,
-                        );
-                    }
-                    self.binding_worker_generation = Some(summary.worker_generation);
-                    if let Some(display) = workspace_display {
-                        if model.active_session.as_ref() == Some(&summary.session_id) {
-                            model.session_dir = display;
-                        } else if let Some(row) = model
-                            .sessions
-                            .iter_mut()
-                            .find(|row| row.id == summary.session_id)
-                        {
-                            row.dir = display;
-                        }
-                    }
-                    // Launcher fix 2: the additive turn/footprint fields
-                    // hydrate the row's counts at list time — tolerantly
-                    // (an older daemon's summary stores nothing).
-                    model.note_summary_counts(&summary);
-                    self.generations
-                        .insert(summary.session_id.clone(), summary.worker_generation);
-                    if !self.attachments.contains_key(&summary.session_id) {
-                        self.cold.insert(
-                            summary.session_id,
-                            Cold {
-                                head_seq: summary.head_seq,
-                            },
-                        );
-                    }
-                }
-                model.dirty = true;
-                // ADE seam (`haider --session <id>`): the LIST is the proof
-                // of existence — open the target the moment it appears; once
-                // the list is COMPLETE (no next page) an unknown id flashes
-                // honestly instead of waiting forever.
-                if let Some(target) = model.initial_session.clone() {
-                    if model.sessions.iter().any(|entry| entry.id == target) {
-                        model.initial_session = None;
-                        model.open_session(&target);
-                    } else if next_cursor.is_none() {
-                        model.initial_session = None;
-                        model.flash =
-                            Some(format!("· --session: {} is not a known session", target));
-                    }
-                }
-                let last_page = next_cursor.is_none();
-                let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
-                    vec![LiveCommand::ListAt {
-                        cursor: Some(cursor),
-                        epoch: self.connection_epoch,
-                    }]
-                });
-                if last_page && !self.meter_list_dirty.is_empty() {
-                    self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
-                    self.meter_list_pending = true;
-                    follow.push(LiveCommand::ListAt {
-                        cursor: None,
-                        epoch: self.connection_epoch,
-                    });
-                } else if last_page {
-                    self.meter_list_started.clear();
-                }
-                // D1: hydrate the Loom registry once per connection — the
-                // typed-chip colors and graph annotations read from it.
-                // Round 4: the dedup latch (`loom_requested`) is separate
-                // from the truth latch (`loom_loaded`, set only when the
-                // reply installs) so /loom can render LOADING honestly.
-                if !model.loom_requested && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
-                    model.loom_requested = true;
-                    follow.push(LiveCommand::LoomList {
-                        epoch: self.connection_epoch,
-                    });
-                }
-                follow
+            } => self.apply_session_summaries(model, sessions, next_cursor, true),
+            LiveReply::RosterUpdated { sessions } => {
+                self.apply_session_summaries(model, sessions, None, false)
             }
             LiveReply::ListFailed => {
                 self.meter_list_pending = false;
@@ -4063,8 +4001,8 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
-            LiveReply::SshShellOpened { shell } => {
-                model.apply_ssh_shell_opened(shell);
+            LiveReply::SshShellOpened { attempt_id, shell } => {
+                model.apply_ssh_shell_opened(attempt_id, shell);
                 Vec::new()
             }
             LiveReply::SshShellOutput { id, chunk_b64 } => {
@@ -4081,7 +4019,18 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
-            LiveReply::SshShellFailed { code, message } => {
+            LiveReply::SshShellFailed {
+                attempt_id,
+                code,
+                message,
+            } => {
+                if model
+                    .ssh_terminal
+                    .as_ref()
+                    .is_none_or(|pane| pane.attempt_id != attempt_id)
+                {
+                    return Vec::new();
+                }
                 model.ssh_terminal = None;
                 model.flash = Some(format!("· SSH terminal refused [{code}] — {message}"));
                 model.dirty = true;
@@ -4219,9 +4168,7 @@ impl LiveDriver {
                 model.apply_fleet_snapshot(*snapshot);
                 // Events applied while the read flew folded into ONE chase:
                 // re-read now, only while the screen is still open.
-                if std::mem::take(&mut self.fleet_chase)
-                    && model.screen == crate::app::Screen::Fleet
-                {
+                if std::mem::take(&mut self.fleet_chase) {
                     return self.fleet_refresh(model);
                 }
                 Vec::new()
@@ -6185,7 +6132,9 @@ impl LiveDriver {
                 let mut commands = self.resume(model);
                 // A fleet screen left open across the redial re-reads its
                 // snapshot on the fresh socket — the same one-emitter seam.
-                if model.screen == crate::app::Screen::Fleet {
+                if (model.screen == crate::app::Screen::Fleet || !model.chips.is_empty())
+                    && model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1)
+                {
                     commands.extend(self.fleet_refresh(model));
                 }
                 // A pinned graph re-reads its reduction on the fresh socket:
@@ -6203,27 +6152,26 @@ impl LiveDriver {
                 commands
             }
             LiveReply::InputInjected { session, op } => {
-                // Apply only when this composer is genuinely the session's
-                // live input surface: the session is active and a session
-                // surface is on screen. Anything else ignores the op — the
-                // absence of a republish tells the injector it did not land.
-                // rev933c/d finding 4: an injected op lands only when the
-                // PLAIN session composer is the live Enter target — the
-                // single predicate that mirrors key-dispatch precedence
-                // (no login/talk-setup/engaged-talk card, no menu, no help,
-                // not the child-messaging subagent view). A synthesized
-                // Submit can therefore never activate a card row.
-                if model.active_session.as_ref() == Some(&session) && model.accepts_injected_input()
-                {
+                // Judge edits and Submit separately against the current
+                // owner at delivery. A shared answer-line card may accept
+                // Set/Insert/Clear while still refusing a synthetic Enter.
+                // Covered owners never receive a queued injected edit.
+                if model.active_session.as_ref() == Some(&session) {
                     match op {
-                        haider_rpc::SurfaceInjectOp::Set { text } => {
-                            model.composer.set_text(text);
+                        haider_rpc::SurfaceInjectOp::Set { text }
+                            if model.accepts_injected_edits() =>
+                        {
+                            model.edit_composer_from_outside(|composer| composer.set_text(text));
                         }
-                        haider_rpc::SurfaceInjectOp::Insert { text } => {
-                            model.composer.insert_str(&text);
+                        haider_rpc::SurfaceInjectOp::Insert { text }
+                            if model.accepts_injected_edits() =>
+                        {
+                            model.edit_composer_from_outside(|composer| composer.insert_str(&text));
                         }
-                        haider_rpc::SurfaceInjectOp::Clear => model.composer.clear(),
-                        haider_rpc::SurfaceInjectOp::Submit => {
+                        haider_rpc::SurfaceInjectOp::Clear if model.accepts_injected_edits() => {
+                            model.edit_composer_from_outside(crate::composer::Composer::clear);
+                        }
+                        haider_rpc::SurfaceInjectOp::Submit if model.accepts_injected_submit() => {
                             // Exactly the Enter path — mid-turn queue modes,
                             // command dispatch, and drafts all keep their
                             // ordinary meaning.
@@ -6488,6 +6436,182 @@ impl LiveDriver {
         }
     }
 
+    fn apply_session_summaries(
+        &mut self,
+        model: &mut AppModel,
+        sessions: Vec<SessionSummary>,
+        next_cursor: Option<String>,
+        list_complete: bool,
+    ) -> Vec<LiveCommand> {
+        if list_complete && next_cursor.is_none() {
+            self.meter_list_pending = false;
+            self.meter_list_retry_at = None;
+            self.meter_list_retry_delay = METER_LIST_RETRY_INITIAL;
+        }
+        let mut child_changed = false;
+        for summary in sessions {
+            if self
+                .generations
+                .get(&summary.session_id)
+                .is_some_and(|known| summary.worker_generation < *known)
+            {
+                continue;
+            }
+            child_changed |= crate::app::flatten_chips(&model.chips)
+                .iter()
+                .any(|(_, chip)| {
+                    chip.child_session.as_deref() == Some(summary.session_id.as_str())
+                        && chip
+                            .metrics
+                            .as_ref()
+                            .is_none_or(|metrics| metrics.head_seq < summary.head_seq)
+                });
+            let workspace_display = summary
+                .workspace_cwd
+                .as_deref()
+                .or_else(|| {
+                    summary
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.cwd.as_str())
+                })
+                .map(workspace_display_path);
+            model.upsert_live_session(&summary.session_id);
+            if summary.metadata.is_none()
+                && let Some(row) = model
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.id == summary.session_id)
+            {
+                let current = if model.active_session.as_ref() == Some(&summary.session_id) {
+                    model.meter_epoch.selection_epoch
+                } else {
+                    row.meter_epoch.selection_epoch
+                };
+                if current
+                    .max(row.route_reset_epoch)
+                    .max(row.account_request_epoch)
+                    .max(row.account_metadata_epoch)
+                    .is_none_or(|epoch| summary.head_seq >= epoch)
+                {
+                    row.account_default_epoch = None;
+                }
+            }
+            if let Some(metadata) = summary.metadata.as_ref() {
+                // Forks copy the source's current configuration, but
+                // only their selected history prefix. Its selection
+                // epoch can exceed the child's local journal head.
+                // Epoch and pair admission order the configuration;
+                // the summary watermark orders the history counts.
+                model.note_session_metadata_at(
+                    &summary.session_id,
+                    &metadata.provider,
+                    &metadata.model,
+                    metadata.max_tokens,
+                    metadata.selection_epoch,
+                    metadata.max_tokens_source,
+                );
+                model.note_session_account(&summary.session_id, metadata);
+                model.note_session_budget_clamp(&summary.session_id, metadata);
+                self.workspace_paths
+                    .insert(summary.session_id.clone(), metadata.cwd.clone());
+                if metadata.workspace_allocation.is_some() {
+                    self.dated_sessions.insert(summary.session_id.clone());
+                }
+                if let Some(origin) = metadata.launch_origin.as_ref() {
+                    self.origin_revisions
+                        .insert(summary.session_id.clone(), origin.revision);
+                }
+            } else if let (Some(provider), Some(model_name)) =
+                (summary.provider.as_deref(), summary.last_model.as_deref())
+            {
+                // Legacy rows may have only the session's own folded
+                // pair. It is useful for projection, never proof that
+                // an epochless footprint is current.
+                model.note_session_metadata_at(
+                    &summary.session_id,
+                    provider,
+                    model_name,
+                    0,
+                    None,
+                    None,
+                );
+            }
+            self.binding_worker_generation = Some(summary.worker_generation);
+            if let Some(display) = workspace_display {
+                if model.active_session.as_ref() == Some(&summary.session_id) {
+                    model.session_dir = display;
+                } else if let Some(row) = model
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.id == summary.session_id)
+                {
+                    row.dir = display;
+                }
+            }
+            // Launcher fix 2: the additive turn/footprint fields
+            // hydrate the row's counts at list time — tolerantly
+            // (an older daemon's summary stores nothing).
+            model.note_summary_counts(&summary);
+            self.generations
+                .insert(summary.session_id.clone(), summary.worker_generation);
+            if !self.attachments.contains_key(&summary.session_id) {
+                self.cold.insert(
+                    summary.session_id,
+                    Cold {
+                        head_seq: summary.head_seq,
+                    },
+                );
+            }
+        }
+        model.dirty = true;
+        // ADE seam (`haider --session <id>`): the LIST is the proof
+        // of existence — open the target the moment it appears; once
+        // the list is COMPLETE (no next page) an unknown id flashes
+        // honestly instead of waiting forever.
+        if let Some(target) = model.initial_session.clone() {
+            if model.sessions.iter().any(|entry| entry.id == target) {
+                model.initial_session = None;
+                model.open_session(&target);
+            } else if list_complete && next_cursor.is_none() {
+                model.initial_session = None;
+                model.flash = Some(format!("· --session: {} is not a known session", target));
+            }
+        }
+        let last_page = list_complete && next_cursor.is_none();
+        let mut follow = next_cursor.map_or_else(Vec::new, |cursor| {
+            vec![LiveCommand::ListAt {
+                cursor: Some(cursor),
+                epoch: self.connection_epoch,
+            }]
+        });
+        if last_page && !self.meter_list_dirty.is_empty() {
+            self.meter_list_started = std::mem::take(&mut self.meter_list_dirty);
+            self.meter_list_pending = true;
+            follow.push(LiveCommand::ListAt {
+                cursor: None,
+                epoch: self.connection_epoch,
+            });
+        } else if last_page {
+            self.meter_list_started.clear();
+        }
+        // D1: hydrate the Loom registry once per connection — the
+        // typed-chip colors and graph annotations read from it.
+        // Round 4: the dedup latch (`loom_requested`) is separate
+        // from the truth latch (`loom_loaded`, set only when the
+        // reply installs) so /loom can render LOADING honestly.
+        if !model.loom_requested && model.daemon_serves(haider_rpc::FEATURE_LOOM_V1) {
+            model.loom_requested = true;
+            follow.push(LiveCommand::LoomList {
+                epoch: self.connection_epoch,
+            });
+        }
+        if child_changed && model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1) {
+            follow.extend(self.fleet_refresh(model));
+        }
+        follow
+    }
+
     /// One committed envelope: route it, record menu coordinates, and honor
     /// the reducer's strict gap law.
     /// Issue the single-flight `session.fleet` read for the ACTIVE session,
@@ -6507,15 +6631,15 @@ impl LiveDriver {
         vec![LiveCommand::SessionFleet { session }]
     }
 
-    /// The fleet screen's refresh cadence IS the event stream (the same
-    /// cadence that keeps the subagents panel current): one APPLIED
-    /// envelope for the attached session while the screen is open chases
-    /// one bounded re-read; bursts fold through the single-flight gate.
+    /// The fleet and main chip projections share the event cadence: one
+    /// applied parent envelope chases child truth, including a message
+    /// starting a later child run. Bursts fold through the single-flight gate.
     /// No new polling loop — a quiet (terminal) session renders its
     /// durable snapshot once and never re-reads.
     fn fleet_event_chase(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
-        if model.screen != crate::app::Screen::Fleet
+        if (model.screen != crate::app::Screen::Fleet && model.chips.is_empty())
             || model.active_session.as_ref() != Some(session)
+            || !model.daemon_serves(haider_rpc::FEATURE_SESSION_FLEET_V1)
         {
             return Vec::new();
         }
@@ -6983,8 +7107,14 @@ impl LiveDriver {
                     rebound,
                 ) => {
                     let epoch = rebound.selection_epoch.or(Some(envelope.seq));
-                    model.note_parked_provider_rebound_at(session, &rebound.provider, epoch);
-                    model.note_session_rebound_account_at(session, &rebound, epoch);
+                    if model.note_parked_provider_rebound_budget_at(
+                        session,
+                        &rebound.provider,
+                        epoch,
+                        rebound.output_budget.as_ref(),
+                    ) {
+                        model.note_session_rebound_account_at(session, &rebound, epoch);
+                    }
                 }
                 _ => {}
             }
@@ -7055,11 +7185,12 @@ impl LiveDriver {
                 model.dirty = true;
             }
             haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
-                let Some((_, current_model)) = model.meter_epoch.pair.clone() else {
-                    return model_fact;
-                };
-                if !model.meter_epoch.admit((rebound.provider.clone(), current_model),
-                    rebound.selection_epoch.or(Some(envelope.seq)), None, None) {
+                let budget = rebound.output_budget.as_ref();
+                let max_tokens = budget.map(|budget| budget.max_tokens);
+                let user_budget = budget.map(|budget| matches!(budget.source,
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { .. }));
+                if !model.meter_epoch.admit_rebound(&rebound.provider,
+                    rebound.selection_epoch.or(Some(envelope.seq)), max_tokens, user_budget) {
                     return false;
                 }
                 model.note_session_rebound_account_at(session, &rebound,
@@ -7068,6 +7199,15 @@ impl LiveDriver {
                     model.identity.provider = rebound.provider;
                     model.refresh_context_window();
                     model.dirty = true;
+                }
+                let next_clamp = rebound.output_budget.and_then(|budget| budget.clamped);
+                if let Some(clamp) = next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
+                }
+                if let Some(clamp) = rebound.active_output_budget
+                    .and_then(|active| active.budget.clamped)
+                    && Some(clamp) != next_clamp {
+                    model.apply_output_budget_clamp(&clamp);
                 }
             }
             // Dated-workspace addendum O5/O7: ONE replaceable context slot.
@@ -7116,6 +7256,7 @@ impl LiveDriver {
                         request_seq: envelope.seq,
                         worker_generation: envelope.worker_generation,
                         command_id: None,
+                        has_options: !menu.options.is_empty(),
                     },
                 );
             }
@@ -7925,8 +8066,13 @@ impl LiveDriver {
                 mutation,
                 secret: None,
             } => ssh_profile_command(mutation, None).into_iter().collect(),
-            AppRequest::SshShellOpen { profile, size } => {
+            AppRequest::SshShellOpen {
+                attempt_id,
+                profile,
+                size,
+            } => {
                 vec![LiveCommand::SshShellOpen {
+                    attempt_id,
                     profile,
                     session: model.active_session.clone(),
                     size,
@@ -8514,10 +8660,11 @@ impl LiveDriver {
     fn answer_command(&mut self, pending: &OutboundAnswer) -> Option<LiveCommand> {
         let menu = pending.answer.menu.clone();
         let coordinates = self.menus.get(&menu)?;
-        let (session, request_seq, worker_generation) = (
+        let (session, request_seq, worker_generation, has_options) = (
             coordinates.session.clone(),
             coordinates.request_seq,
             coordinates.worker_generation,
+            coordinates.has_options,
         );
         let command_id = match &coordinates.command_id {
             Some(existing) => existing.clone(),
@@ -8535,11 +8682,13 @@ impl LiveDriver {
             menu,
             request_seq,
             worker_generation,
-            option_key: pending
-                .answer
-                .option_key
-                .clone()
-                .unwrap_or_else(|| pending.answer.option_index.to_string()),
+            option_key: pending.answer.option_key.clone().unwrap_or_else(|| {
+                if has_options {
+                    pending.answer.option_index.to_string()
+                } else {
+                    String::new()
+                }
+            }),
             option_index: pending.answer.option_index,
             input: pending
                 .answer

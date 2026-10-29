@@ -56,6 +56,7 @@ pub mod session;
 pub mod session_fork;
 pub mod spawn_subagent;
 pub mod state;
+pub mod subagent_stop;
 pub mod task;
 pub mod task_outcome;
 pub mod tool;

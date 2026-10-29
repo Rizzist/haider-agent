@@ -29,10 +29,18 @@ pub const GRAPH_NODE_NAME_MAX_BYTES: usize = 64;
 pub const GRAPH_MAX_NODES: usize = 512;
 pub const GRAPH_MAX_EDGES: usize = 4_096;
 pub const GRAPH_MAX_SLOTS: usize = 4_096;
-pub const GRAPH_MAX_ATTEMPTS: u32 = 8;
-/// Maximum conditional self/back hops in one immutable graph instance.
-/// Forward DAG traversal does not consume this budget.
-pub const GRAPH_MAX_CONDITIONAL_HOPS: u32 = 24;
+/// Default per-node attempt bound of built-in templates and compiled Loom
+/// workflows. Owner rule (2026-09-23): no default cap stops a productive
+/// automated repair loop, so the default is the whole `u32` attempt space
+/// (the graph epoch counter is itself a `u32`), i.e. effectively unbounded.
+/// A genuinely stuck loop is still stopped by the repeated-red-fingerprint
+/// `GraphBlockReason::NoProgress` guard, and a template may declare any
+/// explicit positive `max_attempts` as an opt-in bound.
+pub const GRAPH_DEFAULT_MAX_ATTEMPTS: u32 = u32::MAX;
+/// Default back-edge activation bound of a workflow activation AST
+/// (effectively unbounded, as above). Forward DAG traversal never consumes
+/// it; an AST may carry any explicit positive value as an opt-in bound.
+pub const GRAPH_DEFAULT_BACK_EDGE_ACTIVATIONS: u32 = u32::MAX;
 pub const GRAPH_MAX_EVIDENCE_PER_ATTEMPT: u32 = 8;
 pub const GRAPH_EVIDENCE_DETAIL_MAX_BYTES: usize = 1_024;
 pub const GRAPH_BRIEF_MAX_BYTES: usize = 400;
@@ -1134,7 +1142,6 @@ pub fn validate_workflow_activation_ast(
         || ast.edges.is_empty()
         || ast.edges.len() > GRAPH_MAX_EDGES
         || ast.max_back_edge_activations == 0
-        || ast.max_back_edge_activations > GRAPH_MAX_CONDITIONAL_HOPS
     {
         return Err(invalid_workflow_ast(
             "workflow activation AST identity, bounds, or types are invalid",
@@ -1407,7 +1414,7 @@ pub fn workflow_activation_ast_from_loom(
         output_type: workflow.out_type.clone(),
         nodes,
         edges,
-        max_back_edge_activations: GRAPH_MAX_CONDITIONAL_HOPS,
+        max_back_edge_activations: GRAPH_DEFAULT_BACK_EDGE_ACTIVATIONS,
     };
     validate_workflow_activation_ast(&ast)?;
     Ok(ast)
@@ -2360,10 +2367,9 @@ impl GraphStatus {
                 .join(",")
         };
         let line = format!(
-            "GraphBrief: {} attempt {}/{}; graph_id={}; ready={}; gate {}; evidence {} green/{} red ({} effective); next: {}.",
+            "GraphBrief: {} attempt {}; graph_id={}; ready={}; gate {}; evidence {} green/{} red ({} effective); next: {}.",
             node.label(),
             node_status.current_attempt.unwrap_or(self.attempt),
-            GRAPH_MAX_ATTEMPTS,
             self.graph_id,
             ready,
             gate,
@@ -4215,7 +4221,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             name: build_node(),
             gate: GraphGateKind::CommandGreen,
             executor: GraphExecutorShape::Inline,
-            max_attempts: GRAPH_MAX_ATTEMPTS,
+            max_attempts: GRAPH_DEFAULT_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: Vec::new(),
             red_target: None,
@@ -4225,7 +4231,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             name: verify_node(),
             gate: GraphGateKind::AllOfN { n: 3 },
             executor: GraphExecutorShape::FanOut,
-            max_attempts: GRAPH_MAX_ATTEMPTS,
+            max_attempts: GRAPH_DEFAULT_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: vec![build_node()],
             red_target: None,
@@ -4242,7 +4248,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             name: ship_node(),
             gate: GraphGateKind::HumanConfirm,
             executor: GraphExecutorShape::Human,
-            max_attempts: GRAPH_MAX_ATTEMPTS,
+            max_attempts: GRAPH_DEFAULT_MAX_ATTEMPTS,
             max_evidence_per_attempt: None,
             depends_on: vec![verify_node()],
             red_target: None,
@@ -4486,10 +4492,11 @@ pub fn validate_graph_template(template: &GraphTemplateSpec) -> Result<(), Graph
     }
 
     for node in &template.nodes {
-        if node.max_attempts == 0 || node.max_attempts > GRAPH_MAX_ATTEMPTS {
+        // Any explicit positive bound is accepted; there is no ceiling.
+        if node.max_attempts == 0 {
             return Err(reject(
                 GraphTemplateRejection::OverCeiling,
-                format!("graph node {} exceeds the attempt ceiling", node.name),
+                format!("graph node {} must allow at least one attempt", node.name),
             ));
         }
         if node
@@ -4685,7 +4692,7 @@ fn node_spec(
         name: GraphNodeName::new(name).unwrap_or_else(|_| build_node()),
         gate: gate.clone(),
         executor,
-        max_attempts: GRAPH_MAX_ATTEMPTS,
+        max_attempts: GRAPH_DEFAULT_MAX_ATTEMPTS,
         max_evidence_per_attempt: (!matches!(gate, GraphGateKind::HumanConfirm))
             .then_some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
         depends_on: dependencies
@@ -5193,7 +5200,7 @@ mod tests {
         };
         let brief = status.graph_brief().unwrap_or_default();
         assert!(!brief.is_empty());
-        assert!(brief.contains("VERIFY attempt 2/8"));
+        assert!(brief.contains("VERIFY attempt 2;"));
         assert!(brief.len() <= GRAPH_BRIEF_MAX_BYTES);
     }
 
@@ -5631,9 +5638,13 @@ mod tests {
                 format!("\"{legacy}\"")
             );
         }
+        // v0.0.973 deliberately re-minted this identity: the node attempt
+        // bound became the unbounded default (owner rule: no default caps).
+        // Graphs pinned under the former 8-attempt digest
+        // (1c30a48b…4147b9) keep their pinned nodes and bounds.
         assert_eq!(
             ship_loop_digest(),
-            "1c30a48bdb255309f5b69ce5497d99a41b7182b263e55f8bfb5864fdaf4147b9"
+            "7ee15837a37c98ad05bde03d70ef487c6d565d012ca6566d71c949a5d2f277ad"
         );
         assert_eq!(
             graph_template_digest(&ship_loop_template()),
@@ -5783,7 +5794,7 @@ mod tests {
                         name: GraphNodeName::new(name).expect("bounded generated node"),
                         gate: GraphGateKind::CommandGreen,
                         executor: GraphExecutorShape::Inline,
-                        max_attempts: GRAPH_MAX_ATTEMPTS,
+                        max_attempts: GRAPH_DEFAULT_MAX_ATTEMPTS,
                         max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
                         depends_on: dependencies
                             .iter()
@@ -6340,6 +6351,45 @@ mod tests {
             state.apply(6, &forged_sibling).is_err(),
             "a terminal graph rejection seals every unfinished sibling"
         );
+    }
+
+    /// OWNER RULE (no default caps): iteration bounds are explicit opt-ins.
+    /// Built-in templates default to the unbounded attempt space, validators
+    /// accept any positive explicit bound (the former 8-attempt and
+    /// 24-back-edge ceilings are gone), and zero stays invalid.
+    /// MUTATION CHECK: restore either ceiling. Expected failure: the large
+    /// explicit template/AST below is rejected.
+    #[test]
+    fn graph_iteration_bounds_are_unbounded_defaults_and_explicit_opt_ins() {
+        assert_eq!(GRAPH_DEFAULT_MAX_ATTEMPTS, u32::MAX);
+        assert!(
+            ship_loop_nodes()
+                .iter()
+                .all(|node| node.max_attempts == GRAPH_DEFAULT_MAX_ATTEMPTS)
+        );
+        for template in graph_template_catalog() {
+            validate_graph_template(&template).expect("built-in template validates");
+        }
+        let mut large = GraphTemplateSpec {
+            name: "large-explicit".into(),
+            version: 1,
+            start_node: Some(build_node()),
+            nodes: ship_loop_nodes(),
+        };
+        for node in &mut large.nodes {
+            node.max_attempts = 1_000;
+        }
+        validate_graph_template(&large).expect("an explicit bound above 8 is accepted");
+        large.nodes[0].max_attempts = 0;
+        assert!(validate_graph_template(&large).is_err());
+
+        let mut ast = diamond_activation_ast();
+        ast.max_back_edge_activations = 100;
+        validate_workflow_activation_ast(&ast).expect("explicit bound above 24 is accepted");
+        ast.max_back_edge_activations = GRAPH_DEFAULT_BACK_EDGE_ACTIVATIONS;
+        validate_workflow_activation_ast(&ast).expect("unbounded default is accepted");
+        ast.max_back_edge_activations = 0;
+        assert!(validate_workflow_activation_ast(&ast).is_err());
     }
 
     #[test]

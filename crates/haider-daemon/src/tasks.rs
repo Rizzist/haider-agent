@@ -215,6 +215,17 @@ impl TaskRegistry {
             .cloned()
     }
 
+    /// The monitor sees only a task owned by this session and its durable
+    /// terminal digest. It never reads a process or an output side-effect file.
+    pub(crate) fn monitor_completion(
+        &self,
+        session_id: &SessionId,
+        task: &TaskId,
+    ) -> Option<TaskCompleted> {
+        self.get(session_id, task)
+            .and_then(|entry| entry.terminal_fact)
+    }
+
     fn known(&self, session_id: &SessionId, task: &TaskId) -> bool {
         self.lock()
             .get(session_id)
@@ -422,6 +433,24 @@ impl TaskFacade {
     pub(crate) async fn adopt_session(&self, session_id: &SessionId) -> Result<(), HaiderError> {
         self.adopt_session_with_probe(session_id, probe_group_liveness)
             .await
+    }
+
+    /// Ownership survives an adoption already in progress: its registry
+    /// marker is set before the scan has restored every completed task.
+    pub(crate) async fn owns_task(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<bool, HaiderError> {
+        self.adopt_session(session_id).await?;
+        if self.hub.task_registry().get(session_id, task_id).is_some() {
+            return Ok(true);
+        }
+        Ok(self
+            .scan_session_tasks(session_id)
+            .await?
+            .started
+            .contains_key(task_id))
     }
 
     /// Supervisor startup must admit recovery before spawning it. Otherwise

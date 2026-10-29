@@ -203,6 +203,19 @@ fn branch_create_receipt_event_and_registry_are_one_atomic_fact() {
     };
     assert_eq!(created.branch_id, BranchId::new("branch-a"));
     assert_eq!(created.created_seq, envelope.seq);
+    let pair = store
+        .session_output_pair_at(&session_id, created.created_seq)
+        .expect("branch snapshot")
+        .expect("typed branch origin");
+    assert_eq!(
+        (
+            pair.provider.as_str(),
+            pair.model.as_str(),
+            pair.max_tokens,
+            pair.source
+        ),
+        ("fake", "fake-model", 4096, None)
+    );
     let fact = BranchCreated::from_payload_value(&envelope.payload).expect("branch fact");
     assert_eq!(fact.branch.branch_id, created.branch_id);
     assert_eq!(

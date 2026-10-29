@@ -3,7 +3,7 @@
     "type": "graph_pinned",
     "graph_id": "graph-ship-loop-m2a",
     "template": "ship-loop",
-    "digest": "1c30a48bdb255309f5b69ce5497d99a41b7182b263e55f8bfb5864fdaf4147b9",
+    "digest": "7ee15837a37c98ad05bde03d70ef487c6d565d012ca6566d71c949a5d2f277ad",
     "nodes": [
       {
         "name": "BUILD",
@@ -11,7 +11,7 @@
           "kind": "command-green"
         },
         "executor": "inline",
-        "max_attempts": 8,
+        "max_attempts": 4294967295,
         "max_evidence_per_attempt": 8
       },
       {
@@ -21,7 +21,7 @@
           "n": 3
         },
         "executor": "fan-out",
-        "max_attempts": 8,
+        "max_attempts": 4294967295,
         "max_evidence_per_attempt": 8,
         "depends_on": [
           "BUILD"
@@ -50,7 +50,7 @@
           "kind": "human-confirm"
         },
         "executor": "human",
-        "max_attempts": 8,
+        "max_attempts": 4294967295,
         "depends_on": [
           "VERIFY"
         ]

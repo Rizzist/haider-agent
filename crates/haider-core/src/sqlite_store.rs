@@ -38,8 +38,8 @@ use haider_store::{
     SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey, SessionRecencyRow,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome, TypedAgentInstallCas,
+    ShellExecAcceptOutcome, StopOperationClaim, Store, SubagentStopClaim, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -374,7 +374,7 @@ impl SqliteStoreHandle {
             device_id,
         )
         .await
-        .map(|(epoch, _)| epoch)
+        .map(|(epoch, _)| epoch.unwrap_or(expected_epoch))
     }
 
     /// Commit route provenance and return only durable facts for publication.
@@ -386,7 +386,7 @@ impl SqliteStoreHandle {
         expected_epoch: u64,
         resolved_alias: Option<&str>,
         device_id: &haider_protocol::ids::DeviceId,
-    ) -> Result<(u64, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
+    ) -> Result<(Option<u64>, Vec<haider_protocol::envelope::RawEnvelope>), HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         let expected_provider = expected_provider.to_owned();
@@ -742,6 +742,54 @@ impl SqliteStoreHandle {
             owner.with_store(|store| {
                 store.session_create_receipt(&command_id, &request_digest, &request_json)
             })
+        })
+        .await
+    }
+
+    pub async fn child_create_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        parent_session_id: SessionId,
+    ) -> Result<Option<(String, SessionMetadataV1)>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.child_create_admission(&command_id, &session_id, &parent_session_id)
+            })
+        })
+        .await
+    }
+
+    pub async fn child_turn_admission(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+    ) -> Result<Option<String>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.child_turn_admission(&command_id, &session_id))
+        })
+        .await
+    }
+
+    pub async fn automatic_run_switches(
+        &self,
+        session_id: SessionId,
+    ) -> Result<std::collections::BTreeMap<u64, RunId>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.automatic_run_switches(&session_id)))
+            .await
+    }
+
+    pub async fn session_output_pair_at(
+        &self,
+        session_id: SessionId,
+        through_seq: u64,
+    ) -> Result<Option<haider_store::SessionOutputPairSnapshot>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.session_output_pair_at(&session_id, through_seq))
         })
         .await
     }
@@ -1219,6 +1267,17 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| store.delegations_for_parent_run(&session_id, &run_id))
+        })
+        .await
+    }
+
+    pub async fn delegations_for_parent_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<DelegationRecord>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.delegations_for_parent_session(&session_id))
         })
         .await
     }
@@ -2405,6 +2464,112 @@ impl SqliteStoreHandle {
                     accepted_seq,
                     &response,
                 )
+            })
+        })
+        .await
+    }
+
+    pub async fn subagent_stop_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.subagent_stop_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn claim_subagent_stop_receipt(
+        &self,
+        command_id: String,
+        worker_generation: u64,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<SubagentStopClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_subagent_stop_receipt(
+                    &command_id,
+                    worker_generation,
+                    &request_digest,
+                    &request_json,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_subagent_stop_receipt(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        request_digest: String,
+        request_json: String,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_subagent_stop_receipt(
+                    &command_id,
+                    &session_id,
+                    &request_digest,
+                    &request_json,
+                    &response,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn stop_operation_receipt(
+        &self,
+        command_id: String,
+        digest: String,
+        json: String,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.stop_operation_receipt(&command_id, &digest, &json))
+        })
+        .await
+    }
+
+    pub async fn claim_stop_operation(
+        &self,
+        command_id: String,
+        generation: u64,
+        digest: String,
+        json: String,
+        intent: serde_json::Value,
+    ) -> Result<StopOperationClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_stop_operation(&command_id, generation, &digest, &json, &intent)
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_stop_operation(
+        &self,
+        command_id: String,
+        session: SessionId,
+        digest: String,
+        json: String,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_stop_operation(&command_id, &session, &digest, &json, &response)
             })
         })
         .await

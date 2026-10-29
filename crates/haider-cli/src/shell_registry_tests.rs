@@ -10,6 +10,7 @@ fn shell_list_json_shape_is_stable_and_public() {
             profile: "prod".into(),
         },
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "release checks".into(),
         cwd_or_host: "prod.example.invalid".into(),
         created_at_ms: 1,

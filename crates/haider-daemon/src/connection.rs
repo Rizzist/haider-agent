@@ -68,11 +68,12 @@ use haider_rpc::{
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_PROMPT_FORK_V1,
     FEATURE_SESSION_READ_ONLY_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1,
     FEATURE_SHELL_EXEC_V1, FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1,
-    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
-    FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1,
-    FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, FEATURE_WORKFLOW_CATALOG_V1,
-    FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
-    ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate, uds_codec,
+    FEATURE_SSH_TYPED_SETUP_ERRORS_V1, FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1, FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1,
+    FEATURE_WORKFLOW_CATALOG_V1, FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError,
+    RequestBody, RequestId, ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate,
+    uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -2457,6 +2458,8 @@ fn welcome_features_for(hello: &Hello) -> BTreeSet<String> {
 fn welcome_features() -> BTreeSet<String> {
     BTreeSet::from([
         haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
+        haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
+        haider_rpc::FEATURE_HELPER_STOP_V1.to_owned(),
         haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
         FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
@@ -2558,6 +2561,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_LINEAGE_V1.to_owned(),
         FEATURE_SHELL_EXEC_V1.to_owned(),
         FEATURE_SSH_PROFILES_V1.to_owned(),
+        FEATURE_SSH_TYPED_SETUP_ERRORS_V1.to_owned(),
         FEATURE_SHELL_REGISTRY_V1.to_owned(),
         FEATURE_USER_COMMAND_V1.to_owned(),
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
@@ -2601,6 +2605,14 @@ fn encode_welcome_for_peer(
                     features: welcome.features,
                 });
             }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SSH_TYPED_SETUP_ERRORS_V1) => {}
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(haider_rpc::FEATURE_HELPER_STOP_V1) => {}
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome
+                    .features
+                    .remove(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(FEATURE_SESSION_ACTIVITY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })

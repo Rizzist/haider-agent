@@ -44,6 +44,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
                 display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
                 max_output_tokens: Some(128_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -56,6 +57,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
                 display_name: None,
                 context_window: None,
                 max_output_tokens: None,
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -92,6 +94,51 @@ fn provider_summary_model_details_round_trip_token_limits() {
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);
+}
+
+/// 973-output-cap-fixes B2: the output-maximum provenance is additive. An
+/// older detail without it decodes as absent and re-encodes byte-identically;
+/// each known spelling round-trips; an unknown future spelling decodes as
+/// `Unknown` instead of failing the whole provider summary.
+/// MUTATION CHECK: drop `serde(other)` from `ModelOutputLimitSourceWire`, or
+/// `skip_serializing_if` from the field. Expected runtime failure: the future
+/// spelling fails to decode, or the old detail gains a `null` key.
+#[test]
+fn model_detail_output_limit_source_is_additive_and_tolerant() {
+    use haider_rpc::ModelOutputLimitSourceWire;
+    let old = serde_json::json!({"name": "m", "max_output_tokens": 8192});
+    let decoded: ModelDetailWire = serde_json::from_value(old.clone()).expect("old detail decodes");
+    assert_eq!(decoded.max_output_tokens_source, None);
+    assert_eq!(serde_json::to_value(&decoded).expect("encode"), old);
+    for (spelling, expected) in [
+        ("declared", ModelOutputLimitSourceWire::Declared),
+        ("static", ModelOutputLimitSourceWire::Static),
+        ("fallback", ModelOutputLimitSourceWire::Fallback),
+        (
+            "published_by_a_future_daemon",
+            ModelOutputLimitSourceWire::Unknown,
+        ),
+    ] {
+        let decoded: ModelDetailWire = serde_json::from_value(serde_json::json!({
+            "name": "m",
+            "max_output_tokens": 8192,
+            "max_output_tokens_source": spelling,
+        }))
+        .expect("detail with a provenance decodes");
+        assert_eq!(
+            decoded.max_output_tokens_source,
+            Some(expected),
+            "{spelling}"
+        );
+    }
+    let declared = ModelDetailWire {
+        max_output_tokens_source: Some(ModelOutputLimitSourceWire::Declared),
+        ..serde_json::from_value(old).expect("old detail decodes")
+    };
+    assert_eq!(
+        serde_json::to_value(&declared).expect("encode")["max_output_tokens_source"],
+        "declared"
+    );
 }
 
 #[test]

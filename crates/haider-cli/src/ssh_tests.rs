@@ -102,6 +102,14 @@ fn typed_refusals_map_to_scriptable_exit_codes() {
     assert_eq!(exit_code_for_refusal("ssh_timeout"), EX_TIMEOUT);
     assert_eq!(exit_code_for_refusal("ssh_host_key_changed"), EX_BLOCKED);
     assert_eq!(
+        exit_code_for_refusal("ssh_authentication_failed"),
+        EX_BLOCKED
+    );
+    assert_eq!(
+        exit_code_for_refusal("ssh_connection_failed"),
+        EX_UNAVAILABLE
+    );
+    assert_eq!(
         exit_code_for_refusal("ssh_agent_unavailable"),
         EX_UNAVAILABLE
     );
@@ -109,4 +117,29 @@ fn typed_refusals_map_to_scriptable_exit_codes() {
     assert_eq!(exit_code_for_refusal("ssh_command_failed"), EX_SOFTWARE);
     assert_eq!(exit_code_for_refusal("ssh_output_limit"), EX_SOFTWARE);
     assert_eq!(exit_code_for_refusal("ssh_channel_quota"), EX_BLOCKED);
+}
+
+#[test]
+fn terminal_setup_timeout_keeps_base_exit_and_command_timeout_stays_124() {
+    let refusal = |code: &str| haider_client::SshProfilesClientError::Refused {
+        code: code.into(),
+        message: "synthetic refusal".into(),
+        retryable: true,
+        data: None,
+    };
+    for (code, expected) in [
+        ("ssh_timeout", EX_PROTOCOL),
+        ("ssh_connection_failed", EX_UNAVAILABLE),
+        ("ssh_authentication_failed", EX_BLOCKED),
+        ("ssh_host_key_changed", EX_BLOCKED),
+        ("ssh_channel_quota", EX_BLOCKED),
+    ] {
+        let error = terminal_error(TerminalError::Client(refusal(code)));
+        assert_eq!(error.exit_code(), expected, "{code}");
+        assert_eq!(error.to_string(), format!("{code}: synthetic refusal"));
+    }
+    assert_eq!(
+        CliSshError::from(refusal("ssh_timeout")).exit_code(),
+        EX_TIMEOUT
+    );
 }

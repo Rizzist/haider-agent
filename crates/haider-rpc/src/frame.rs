@@ -420,6 +420,16 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// Daemon implements receipt-backed cancellation of an owned direct child.
 /// The child remains visible and reaches a durable terminal run state.
 pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
+/// Daemon honours `headless.run.stop` `scope` (`all`/`main`/`subagents`) and
+/// serves `agent.cancel_all` (owner decision 2026-09-25). An older daemon
+/// ignores the scope field, so clients must require this feature before
+/// sending a non-default scope.
+pub const FEATURE_RUN_STOP_SCOPE_V1: &str = "run_stop_scope_v1";
+/// Main-only interruption, current-incarnation named stop, and full tree stop
+/// share this negotiated semantic contract (including durable replay).
+pub const FEATURE_HELPER_STOP_V1: &str = "helper_stop_v1";
+pub const HELPER_STOP_UNSUPPORTED_MESSAGE: &str = "This daemon is older than this CLI and cannot end helper tasks reliably. First close older clients attached to this profile (including session --watch and TUI clients) so they cannot restart the old daemon. Stop it with `haider daemon stop`, then run your command again; the current daemon starts automatically.";
+pub const HELPER_STOP_UNSUPPORTED_NO_SPAWN_MESSAGE: &str = "This daemon is older than this CLI and cannot end helper tasks reliably. First close older clients attached to this profile (including session --watch and TUI clients) so they cannot restart the old daemon. Stop it with `haider daemon stop`, then run your command again without --no-spawn so the current daemon can start.";
 /// Daemon implements receipt-backed per-session provider/account/endpoint
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
@@ -639,6 +649,9 @@ pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// SSH setup failures use `ShellWire::setup_error`; uncoded completion is not
+/// inferred to be a setup failure from ordinary terminal output.
+pub const FEATURE_SSH_TYPED_SETUP_ERRORS_V1: &str = "ssh_typed_setup_errors_v1";
 /// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
 pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
@@ -1306,6 +1319,12 @@ pub struct ModelDetailWire {
     /// the remote catalog omits the field or cannot be reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Where `max_output_tokens` came from. Additive (973-output-cap-fixes):
+    /// older peers omit it, and a spelling this peer does not know decodes as
+    /// [`ModelOutputLimitSourceWire::Unknown`]; either leaves the daemon to
+    /// derive provenance from its own tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<ModelOutputLimitSourceWire>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1360,6 +1379,24 @@ impl ModelDetailSourceWire {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Provenance of one [`ModelDetailWire::max_output_tokens`] value. Numeric
+/// equality with a local fallback is never provenance, so the daemon carries
+/// this explicitly from projection to selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOutputLimitSourceWire {
+    /// The provider's model catalog declared the maximum: it is exact.
+    Declared,
+    /// The daemon's pinned table, from a published provider maximum: exact.
+    Static,
+    /// A local value the provider does not publish; explicit budgets may
+    /// exceed it within the global and context-window bounds.
+    Fallback,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One provider's read-only management projection.
@@ -1949,12 +1986,23 @@ pub enum ShellStatusWire {
     Closed,
 }
 
+/// Coded refusal during asynchronous shell setup, before a remote command
+/// starts. Kept separate from the remote command's numeric exit status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSetupErrorWire {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 /// Public, secret-free projection of one entry in the unified shell registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellWire {
     pub id: String,
     pub kind: ShellKindWire,
     pub status: ShellStatusWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<ShellSetupErrorWire>,
     pub title: String,
     pub cwd_or_host: String,
     pub created_at_ms: u64,
@@ -2865,6 +2913,8 @@ pub enum HookTrustStateWire {
 #[non_exhaustive]
 pub enum MonitorSourceKindWire {
     Sms,
+    Task,
+    Agent,
     Process,
     File,
     Poll,
@@ -2880,6 +2930,12 @@ pub enum MonitorSourceKindWire {
 #[non_exhaustive]
 pub enum MonitorSourceWire {
     Sms,
+    Task {
+        task_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
     Process {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3501,6 +3557,12 @@ pub enum MonitorEventPayloadWire {
         body: String,
         received_at_ms: i64,
     },
+    Task {
+        payload: String,
+    },
+    Agent {
+        payload: String,
+    },
     Process {
         line: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3976,14 +4038,24 @@ pub enum RequestBody {
         agent: AgentId,
         text: String,
     },
-    /// Cancel one direct child of the named parent session. The daemon owns
-    /// the child run coordinate and recursively stops its descendants.
+    /// Cancel one direct child of the named parent session: its original run
+    /// and any later active run (messaged or monitor-woken). Only that child
+    /// stops; its own subagents keep running (owner decision 2026-09-25).
     #[serde(rename = "agent.cancel")]
     AgentCancel {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
         agent: AgentId,
+    },
+    /// Stop every subagent in the named session's delegation tree, however
+    /// deep, including descendants started in later child runs, and remove
+    /// those subagents' monitors. The session's own runs are not touched.
+    #[serde(rename = "agent.cancel_all")]
+    AgentCancelAll {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
     },
     /// Branch-capable decode form of `turn.submit`.
     #[serde(rename = "turn.submit")]
@@ -4605,10 +4677,15 @@ pub enum RequestBody {
     #[serde(rename = "headless.run.status")]
     HeadlessRunStatus { run_id: RunId },
     /// Idempotently stops a detached run after daemon-owned run lookup.
+    /// `scope` absent (the default `all`) stops the run and every subagent
+    /// in its tree; `main` stops only the run; `subagents` stops only the
+    /// subagents in its tree.
     #[serde(rename = "headless.run.stop")]
     HeadlessRunStop {
         command_id: CommandId,
         run_id: RunId,
+        #[serde(default, skip_serializing_if = "RunStopScopeWire::is_all")]
+        scope: RunStopScopeWire,
     },
     /// Indexed state of one typed workflow activation graph. Omission picks
     /// the session's most recently changed activation graph.
@@ -5237,6 +5314,12 @@ pub enum ResponseBody {
     },
     #[serde(rename = "agent.message")]
     AgentMessage { receipt: AgentMessageReceipt },
+    /// Result of `agent.cancel_all`.
+    #[serde(rename = "agent.cancel_all")]
+    AgentCancelAll {
+        session_id: SessionId,
+        stopped: SubagentStopSummaryWire,
+    },
     /// Result of durably cancelling an owned direct child. `terminal_seq` is
     /// present exactly when the target run was already terminal.
     #[serde(rename = "agent.cancel")]
@@ -5334,6 +5417,10 @@ pub enum ResponseBody {
         account: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
@@ -5741,6 +5828,13 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+        /// Echo of a non-default request scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<RunStopScopeWire>,
+        /// What happened to the run's subagents (additive; absent from older
+        /// daemons).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagents: Option<SubagentStopSummaryWire>,
     },
     #[serde(rename = "workflow.graph.state")]
     WorkflowGraphState {
@@ -5880,6 +5974,43 @@ pub enum SubmitDisposition {
     SubturnPending,
     #[serde(other)]
     Unknown,
+}
+
+/// Scope of `headless.run.stop` (owner decision 2026-09-25).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunStopScopeWire {
+    /// The run plus every subagent in its tree (`haider run --stop`).
+    #[default]
+    All,
+    /// Only the run; its subagents keep running (`--stop-main`).
+    Main,
+    /// Only the subagents in the run's tree; the run keeps going
+    /// (`--stop-subagents`).
+    Subagents,
+    #[serde(other)]
+    Unknown,
+}
+
+impl RunStopScopeWire {
+    #[must_use]
+    pub fn is_all(&self) -> bool {
+        *self == Self::All
+    }
+}
+
+/// Subagent outcome of a stop request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentStopSummaryWire {
+    /// Subagent runs moved to cancelling by this request.
+    pub cancelled_runs: u64,
+    /// Distinct subagent sessions visited in the tree.
+    pub sessions: u64,
+    /// Monitors removed from stopped subagent sessions.
+    pub monitors_removed: u64,
+    /// Subagents left running (a main-only stop leaves them by design).
+    pub still_running: u64,
 }
 
 /// Result of a durable turn-cancellation command.

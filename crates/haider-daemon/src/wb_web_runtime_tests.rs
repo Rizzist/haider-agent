@@ -304,6 +304,7 @@ impl WebWorld {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
                 expected_pair: None,
+                automatic_run: None,
                 account_alias: None,
                 output_budget: None,
                 event_id: EventId::new(format!("{command_id}-event")),

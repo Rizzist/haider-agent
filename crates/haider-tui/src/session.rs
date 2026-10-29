@@ -705,7 +705,8 @@ fn chip_or_session(chips: &[ChipModel], agent: Option<&AgentId>) -> Destination 
 /// Chip-tree bookkeeping for the three agent payloads (report R11 cut 2).
 ///
 /// `AgentSpawned` creates the chip from its manifest (idempotent under
-/// replay), `AgentChipState` is the SOLE chip-state authority, and
+/// replay), `AgentChipState` supplies state until a sealed child-session
+/// snapshot supersedes it, and
 /// `AgentReport` contributes ONLY summary/verification content — never
 /// state. Shared by the attached and background routes. `at_ms` is the
 /// envelope's `committed_at_ms`: the spawn instant on `AgentSpawned`, an
@@ -744,7 +745,9 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, a
             }
         }
         EventPayload::AgentChipState { agent, chip } => {
-            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str()) {
+            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str())
+                && model.state_child_head_seq.is_none()
+            {
                 // S4: through the shared transition law — a terminal flip
                 // freezes the chip's clock at this envelope's timestamp.
                 model.set_state_at(crate::script::ChipDisplayState::from_protocol(chip), at_ms);
@@ -776,9 +779,47 @@ pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, envelope: &RawEn
     // S4: every child-attributed envelope advances this chip's event
     // clock (the frozen-final measure's far end) before the payload lands.
     chip.note_event_at(envelope.committed_at_ms);
-    // Preserve typed operator provenance and accepted effectless metadata on
-    // attached, background and parked-branch paths, including journal replay.
+    // Preserve provenance on attached, background, parked and replay paths.
     chip.activity.observe_raw(envelope);
+    match payload {
+        EventPayload::MenuOpened(menu) => {
+            chip.question = Some(crate::app::ChipQuestion {
+                recovery: matches!(
+                    menu.kind,
+                    haider_protocol::menu::MenuKind::ErrorRecovery { .. }
+                ),
+                text: menu.title.clone(),
+                options: menu
+                    .options
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect(),
+                resolved: false,
+            });
+        }
+        EventPayload::MenuAnswered(answer)
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|menu| menu.id == answer.menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        EventPayload::MenuClosed { menu, .. }
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|open| open.id == *menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        _ => {}
+    }
+
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

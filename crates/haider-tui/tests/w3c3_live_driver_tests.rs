@@ -1709,6 +1709,84 @@ fn an_answer_for_a_menu_this_connection_never_saw_open_is_not_invented() {
     );
 }
 
+#[test]
+fn optionless_live_answers_keep_empty_keys_and_choice_index_fallback() {
+    for session_n in [0, 1] {
+        for kind in [MenuKind::Question, MenuKind::File, MenuKind::Choice] {
+            for explicit in [false, true] {
+                let mut model = live_model();
+                let mut driver = LiveDriver::new("optionless-answer");
+                attach_all(&mut driver, &mut model, 2);
+                model.open_session(&sid(0));
+                let choices = kind == MenuKind::Choice;
+                let mut menu = card("answer", MenuScope::Session);
+                menu.kind = kind.clone();
+                if choices {
+                    menu.options[0].key = if explicit { "explicit" } else { "0" }.into();
+                } else {
+                    menu.options.clear();
+                }
+                driver.apply(
+                    &mut model,
+                    LiveReply::Event {
+                        attachment: attachment(session_n),
+                        session: sid(session_n),
+                        envelope: Box::new(envelope(
+                            &sid(session_n),
+                            1,
+                            &EventPayload::MenuOpened(menu),
+                        )),
+                    },
+                );
+                let pending = OutboundAnswer {
+                    origin: model.ui_generation(),
+                    branch: None,
+                    answer: MenuAnswer {
+                        menu: MenuId::new("answer"),
+                        option_key: explicit.then(|| "explicit".into()),
+                        option_index: 0,
+                        value: Some("synthetic answer".into()),
+                        via: AnswerVia::Tui,
+                    },
+                };
+                model.outbox.push(pending.clone());
+                let commands = driver.drain_answers(&mut model);
+                let LiveCommand::Answer {
+                    session,
+                    request_seq,
+                    worker_generation,
+                    option_key,
+                    option_index,
+                    input,
+                    ..
+                } = commands.first().expect("committed answer")
+                else {
+                    panic!("expected answer")
+                };
+                assert_eq!(*session, sid(session_n));
+                assert_eq!((*request_seq, *worker_generation, *option_index), (1, 9, 0));
+                let expected = if explicit {
+                    "explicit"
+                } else if choices {
+                    "0"
+                } else {
+                    ""
+                };
+                assert_eq!(option_key, expected, "{kind:?} explicit={explicit}");
+                assert!(
+                    matches!(input, Some(haider_rpc::MenuInput::Text { text }) if text == "synthetic answer")
+                );
+                model.outbox.push(pending);
+                let retry = driver.drain_answers(&mut model);
+                assert_eq!(
+                    commands.first().and_then(LiveCommand::command_id),
+                    retry.first().and_then(LiveCommand::command_id)
+                );
+            }
+        }
+    }
+}
+
 // ---- cold sessions ----------------------------------------------------
 
 #[test]
@@ -1978,4 +2056,226 @@ fn session_seen_acknowledgement_debounces_per_view_window() {
         matches!(renewed.first(), Some(LiveCommand::Seen { .. })),
         "a later read re-acknowledges, got {renewed:?}"
     );
+}
+
+#[test]
+fn main_chips_chase_parent_events_child_heads_and_reconnect_without_rewinding() {
+    for supported in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("chip-refresh");
+        attach_all(&mut driver, &mut model, 1);
+        model.open_session(&sid(0));
+        model.screen = Screen::Session;
+        if supported {
+            model
+                .daemon_features
+                .insert(haider_rpc::FEATURE_SESSION_FLEET_V1.into());
+        }
+        let mut child =
+            haider_tui::app::ChipModel::from_manifest(&haider_protocol::agent::AgentManifest {
+                agent: AgentId::new("refresh-child"),
+                role: haider_protocol::agent::AgentRole::Subagent,
+                task: "test".into(),
+                callsign: None,
+                model_profile: "fake".into(),
+                grant: haider_protocol::agent::Grant {
+                    tools: vec![],
+                    effect_ceiling: vec![],
+                },
+                budget_tokens: None,
+                placement: haider_protocol::agent::Placement::Local,
+                lease: haider_protocol::ids::LeaseId::new("lease"),
+                fencing_epoch: 1,
+                attempt: 0,
+                parent: None,
+                coordinates: None,
+                cli_scope: None,
+            });
+        child.child_session = Some(sid(1).as_str().into());
+        model.chips = vec![child];
+        model.initial_session = Some(sid(99));
+        assert!(
+            driver
+                .apply(
+                    &mut model,
+                    LiveReply::RosterUpdated {
+                        sessions: vec![summary(2, 0)]
+                    }
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            model.initial_session,
+            Some(sid(99)),
+            "a delta cannot refuse an initial session before its paged baseline"
+        );
+        model.initial_session = None;
+        let event = || LiveReply::Event {
+            attachment: attachment(0),
+            session: sid(0),
+            envelope: Box::new(envelope(&sid(0), 1, &user("later child message"))),
+        };
+        let expected = if supported {
+            vec![LiveCommand::SessionFleet { session: sid(0) }]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            driver.apply(&mut model, event()),
+            expected,
+            "parent facts refresh chips on the main view"
+        );
+        assert!(
+            driver.apply(&mut model, event()).is_empty(),
+            "duplicate envelopes do not refresh"
+        );
+        let commands = driver.apply(
+            &mut model,
+            LiveReply::RosterUpdated {
+                sessions: vec![summary(1, 10)],
+            },
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, LiveCommand::SessionFleet { .. })),
+            "child updates fold while the read is in flight or unsupported"
+        );
+        if supported {
+            let fleet = haider_rpc::SessionFleetSnapshot {
+                session_id: sid(0),
+                generated_at_ms: 1,
+                node_limit: haider_rpc::FLEET_MAX_NODES,
+                depth_limit: haider_rpc::FLEET_MAX_DEPTH,
+                roots: vec![],
+                truncated: false,
+                rollup: haider_rpc::FleetRollupWire {
+                    node_count: 0,
+                    max_depth: 0,
+                    states: Default::default(),
+                    metrics: Default::default(),
+                    metrics_complete: false,
+                    complete: true,
+                },
+            };
+            assert_eq!(
+                driver.apply(
+                    &mut model,
+                    LiveReply::Fleet {
+                        snapshot: Box::new(fleet.clone())
+                    }
+                ),
+                expected,
+                "child-only advances request one chase on reply"
+            );
+            assert!(
+                driver
+                    .apply(
+                        &mut model,
+                        LiveReply::Fleet {
+                            snapshot: Box::new(fleet)
+                        }
+                    )
+                    .is_empty()
+            );
+            let resumed = driver.apply(&mut model, LiveReply::Reconnected);
+            assert!(
+                resumed.contains(&LiveCommand::SessionFleet { session: sid(0) }),
+                "main chips refresh on reconnect too"
+            );
+        }
+    }
+}
+
+#[test]
+fn real_driver_reattach_retains_every_pending_card_and_closes_each_once() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("synthetic-pending");
+    attach_all(&mut driver, &mut model, 2);
+    model.open_session(&sid(0));
+    for (n, count) in [(0, 3), (1, 2)] {
+        for index in 0..count {
+            driver.apply(
+                &mut model,
+                LiveReply::Event {
+                    attachment: attachment(n),
+                    session: sid(n),
+                    envelope: Box::new(envelope(
+                        &sid(n),
+                        index as u64 + 1,
+                        &EventPayload::MenuOpened(card(
+                            &format!("pending-{n}-{index}"),
+                            MenuScope::Session,
+                        )),
+                    )),
+                },
+            );
+        }
+    }
+    assert_eq!(model.inbox_counts().asks, 5);
+    driver.apply(
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "synthetic reconnect".into(),
+        },
+    );
+    assert_eq!(model.inbox_counts().asks, 5);
+    let commands = driver.apply(&mut model, LiveReply::Reconnected);
+    for (n, seq) in [(0, 3), (1, 2)] {
+        assert!(commands.contains(&LiveCommand::Attach {
+            session: sid(n),
+            after_seq: seq
+        }));
+        driver.apply(
+            &mut model,
+            LiveReply::Attached {
+                session: sid(n),
+                attachment: attachment(n + 50),
+                worker_generation: 7,
+                replay_through_seq: seq,
+                launch_origin: None,
+            },
+        );
+        // Redelivery after reattachment cannot inflate the count.
+        driver.apply(
+            &mut model,
+            LiveReply::Event {
+                attachment: attachment(n + 50),
+                session: sid(n),
+                envelope: Box::new(envelope(
+                    &sid(n),
+                    seq,
+                    &EventPayload::MenuOpened(card(
+                        &format!("pending-{n}-{}", seq - 1),
+                        MenuScope::Session,
+                    )),
+                )),
+            },
+        );
+        assert_eq!(model.inbox_counts().asks, 5);
+    }
+    let mut remaining = 5;
+    for (n, count) in [(0, 3), (1, 2)] {
+        model.open_session(&sid(n));
+        assert_eq!(model.inbox_counts().asks, remaining);
+        for index in 0..count {
+            driver.apply(
+                &mut model,
+                LiveReply::Event {
+                    attachment: attachment(n + 50),
+                    session: sid(n),
+                    envelope: Box::new(envelope(
+                        &sid(n),
+                        (count + index + 1) as u64,
+                        &EventPayload::MenuClosed {
+                            menu: MenuId::new(format!("pending-{n}-{index}")),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                    )),
+                },
+            );
+            remaining -= 1;
+            assert_eq!(model.inbox_counts().asks, remaining);
+        }
+    }
 }

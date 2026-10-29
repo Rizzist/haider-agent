@@ -45,6 +45,15 @@ fn replay(
 }
 
 fn upgrade_variant(pin: bool, endpoint: bool, autonomous: bool) {
+    upgrade_variant_with_budget_source(pin, endpoint, autonomous, false);
+}
+
+fn upgrade_variant_with_budget_source(
+    pin: bool,
+    endpoint: bool,
+    autonomous: bool,
+    source_present: bool,
+) {
     let root = tempfile::tempdir().expect("private store");
     let store = Store::open(root.path()).expect("store");
     let parent = create_command("parent", &json!({"parent":true}));
@@ -60,11 +69,18 @@ fn upgrade_variant(pin: bool, endpoint: bool, autonomous: bool) {
         account: pin.then(|| "synthetic-pin".into()),
         event_id: EventId::new("parent-rebound"),
         device_id: DeviceId::new("test"),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
     };
     store
         .rebind_session_provider(&rebind)
         .expect("parent route");
     let mut old = old_body();
+    if source_present {
+        old["max_tokens_source"] = Value::Null;
+    }
     if autonomous {
         old["interaction_mode"] = json!("autonomous");
     }
@@ -79,6 +95,10 @@ fn upgrade_variant(pin: bool, endpoint: bool, autonomous: bool) {
         .expect("old daemon child create");
     // No delegation row exists: the old daemon can crash right after create.
     let mut new = old.clone();
+    if source_present {
+        new["max_tokens_source"] =
+            json!(haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived);
+    }
     new["inheritance_parent_session_id"] = json!("parent");
     new["inherited_account_alias"] = json!(rebind.account);
     new["inherited_provider_base_url"] = json!(rebind.base_url);
@@ -117,6 +137,7 @@ fn upgrade_variant(pin: bool, endpoint: bool, autonomous: bool) {
         "cwd",
         "permission_overrides",
         "max_tokens",
+        "max_tokens_source",
         "effort",
         "fast",
         "cache_policy",
@@ -134,6 +155,12 @@ fn upgrade_variant(pin: bool, endpoint: bool, autonomous: bool) {
             "semantic change in {key}"
         );
     }
+    let mut changed = new.clone();
+    changed["max_tokens_source"] = json!({"kind":"user_set", "requested":4096});
+    assert!(
+        replay(&store, &command.command_id, &changed).is_err(),
+        "a valid source with the same effective cap cannot change admitted intent"
+    );
     // Today's changed parent cannot legitimise a changed old request.
     let mut later = rebind.clone();
     later.command_id = "later-route".into();
@@ -308,6 +335,10 @@ fn upgrade_child_of_fork_uses_the_fork_receipt_before_its_copied_history() {
         account: Some("old-source-pin".into()),
         event_id: EventId::new("before-cut-event"),
         device_id: DeviceId::new("test"),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
     };
     store
         .rebind_session_provider(&route)
@@ -440,6 +471,10 @@ fn upgrade_cross_provider_child_does_not_inherit_incompatible_parent_choices() {
             account: Some("bed-synthetic".into()),
             event_id: EventId::new("cross-parent-route-event"),
             device_id: DeviceId::new("test"),
+            max_tokens: 4096,
+            max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+            active_output_budget: None,
         })
         .expect("parent choices");
     let mut old = old_body();
@@ -720,6 +755,11 @@ fn upgrade_cross_provider_pick_reconstructs_historical_creation_and_rebind_pins(
                         account: Some("bed-b".into()),
                         event_id: EventId::new("old-rebind-event"),
                         device_id: DeviceId::new("test"),
+                        max_tokens: 4096,
+                        max_tokens_source:
+                            haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+                        clamped: None,
+                        active_output_budget: None,
                     })
                     .expect("rebind pin and endpoint");
             }
@@ -868,6 +908,7 @@ fn candidate_pick(store: &Store, session: &SessionId, index: usize, provider: &s
             provider: provider.into(),
             model: model.into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new(format!("candidate-picked-{session}-{index}")),
@@ -1286,6 +1327,10 @@ fn mixed_writer_cycles_preserve_each_child_cutoff_and_later_rebind() {
             account: Some("later-pin".into()),
             event_id: EventId::new("cycles-rebound"),
             device_id: DeviceId::new("test"),
+            max_tokens: 4096,
+            max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+            active_output_budget: None,
         })
         .expect("later explicit route");
     children.push(legacy_descendant(
@@ -1331,4 +1376,666 @@ fn mixed_writer_cycles_preserve_each_child_cutoff_and_later_rebind() {
             );
         }
     }
+}
+
+#[test]
+fn pre_route_digest_source_present_inherits_the_historical_route_and_budget_intent() {
+    upgrade_variant_with_budget_source(true, true, false, true);
+    upgrade_variant_with_budget_source(false, false, true, true);
+}
+
+#[test]
+fn current_receipt_binds_budget_source_and_every_route_field_strictly() {
+    let root = tempfile::tempdir().expect("private store");
+    let store = Store::open(root.path()).expect("store");
+    let mut body = old_body();
+    body["max_tokens_source"] = json!({"kind":"derived"});
+    body["inheritance_parent_session_id"] = json!("parent");
+    for key in [
+        "inherited_account_alias",
+        "inherited_provider_base_url",
+        "inherited_provider_rebind_id",
+    ] {
+        body[key] = Value::Null;
+    }
+    let command = create_command("current-budget-route", &body);
+    store.create_session(&command).expect("create");
+    assert!(
+        replay(&store, &command.command_id, &body)
+            .expect("exact control")
+            .is_some()
+    );
+    for key in [
+        "max_tokens_source",
+        "inheritance_parent_session_id",
+        "inherited_account_alias",
+        "inherited_provider_base_url",
+        "inherited_provider_rebind_id",
+    ] {
+        let mut changed = body.clone();
+        changed[key] = if key == "max_tokens_source" {
+            json!({"kind":"user_set", "requested":4096})
+        } else {
+            json!("changed")
+        };
+        assert!(
+            replay(&store, &command.command_id, &changed).is_err(),
+            "current {key} stays strict"
+        );
+    }
+}
+
+#[test]
+fn unknown_receipt_schema_cannot_use_source_only_upgrade_equivalence() {
+    let root = tempfile::tempdir().expect("private store");
+    let store = Store::open(root.path()).expect("store");
+    let mut old = old_body();
+    old["future_semantics"] = json!(true);
+    let command = create_command("unknown-schema", &old);
+    store.create_session(&command).expect("create");
+    assert!(
+        replay(&store, &command.command_id, &old)
+            .expect("exact control")
+            .is_some()
+    );
+    let mut new = old;
+    new["max_tokens_source"] = json!({"kind":"derived"});
+    assert!(
+        replay(&store, &command.command_id, &new).is_err(),
+        "only exact historical schemas allow source addition"
+    );
+}
+
+#[test]
+fn frozen_child_route_precedes_next_turn_parent_route_on_legacy_replay() {
+    for (pin, endpoint) in [(true, false), (false, true), (true, true)] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let parent = create_command("frozen-parent", &json!({"parent":true}));
+        store.create_session(&parent).expect("parent");
+        let route = SessionProviderRebindCommand {
+            command_id: "frozen-route".into(),
+            request_digest: "frozen-route".into(),
+            request_json: "{}".into(),
+            session_id: parent.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "bedrock".into(),
+            base_url: endpoint.then(|| "http://127.0.0.1:8020".into()),
+            account: pin.then(|| "frozen-pin".into()),
+            max_tokens: 4096,
+            max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+            active_output_budget: None,
+            event_id: EventId::new("frozen-route"),
+            device_id: DeviceId::new("test"),
+        };
+        store
+            .rebind_session_provider(&route)
+            .expect("original route");
+        let admitted = store
+            .session_metadata(&parent.session_id)
+            .expect("parent")
+            .expect("typed");
+        store
+            .select_session_model(&haider_store::SessionSelectModelCommand {
+                command_id: "next-parent".into(),
+                request_digest: "next-parent".into(),
+                request_json: "{}".into(),
+                session_id: parent.session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+                expected_pair: None,
+                automatic_run: None,
+                account_alias: None,
+                output_budget: None,
+                event_id: EventId::new("next-parent"),
+                device_id: DeviceId::new("test"),
+            })
+            .expect("next-turn selection");
+        let old = old_body();
+        let child = create_command("frozen-child", &old);
+        store
+            .create_session_with_workspace_configuration(
+                &child,
+                SessionInteractionModeV1::Interactive,
+                None,
+                None,
+                Some(admitted),
+            )
+            .expect("child admitted from the running route");
+        let before = store
+            .session_metadata(&child.session_id)
+            .expect("child")
+            .expect("typed");
+        assert_eq!(before.account_alias, route.account);
+        assert_eq!(before.provider_base_url, route.base_url);
+        let journal = store.journal_replay(&child.session_id).expect("journal");
+        let mut new = old.clone();
+        new["max_tokens_source"] = json!({"kind":"derived"});
+        new["inheritance_parent_session_id"] = json!(parent.session_id);
+        new["inherited_account_alias"] = json!(route.account);
+        new["inherited_provider_base_url"] = json!(route.base_url);
+        new["inherited_provider_rebind_id"] = json!(route.command_id);
+        drop(store);
+        let store = Store::open(root.path()).expect("restart");
+        assert!(
+            replay(&store, &child.command_id, &old)
+                .expect("original control")
+                .is_some()
+        );
+        assert!(
+            replay(&store, &child.command_id, &new)
+                .expect("frozen route replay")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .session_metadata(&child.session_id)
+                .expect("child")
+                .expect("typed"),
+            before
+        );
+        assert_eq!(
+            store.journal_replay(&child.session_id).expect("journal"),
+            journal
+        );
+        for key in [
+            "inherited_account_alias",
+            "inherited_provider_base_url",
+            "inherited_provider_rebind_id",
+            "inheritance_parent_session_id",
+            "max_tokens",
+            "max_tokens_source",
+        ] {
+            let mut changed = new.clone();
+            changed[key] = match key {
+                "max_tokens" => json!(8192),
+                "max_tokens_source" => json!({"kind":"user_set", "requested":4096}),
+                _ => json!("changed"),
+            };
+            assert!(
+                replay(&store, &child.command_id, &changed).is_err(),
+                "frozen {key} stays strict"
+            );
+        }
+        let mut discarded = new.clone();
+        for key in [
+            "inherited_account_alias",
+            "inherited_provider_base_url",
+            "inherited_provider_rebind_id",
+        ] {
+            discarded[key] = Value::Null;
+        }
+        assert!(
+            replay(&store, &child.command_id, &discarded).is_err(),
+            "next-turn route cannot discard admission"
+        );
+    }
+}
+
+#[test]
+fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
+    use haider_protocol::{
+        EventPayload,
+        envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION},
+        ids::{AgentId, ItemId, LeaseId, RunId},
+        item::{ItemEvent, TurnItem},
+        state::RunState,
+    };
+    fn append(store: &Store, parent: &SessionId, run: &RunId, label: &str, payload: EventPayload) {
+        let mut events = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(label),
+            seq: 0,
+            session_id: parent.clone(),
+            branch_id: None,
+            run_id: Some(run.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("test"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("payload").into(),
+        }];
+        store.append_worker(&mut events).expect("parent run event");
+    }
+    fn accept(store: &Store, parent: &SessionId, run: &RunId) {
+        store
+            .accept_turn(&haider_store::TurnAcceptCommand {
+                command_id: format!("turn-{run}"),
+                request_digest: format!("turn-{run}"),
+                request_json: "{}".into(),
+                session_id: parent.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: run.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "parent turn".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new(format!("queued-{run}")),
+                user_event_id: EventId::new(format!("user-{run}")),
+                active_event_id: EventId::new(format!("active-{run}")),
+                device_id: DeviceId::new("test"),
+            })
+            .expect("accept parent run");
+    }
+    let mut delayed_failures = Vec::new();
+    for case in [
+        "pinned",
+        "legacy-rebound",
+        "same-provider-auto",
+        "cross-provider-auto",
+        "same-provider-delayed-auto",
+        "cross-provider-delayed-auto",
+        "other-run-auto",
+        "queued-only",
+        "completed",
+        "linked-original",
+        "linked-queued",
+        "ambiguous",
+        "future-rebound",
+    ] {
+        for (pin, endpoint) in [(true, false), (false, true), (true, true)] {
+            for source_present in [false, true] {
+                let root = tempfile::tempdir().expect("profile");
+                let store = Store::open(root.path()).expect("store");
+                let parent = create_command("running-parent", &json!({"parent": true}));
+                store.create_session(&parent).expect("parent");
+                let mut binding = SessionProviderRebindCommand {
+                    command_id: "running-route".into(),
+                    request_digest: "running-route".into(),
+                    request_json: "{}".into(),
+                    session_id: parent.session_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    provider: "bedrock".into(),
+                    base_url: endpoint.then(|| "http://127.0.0.1:8020".into()),
+                    account: pin.then(|| "running-pin".into()),
+                    max_tokens: 4096,
+                    max_tokens_source:
+                        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                            requested: 4096,
+                        },
+                    clamped: None,
+                    active_output_budget: None,
+                    event_id: EventId::new("running-route"),
+                    device_id: DeviceId::new("test"),
+                };
+                if case.contains("delayed") {
+                    binding.account = None;
+                    binding.base_url = None;
+                }
+                store
+                    .rebind_session_provider(&binding)
+                    .expect("original route");
+                let admitted = store
+                    .session_metadata(&parent.session_id)
+                    .expect("parent")
+                    .expect("typed");
+                let run = RunId::new("original-parent-run");
+                accept(&store, &parent.session_id, &run);
+                if !matches!(case, "legacy-rebound" | "linked-queued") {
+                    let pair = haider_protocol::session::RunOutputPairPinnedV1 {
+                        route_snapshot: Some(
+                            haider_protocol::session::RunOutputRouteSnapshotV1::capture(&admitted),
+                        ),
+                        provider: admitted.provider.clone(),
+                        model: admitted.model.clone(),
+                        max_tokens: admitted.max_tokens,
+                        source:
+                            haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                                requested: 4096,
+                            },
+                        provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(
+                            &admitted,
+                        ),
+                    };
+                    append(
+                        &store,
+                        &parent.session_id,
+                        &run,
+                        "parent-pin",
+                        pair.to_event(&run).expect("pin"),
+                    );
+                }
+                if !matches!(case, "queued-only" | "linked-queued") {
+                    append(
+                        &store,
+                        &parent.session_id,
+                        &run,
+                        "parent-thinking",
+                        EventPayload::RunState(RunState::Thinking),
+                    );
+                }
+                if case == "legacy-rebound" {
+                    binding.command_id = "after-start-route".into();
+                    binding.request_digest = "after-start-route".into();
+                    binding.event_id = EventId::new("after-start-route");
+                    store
+                        .rebind_session_provider(&binding)
+                        .expect("legacy active rebind");
+                }
+                if case.ends_with("-auto") {
+                    let scope = if case == "other-run-auto" {
+                        let other = RunId::new("other-queued-run");
+                        accept(&store, &parent.session_id, &other);
+                        other
+                    } else {
+                        run.clone()
+                    };
+                    if case.contains("delayed") {
+                        // The previous writer's production selection receipt
+                        // names the run even though its event was unscoped.
+                        store
+                            .select_session_model(&haider_store::SessionSelectModelCommand {
+                                command_id: "automatic-prepared".into(),
+                                request_digest: "automatic-prepared".into(),
+                                request_json: json!({"automatic":true,"run_id":run}).to_string(),
+                                session_id: parent.session_id.clone(),
+                                worker_generation: store.worker_generation(),
+                                provider: if case.starts_with("same-provider") {
+                                    "bedrock"
+                                } else {
+                                    "anthropic"
+                                }
+                                .into(),
+                                model: "automatic-model".into(),
+                                expected_pair: None,
+                                automatic_run: None,
+                                account_alias: None,
+                                output_budget: None,
+                                event_id: EventId::new("automatic-prepared"),
+                                device_id: DeviceId::new("test"),
+                            })
+                            .expect("legacy automatic selection");
+                        binding.command_id = "newer-explicit-route".into();
+                        binding.request_digest = "newer-explicit-route".into();
+                        binding.event_id = EventId::new("newer-explicit-route");
+                        binding.account = pin.then(|| "running-pin".into());
+                        binding.base_url = endpoint.then(|| "http://127.0.0.1:8020".into());
+                        store
+                            .rebind_session_provider(&binding)
+                            .expect("newer explicit route");
+                        store
+                            .select_session_model(&haider_store::SessionSelectModelCommand {
+                                command_id: "next-parent".into(),
+                                request_digest: "next-parent".into(),
+                                request_json: "{}".into(),
+                                session_id: parent.session_id.clone(),
+                                worker_generation: store.worker_generation(),
+                                provider: "anthropic".into(),
+                                model: "claude-sonnet-5".into(),
+                                expected_pair: None,
+                                automatic_run: None,
+                                account_alias: None,
+                                output_budget: None,
+                                event_id: EventId::new("next-parent"),
+                                device_id: DeviceId::new("test"),
+                            })
+                            .expect("ordinary target lookalike is next-turn only");
+                    }
+                    append(
+                        &store,
+                        &parent.session_id,
+                        &scope,
+                        "automatic-switch",
+                        EventPayload::Item(ItemEvent::Completed {
+                            item_id: ItemId::new("automatic-switch"),
+                            item: TurnItem::Extension {
+                                kind: "provider_pair_switch_v1".into(),
+                                data: json!({"to_provider": if case.starts_with("same-provider") { "bedrock" } else { "anthropic" }, "to_model": "automatic-model"}),
+                            },
+                        }),
+                    );
+                }
+                if matches!(case, "completed" | "linked-original") {
+                    append(
+                        &store,
+                        &parent.session_id,
+                        &run,
+                        "parent-done",
+                        EventPayload::RunState(RunState::Done),
+                    );
+                }
+                store
+                    .select_session_model(&haider_store::SessionSelectModelCommand {
+                        command_id: "next-parent".into(),
+                        request_digest: "next-parent".into(),
+                        request_json: "{}".into(),
+                        session_id: parent.session_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        provider: "anthropic".into(),
+                        model: "claude-sonnet-5".into(),
+                        expected_pair: None,
+                        automatic_run: None,
+                        account_alias: None,
+                        output_budget: None,
+                        event_id: EventId::new("next-parent"),
+                        device_id: DeviceId::new("test"),
+                    })
+                    .expect("next-turn selection");
+                if case == "linked-queued" {
+                    binding.command_id = "queued-current-route".into();
+                    binding.request_digest = "queued-current-route".into();
+                    binding.event_id = EventId::new("queued-current-route");
+                    binding.provider = "anthropic".into();
+                    binding.account = pin.then(|| "queued-current-pin".into());
+                    binding.base_url = endpoint.then(|| "http://127.0.0.1:8022".into());
+                    store
+                        .rebind_session_provider(&binding)
+                        .expect("queued parent uses the current historical session route");
+                }
+                if matches!(case, "linked-original" | "ambiguous") {
+                    let next = RunId::new("next-parent-run");
+                    accept(&store, &parent.session_id, &next);
+                    append(
+                        &store,
+                        &parent.session_id,
+                        &next,
+                        "next-thinking",
+                        EventPayload::RunState(RunState::Thinking),
+                    );
+                }
+                let mut old = old_body();
+                if source_present {
+                    old["max_tokens_source"] = json!({"kind": "user_set", "requested": 4096});
+                }
+                if matches!(case, "cross-provider-auto" | "linked-queued") {
+                    old["provider"] = json!("anthropic");
+                    old["model"] = json!("claude-sonnet-5");
+                }
+                let mut child = create_command("unrecorded-child", &old);
+                if matches!(case, "cross-provider-auto" | "linked-queued") {
+                    child.provider = "anthropic".into();
+                    child.model = "claude-sonnet-5".into();
+                }
+                child.max_tokens_source = Some(
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested: 4096,
+                    },
+                );
+                store
+                    .create_session_with_interaction_mode(
+                        &child,
+                        SessionInteractionModeV1::Interactive,
+                    )
+                    .expect("original legacy child");
+                let before = store
+                    .session_metadata(&child.session_id)
+                    .expect("child")
+                    .expect("typed");
+                assert_eq!(before.account_alias, None);
+                assert_eq!(before.provider_base_url, None);
+                if matches!(case, "linked-original" | "linked-queued") {
+                    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+                    let agent = AgentId::new("agent-synthetic");
+                    store
+                        .create_delegation(&haider_store::DelegationRecord {
+                            agent_id: agent.clone(),
+                            child_session_id: child.session_id.clone(),
+                            child_run_id: RunId::new("child-run"),
+                            parent_session_id: parent.session_id.clone(),
+                            parent_run_id: run.clone(),
+                            parent_branch_id: None,
+                            call_id: "child-call".into(),
+                            tool_item_id: ItemId::new("child-call"),
+                            parent_agent_id: None,
+                            root_session_id: parent.session_id.clone(),
+                            depth: 1,
+                            task: "test route inheritance".into(),
+                            prompt: "test route inheritance".into(),
+                            manifest: AgentManifest {
+                                agent,
+                                role: AgentRole::Subagent,
+                                task: "test route inheritance".into(),
+                                callsign: None,
+                                model_profile: "anthropic.claude-opus-5".into(),
+                                grant: Grant {
+                                    tools: Vec::new(),
+                                    effect_ceiling: Vec::new(),
+                                },
+                                budget_tokens: Some(4096),
+                                placement: Placement::Local,
+                                lease: LeaseId::new("child-lease"),
+                                fencing_epoch: 1,
+                                attempt: 0,
+                                parent: None,
+                                coordinates: None,
+                                cli_scope: None,
+                            },
+                            state: haider_store::DelegationState::Spawned,
+                            report: None,
+                        })
+                        .expect("original durable delegation witness");
+                }
+                if case == "future-rebound" {
+                    let mut future = binding.clone();
+                    future.command_id = "future-route".into();
+                    future.request_digest = "future-route".into();
+                    future.event_id = EventId::new("future-route");
+                    future.account = Some("future-pin".into());
+                    future.base_url = Some("http://127.0.0.1:8021".into());
+                    store
+                        .rebind_session_provider(&future)
+                        .expect("later route cannot change the original cutoff");
+                }
+                let journal = store.journal_replay(&child.session_id).expect("journal");
+                let inherits = !matches!(case, "cross-provider-auto" | "queued-only" | "completed");
+                let mut new = old.clone();
+                new["max_tokens_source"] = json!({"kind": "user_set", "requested": 4096});
+                new["inheritance_parent_session_id"] = json!(parent.session_id);
+                new["inherited_account_alias"] = if inherits {
+                    json!(binding.account)
+                } else {
+                    Value::Null
+                };
+                new["inherited_provider_base_url"] = if inherits {
+                    json!(binding.base_url)
+                } else {
+                    Value::Null
+                };
+                new["inherited_provider_rebind_id"] = if inherits {
+                    json!(binding.command_id)
+                } else {
+                    Value::Null
+                };
+                drop(store);
+                let store = Store::open(root.path()).expect("restart");
+                assert!(
+                    replay(&store, &child.command_id, &old)
+                        .expect("original control")
+                        .is_some()
+                );
+                let (_, admission) = store
+                    .child_create_admission(
+                        &child.command_id,
+                        &child.session_id,
+                        &parent.session_id,
+                    )
+                    .expect("original admission proof")
+                    .expect("receipt");
+                if case.contains("delayed")
+                    && (serde_json::to_value(&admission.account_alias).expect("account")
+                        != new["inherited_account_alias"]
+                        || serde_json::to_value(&admission.provider_base_url).expect("endpoint")
+                            != new["inherited_provider_base_url"]
+                        || serde_json::to_value(&admission.provider_rebind_id).expect("rebind")
+                            != new["inherited_provider_rebind_id"])
+                {
+                    delayed_failures.push(format!("{case}/pin={pin}/endpoint={endpoint}/source={source_present}: newer rebind lost in legacy child receipt"));
+                    continue;
+                }
+                if case != "ambiguous" {
+                    assert_eq!(
+                        serde_json::to_value(admission.account_alias).expect("account_alias JSON"),
+                        new["inherited_account_alias"],
+                        "{case}: admitted alias"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(admission.provider_base_url)
+                            .expect("provider_base_url JSON"),
+                        new["inherited_provider_base_url"],
+                        "{case}: admitted endpoint"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(admission.provider_rebind_id)
+                            .expect("provider_rebind_id JSON"),
+                        new["inherited_provider_rebind_id"],
+                        "{case}: admitted rebind"
+                    );
+                } else {
+                    assert_eq!(admission, before, "ambiguous history supplies no route");
+                }
+                if case == "ambiguous" {
+                    assert!(
+                        replay(&store, &child.command_id, &new).is_err(),
+                        "no unique run witness"
+                    );
+                } else {
+                    assert!(replay(&store, &child.command_id, &new).unwrap_or_else(|error| panic!("{case} pin={pin} endpoint={endpoint} source={source_present}: {error:?}")).is_some());
+                    for field in [
+                        "inherited_account_alias",
+                        "inherited_provider_base_url",
+                        "inherited_provider_rebind_id",
+                    ] {
+                        let mut changed = new.clone();
+                        changed[field] = json!("changed-choice");
+                        assert!(
+                            replay(&store, &child.command_id, &changed).is_err(),
+                            "{case}: {field}"
+                        );
+                    }
+                    let mut changed = new;
+                    changed["max_tokens_source"] = json!({"kind": "user_set", "requested": 8192});
+                    assert!(
+                        replay(&store, &child.command_id, &changed).is_err(),
+                        "budget intent stays strict"
+                    );
+                }
+                assert_eq!(
+                    store
+                        .session_metadata(&child.session_id)
+                        .expect("child")
+                        .expect("typed"),
+                    before
+                );
+                assert_eq!(
+                    store.journal_replay(&child.session_id).expect("journal"),
+                    journal
+                );
+            }
+        }
+    }
+    assert!(
+        delayed_failures.is_empty(),
+        "delayed automatic facts must preserve the inherited newer rebind: {delayed_failures:#?}"
+    );
 }

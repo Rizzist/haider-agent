@@ -49,6 +49,7 @@ fn legacy_omitted_budget_source_does_not_mint_a_noop_selection_epoch() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 4096,
@@ -87,6 +88,10 @@ fn command(store: &Store) -> SessionProviderRebindCommand {
         provider: "proxy".into(),
         base_url: Some("http://127.0.0.1:4242/v1".into()),
         account: Some("row-account".into()),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
         event_id: EventId::new("rebound-1"),
         device_id: DeviceId::new("test-device"),
     }
@@ -107,6 +112,7 @@ fn cross_provider_pick_clears_pin_and_old_route_with_typed_notice() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: Some("bed-a".into()),
         output_budget: None,
         event_id: EventId::new("pin-source-event"),
@@ -262,7 +268,26 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     let store = Store::open(root.path()).expect("open");
     create(&store, "session-a");
     create(&store, "session-b");
-    let command = command(&store);
+    let mut command = command(&store);
+    command.max_tokens = 8192;
+    command.max_tokens_source =
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 20_000 };
+    command.clamped = Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+        requested: 20_000,
+        max_output_tokens: 8192,
+    });
+    command.active_output_budget = Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+        run_id: haider_protocol::ids::RunId::new("active-run"),
+        model: "small-active-model".into(),
+        budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: 4096,
+            source: command.max_tokens_source,
+            clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 4096,
+            }),
+        },
+    });
     let mut replayed_metadata = store
         .session_metadata(&command.session_id)
         .expect("read metadata")
@@ -278,13 +303,27 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
     };
     assert_eq!(envelope.seq, 2);
     assert_eq!(selected.selected_seq, envelope.seq);
+    assert_eq!(selected.max_tokens, 8192);
+    assert_eq!(selected.max_tokens_source, command.max_tokens_source);
+    assert_eq!(selected.clamped, command.clamped);
+    assert_eq!(selected.active_output_budget, command.active_output_budget);
     assert!(matches!(envelope.render.prompt, PromptRender::Omit));
     assert_eq!(envelope.payload["type"], "session_provider_rebound");
     let fact =
         SessionProviderRebound::from_payload_value(&envelope.payload).expect("typed replay fact");
+    assert_eq!(fact.active_output_budget, command.active_output_budget);
+    assert_eq!(
+        fact.output_budget.expect("next-turn budget").max_tokens,
+        8192
+    );
     fact.apply_to_metadata(&mut replayed_metadata);
     assert_eq!(replayed_metadata.model, "test-model");
     assert_eq!(replayed_metadata.provider, "proxy");
+    assert_eq!(replayed_metadata.max_tokens, 8192);
+    assert_eq!(
+        replayed_metadata.max_tokens_source,
+        Some(command.max_tokens_source)
+    );
     assert_eq!(replayed_metadata.provider_base_url, command.base_url);
     assert_eq!(replayed_metadata.account_alias, command.account);
     assert_eq!(
@@ -336,6 +375,40 @@ fn provider_rebind_durable_event_replays_to_identical_metadata_and_receipt() {
             )
             .expect("receipt across generation change"),
         Some(selected)
+    );
+}
+
+#[test]
+fn provider_rebind_keeps_larger_active_derived_budget_separate_from_queued_budget() {
+    let root = tempfile::tempdir().expect("temporary store");
+    let store = Store::open(root.path()).expect("open");
+    create(&store, "session-a");
+    let mut command = command(&store);
+    command.max_tokens = 8192;
+    command.active_output_budget = Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+        run_id: haider_protocol::ids::RunId::new("active-large"),
+        model: "wide-model".into(),
+        budget: haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: 30_000,
+            source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+            clamped: None,
+        },
+    });
+    let SessionProviderRebindOutcome::Committed { envelope, .. } =
+        store.rebind_session_provider(&command).expect("rebind")
+    else {
+        panic!("commit")
+    };
+    let fact = SessionProviderRebound::from_payload_value(&envelope.payload).expect("fact");
+    assert_eq!(fact.output_budget.expect("queued budget").max_tokens, 8192);
+    assert_eq!(fact.active_output_budget, command.active_output_budget);
+    assert_eq!(
+        store
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("typed")
+            .max_tokens,
+        8192
     );
 }
 
@@ -404,7 +477,16 @@ fn provider_rebind_omitted_coordinates_clear_only_the_session_override() {
     };
     assert_eq!(
         *envelope.payload,
-        serde_json::json!({"type":"session_provider_rebound","rebind_id":"rebind-2","provider":"proxy","selection_epoch":envelope.seq})
+        serde_json::json!({
+            "type":"session_provider_rebound", "rebind_id":"rebind-2", "provider":"proxy",
+            "selection_epoch":envelope.seq,
+            "route_snapshot": {
+                "account":null,"base_url":null,"rebind_id":"rebind-2",
+                "resolved_alias":null,"resolved_seen":false,
+                "selection_epoch":envelope.seq,"reset_epoch":envelope.seq
+            },
+            "output_budget":{"max_tokens":4096,"source":{"kind":"derived"}}
+        })
     );
     let metadata = store
         .session_metadata(&command.session_id)
@@ -431,6 +513,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         provider: "proxy".into(),
         model: "model-2".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: None,
         event_id: EventId::new("model-selected-1"),
@@ -494,6 +577,7 @@ fn selection_epoch_survives_restart_and_advances_for_budget_model_and_route() {
         provider: "source".into(),
         model: "test-model".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 20_000,
@@ -636,7 +720,7 @@ fn first_route_is_journaled_without_advancing_request_selection_and_noop_is_sile
     let (epoch, facts) = store
         .commit_resolved_route_fact(&id, "source", "test-model", 0, None, &DeviceId::new("test"))
         .expect("first route");
-    assert_eq!(epoch, 0);
+    assert_eq!(epoch, Some(0));
     assert_eq!(facts.len(), 1);
     let fact = ModelSelected::from_payload_value(&facts[0].payload).expect("typed");
     assert!(fact.route_only);
@@ -651,20 +735,21 @@ fn first_route_is_journaled_without_advancing_request_selection_and_noop_is_sile
     );
     assert_eq!(fact.cleared_account_pin, None);
     assert_eq!(fact.cleared_provider_endpoint, None);
-    assert!(
-        store
-            .commit_resolved_route_fact(
-                &id,
-                "source",
-                "test-model",
-                epoch,
-                None,
-                &DeviceId::new("test")
-            )
-            .expect("same route")
-            .1
-            .is_empty()
+    let (accepted_epoch, facts) = store
+        .commit_resolved_route_fact(
+            &id,
+            "source",
+            "test-model",
+            epoch.expect("accepted route"),
+            None,
+            &DeviceId::new("test"),
+        )
+        .expect("same route");
+    assert_eq!(
+        accepted_epoch, epoch,
+        "an accepted no-op is distinct from refusal"
     );
+    assert!(facts.is_empty(), "same route is silent");
 }
 
 #[test]
@@ -752,6 +837,7 @@ fn endpoint_only_and_both_choices_get_complete_clear_receipts_and_facts() {
             provider: "target".into(),
             model: "target-model".into(),
             expected_pair: None,
+            automatic_run: None,
             account_alias: None,
             output_budget: None,
             event_id: EventId::new("clear-endpoint-fact"),
@@ -814,6 +900,7 @@ fn clamps_survive_selection_replay_and_unreported_legacy_route_gets_one_fact() {
         provider: "source".into(),
         model: "smaller".into(),
         expected_pair: None,
+        automatic_run: None,
         account_alias: None,
         output_budget: Some(SessionOutputBudgetV1 {
             max_tokens: 8192,
@@ -942,6 +1029,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 }
                 .into(),
                 expected_pair: None,
+                automatic_run: None,
                 account_alias: None,
                 output_budget: (variant == "budget").then_some(SessionOutputBudgetV1 {
                     max_tokens: 8192,
@@ -1000,9 +1088,8 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 )
                 .expect("late old request callback");
             assert_eq!(
-                returned_epoch,
-                captured.selection_epoch.unwrap_or(0),
-                "old request retains its epoch: {variant}"
+                returned_epoch, None,
+                "old request is explicitly refused: {variant}"
             );
             assert!(
                 facts.is_empty(),
@@ -1036,7 +1123,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                     &DeviceId::new("test-device"),
                 )
                 .expect("current request callback");
-            assert_eq!(epoch, current.selection_epoch.unwrap_or(0));
+            assert_eq!(epoch, current.selection_epoch);
             assert_eq!(
                 facts.len(),
                 1,
@@ -1057,7 +1144,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                         &id,
                         &current.provider,
                         &current.model,
-                        epoch,
+                        epoch.expect("accepted route"),
                         Some("current-request-alias"),
                         &DeviceId::new("test-device"),
                     )
@@ -1067,5 +1154,63 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 "same served route remains a no-op: {variant}"
             );
         }
+    }
+}
+
+#[test]
+fn same_route_rebind_clamp_and_restore_advance_budget_selection_epoch() {
+    use haider_protocol::output_budget::{OutputBudgetClampV1, SessionOutputBudgetSourceV1};
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    create(&store, "same-route-budget");
+    let session = SessionId::new("same-route-budget");
+    let mut prior = store
+        .session_metadata(&session)
+        .expect("metadata")
+        .expect("typed")
+        .selection_epoch
+        .unwrap_or(0);
+    for (ordinal, cap) in [(0, 8192), (1, 20_000)] {
+        let command = SessionProviderRebindCommand {
+            command_id: format!("budget-{ordinal}"),
+            request_digest: format!("budget-{ordinal}"),
+            request_json: "{}".into(),
+            session_id: session.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "proxy".into(),
+            base_url: None,
+            account: None,
+            max_tokens: cap,
+            max_tokens_source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: (cap < 20_000).then_some(OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: cap,
+            }),
+            active_output_budget: None,
+            event_id: EventId::new(format!("budget-{ordinal}")),
+            device_id: DeviceId::new("test"),
+        };
+        let SessionProviderRebindOutcome::Committed { selected, envelope } =
+            store.rebind_session_provider(&command).expect("rebind")
+        else {
+            panic!("new rebind");
+        };
+        let metadata = store
+            .session_metadata(&session)
+            .expect("metadata")
+            .expect("typed");
+        assert!(
+            metadata.selection_epoch.unwrap_or(0) > prior,
+            "budget restore must advance even on the same route"
+        );
+        assert_eq!(metadata.selection_epoch, Some(envelope.seq));
+        assert_eq!(selected.max_tokens, cap);
+        assert_eq!(metadata.max_tokens, cap);
+        let fact =
+            haider_protocol::session::SessionProviderRebound::from_payload_value(&envelope.payload)
+                .expect("typed fact");
+        assert_eq!(fact.selection_epoch, metadata.selection_epoch);
+        assert_eq!(fact.output_budget.expect("budget").max_tokens, cap);
+        prior = metadata.selection_epoch.expect("epoch");
     }
 }

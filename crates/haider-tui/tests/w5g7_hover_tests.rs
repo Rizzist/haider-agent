@@ -8,7 +8,7 @@
 //! never let the pointer steal keyboard navigation.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AccountAddKind, Hit};
+use haider_tui::app::Hit;
 use haider_tui::runtime::settle_hover_after_draw;
 use ratatui::layout::Rect;
 
@@ -31,7 +31,7 @@ fn rect(y: u16) -> Rect {
 #[test]
 fn a_target_that_moved_under_a_stationary_pointer_loses_its_highlight() {
     let mut model = launcher_model();
-    let target = Hit::AccountAdd(AccountAddKind::OpenAiOAuth);
+    let target = Hit::HelpHint;
     model.handle_hover(Some(target.clone()));
     model.dirty = false;
 
@@ -47,7 +47,7 @@ fn a_target_that_moved_under_a_stationary_pointer_loses_its_highlight() {
 #[test]
 fn a_target_still_under_the_pointer_keeps_its_highlight() {
     let mut model = launcher_model();
-    let target = Hit::AccountAdd(AccountAddKind::OpenAiOAuth);
+    let target = Hit::HelpHint;
     model.handle_hover(Some(target.clone()));
     model.dirty = false;
 
@@ -64,8 +64,8 @@ fn a_target_still_under_the_pointer_keeps_its_highlight() {
 #[test]
 fn settling_never_adopts_the_new_target_under_the_pointer() {
     let mut model = launcher_model();
-    let old = Hit::AccountAdd(AccountAddKind::OpenAiOAuth);
-    let new = Hit::AccountAdd(AccountAddKind::AnthropicOAuth);
+    let old = Hit::HelpHint;
+    let new = Hit::TalkChip;
     model.handle_hover(Some(old));
     model.dirty = false;
 

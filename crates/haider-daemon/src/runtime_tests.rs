@@ -978,7 +978,8 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1335,7 +1336,8 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(

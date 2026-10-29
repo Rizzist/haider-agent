@@ -43,6 +43,45 @@ fn monitor_event_payload_rejects_unknown_variant_fields() {
     assert!(error.to_string().contains("unexpected"));
 }
 
+#[tokio::test]
+async fn missing_registered_agent_emits_terminal_digest() {
+    let root = tempfile::tempdir().expect("store root");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(
+        store.clone(),
+        crate::session_hub::SessionHubConfig::default(),
+    )
+    .expect("hub");
+    let mut watch = registration(None);
+    watch.source = MonitorSource::Agent {
+        agent_id: "agent-disappeared".into(),
+    };
+    let service = MonitorService::default();
+    service.activate(hub.downgrade());
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let mut subscription = service.source_hub().subscribe(MonitorSourceKind::Agent);
+    let (_cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service.clone(), watch, cancelled));
+    let event = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .expect("agent monitor did not publish")
+        .expect("agent source closed");
+    let MonitorEventPayload::Agent { payload } = event.payload else {
+        panic!("missing registered child must publish an agent event");
+    };
+    let digest: serde_json::Value = serde_json::from_str(&payload).expect("typed digest");
+    assert_eq!(digest["kind"], "child_record_missing");
+    assert_eq!(digest["agent"], "agent-disappeared");
+    assert_eq!(digest["terminal"], true);
+    task.await.expect("agent runner ended after terminal event");
+    service.shutdown().await.expect("monitor shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 #[test]
 fn monitor_prompt_has_one_json_fence_even_when_event_data_contains_delimiters() {
     let payload = "[REDACTED:high_entropy] ``` </monitor-event> &";
@@ -358,6 +397,14 @@ fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
                 availability: Availability::Available,
             },
             haider_rpc::MonitorSourceAvailabilityWire {
+                source: Source::Task,
+                availability: Availability::Available,
+            },
+            haider_rpc::MonitorSourceAvailabilityWire {
+                source: Source::Agent,
+                availability: Availability::Available,
+            },
+            haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::Process,
                 availability: Availability::Available,
             },
@@ -637,6 +684,130 @@ impl MonitorWorld {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = sink;
     }
+}
+
+/// A stopped run remains barred after the session guard is gone. Exercise
+/// the actual monitor tool path, including its rejected result, rather than
+/// only the fence registry's predicate.
+#[tokio::test]
+async fn stopped_run_registration_is_rejected_after_fence_drop_until_terminal_observation() {
+    let world = MonitorWorld::new("stopped-run-registration").await;
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "stopped-run-cancelling",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelling)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    let fences = world.hub.inner_monitor().stop_fences().clone();
+    let fence = fences.fence(&world.session, std::slice::from_ref(&world.run), &[]);
+    fences.mark_run_stopped(&world.session, &world.run);
+    drop(fence);
+    assert!(!fences.session_fenced(&world.session));
+    let request = MonitorRequest::Register {
+        source: MonitorSource::Sms,
+        filter: None,
+        action: MonitorAction {
+            report: true,
+            follow_up: None,
+        },
+        occurrence: MonitorOccurrence::Every,
+        lifetime: MonitorLifetime::Session,
+    };
+    let refused = world.execute("stopped-after-drop", request.clone()).await;
+    assert_eq!(refused.status, ToolResultStatus::Rejected);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&refused.preview).unwrap()["status"],
+        "subagent_stopping"
+    );
+    assert!(
+        world
+            .execute("stopped-list", MonitorRequest::List)
+            .await
+            .preview
+            .contains("\"count\":0")
+    );
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&world.run),
+            None,
+            None,
+            "stopped-run-terminal",
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelled)).unwrap(),
+        )])
+        .await
+        .unwrap();
+    fences.forget_stopped_run(&world.session, &world.run);
+    let admitted = world.execute("new-after-terminal", request.clone()).await;
+    assert_eq!(admitted.status, ToolResultStatus::Completed);
+    let next_run = RunId::new("new-run-after-stopped-run");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "new-run-after-stop-command".into(),
+            request_digest: "new-run-after-stop-digest".into(),
+            request_json: r#"{"new_run":"after_stop"}"#.into(),
+            session_id: world.session.clone(),
+            worker_generation: world.store.worker_generation(),
+            run_id: next_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "new unrelated work".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("new-run-after-stop-queued"),
+            user_event_id: EventId::new("new-run-after-stop-user"),
+            active_event_id: EventId::new("new-run-after-stop-active"),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("accept new run after stop");
+    let mut coordinates = world.coordinates("new-run-register");
+    coordinates.run_id = next_run;
+    let fresh = world
+        .hub
+        .execute_monitor_tool(&world.lease, coordinates, request)
+        .await
+        .expect("new run monitor registration");
+    assert_eq!(fresh.status, ToolResultStatus::Completed);
+}
+
+#[tokio::test]
+async fn monitor_registration_in_other_session_succeeds_while_stop_fence_is_held() {
+    let world = MonitorWorld::new("unrelated-fence").await;
+    let other = SessionId::new("another-subagent-being-stopped");
+    let _fence = world.hub.inner_monitor().stop_fences().fence(
+        &other,
+        std::slice::from_ref(&world.run),
+        &[],
+    );
+    let result = world
+        .execute(
+            "unrelated-register",
+            MonitorRequest::Register {
+                source: MonitorSource::Sms,
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await;
+    assert_eq!(result.status, ToolResultStatus::Completed);
 }
 
 struct CapturingSink {
@@ -2598,5 +2769,612 @@ async fn completed_monitor_commands_reap_redirected_descendants() {
         }
         assert_monitor_descendant_exited(&mut lifeline);
         assert!(!root.path().join("after-close").exists());
+    }
+}
+
+// These fixtures keep a run deterministically Cancelling with a held worker
+// lease and no worker manager. Awaiting the real stop-convergence bound,
+// rather than racing a sleeping worker, exposes retention after guard release.
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_cancel_all() {
+    assert_already_cancelling_stop_retention("all").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_run_stop() {
+    assert_already_cancelling_stop_retention("run").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_stop_subagents() {
+    assert_already_cancelling_stop_retention("subagents").await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stopped_run_that_was_already_cancelling_is_retained_after_named_cancel() {
+    assert_already_cancelling_stop_retention("named").await;
+}
+
+#[cfg(unix)]
+async fn assert_already_cancelling_stop_retention(scope: &str) {
+    use haider_core::{DelegationRecord, DelegationState, TurnCancelCommand};
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{AgentId, ItemId, LeaseId};
+
+    let label = format!("already-cancelling-{scope}");
+    let world = MonitorWorld::new(&label).await;
+    let parent = SessionId::new(format!("{label}-parent"));
+    let parent_run = RunId::new(format!("{label}-parent-run"));
+    world
+        .hub
+        .create_internal_session(SessionCreateCommand {
+            command_id: format!("{label}-create-parent"),
+            request_digest: format!("{label}-create-parent-digest"),
+            request_json: serde_json::json!({"session":parent}).to_string(),
+            session_id: parent.clone(),
+            cwd: world._root.path().to_string_lossy().into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            max_tokens_source: None,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("{label}-parent-created")),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("create parent session");
+    world
+        .hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: format!("{label}-accept-parent"),
+            request_digest: format!("{label}-accept-parent-digest"),
+            request_json: serde_json::json!({"turn":parent_run}).to_string(),
+            session_id: parent.clone(),
+            worker_generation: world.hub.worker_generation(),
+            run_id: parent_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "parent work".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("{label}-parent-queued")),
+            user_event_id: EventId::new(format!("{label}-parent-user")),
+            active_event_id: EventId::new(format!("{label}-parent-active")),
+            device_id: world.hub.device_id(),
+        })
+        .await
+        .expect("accept parent run");
+    let stopped_run = if scope == "named" {
+        world
+            .lease
+            .append(&mut [monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                &format!("{label}-primary-done"),
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                serde_json::to_value(EventPayload::RunState(RunState::Done)).unwrap(),
+            )])
+            .await
+            .expect("terminal primary run");
+        let later = RunId::new(format!("{label}-later-run"));
+        world
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("{label}-accept-later"),
+                request_digest: format!("{label}-accept-later-digest"),
+                request_json: serde_json::json!({"turn":later}).to_string(),
+                session_id: world.session.clone(),
+                worker_generation: world.hub.worker_generation(),
+                run_id: later.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "later child work".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+                queued_event_id: EventId::new(format!("{label}-later-queued")),
+                user_event_id: EventId::new(format!("{label}-later-user")),
+                active_event_id: EventId::new(format!("{label}-later-active")),
+                device_id: world.hub.device_id(),
+            })
+            .await
+            .expect("accept later run");
+        later
+    } else {
+        world.run.clone()
+    };
+    world
+        .lease
+        .append(&mut [monitor_envelope(
+            &world.session,
+            Some(&stopped_run),
+            None,
+            None,
+            &format!("{label}-already-cancelling"),
+            world.hub.device_id(),
+            world.hub.worker_generation(),
+            serde_json::to_value(EventPayload::RunState(RunState::Cancelling)).unwrap(),
+        )])
+        .await
+        .expect("prior cancellation intent");
+    let agent = AgentId::new(format!("{label}-agent"));
+    let record = DelegationRecord {
+        agent_id: agent.clone(),
+        child_session_id: world.session.clone(),
+        child_run_id: world.run.clone(),
+        parent_session_id: parent.clone(),
+        parent_run_id: parent_run.clone(),
+        parent_branch_id: None,
+        call_id: format!("{label}-spawn"),
+        tool_item_id: ItemId::new(format!("{label}-spawn-item")),
+        parent_agent_id: None,
+        root_session_id: parent.clone(),
+        depth: 1,
+        task: label.clone(),
+        prompt: "keep cancelling until the stop bound".into(),
+        manifest: AgentManifest {
+            agent,
+            role: AgentRole::Subagent,
+            task: label.clone(),
+            callsign: None,
+            model_profile: "fake-model".into(),
+            grant: Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: None,
+            placement: Placement::Local,
+            lease: LeaseId::new(format!("{label}-lease")),
+            fencing_epoch: world.hub.worker_generation(),
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+            cli_scope: None,
+        },
+        state: DelegationState::Spawned,
+        report: None,
+    };
+    world
+        .hub
+        .create_delegation(record.clone())
+        .await
+        .expect("record child");
+    let coordinator = crate::delegation::DelegationHandle::new(world.hub.clone());
+    if scope == "named" {
+        let request_json =
+            serde_json::json!({"session_id":world.session,"run_id":world.run,"reason":"manual"})
+                .to_string();
+        coordinator
+            .cancel_single_subagent(
+                &record,
+                TurnCancelCommand {
+                    command_id: format!("{label}-cancel-primary"),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: world.session.clone(),
+                    worker_generation: world.hub.worker_generation(),
+                    run_id: world.run.clone(),
+                    cancelling_event_id: EventId::new(format!("{label}-primary-cancelling")),
+                    device_id: world.hub.device_id(),
+                },
+                &label,
+            )
+            .await
+            .expect("named cancellation");
+        timeout(Duration::from_secs(30), async {
+            while world
+                .hub
+                .inner_monitor()
+                .stop_fences()
+                .session_fenced(&world.session)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("named convergence releases its guard");
+    } else {
+        let root = if scope == "all" {
+            crate::delegation::SubagentTreeRoot::Session(parent.clone())
+        } else {
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: parent.clone(),
+                run_id: parent_run,
+            }
+        };
+        let stopped = timeout(
+            Duration::from_secs(30),
+            coordinator.stop_subagent_tree(root, &label),
+        )
+        .await
+        .expect("tree convergence bound")
+        .expect("tree stop");
+        assert_eq!(stopped.sessions, 1);
+        assert_eq!(
+            stopped.still_running, 1,
+            "the existing cancellation is still pending"
+        );
+    }
+    let fences = world.hub.inner_monitor().stop_fences().clone();
+    assert!(
+        !fences.session_fenced(&world.session),
+        "stop guard must have dropped"
+    );
+    assert!(!fences.session_fenced(&parent), "root is never fenced");
+    let mut coordinates = world.coordinates("after-existing-cancellation-bound");
+    coordinates.run_id = stopped_run;
+    let result = world
+        .hub
+        .execute_monitor_tool(
+            &world.lease,
+            coordinates,
+            MonitorRequest::Register {
+                source: MonitorSource::Sms,
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await
+        .expect("late monitor registration result");
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Rejected,
+        "{scope}: already cancelling run escaped retention: {}",
+        result.preview
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result.preview).unwrap()["status"],
+        "subagent_stopping",
+        "{scope}: {result:?}"
+    );
+}
+
+// MUTATION: write unsupported registrations/pending revisions directly, or
+// forget to unwrap their fences in CompletionProjection. Either old replay
+// resurrects a source/action, or the new reader loses the current obligation.
+#[test]
+fn unsupported_monitor_replacements_fence_every_legacy_source_and_pending_action() {
+    use haider_protocol::completion::CompletionProjection;
+    let sources = [
+        json!({"kind":"sms"}),
+        json!({"kind":"timer","interval_ms":3600000}),
+        json!({"kind":"process","command":"printf old"}),
+        json!({"kind":"file","path":"old.txt"}),
+        json!({"kind":"poll","command":"printf old","interval_ms":3600000}),
+        json!({"kind":"cli","preset":"gh-ci","argv":["run","view"]}),
+    ];
+    for old in sources {
+        let mut prior = registration(None);
+        prior.source = serde_json::from_value(old.clone()).expect("legacy source");
+        let original = MonitorJournalEvent::MonitorRegistered {
+            registration: prior.clone(),
+        };
+        assert_eq!(
+            MonitorJournalEvent::from_value(&original.to_value().unwrap()),
+            Some(original)
+        );
+        for source in [
+            MonitorSource::Task {
+                task_id: "owned-task".into(),
+            },
+            MonitorSource::Agent {
+                agent_id: "owned-agent".into(),
+            },
+        ] {
+            for (paused, exited) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut replacement = prior.clone();
+                replacement.source = source.clone();
+                replacement.paused = paused;
+                replacement.exited = exited;
+                replacement.action.follow_up = Some("new action".into());
+                let fact = MonitorJournalEvent::MonitorRegistered {
+                    registration: replacement,
+                };
+                let encoded = fact.to_value().unwrap();
+                assert_eq!(MonitorJournalEvent::from_value(&encoded), Some(fact));
+                // Ignore additive fields exactly as the previous daemon does.
+                assert!(
+                    matches!(serde_json::from_value::<MonitorJournalEvent>(encoded).unwrap(),
+                    MonitorJournalEvent::MonitorRemoved { monitor_id, reason:MonitorRemovalReason::Removed, .. }
+                    if monitor_id == prior.monitor_id)
+                );
+            }
+        }
+    }
+    for kind in [MonitorSourceKind::Task, MonitorSourceKind::Agent] {
+        for payload_only in [false, true] {
+            let mut report = test_report("coalesced-slot", "old", MonitorReportStatus::Matched);
+            report.action.follow_up = Some("obsolete action".into());
+            let pending = PendingMonitorReport {
+                report: report.clone(),
+                terminal_reason: None,
+                queue_order: 1,
+                queued_at_ms: 2,
+            };
+            let mut envelope = monitor_envelope(
+                &report.session_id,
+                None,
+                None,
+                None,
+                "old-pending",
+                DeviceId::new("test"),
+                1,
+                MonitorJournalEvent::MonitorReportPending {
+                    pending: pending.clone(),
+                }
+                .to_value()
+                .unwrap(),
+            );
+            envelope.seq = 1;
+            let mut current = CompletionProjection::default();
+            current.apply(&envelope);
+            let mut legacy = current.clone();
+            let mut replacement = pending;
+            replacement.report.action.follow_up = Some("new action".into());
+            if !payload_only {
+                replacement.report.source = kind;
+            }
+            replacement.report.events[0].payload = match kind {
+                MonitorSourceKind::Task => MonitorEventPayload::Task {
+                    payload: "done".into(),
+                },
+                _ => MonitorEventPayload::Agent {
+                    payload: "done".into(),
+                },
+            };
+            let fact = MonitorJournalEvent::MonitorReportPending {
+                pending: replacement.clone(),
+            };
+            envelope.payload = fact.to_value().unwrap().into();
+            envelope.seq = 2;
+            assert_eq!(
+                MonitorJournalEvent::from_value(&envelope.payload),
+                Some(fact)
+            );
+            assert_eq!(
+                pending_monitor_report(&envelope.payload),
+                Some(replacement.report.clone())
+            );
+            assert!(monitor_delivery_report(&envelope).is_some());
+            current.apply(&envelope);
+            envelope
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove("monitor_v2");
+            legacy.apply(&envelope);
+            assert!(
+                legacy.pending.is_empty(),
+                "old completion must not fire obsolete action"
+            );
+            assert!(legacy.is_settled("monitor:coalesced-slot"));
+            assert!(current.pending.contains_key("monitor:coalesced-slot"));
+            assert!(!current.is_settled("monitor:coalesced-slot"));
+            assert!(matches!(
+                serde_json::from_value::<MonitorJournalEvent>(envelope.payload.to_json_value())
+                    .unwrap(),
+                MonitorJournalEvent::MonitorRemoved { .. }
+            ));
+        }
+    }
+}
+
+// MUTATION: bypass any one of the tool/client Register/Update ownership guards.
+#[tokio::test]
+async fn monitor_source_ownership_is_enforced_on_every_mutation_door() {
+    let world = MonitorWorld::new("source-owner").await;
+    let monitor_id = world
+        .register("initial", None, MonitorOccurrence::Every)
+        .await;
+    let completed = haider_protocol::task::TaskCompleted {
+        completion_consumer: None,
+        task: TaskId::new("owned-completed-task"),
+        name: "done".into(),
+        state: haider_protocol::task::TaskTerminalState::Completed { exit_code: Some(0) },
+        elapsed_ms: 1,
+        output_bytes: 0,
+        output_sha256: None,
+        tail: String::new(),
+        output_digest: None,
+        output_digest_complete: false,
+        artifact: None,
+        full_output_unavailable: false,
+        truncated: false,
+        delivery: haider_protocol::task::TaskCompletionDelivery::DeliveredQueued,
+        workspace_mutation: None,
+    };
+    let started = haider_protocol::task::TaskStarted {
+        task: completed.task.clone(),
+        name: "done".into(),
+        command: "fixture completed task".into(),
+        pid: i32::MAX,
+        started_at_ms: 1,
+    };
+    world
+        .hub
+        .append(&mut [
+            monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                "owned-task-start",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                started.to_payload_value().unwrap(),
+            ),
+            monitor_envelope(
+                &world.session,
+                Some(&world.run),
+                None,
+                None,
+                "owned-task-fact",
+                world.hub.device_id(),
+                world.hub.worker_generation(),
+                completed.to_payload_value().unwrap(),
+            ),
+        ])
+        .await
+        .unwrap();
+    let sources = [
+        MonitorSource::Task {
+            task_id: "missing-task".into(),
+        },
+        MonitorSource::Agent {
+            agent_id: "missing-agent".into(),
+        },
+    ];
+    let sources = sources
+        .into_iter()
+        .map(|source| (source, false))
+        .chain(std::iter::once((
+            MonitorSource::Task {
+                task_id: completed.task.to_string(),
+            },
+            true,
+        )));
+    for (n, (source, owned)) in sources.enumerate() {
+        for update in [false, true] {
+            let request = if update {
+                MonitorRequest::Update {
+                    monitor_id: monitor_id.clone(),
+                    source: source.clone(),
+                    filter: Some(MonitorFilter {
+                        field: MonitorFilterField::Payload,
+                        operator: MonitorFilterOperator::Contains,
+                        value: "NEVER_MATCH_OWNER_TEST".into(),
+                        case_sensitive: true,
+                    }),
+                    action: MonitorAction {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: MonitorOccurrence::Every,
+                    lifetime: MonitorLifetime::Session,
+                }
+            } else {
+                MonitorRequest::Register {
+                    source: source.clone(),
+                    filter: Some(MonitorFilter {
+                        field: MonitorFilterField::Payload,
+                        operator: MonitorFilterOperator::Contains,
+                        value: "NEVER_MATCH_OWNER_TEST".into(),
+                        case_sensitive: true,
+                    }),
+                    action: MonitorAction {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: MonitorOccurrence::Every,
+                    lifetime: MonitorLifetime::Session,
+                }
+            };
+            let result = world.execute(&format!("tool-{n}-{update}"), request).await;
+            assert_eq!(result.status.is_completed(), owned, "{result:?}");
+            if !owned {
+                assert!(result.preview.contains("source_not_owned"));
+            }
+            let wire = monitor_source_wire(&source);
+            if update {
+                let receipt = world
+                    .hub
+                    .inner_monitor()
+                    .client_mutate(
+                        &world.hub,
+                        haider_rpc::CommandId::new(format!("client-{n}-{update}")),
+                        world.session.clone(),
+                        world.hub.worker_generation(),
+                        haider_rpc::MonitorMutationWire::Update {
+                            monitor_id: monitor_id.clone(),
+                            source: wire,
+                            filter: Some(haider_rpc::MonitorFilterWire {
+                                field: haider_rpc::MonitorFilterFieldWire::Payload,
+                                operator: haider_rpc::MonitorFilterOperatorWire::Contains,
+                                value: "NEVER_MATCH_OWNER_TEST".into(),
+                                case_sensitive: true,
+                            }),
+                            action: haider_rpc::MonitorActionWire {
+                                report: true,
+                                follow_up: None,
+                            },
+                            occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                            lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    matches!(
+                        receipt.outcome,
+                        haider_rpc::MonitorMutateOutcomeWire::Updated { .. }
+                    ),
+                    owned,
+                    "{receipt:?}"
+                );
+            } else {
+                let receipt = world
+                    .hub
+                    .inner_monitor()
+                    .client_register(
+                        &world.hub,
+                        MonitorClientRegistrationRequest {
+                            command_id: haider_rpc::CommandId::new(format!("client-{n}-{update}")),
+                            session_id: world.session.clone(),
+                            worker_generation: world.hub.worker_generation(),
+                            source: wire,
+                            filter: Some(haider_rpc::MonitorFilterWire {
+                                field: haider_rpc::MonitorFilterFieldWire::Payload,
+                                operator: haider_rpc::MonitorFilterOperatorWire::Contains,
+                                value: "NEVER_MATCH_OWNER_TEST".into(),
+                                case_sensitive: true,
+                            }),
+                            action: haider_rpc::MonitorActionWire {
+                                report: true,
+                                follow_up: None,
+                            },
+                            occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                            lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    matches!(
+                        receipt.outcome,
+                        haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+                    ),
+                    owned,
+                    "{receipt:?}"
+                );
+            }
+            assert_eq!(
+                world
+                    .hub
+                    .inner_monitor()
+                    .inner
+                    .registry
+                    .get(&world.session, &monitor_id)
+                    .unwrap()
+                    .source,
+                if owned && update {
+                    source.clone()
+                } else {
+                    MonitorSource::Sms
+                }
+            );
+        }
     }
 }

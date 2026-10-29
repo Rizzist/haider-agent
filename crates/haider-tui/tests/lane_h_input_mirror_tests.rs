@@ -534,7 +534,7 @@ fn remote_replace_never_overwrites_a_modal_in_progress() {
     // (rev934 P3-5): with the composer not the live Enter target, a remote
     // frame must not clobber it.
     model.help_open = true;
-    assert!(!model.accepts_injected_input());
+    assert!(!model.accepts_injected_edits());
     driver.apply(
         &mut model,
         LiveReply::SurfaceInput {

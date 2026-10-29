@@ -42,6 +42,131 @@ fn fixture_path() -> PathBuf {
         .join("wire_transcript.json")
 }
 
+#[test]
+fn monitor_handle_sources_are_additive_wire_variants() {
+    let pinned: Value =
+        serde_json::from_str(include_str!("fixtures/monitor_handle_sources_v1.json"))
+            .expect("monitor handle wire fixture");
+    let sources = [
+        haider_rpc::MonitorSourceWire::Task {
+            task_id: "task-fixture".into(),
+        },
+        haider_rpc::MonitorSourceWire::Agent {
+            agent_id: "agent-fixture".into(),
+        },
+    ];
+    let events = [
+        haider_rpc::MonitorEventPayloadWire::Task {
+            payload: "{\"output_digest\":\"ok\"}".into(),
+        },
+        haider_rpc::MonitorEventPayloadWire::Agent {
+            payload: "{\"report\":\"done\"}".into(),
+        },
+    ];
+    assert_eq!(
+        serde_json::to_value(&sources).expect("encode sources"),
+        pinned["sources"]
+    );
+    assert_eq!(
+        serde_json::to_value(&events).expect("encode events"),
+        pinned["events"]
+    );
+    for source in sources {
+        let value = serde_json::to_value(&source).expect("encode source");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorSourceWire>(value).expect("decode source"),
+            source
+        );
+    }
+    for event in events {
+        let value = serde_json::to_value(&event).expect("encode event");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorEventPayloadWire>(value)
+                .expect("decode event"),
+            event
+        );
+    }
+}
+
+/// Owner decision 2026-09-25: `headless.run.stop` gains an additive
+/// `scope` (absent = `all`, byte-identical to the historical request) and the
+/// response an additive `scope` echo plus `subagents` summary.
+///
+/// MUTATION CHECK: serialize `scope` for the default, rename a scope or a
+/// summary field. Expected runtime failure: the pinned JSON differs.
+#[test]
+fn headless_run_stop_scope_is_additive_and_default_absent() {
+    let default_stop = RequestBody::HeadlessRunStop {
+        command_id: haider_rpc::CommandId::new("command-stop"),
+        run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+        scope: haider_rpc::RunStopScopeWire::All,
+    };
+    assert_eq!(
+        serde_json::to_value(&default_stop).expect("encode stop"),
+        serde_json::json!({"method":"headless.run.stop","command_id":"command-stop","run_id":"run-1"})
+    );
+    for (scope, name) in [
+        (haider_rpc::RunStopScopeWire::Main, "main"),
+        (haider_rpc::RunStopScopeWire::Subagents, "subagents"),
+    ] {
+        let request = RequestBody::HeadlessRunStop {
+            command_id: haider_rpc::CommandId::new("command-stop"),
+            run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+            scope,
+        };
+        let value = serde_json::to_value(&request).expect("encode scoped stop");
+        assert_eq!(value["scope"], name);
+        assert_eq!(
+            serde_json::from_value::<RequestBody>(value).expect("decode scoped stop"),
+            request
+        );
+    }
+    let legacy: RequestBody = serde_json::from_value(serde_json::json!({
+        "method":"headless.run.stop","command_id":"command-stop","run_id":"run-1"
+    }))
+    .expect("decode legacy stop");
+    assert!(matches!(
+        legacy,
+        RequestBody::HeadlessRunStop {
+            scope: haider_rpc::RunStopScopeWire::All,
+            ..
+        }
+    ));
+    let response = ResponseBody::HeadlessRunStop {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+        status: CancelStatus::Accepted,
+        terminal_seq: None,
+        scope: Some(haider_rpc::RunStopScopeWire::Main),
+        subagents: Some(haider_rpc::SubagentStopSummaryWire {
+            cancelled_runs: 0,
+            sessions: 2,
+            monitors_removed: 0,
+            still_running: 2,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(&response).expect("encode stop response"),
+        serde_json::json!({
+            "method":"headless.run.stop","session_id":"session-1","run_id":"run-1",
+            "status":"accepted","scope":"main",
+            "subagents":{"cancelled_runs":0,"sessions":2,"monitors_removed":0,"still_running":2}
+        })
+    );
+    let legacy_response: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method":"headless.run.stop","session_id":"session-1","run_id":"run-1","status":"accepted"
+    }))
+    .expect("decode legacy stop response");
+    assert!(matches!(
+        legacy_response,
+        ResponseBody::HeadlessRunStop {
+            scope: None,
+            subagents: None,
+            ..
+        }
+    ));
+}
+
 /// Earlier append laws still pin their exact 184-frame history. The new
 /// subscription response is separately pinned by the full golden test.
 fn frozen_pre_subscription_transcript() -> Vec<WireFrame> {
@@ -714,6 +839,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "account.source_remove",
         "account.source_scan",
         "agent.cancel",
+        "agent.cancel_all",
         "agent.message",
         "artifact.put",
         "branch.create",
@@ -837,8 +963,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        136,
-        "133 merged methods plus turn.retract and two peer injection methods"
+        137,
+        "133 merged methods plus turn.retract, two peer injection methods and agent.cancel_all"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -890,8 +1016,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        68,
-        "the supplemental fixture must contain the 68 methods absent from the union transcript"
+        69,
+        "the supplemental fixture must contain the 69 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -934,6 +1060,7 @@ fn shell_registry_events_are_additive_and_golden() {
             profile: "prod".into(),
         },
         status: haider_rpc::ShellStatusWire::Starting,
+        setup_error: None,
         title: "prod: tests".into(),
         cwd_or_host: "prod.example.invalid".into(),
         created_at_ms: 10,
@@ -947,6 +1074,7 @@ fn shell_registry_events_are_additive_and_golden() {
         WireFrame::ShellState {
             shell: haider_rpc::ShellWire {
                 status: haider_rpc::ShellStatusWire::Running,
+                setup_error: None,
                 ..base.clone()
             },
         },
@@ -4252,6 +4380,62 @@ fn session_select_model_output_budget_fields_are_golden() {
     );
 }
 
+#[test]
+fn session_provider_rebind_output_budget_is_additive_and_golden() {
+    use haider_rpc::haider_protocol::output_budget::{
+        OutputBudgetClampV1, SessionOutputBudgetSourceV1, SessionOutputBudgetV1,
+    };
+    let old = r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7}"#;
+    let decoded: ResponseBody = serde_json::from_str(old).expect("older response decodes");
+    assert!(matches!(
+        decoded,
+        ResponseBody::SessionProviderRebind {
+            output_budget: None,
+            active_output_budget: None,
+            ..
+        }
+    ));
+    let body = ResponseBody::SessionProviderRebind {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        provider: "haider-code".into(),
+        base_url: None,
+        account: None,
+        selected_seq: 43,
+        worker_generation: 7,
+        output_budget: Some(SessionOutputBudgetV1 {
+            max_tokens: 8_192,
+            source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+            clamped: Some(OutputBudgetClampV1 {
+                requested: 20_000,
+                max_output_tokens: 8_192,
+            }),
+        }),
+        active_output_budget: Some(
+            haider_rpc::haider_protocol::session::ActiveRunOutputBudgetV1 {
+                run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+                model: "active-small".into(),
+                budget: SessionOutputBudgetV1 {
+                    max_tokens: 8_192,
+                    source: SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+                    clamped: Some(OutputBudgetClampV1 {
+                        requested: 20_000,
+                        max_output_tokens: 8_192,
+                    }),
+                },
+            },
+        ),
+    };
+    let encoded = serde_json::to_string(&body).expect("encode new response");
+    assert_eq!(
+        encoded,
+        r#"{"method":"session.provider.rebind","session_id":"session-1","provider":"haider-code","base_url":null,"account":null,"selected_seq":43,"worker_generation":7,"output_budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}},"active_output_budget":{"run_id":"run-1","model":"active-small","budget":{"max_tokens":8192,"source":{"kind":"user_set","requested":20000},"clamped":{"requested":20000,"max_output_tokens":8192}}}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ResponseBody>(&encoded).expect("decode new response"),
+        body
+    );
+}
+
 /// The full pair-selection request and its response are golden: the request
 /// carries the optional provider attribute of the selected model row, and
 /// the response reports the RESOLVED pair plus committed fact coordinates.
@@ -6458,4 +6642,35 @@ fn android_shell_capability_is_additive_and_round_trips_over_uds() {
     let batch = uds_codec::Decoder::new(TEST_FRAME_LIMIT).push(&bytes);
     assert!(batch.error.is_none());
     assert_eq!(batch.frames, vec![frame]);
+}
+
+#[test]
+fn shell_setup_errors_are_additive_and_roundtrip_in_both_codecs() {
+    let legacy = serde_json::json!({
+        "id": "fixture", "kind": {"kind": "ssh", "profile": "fixture"},
+        "status": {"status": "exited"}, "title": "fixture", "cwd_or_host": "127.0.0.1",
+        "created_at_ms": 0, "last_activity_ms": 0, "bytes_out": 0
+    });
+    let mut shell: haider_rpc::ShellWire =
+        serde_json::from_value(legacy.clone()).expect("old shell shape");
+    assert!(shell.setup_error.is_none());
+    assert_eq!(
+        serde_json::to_value(&shell).expect("unchanged old shape"),
+        legacy
+    );
+    shell.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+        code: "ssh_connection_failed".into(),
+        message: "synthetic refusal".into(),
+        retryable: true,
+    });
+    let json = serde_json::to_vec(&shell).expect("JSON");
+    let msgpack = rmp_serde::to_vec_named(&shell).expect("MessagePack");
+    assert_eq!(
+        serde_json::from_slice::<haider_rpc::ShellWire>(&json).expect("JSON decode"),
+        shell
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<haider_rpc::ShellWire>(&msgpack).expect("MessagePack decode"),
+        shell
+    );
 }
