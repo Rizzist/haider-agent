@@ -57,7 +57,10 @@ human clicks Stop (desktop badge | phone chip/notification | Chrome infobar Canc
       3. the run's stop hook submits TurnCancelCommand
          {command_id:"cu-presence-stop-<run>", reason:"cu-presence-stop"}
          via SessionHub::cancel_internal_turn — the same receipt-backed
-         cancellation authority as the TUI's ESC (`turn.cancel`)
+         cancellation authority as the TUI's ESC (`turn.cancel`); it
+         cancels only the run that holds the lease (the main thread's run
+         or one subagent's run), and that run's own subagents keep running
+         (owner decision 2026-09-25)
       4. the surface shows "…" then hides
   → core cancels the turn → dispatcher close_effects(cancelled=true)
       → emergency_stop releases held buttons, broker journals EffectOutcome::Cancelled
@@ -128,7 +131,12 @@ being driven: the macOS badge is a non-activating `NSPanel` owned by an
 accessory (no Dock icon) process; the Windows badge answers
 `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`; the Android chip is
 `FLAG_NOT_FOCUSABLE`; the Chrome infobar is browser chrome. ESC in the TUI
-remains a second Stop.
+is a second Stop only for computer use driven by the main thread: it stops
+the main thread's run, and subagents keep running (owner decision
+2026-09-25). Computer use driven by a subagent is stopped by the overlay
+Stop, `haider agent cancel <parent-session> <agent>`, or `haider agent cancel
+<parent-session> --all`. For configured headless runs,
+`haider run --stop <run-id>` also stops the run and its subagents.
 
 **The agent cannot press its own Stop.** Every mouse event Haider synthesises
 carries `SYNTHETIC_INPUT_TAG` (macOS `kCGEventSourceUserData`, Windows
@@ -214,11 +222,16 @@ Failure is reported as `conceal_failed`; production keeps sharing-none.
   * The helper calls `GetCapabilities` first. Actions are optional in the
     freedesktop spec: only when the server advertises `actions` does the
     notification carry a **Stop** button (wired to the same Stop path). When
-    it does not, the notification body says how to stop instead ("press Esc
-    in the Haider TUI session, or for a headless run use `haider run --stop
-    <run-id>`"), the helper reports `ready.platform =
+    it does not, the notification body says how to stop instead: for a configured
+    headless run, `haider run --stop <run-id>` stops it and all
+    its subagents; in the TUI, press Esc if its main thread controls the
+    screen; for a subagent, use `haider agent cancel <parent-session> <agent>`.
+    The headless stop API requires a configured headless run: an interactive,
+    messaged or monitor-woken run id does not necessarily have that record.
+    Named agent cancellation covers its later runs too. The helper reports `ready.platform =
     "linux-notification-no-actions"` and logs the degraded state. The TUI
-    header's `esc stop` chip is always there.
+    header's `esc stop` chip is shown while the main thread drives the
+    screen; Esc does not stop a subagent.
   * Screenshots: the popup is an ordinary window. The helper reports
     `capture_excluded:false`, so the daemon asks it to `conceal` before every
     model-facing `screenshot`/`inspect`: it closes the notification, waits
@@ -235,8 +248,11 @@ Failure is reported as `conceal_failed`; production keeps sharing-none.
     later one (`LinuxStopRouter`).
 * **What Linux guarantees**: a visible "Haider is controlling this screen"
   notification (on a desktop with a notification server), a Stop that reaches
-  the run from the notification when the server supports actions and from
-  the TUI (Esc) or CLI otherwise, and best-effort absence from model
+  the run from the notification when the server supports actions and
+  otherwise from the CLI (`haider agent cancel <parent-session> <agent>` or
+  `--all` for subagents; `haider run --stop <run-id>` for a headless run) or,
+  when the main thread is driving, the TUI (Esc), and
+  best-effort absence from model
   screenshots. There is **no agent pointer** on Linux. Nothing here has run
   on a real Linux desktop; it is compile/Clippy-checked only.
 
@@ -347,9 +363,14 @@ silently.
 While the current run has used `computer`/`mobile` within the idle window the
 session header's top-right shows `[ ◉ controlling screen · esc stop ]` (or
 `phone`), left of the voice chip. It clears at run end and after 30 s idle.
-ESC is the existing turn cancel. The pre-existing transient "◉ controlling
-your screen — esc to stop" banner (in-flight control actions only) is
-unchanged.
+ESC is the existing turn cancel and stops the main thread only (owner
+decision 2026-09-25). The chip and the pre-existing transient "◉ controlling
+your screen — esc to stop" banner (in-flight control actions only) are
+derived from this session's own `computer`/`mobile` calls, so they only
+claim Esc for the main thread's control. A subagent driving the screen keeps
+running after Esc; stop it with the overlay Stop or `haider agent cancel
+<parent-session> <agent>` / `--all`. A configured headless run can also be
+stopped with `haider run --stop <run-id>`.
 
 ## 7. Known limits
 

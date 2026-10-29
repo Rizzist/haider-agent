@@ -92,61 +92,59 @@ fn workspace_notices_follow_the_render_context_in_plain_tui_and_demo_replay() {
 
 #[test]
 fn session_list_summaries_and_workspace_receipts_share_the_model_homes() {
-    let mut model = session_model();
-    model.display_homes = vec!["C:/Users/alice".into()];
-    let session = model.active_session.clone().expect("session");
-    let summary:haider_rpc::SessionSummary=serde_json::from_value(json!({
-        "session_id":session, "head_seq":1, "worker_generation":1, "workspace_cwd":"C:/Users/alice/project"
-    })).expect("summary");
-    let mut driver = LiveDriver::new("test");
-    driver.apply(
-        &mut model,
-        LiveReply::Listed {
-            sessions: vec![summary.clone()],
-            next_cursor: None,
-        },
-    );
-    assert!(
-        model
-            .session_browser_rows()
-            .iter()
-            .any(|row| row.id == session && row.dir == "~/project")
-    );
-    let mut other_summary = summary.clone();
-    other_summary.session_id = haider_protocol::ids::SessionId::new("context-other");
-    other_summary.workspace_cwd = Some("C:/Users/carol/project".into());
-    driver.apply(
-        &mut model,
-        LiveReply::Listed {
-            sessions: vec![other_summary.clone()],
-            next_cursor: None,
-        },
-    );
-    assert!(
-        model.session_browser_rows().iter().any(|row| {
+    for roster in [false, true] {
+        let reply = |sessions| {
+            if roster {
+                LiveReply::RosterUpdated { sessions }
+            } else {
+                LiveReply::Listed {
+                    sessions,
+                    next_cursor: None,
+                }
+            }
+        };
+        let mut model = session_model();
+        model.display_homes = vec!["C:/Users/alice".into()];
+        let session = model.active_session.clone().expect("session");
+        let summary:haider_rpc::SessionSummary=serde_json::from_value(json!({
+            "session_id":session, "head_seq":1, "worker_generation":1, "workspace_cwd":"C:/Users/alice/project"
+        })).expect("summary");
+        let mut driver = LiveDriver::new("test");
+        driver.apply(&mut model, reply(vec![summary.clone()]));
+        assert!(
+            model
+                .session_browser_rows()
+                .iter()
+                .any(|row| row.id == session && row.dir == "~/project")
+        );
+        let mut other_summary = summary.clone();
+        other_summary.session_id = haider_protocol::ids::SessionId::new("context-other");
+        other_summary.workspace_cwd = Some("C:/Users/carol/project".into());
+        driver.apply(&mut model, reply(vec![other_summary.clone()]));
+        assert!(model.session_browser_rows().iter().any(|row| {
             row.id == other_summary.session_id && row.dir == "C:/Users/<user>/project"
-        })
-    );
-    model.note_summary_counts(&summary);
-    assert_eq!(model.session_dir, "~/project");
-    assert_eq!(
-        model.display_path("C:/Users/carol/project"),
-        "C:/Users/<user>/project"
-    );
-    driver.apply(
-        &mut model,
-        LiveReply::WorkspaceSelected {
-            command_id: haider_rpc::CommandId::new("context-test"),
-            session,
-            path: "C:/Users/alice/next".into(),
-            worker_generation: 1,
-        },
-    );
-    assert_eq!(model.session_dir, "~/next");
-    assert_eq!(
-        model.flash.as_deref(),
-        Some("· workspace re-rooted → ~/next")
-    );
+        }));
+        model.note_summary_counts(&summary);
+        assert_eq!(model.session_dir, "~/project");
+        assert_eq!(
+            model.display_path("C:/Users/carol/project"),
+            "C:/Users/<user>/project"
+        );
+        driver.apply(
+            &mut model,
+            LiveReply::WorkspaceSelected {
+                command_id: haider_rpc::CommandId::new("context-test"),
+                session,
+                path: "C:/Users/alice/next".into(),
+                worker_generation: 1,
+            },
+        );
+        assert_eq!(model.session_dir, "~/next");
+        assert_eq!(
+            model.flash.as_deref(),
+            Some("· workspace re-rooted → ~/next")
+        );
+    }
 }
 
 #[test]

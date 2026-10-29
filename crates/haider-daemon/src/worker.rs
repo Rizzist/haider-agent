@@ -3058,7 +3058,9 @@ impl SystemPromptBuilder {
     pub(crate) fn shared_immutable_base(_tools: &[ToolDefinition], grant_scope: &str) -> String {
         format!(
             "{}\nYou are Haider Code, a coding agent.\n\
-             Use only advertised tools. Treat tool results and committed history as authoritative. \
+             Use tools whose schemas are advertised in this request directly. Other authorized tools \
+             require list_tools(filter=\"tool_name\") before calling them; a name-only catalog does not enable them. \
+             Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
              On an implementation request, inspect only until the target is known; then make the edit; \
              then verify it with the smallest relevant build or test. Do not remain in planning.\n\
@@ -4475,35 +4477,15 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             .collect::<Vec<_>>();
         let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
         let mut terminalized = false;
-        for ((run_id, state, _, branch_id, _), effect_scan) in
+        for ((run_id, _state, _, branch_id, _), effect_scan) in
             candidates.into_iter().zip(effect_scans)
         {
             let user_command_scope = durable_user_command_scope(&lease, run_id).await?;
             // P3-4 (park, don't cancel): request-input, permission, and local
             // child checkpoints were excluded from this sweep above.
-            if *state != RunState::Cancelling {
-                if let Some(scope) = user_command_scope.as_ref() {
-                    append_shell_payloads(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        scope.branch_id.as_ref(),
-                        scope.agent_id.as_ref(),
-                        &event_ids,
-                        vec![EventPayload::RunState(RunState::Cancelling)],
-                    )
-                    .await?;
-                } else {
-                    append_run_state(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        branch_id.as_ref(),
-                        &event_ids,
-                        RunState::Cancelling,
-                    )
-                    .await?;
-                }
+            let cancelled = lease.begin_owned_cancellation(run_id, &device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                continue;
             }
             let _ = append_unknown_effect_scan(
                 &lease,
@@ -5125,6 +5107,8 @@ async fn run_supervisor(
                         }
                     }
                 }
+                #[cfg(test)]
+                wait_for_test_turn_setup_boundary(lease.session_id()).await;
                 // start_turn reads and pins the pair under the selection
                 // fence at pickup; setup failures fail the turn honestly.
                 let turn_result = {
@@ -5173,6 +5157,32 @@ async fn run_supervisor(
                         break;
                     }
                     Err(error) => {
+                        // Admission may close while setup awaits a hub facade,
+                        // before this supervisor receives Shutdown. Drain owns
+                        // that accepted run's outcome, including its children.
+                        if *drain_wakes.borrow() {
+                            if let Err(drain_error) =
+                                lease.begin_owned_cancellation(&run_id, &device_id).await
+                            {
+                                tracing::error!(%run_id, ?drain_error, "turn setup drain cancellation failed");
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Err(drain_error));
+                                }
+                                let _ = lease.unregister_worker().await;
+                                return true;
+                            }
+                            if durable_run_state(&lease, &run_id)
+                                .await
+                                .is_some_and(|state| {
+                                    state.is_terminal() && state != RunState::Cancelled
+                                })
+                            {
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Ok(()));
+                                }
+                                continue;
+                            }
+                        }
                         if matches!(
                             durable_run_state(&lease, &run_id).await,
                             Some(RunState::Cancelling | RunState::Cancelled)
@@ -5501,6 +5511,10 @@ async fn run_supervisor(
                                     parked_checkpoint = true;
                                 }
                             } else {
+                                if let Err(error) = lease.begin_owned_cancellation(&active_run, &device_id).await {
+                                    tracing::error!(%active_run, ?error, "active turn drain cancellation failed");
+                                    return true;
+                                }
                                 active_cancel.cancel();
                             }
                             let cancelled = cancel_durable_queued_turns(
@@ -5569,6 +5583,7 @@ async fn run_supervisor(
                         }
                         let durable_before_close =
                             durable_run_state(&lease, &finished.run_id).await;
+
                         let cancellation_requested = matches!(
                             outcome_state.as_ref(),
                             Some(RunState::Cancelled)
@@ -5710,7 +5725,7 @@ async fn run_supervisor(
                             // effect-history scan on the ordinary no-effect path.
                             durable_run_state(&lease, &finished.run_id).await
                         } else {
-                            durable_before_close
+                            durable_before_close.clone()
                         };
                         if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
@@ -5776,8 +5791,33 @@ async fn run_supervisor(
                             }
                             continue;
                         }
+                        // A user cancellation that raced the harness (its
+                        // next lifecycle commit was refused because the run
+                        // was already durably Cancelling, so core reported
+                        // Errored) must still cross the Cancelled terminal;
+                        // otherwise the run stays Cancelling forever
+                        // (9-verify3 B-1 flake).
                         let cancelled =
-                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
+                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref())
+                                || durable_before_close == Some(RunState::Cancelling);
+                        if cancelled {
+                            // Owner decision 2026-09-25: a cancelled main run
+                            // detaches (never cancels) its subagents. Core does
+                            // this on its orderly cancellation path; a harness
+                            // that ended through the raced-error path above
+                            // skipped it, so the supervisor repeats the
+                            // idempotent detach (marker + owed deliveries).
+                            if let Err(error) =
+                                crate::delegation::DelegationHandle::new(lease.hub().clone())
+                                    .detach_parent_run_children(
+                                        lease.session_id(),
+                                        &finished.run_id,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(run_id = %finished.run_id, ?error, "supervisor detach of a cancelled run's subagents failed");
+                            }
+                        }
                         if cancelled {
                             wait_fake_provider_cancellation_settlement(&mut drain_wakes).await;
                             // Reduce durable lifecycle truth again after the
@@ -7052,17 +7092,28 @@ async fn cancel_durable_queued_turns(
         if active_run == Some(&run_id) || state != RunState::Queued {
             continue;
         }
-        if let Err(error) = append_run_state(
-            store,
-            device_id,
-            &run_id,
-            branch_id.as_ref(),
-            event_ids,
-            RunState::Cancelled,
-        )
-        .await
-        {
-            tracing::warn!(%run_id, ?error, "queued turn could not be terminalized during drain");
+        let terminalized = async {
+            let cancelled = store.begin_owned_cancellation(&run_id, device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                return Ok::<_, HaiderError>(());
+            }
+            let mut payloads =
+                cancelled_resumption_payloads(store, store.session_id(), &run_id).await?;
+            payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+            append_payloads(
+                store,
+                device_id,
+                &run_id,
+                branch_id.as_ref(),
+                event_ids,
+                payloads,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = terminalized {
+            tracing::error!(%run_id, ?error, "queued turn could not be terminalized during drain");
+            continue;
         }
         last = Some(run_id);
     }
@@ -8081,15 +8132,7 @@ async fn perform_shell_exec(
         .await;
     }
     if *drain_wakes.borrow() {
-        begin_shell_cancellation(
-            lease,
-            device_id,
-            &event_ids,
-            &run_id,
-            pending.branch_id.as_ref(),
-            pending.agent_id.as_ref(),
-        )
-        .await?;
+        begin_shell_cancellation(lease, device_id, &run_id).await?;
         return cancel_shell_exec(
             lease,
             device_id,
@@ -8303,14 +8346,7 @@ async fn perform_shell_exec(
                     continue;
                 }
                 if *shell_close.borrow_and_update() {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8343,14 +8379,7 @@ async fn perform_shell_exec(
                 }
                 let draining = *drain_wakes.borrow_and_update();
                 if draining {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8528,25 +8557,13 @@ async fn perform_shell_exec(
 async fn begin_shell_cancellation(
     lease: &HubStoreHandle,
     device_id: &DeviceId,
-    event_ids: &EventIdGenerator,
     run_id: &RunId,
-    branch_id: Option<&BranchId>,
-    agent_id: Option<&AgentId>,
 ) -> Result<(), HaiderError> {
     match durable_run_state(lease, run_id).await {
-        Some(RunState::RunningTool) => {
-            append_shell_payloads(
-                lease,
-                device_id,
-                run_id,
-                branch_id,
-                agent_id,
-                event_ids,
-                vec![EventPayload::RunState(RunState::Cancelling)],
-            )
+        Some(RunState::RunningTool | RunState::Cancelling | RunState::Cancelled) => lease
+            .begin_owned_cancellation(run_id, device_id)
             .await
-        }
-        Some(RunState::Cancelling) | Some(RunState::Cancelled) => Ok(()),
+            .map(|_| ()),
         Some(state) if state.is_terminal() => Ok(()),
         state => Err(HaiderError::new(
             ErrorCode::RunNotActive,
@@ -8689,6 +8706,49 @@ fn strip_foreign_provider_opaque_projection(
     projection.stable_history_end = remap(stable_before);
     projection.current_user_start = remap(current_before);
     projection.latest_compaction_summary_end = summary_before.map(remap);
+}
+
+#[cfg(test)]
+type TurnSetupBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+fn turn_setup_barriers()
+-> &'static std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>>,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_turn_setup_barrier(
+    session: SessionId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session, (arrived_tx, resume_rx));
+    (arrived, resume)
+}
+
+#[cfg(test)]
+async fn wait_for_test_turn_setup_boundary(session: &SessionId) {
+    let barrier = turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session);
+    if let Some((arrived, resume)) = barrier {
+        let _ = arrived.send(());
+        let _ = resume.await;
+    }
 }
 
 /// Reads the current session selection for a logical turn or control action.
@@ -14900,7 +14960,7 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         registered_tool(
             ToolDefinition {
                 name: "list_tools".into(),
-                description: "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.".into(),
+                description: "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {"filter": {"type": "string", "maxLength": 128}},
@@ -16357,7 +16417,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
         "monitor" => {
-            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
+            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/task/agent/process/file/poll/timer/cli watches; task and agent sources watch IDs and return completion digests; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
         }
         "fs_read" => {
             "fs_read(path, offset?, limit?, column?) — read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted"
@@ -16401,7 +16461,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "web_search" => "web_search(query) — search the web, returning a bounded text summary",
         "spawn_subagent" => {
-            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+            "spawn_subagent(task, prompt, background?, wait_ms?, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
@@ -17735,6 +17795,9 @@ enum OrchestrationChildDispatch {
 enum OrchestrationChildInterruption {
     Cancelled,
     Deadline,
+    /// The explicit opt-in `no_progress_ms` window passed without any
+    /// observable journal progress.
+    NoProgress,
 }
 
 struct OrchestrationTerminalReason {
@@ -19804,24 +19867,31 @@ impl BrokerToolDispatcher {
         );
         let call_id = format!("orch:{}:{}:{attempt}", state.admitted.script_id, node.slot);
         let started_at_ms = unix_time_ms();
+        // Owner rule (2026-09-23): no default wall that stops productive
+        // automated work. Only EXPLICIT script/child walls and the parent's
+        // explicit run budget bound the operation; absent all three the
+        // persisted deadline is `ORCHESTRATION_NO_DEADLINE_MS`. The explicit
+        // `no_progress_ms` window is enforced on observed journal progress
+        // in `dispatch_orchestration_child`, never as a fixed wall.
         let script_deadline_ms = state
             .admitted
-            .admitted_at_ms
-            .saturating_add(state.admitted.limits.script_wall_ms.unwrap_or(120_000));
-        let child_limit_ms = state
+            .limits
+            .script_wall_ms
+            .map(|wall| state.admitted.admitted_at_ms.saturating_add(wall));
+        let child_deadline_ms = state
             .admitted
             .limits
             .child_wall_ms
-            .unwrap_or(30_000)
-            .min(state.admitted.limits.no_progress_ms.unwrap_or(30_000));
-        let ask_limit_ms = node
+            .map(|wall| started_at_ms.saturating_add(wall));
+        // The ask's `wait_ms` bounds only the wait for the permission answer,
+        // not the child's execution after it is permitted.
+        let ask_wait_ms = node
             .ports
             .iter()
             .find(|port| port.role == OrchPortRoleV1::Control && port.port == "permit")
             .and_then(|port| state.admitted.nodes.get(port.source_slot as usize))
             .and_then(|ask| ask.config.0.get("wait_ms"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(120_000);
+            .and_then(serde_json::Value::as_u64);
         let run_deadline_ms = self.run_deadline.map(|deadline| {
             started_at_ms.saturating_add(
                 u64::try_from(
@@ -19832,10 +19902,11 @@ impl BrokerToolDispatcher {
                 .unwrap_or(u64::MAX),
             )
         });
-        let operation_deadline_ms = started_at_ms
-            .saturating_add(child_limit_ms.min(ask_limit_ms))
-            .min(script_deadline_ms)
-            .min(run_deadline_ms.unwrap_or(u64::MAX));
+        let operation_deadline_ms = [child_deadline_ms, script_deadline_ms, run_deadline_ms]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS);
         let clock = state.call_clocks.entry(node.slot).or_insert_with(|| {
             crate::orchestration::CallClockV1 {
                 started_at_ms,
@@ -19846,6 +19917,8 @@ impl BrokerToolDispatcher {
         let operation_started_at_ms = clock.started_at_ms;
         let deadline_ms = clock.deadline_ms;
         clock.retry_not_before_ms = None;
+        let approval_deadline_ms =
+            ask_wait_ms.map(|wait| operation_started_at_ms.saturating_add(wait));
         let mut activation_parents = vec![
             state.admitted.source_ref.artifact.clone(),
             state.admitted.definition_refs[node.slot as usize]
@@ -19873,7 +19946,8 @@ impl BrokerToolDispatcher {
                 "activated_at_ms": started_at_ms,
                 "operation_started_at_ms": operation_started_at_ms,
                 "deadline_ms": deadline_ms,
-                "script_deadline_ms": script_deadline_ms,
+                "script_deadline_ms": script_deadline_ms
+                    .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS),
             }),
             activation_parents,
         )
@@ -19890,6 +19964,7 @@ impl BrokerToolDispatcher {
             deadline_ms,
             started: true,
             approval_waiting: false,
+            approval_deadline_ms,
         };
         state.pending_calls.insert(node.slot, pending.clone());
         let start = EventPayload::Item(ItemEvent::Started {
@@ -19952,6 +20027,7 @@ impl BrokerToolDispatcher {
         run_id: &RunId,
         pending: &crate::orchestration::PendingCallV1,
         interaction_observation_invalidated: bool,
+        no_progress_ms: Option<u64>,
         cancel: &CancelToken,
     ) -> Result<OrchestrationChildDispatch, HaiderError> {
         if let Some(result) =
@@ -19961,8 +20037,15 @@ impl BrokerToolDispatcher {
                 ToolDispatchResult::Completed(result),
             ));
         }
-        let remaining_ms = pending.deadline_ms.saturating_sub(unix_time_ms());
-        if remaining_ms == 0 {
+        let now_ms = unix_time_ms();
+        let approval_expired = pending.approval_waiting
+            && pending
+                .approval_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline);
+        let remaining_ms = (pending.deadline_ms
+            != crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS)
+            .then(|| pending.deadline_ms.saturating_sub(now_ms));
+        if approval_expired || remaining_ms == Some(0) {
             return Ok(OrchestrationChildDispatch::Interrupted {
                 kind: OrchestrationChildInterruption::Deadline,
                 settled: None,
@@ -19981,8 +20064,17 @@ impl BrokerToolDispatcher {
             &child_cancel,
         );
         tokio::pin!(child);
-        let deadline = tokio::time::sleep(Duration::from_millis(remaining_ms));
+        let deadline = async move {
+            match remaining_ms {
+                Some(remaining_ms) => {
+                    tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(deadline);
+        let stalled = self.orchestration_no_progress(no_progress_ms);
+        tokio::pin!(stalled);
         tokio::select! {
             biased;
             result = &mut child => Ok(OrchestrationChildDispatch::Settled(result?)),
@@ -20015,6 +20107,51 @@ impl BrokerToolDispatcher {
                         outcome_unknown: true,
                     }),
                 }
+            }
+            _ = &mut stalled => {
+                child_cancel.cancel();
+                match child.await {
+                    Ok(settled) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        outcome_unknown: orchestration_dispatch_outcome_unknown(&settled),
+                        settled: Some(settled),
+                    }),
+                    Err(_) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        settled: None,
+                        outcome_unknown: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolves only when an EXPLICIT `no_progress_ms` window passes with no
+    /// observable progress: the session journal head (child tool output,
+    /// delegated-child chip updates, results) must advance at least once per
+    /// window. A child that keeps producing work is never stopped by it.
+    /// Absent the opt-in window this never resolves.
+    async fn orchestration_no_progress(&self, no_progress_ms: Option<u64>) {
+        let Some(window_ms) = no_progress_ms.filter(|window| *window > 0) else {
+            return std::future::pending().await;
+        };
+        let window = Duration::from_millis(window_ms);
+        let poll = (window / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let session_id = self.output.store.session_id().clone();
+        let head = |store: HubStoreHandle, session_id: SessionId| async move {
+            StoreHandle::latest_seq(&store, &session_id).await.ok()
+        };
+        let mut observed = head(self.output.store.clone(), session_id.clone()).await;
+        let mut last_progress = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(poll).await;
+            let current = head(self.output.store.clone(), session_id.clone()).await;
+            // An unreadable head is not evidence of a stall.
+            if current.is_none() || current != observed {
+                observed = current;
+                last_progress = tokio::time::Instant::now();
+            } else if last_progress.elapsed() >= window {
+                return;
             }
         }
     }
@@ -20062,6 +20199,11 @@ impl BrokerToolDispatcher {
                     status: ScriptTerminalStatusV1::Cancelled,
                     code: "cancelled",
                     reason: "orchestration was cancelled while a child call was active",
+                },
+                OrchestrationChildInterruption::NoProgress => OrchestrationTerminalReason {
+                    status: ScriptTerminalStatusV1::TimedOut,
+                    code: "child_no_progress",
+                    reason: "a child call made no observable progress within the explicit no_progress_ms window",
                 },
                 OrchestrationChildInterruption::Deadline => OrchestrationTerminalReason {
                     status: ScriptTerminalStatusV1::TimedOut,
@@ -20191,6 +20333,7 @@ impl BrokerToolDispatcher {
             usize::from(group.max_concurrency)
         };
         let interaction_observation_invalidated = state.interaction_observation_invalidated;
+        let no_progress_ms = state.admitted.limits.no_progress_ms;
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
                 let result = self
@@ -20198,6 +20341,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         call,
                         interaction_observation_invalidated,
+                        no_progress_ms,
                         cancel,
                     )
                     .await;
@@ -20604,9 +20748,9 @@ impl BrokerToolDispatcher {
                     .finish_orchestration(run_id, Some(&mut state), terminal)
                     .await;
             }
-            if unix_time_ms().saturating_sub(state.admitted.admitted_at_ms)
-                >= state.admitted.limits.script_wall_ms.unwrap_or(120_000)
-            {
+            if state.admitted.limits.script_wall_ms.is_some_and(|wall| {
+                unix_time_ms().saturating_sub(state.admitted.admitted_at_ms) >= wall
+            }) {
                 let terminal = orchestration_terminal(
                     &state,
                     ScriptTerminalStatusV1::TimedOut,
@@ -20735,6 +20879,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         &pending,
                         state.interaction_observation_invalidated,
+                        state.admitted.limits.no_progress_ms,
                         cancel,
                     )
                     .await?
@@ -22447,7 +22592,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     && error.message == crate::delegation::RECURSION_LIMIT_MESSAGE
                 {
                     self.clear_cached_call(run_id, item_id, call_id);
-                    return Ok(ToolDispatchResult::Completed(recursion_limit_result()));
+                    return Ok(ToolDispatchResult::Completed(recursion_limit_result(
+                        &error,
+                    )));
                 }
                 self.clear_cached_call(run_id, item_id, call_id);
                 return Err(error);
@@ -22628,6 +22775,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
                 Err(error) => return Err(tool_error(error)),
             };
+            let background = request.background;
             let established = match self
                 .delegation
                 .establish(
@@ -22694,10 +22842,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .record_launch_failure(&established.ticket, &error)
                     .await?;
             }
-            self.deferred.lock().await.insert(
-                established.ticket.manifest.agent.clone(),
-                established.ticket.clone(),
-            );
+            if !background {
+                self.deferred.lock().await.insert(
+                    established.ticket.manifest.agent.clone(),
+                    established.ticket.clone(),
+                );
+            }
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         if route == RegisteredToolRoute::MessageSubagent {
@@ -23356,9 +23506,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             tokio::pin!(wait);
                             let mut close = shell.close_receiver();
                             let mut close_open = true;
+                            let mut dispatch_cancel_pending = true;
                             let waited = loop {
                                 tokio::select! {
                                     result = &mut wait => break result,
+                                    // The dispatch token (turn cancel, or an
+                                    // orchestration deadline / no-progress
+                                    // stop) terminates the foreground process
+                                    // instead of waiting for it to exit.
+                                    () = cancel.cancelled(), if dispatch_cancel_pending => {
+                                        dispatch_cancel_pending = false;
+                                        process_cancel.cancel();
+                                    }
                                     changed = close.changed(), if close_open => {
                                         if changed.is_err() {
                                             close_open = false;
@@ -24691,18 +24850,40 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
-    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
-        let tickets = self
-            .deferred
-            .lock()
+    async fn detach_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        self.deferred.lock().await.remove(&ticket.manifest.agent);
+        // The `wait_ms` observation ended and its `child_still_running`
+        // result is committed: the collector has let go of the child. Owe
+        // the parent session its terminal result so the advertised
+        // `agent wait` collects it (Astra 13-final B2). Bookkeeping failure
+        // never fails the parent turn; the child keeps running either way,
+        // and startup recovery re-derives the obligation from the durable
+        // `child_still_running` tool result.
+        if let Err(error) = self
+            .delegation
+            .detach_observed_child(&ticket.manifest.agent)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for ticket in tickets {
-            self.delegation
-                .cancel_ticket(&ticket, self.run_deadline)
-                .await?;
+        {
+            tracing::warn!(agent = %ticket.manifest.agent, ?error, "observation-detached child delivery was not armed");
+        }
+        Ok(())
+    }
+
+    async fn detach_outstanding_deferred(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        // Owner decision 2026-09-25: a main-thread stop never cancels its
+        // subagents. The live map only tracked blocking collectors; the
+        // journal owns every child of the turn, and the coordinator arms
+        // result delivery for waited-on children and records the
+        // still-running marker.
+        self.deferred.lock().await.clear();
+        // Bookkeeping failure must never turn a user stop into an error: the
+        // children are untouched either way.
+        if let Err(error) = self
+            .delegation
+            .detach_parent_run_children(&self.session_id, run_id)
+            .await
+        {
+            tracing::warn!(%run_id, ?error, "detached-subagent bookkeeping after a main-only stop failed");
         }
         Ok(())
     }
@@ -25491,14 +25672,22 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
     }
 }
 
-fn recursion_limit_result() -> BoundedResult {
+/// Only reachable when the operator opted into `HAIDER_SUBAGENT_MAX_DEPTH`;
+/// subagent depth is unbounded by default.
+fn recursion_limit_result(error: &HaiderError) -> BoundedResult {
+    let limit = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("limit"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     BoundedResult {
         preview: serde_json::json!({
             "status": "rejected",
             "error": {
                 "kind": "recursion_depth_limit",
                 "message": crate::delegation::RECURSION_LIMIT_MESSAGE,
-                "limit": crate::delegation::RECURSION_DEPTH_LIMIT,
+                "limit": limit,
             }
         })
         .to_string(),

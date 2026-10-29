@@ -4893,6 +4893,24 @@ fn render_journal_with_facts(
                         messages.push(Message::user_text(status.model_note()));
                     }
                 }
+                // Owner decision 2026-09-25: a main-thread stop leaves its
+                // subagents running. The still-running marker and a detached
+                // child's later-delivered result are bounded user-role notes
+                // (a steered delivery journals the fact with prompt=omit).
+                TurnItem::Extension { ref kind, .. }
+                    if kind == haider_protocol::subagent_stop::SUBAGENTS_STILL_RUNNING_EXTENSION_KIND =>
+                {
+                    if let Some(marker) = haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(&item) {
+                        messages.push(Message::user_text(marker.model_note()));
+                    }
+                }
+                TurnItem::Extension { ref kind, .. }
+                    if kind == haider_protocol::subagent_stop::DETACHED_CHILD_RESULT_EXTENSION_KIND =>
+                {
+                    if let Some(result) = haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(&item) {
+                        messages.push(Message::user_text(result.model_note()));
+                    }
+                }
                 TurnItem::Extension { ref kind, .. }
                     if kind == haider_protocol::loop_guard::LOOP_SUSPECTED_EXTENSION_KIND =>
                 {

@@ -37,7 +37,7 @@ the session's workspace. Explicit creation/configuration flags and run-budget
 pins (`--provider`, `--model`, `--effort`, `--speed`, `--account`, `--ssh-scope`,
 permission overrides, `--seed`, and budget flags) are rejected with `--session`.
 Use session configuration commands to change durable session configuration.
-`--start`, `--status`, `--stop`, `--replay` and `--resume` remain separate run
+`--start`, `--status`, `--stop` (with `--stop-main` and `--stop-subagents`), `--replay` and `--resume` remain separate run
 lifecycle commands. `--timeout` bounds this client's operation and retains the
 normal cancellation/drain behavior.
 

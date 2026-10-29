@@ -572,16 +572,23 @@ controllers must not send unknown properties
 Creation is observed as `EventPayload::AgentSpawned(AgentManifest)`; the
 manifest carries the opaque agent ID and its grant/fencing coordinates
 (`crates/haider-protocol/src/lib.rs:113-120`;
-`crates/haider-protocol/src/agent.rs:11-46`). The child terminal is the
+`crates/haider-protocol/src/agent.rs:11-46`). A foreground child's collected report is the
 `TurnItem::ChildResult { report: ChildReport }` item
 (`crates/haider-protocol/src/item.rs:109-116`;
 `crates/haider-protocol/src/agent.rs:129-147`).
+Background children and later child runs are collected from their own journal
+as described in the wait contract below. Public session transcripts include
+completed `ChildResult` reports and the named `detached_child_result_v1` and
+`subagents_still_running_v1` notices. Private delivery obligations and unknown
+extensions remain excluded.
 
 For follow-up instructions, a model uses `message_subagent { agent, message }`;
 the message is bounded to 32 KiB and addresses a direct child by opaque agent
 ID (`crates/haider-tools/src/message_subagent.rs:7-36`, `:39-64`). An external
-controller uses the existing `agent.message` method above. To stop a child and
-its descendants, use `agent.cancel`.
+controller uses the existing `agent.message` method above. Named `agent.cancel`
+stops only that child's current run and its own monitors; descendants remain
+alive. To stop every child in the session's tree, use `agent.cancel_all`
+(`haider agent cancel <parent-session-id> --all`).
 
 ## 9. Provider request correlation
 
@@ -804,6 +811,7 @@ haider agent spawn "inspect the failing tests" --task investigation --json
 haider agent list <parent-session-id> --json
 haider agent message <parent-session-id> <agent-id> "inspect the new failure" --json
 haider agent cancel <parent-session-id> <agent-id> --json
+haider agent cancel <parent-session-id> --all --json
 haider agent wait <parent-session-id> <agent-id> --timeout 30s --json
 haider workflow list --json
 haider workflow run child-implement-verify "implement and verify the fix" \
@@ -819,6 +827,39 @@ the accepted `session_id` and `run_id` in `result`; retain these coordinates
 and inspect the session instead of blindly retrying. Explicit cancellation
 uses `agent cancel`. Closing a successful spawn command leaves its child owned
 by the daemon. The ordinary durable delegation lifetime budget still applies.
+
+Stop semantics (owner decision 2026-09-25): `agent cancel <parent> <agent>`
+stops that subagent only (its original run, any later messaged or
+monitor-woken run, and its own monitors); its children keep running.
+`agent cancel <parent> --all` stops every subagent in the parent session's
+tree, however deep, and removes their monitors; the parent's own runs are not
+touched. Stopping a main run is separate: `haider run --stop <run>` stops the
+run and its whole subagent tree, `--stop-main` stops only the run (subagents
+keep running; a waited-on subagent's result is delivered to the session when
+it finishes), and `--stop-subagents` stops only the tree. The TUI's Esc is a
+main-only stop. `agent cancel --all` never stops the parent session's own main
+run (by design; stop a run with `run --stop`). Scoped stops require a daemon
+advertising `run_stop_scope_v1`; otherwise the CLI refuses them and stops
+nothing. All helper stops (including default `run --stop`, named and tree
+`agent cancel`, and the TUI's main-only Esc) also require `helper_stop_v1`.
+This capability promises incarnation-bound stops, durable completed-stop
+replay, and removal of the stopped helper tasks' monitors. If it is absent,
+the CLI JSON and TUI refuse with `protocol_mismatch` (CLI exit 76), without
+sending the stop. The remedy is: "This daemon is older than this CLI and
+cannot end helper tasks reliably. First close older clients attached to this
+profile (including session --watch and TUI clients) so they cannot restart the
+old daemon. Stop it with `haider daemon stop`, then run your command again;
+the current daemon starts automatically."
+With `--no-spawn`, the remedy instead says: "This daemon is older than this
+CLI and cannot end helper tasks reliably. First close older clients attached
+to this profile (including session --watch and TUI clients) so they cannot
+restart the old daemon. Stop it with `haider daemon stop`, then run your
+command again without --no-spawn so the current daemon can start."
+The flag continues to disable automatic startup; recovery requires omitting it.
+An auto-spawned daemon stays up while any run or owed result
+delivery is live and retires only after all work is terminal plus its idle
+TTL. `haider daemon stop` remains an explicit stop of everything, including
+subagents.
 
 Spawn/run accept `--provider`, `--model`, `--agent-type`, `--task`, and
 `--cwd`; `--prompt`/`-p` can replace the positional prompt. Omitted provider
@@ -942,21 +983,25 @@ must tolerate additive fields. Human output is not a parsing contract.
 | agent spawn / workflow run | Parent `session_id`/`run_id`, actual `agent_id`, `child_session_id`/`child_run_id`, and durable `manifest`. |
 | agent list | Native `SessionFleetSnapshot`, including `roots`, bounds, truncation and rollup; each node may carry `activity` and `activities` (973-activity-icons). Without `--json` the verb prints the human fleet tree: state glyph, current activity glyph (emoji, `[text]` label under `NO_COLOR`/limited `TERM`/`HAIDER_ACTIVITY_ICONS=text`, nothing when `off`), name, task and metrics. |
 | agent message | Native `receipt`, including delivery kind and child run coordinates. Running children receive steer; idle children receive a queued fresh turn. |
-| agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. Acceptance is not terminal completion. |
+| agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. When the original run already finished, the fields name the later run that was stopped. Acceptance is not terminal completion. With `--all`: `session_id` and `stopped` (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`). |
 | agent wait | Parent/agent/child coordinates, terminal `state`, child `terminal_seq`, `report`, `report_source`, and nullable parent `child_result_seq`. |
 | workflow status | `session_id`, native `graph` status and nullable typed `activation`. A built-in graph need not have a typed Loom activation. |
 | workflow list | `workflows`: native workflow catalog entries. |
 
 Wait selects the latest child run visible during its initial journal replay
-and keeps that target. For the initial delegation it requires both the child's
-typed terminal and its parent's completed `ChildResult`, with
-`report_source: "child_result"` and the exact `child_result_seq`. After an idle
+and keeps that target. For an initial foreground delegation it requires both
+the child's typed terminal and its parent's completed `ChildResult`, with
+`report_source: "child_result"` and the exact `child_result_seq`. An initial
+background child has no parent collector: wait reads its completed child
+message and terminal from the child journal. After an idle
 child is messaged, its follow-up turn has no new parent collector: wait reads
-the actual completed child message and terminal, reports
-`report_source: "child_journal"`, `verified: "unverified"`, and a null
-`child_result_seq`. It never substitutes the old parent's report. `agent.cancel`
-retains the native RPC's original delegation-run targeting and recursive
-cancellation semantics; its returned child-run coordinate is authoritative.
+the actual completed child message and terminal. Both journal paths report
+`report_source: "child_journal"` and a null `child_result_seq`, and derive
+verification from the terminal state (a successful run is unverified;
+failed or cancelled runs are red). Wait never substitutes the old parent's report.
+Named `agent.cancel` stops the named child's current run, including later
+messaged or monitor-woken runs, and removes its own monitors. Descendants
+remain alive; its returned child-run coordinate is authoritative.
 
 | Exit | Meaning |
 | --- | --- |

@@ -1,5 +1,24 @@
 # Wave 973 integration resolutions
 
+## ci-winpath integration on 2026-10-29
+
+Integrates wave `183a99f63568100539b15d25ae4ceda34618c546` into the lane
+including glob enclosure repair `d370acfc6c6a04b5fe33a70b09e5ab23df6f386b`.
+The four textual conflicts were LiveDriver summary routing, the plain and rich
+extension chains, and the test baseline. Both histories are retained by a merge.
+
+The wave's complete-list/incremental-roster split is retained. The moved summary
+handler continues using the model's home snapshot for path labels; the existing
+context regression now exercises both reply kinds with own/other account rows.
+Plain and rich extension rendering retains both helper-stop notices/results and
+context-aware image projection. Other wave changes are preserved. No actual I/O
+path is replaced by a display label, and this lane adds no daemon/store schema.
+
+The merged source count is 7312 using xtask's exact file/marker rule; the
+queued actual xtask update/check must confirm it. All native, platform, class,
+mutation and live gates run afresh on the committed merged candidate. No receipt
+from the earlier candidate is credited to this integration.
+
 ## ci-winpath integration on 2026-10-26
 
 Integrates wave `b08f4d823d9aee1aee5a2dbd67acd557949da7a7` into
