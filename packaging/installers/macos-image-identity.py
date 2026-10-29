@@ -143,8 +143,31 @@ def create(path, record, staging, arguments):
                         'path': str(raw), 'identity': identity(raw.stat()),
                         'directory': identity(os.fstat(stage_fd))}))
                 print('Create output requires identity-checked cleanup: ' + str(raw), file=sys.stderr)
-            elif not retained_before:
-                (staging / 'retain-create').unlink()
+            else:
+                # No pathname is not proof that the tool created nothing: a
+                # helper can still hold an unlinked image, or the directory
+                # can have been replaced. Only a clear inventory and the same
+                # empty staging directory permit another create attempt.
+                try:
+                    check(raw.parent, identity(os.fstat(stage_fd)))
+                    images = staging_inventory()
+                    for image in images:
+                        candidate = Path(image['image-path'])
+                        try:
+                            same_directory = candidate.parent.samefile(raw.parent)
+                        except OSError:
+                            same_directory = False
+                        if candidate.resolve() == raw.resolve() or same_directory:
+                            raise RuntimeError('missing create output still inventoried; retaining ' + str(raw))
+                    # The inventory subprocess may outlive this pathname's
+                    # generation. Revalidate it immediately before removal.
+                    check(raw.parent, identity(os.fstat(stage_fd)))
+                    raw.parent.rmdir()
+                except (OSError, RuntimeError) as error:
+                    print('Cannot prove create left nothing: ' + str(error), file=sys.stderr)
+                else:
+                    if not retained_before:
+                        (staging / 'retain-create').unlink()
             return result.returncode
         # Native output is untrusted input, not deletion authority. Refuse
         # symlinks and special files without reading through either of them.

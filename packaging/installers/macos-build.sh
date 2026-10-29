@@ -71,6 +71,8 @@ def main():
         backing = {entity["dev-entry"]: image for image in images
                    for entity in image.get("system-entities", []) if "dev-entry" in entity}
         verified = {}
+        unavailable = set()
+        departed = set()
         def is_expected(device):
             image = backing[device]
             pid = image.get("hdid-pid")
@@ -78,8 +80,10 @@ def main():
                 verified[pid] = helper.backing_identity(image, expected)
             if verified[pid] is None:
                 if not pathlib.Path(device).exists():
+                    departed.add(device)
                     return False
-                sys.exit("backing inode unavailable; retaining recorded device " + device)
+                unavailable.add(device)
+                return False
             return verified[pid]
         identities = [(pathlib.Path(image["image-path"]).resolve(), entity["dev-entry"])
                       for image in images if "image-path" in image
@@ -101,6 +105,15 @@ def main():
             owned = [(path, device) for path, device in identities
                      if same_path(path, image_path) and device not in previous and is_expected(device)]
         known_devices = [item["device"] for item in saved] if saved is not None else attach_devices
+        # hdiutil can publish a live device before lsof can observe its backing
+        # vnode. Requery both inventories; an unknown observation never grants
+        # detach authority or overwrites the last ownership record.
+        if unavailable:
+            if attempt == 3:
+                sys.exit("backing inode unavailable; retaining recorded devices: " +
+                         ", ".join(sorted(unavailable)))
+            time.sleep(0.1 * (attempt + 1))
+            continue
         if any(pathlib.Path(device).exists() and device not in inventory_devices for device in known_devices):
             incomplete = True
         if not owned and not snapshot:
@@ -117,10 +130,11 @@ def main():
             time.sleep(0.1 * (attempt + 1))
             continue
         if snapshot:
-            before.write_text(json.dumps([device for path, device in identities if same_path(path, image_path)]))
+            before.write_text(json.dumps([device for path, device in identities
+                                         if same_path(path, image_path) and pathlib.Path(device).exists()]))
         else:
             if saved is None and not owned and any(device not in previous for path, device in identities
-                    if device in attach_devices or same_path(path, image_path)):
+                    if device not in departed and (device in attach_devices or same_path(path, image_path))):
                 sys.exit("cannot attribute attachment to the created backing inode; keeping everything")
             record.write_text(json.dumps([{ "image": str(image_path), "device": device, "identity": expected} for path, device in owned]))
             for path, device in owned:
