@@ -1104,3 +1104,97 @@ fn pre_list_root_cannot_erase_manifest_before_first_owned_prompt() {
     run_slash(&mut model, "/fork 1");
     assert_eq!(fork_request(&model), Some((child, 2)));
 }
+
+/// Both full lists and subagent roster refreshes can arrive after replay and
+/// retraction. They must recover only the surviving owner's original branch.
+#[test]
+fn delayed_roster_scoped_retraction_preserves_prompt_source() {
+    for roster_update in [false, true] {
+        for cold in [false, true] {
+            for source_branch in [None, Some("branch-b")] {
+                for retract_owner in ["late-owner", "another-owner"] {
+                    let (mut model, session) = forkable_model();
+                    model.back_to_launcher();
+                    model.sessions.clear();
+                    model.upsert_live_session(&session);
+                    if !cold {
+                        model.open_session(&session);
+                    }
+                    assert_eq!(
+                        model.route_raw(&branch_created(&session, 1, "branch-b", "B")),
+                        RawOutcome::Applied
+                    );
+                    let mut prompt = raw(&session, 2, &user("delayed owned branch prompt"));
+                    prompt.agent_id = Some(haider_protocol::ids::AgentId::new("late-owner"));
+                    prompt.branch_id = source_branch.map(haider_protocol::ids::BranchId::new);
+                    assert_eq!(model.route_raw(&prompt), RawOutcome::Applied);
+                    let mut retracted = raw(&session, 3, &EventPayload::IdleDecayed);
+                    retracted.agent_id = Some(haider_protocol::ids::AgentId::new(retract_owner));
+                    retracted.branch_id = prompt.branch_id.clone();
+                    retracted.payload = haider_protocol::retraction::PromptRetractedV1 {
+                        prompt_seq: 2,
+                        prompt_node_id: haider_protocol::ids::NodeId::new("delayed-node"),
+                        text: "delayed owned branch prompt".into(),
+                        attachments: vec![],
+                    }
+                    .to_payload_value()
+                    .expect("scoped retraction")
+                    .into();
+                    assert_eq!(model.route_raw(&retracted), RawOutcome::Applied);
+                    let mut summary = owner_summary(&session, "late-owner");
+                    summary.head_seq = 3;
+                    let reply = if roster_update {
+                        LiveReply::RosterUpdated {
+                            sessions: vec![summary],
+                        }
+                    } else {
+                        LiveReply::Listed {
+                            sessions: vec![summary],
+                            next_cursor: None,
+                        }
+                    };
+                    LiveDriver::new("test").apply(&mut model, reply);
+                    if cold {
+                        model.open_session(&session);
+                    }
+                    model.turn_active = false;
+                    model.requests.clear();
+                    if retract_owner == "late-owner" {
+                        assert!(
+                            model.prompt_history.is_empty(),
+                            "a late roster cannot resurrect a retracted prompt"
+                        );
+                        run_slash(&mut model, "/fork 1");
+                        assert_eq!(fork_request(&model), None);
+                        continue;
+                    }
+                    assert_eq!(model.prompt_history.len(), 1);
+                    assert_eq!(model.prompt_history[0].text, "delayed owned branch prompt");
+                    assert!(
+                        model
+                            .switch_branch(Some(&haider_protocol::ids::BranchId::new("branch-b")))
+                            .is_some()
+                    );
+                    if source_branch.is_some() {
+                        assert!(model.switch_branch(None).is_some());
+                    }
+                    run_slash(&mut model, "/fork 1");
+                    let request = model.requests.iter().find_map(|request| match request {
+                        AppRequest::ForkFromPrompt {
+                            session,
+                            source_branch,
+                            seq,
+                            ..
+                        } => Some((session.clone(), source_branch.clone(), *seq)),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        request,
+                        Some((session, prompt.branch_id, 2)),
+                        "roster={roster_update} cold={cold} source={source_branch:?}"
+                    );
+                }
+            }
+        }
+    }
+}

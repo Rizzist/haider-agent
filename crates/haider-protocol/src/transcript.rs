@@ -10,6 +10,7 @@ use crate::envelope::RawEnvelope;
 use crate::ids::{AgentId, BranchId, RunId, SessionId};
 use crate::item::{ItemEvent, TurnItem};
 use crate::pipe::{args_preview, result_preview};
+use crate::subagent_stop::{DetachedChildResultV1, SubagentsStillRunningV1};
 use serde::{Deserialize, Serialize};
 
 pub const TRANSCRIPT_DEFAULT_LIMIT: u32 = 100;
@@ -186,6 +187,21 @@ fn project_text(envelope: &RawEnvelope) -> Option<String> {
                 "terminal {call_id} ({status:?}, exit={exit_code:?}): {command}"
             )),
             TurnItem::Refusal { reason } => Some(format!("assistant refusal: {reason}")),
+            TurnItem::ChildResult { report } => Some(format!(
+                "child result {} ({:?}): {}",
+                report.agent, report.verified, report.summary
+            )),
+            item @ TurnItem::Extension { .. } => {
+                // Only named public notices are readable. Obligation and
+                // provider/audit extensions remain private, including any
+                // extra fields on a recognized notice.
+                DetachedChildResultV1::from_extension_item(&item)
+                    .map(|notice| notice.summary_line())
+                    .or_else(|| {
+                        SubagentsStillRunningV1::from_extension_item(&item)
+                            .map(|notice| notice.summary())
+                    })
+            }
             _ => None,
         },
         EventPayload::ToolResult { call_id, result } => Some(format!(

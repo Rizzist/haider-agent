@@ -22,7 +22,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{AgentId, BranchId, EventId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, EventId, RunId, SessionId, TaskId};
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_tools::{
     MonitorAction, MonitorApproval, MonitorCliPreset, MonitorFilter, MonitorFilterField,
@@ -67,6 +67,8 @@ const MONITOR_TRANSPORT_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_DELIVERY_RETRY_MIN: Duration = Duration::from_secs(1);
 const MONITOR_DELIVERY_RETRY_MAX: Duration = Duration::from_secs(30);
 const MONITOR_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// Task/agent completion digests are durable facts; this only bounds wake latency.
+const MONITOR_HANDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MONITOR_PROCESS_BATCH_WINDOW: Duration = Duration::from_millis(500);
 // Two 500 ms process batches: one may already be filling when the leader
 // exits, and one final batch may contain bytes that raced that observation.
@@ -91,6 +93,12 @@ pub struct SmsIncomingEvent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorEventPayload {
     Sms(SmsIncomingEvent),
+    Task {
+        payload: String,
+    },
+    Agent {
+        payload: String,
+    },
     Process {
         line: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +133,8 @@ pub enum MonitorEventPayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum MonitorEventPayloadWire {
     Sms(SmsIncomingEvent),
+    Task(MonitorFileEvent),
+    Agent(MonitorFileEvent),
     Process(MonitorProcessEvent),
     File(MonitorFileEvent),
     Poll(MonitorPollEvent),
@@ -171,6 +181,12 @@ impl<'de> Deserialize<'de> for MonitorEventPayload {
     {
         Ok(match MonitorEventPayloadWire::deserialize(deserializer)? {
             MonitorEventPayloadWire::Sms(event) => Self::Sms(event),
+            MonitorEventPayloadWire::Task(event) => Self::Task {
+                payload: event.payload,
+            },
+            MonitorEventPayloadWire::Agent(event) => Self::Agent {
+                payload: event.payload,
+            },
             MonitorEventPayloadWire::Process(event) => Self::Process {
                 line: event.line,
                 structured: event.structured,
@@ -201,6 +217,8 @@ impl MonitorEventPayload {
     fn source_kind(&self) -> MonitorSourceKind {
         match self {
             Self::Sms(_) => MonitorSourceKind::Sms,
+            Self::Task { .. } => MonitorSourceKind::Task,
+            Self::Agent { .. } => MonitorSourceKind::Agent,
             Self::Process { .. } => MonitorSourceKind::Process,
             Self::File { .. } => MonitorSourceKind::File,
             Self::Poll { .. } => MonitorSourceKind::Poll,
@@ -216,7 +234,9 @@ impl MonitorEventPayload {
             (Self::Process { line, .. } | Self::Cli { line, .. }, MonitorFilterField::Payload) => {
                 Some(line)
             }
-            (Self::File { payload }, MonitorFilterField::Payload)
+            (Self::Task { payload }, MonitorFilterField::Payload)
+            | (Self::Agent { payload }, MonitorFilterField::Payload)
+            | (Self::File { payload }, MonitorFilterField::Payload)
             | (Self::Poll { payload }, MonitorFilterField::Payload) => Some(payload),
             _ => None,
         }
@@ -495,6 +515,8 @@ fn validate_event_payload(payload: &MonitorEventPayload) -> Result<(), MonitorEr
         }
         MonitorEventPayload::Process { line, .. }
         | MonitorEventPayload::Cli { line, .. }
+        | MonitorEventPayload::Task { payload: line }
+        | MonitorEventPayload::Agent { payload: line }
         | MonitorEventPayload::File { payload: line }
         | MonitorEventPayload::Poll { payload: line } => {
             if line.len() > MAX_SMS_BODY_BYTES {
@@ -571,6 +593,8 @@ impl MonitorReport {
                     "exit_code": exit_code,
                 }),
                 MonitorEventPayload::File { payload: line }
+                | MonitorEventPayload::Task { payload: line }
+                | MonitorEventPayload::Agent { payload: line }
                 | MonitorEventPayload::Poll { payload: line } => json!({
                     "payload": bounded_chars(line, MAX_REPORT_BODY_CHARS),
                 }),
@@ -881,12 +905,44 @@ enum MonitorJournalEvent {
 
 impl MonitorJournalEvent {
     fn from_value(value: &serde_json::Value) -> Option<Self> {
-        serde_json::from_value(value.clone()).ok()
+        serde_json::from_value(value.get("monitor_v2").unwrap_or(value).clone()).ok()
     }
 
     fn to_value(&self) -> Result<serde_json::Value, MonitorError> {
-        serde_json::to_value(self)
-            .map_err(|error| MonitorError::Store(format!("cannot encode monitor fact: {error}")))
+        let fact = serde_json::to_value(self)
+            .map_err(|error| MonitorError::Store(format!("cannot encode monitor fact: {error}")))?;
+        // An old fold must erase the previous registration/pending revision
+        // even when it cannot interpret its replacement. Put the new fact in
+        // an additive field on an old-readable tombstone in the SAME envelope.
+        // New readers restore the replacement; old readers safely omit it.
+        Ok(match self {
+            Self::MonitorRegistered { registration }
+                if matches!(
+                    registration.source,
+                    MonitorSource::Task { .. } | MonitorSource::Agent { .. }
+                ) =>
+            {
+                json!({"type":"monitor_removed", "monitor_id":registration.monitor_id,
+                    "reason":"removed", "removed_at_ms":registration.activated_at_ms,
+                    "monitor_v2":fact})
+            }
+            Self::MonitorReportPending { pending }
+                if matches!(
+                    pending.report.source,
+                    MonitorSourceKind::Task | MonitorSourceKind::Agent
+                ) || pending.report.events.iter().any(|event| {
+                    matches!(
+                        event.payload,
+                        MonitorEventPayload::Task { .. } | MonitorEventPayload::Agent { .. }
+                    )
+                }) =>
+            {
+                json!({"type":"monitor_removed", "monitor_id":pending.report.monitor_id,
+                    "reason":"removed", "removed_at_ms":pending.queued_at_ms,
+                    "monitor_v2":fact})
+            }
+            _ => fact,
+        })
     }
 }
 
@@ -1167,6 +1223,7 @@ enum ReportQueueOutcome {
 
 struct MonitorServiceInner {
     sources: MonitorSourceHub,
+    hub: StdRwLock<Option<WeakSessionHub>>,
     registry: MonitorRegistry,
     mutations: Mutex<()>,
     completion_mutations: Mutex<()>,
@@ -1195,6 +1252,8 @@ struct MonitorServiceInner {
     ready: watch::Sender<bool>,
     activated: AtomicBool,
     shutdown: watch::Sender<bool>,
+    /// Registration/wake admission fence for explicit subagent stops.
+    stop_fences: crate::monitor_stop_fence::MonitorStopFences,
 }
 
 /// Hub-owned monitor service. Clone is cheap and every clone shares the same
@@ -1212,6 +1271,7 @@ impl Default for MonitorService {
         Self {
             inner: Arc::new(MonitorServiceInner {
                 sources: MonitorSourceHub::new(),
+                hub: StdRwLock::new(None),
                 registry: MonitorRegistry::default(),
                 mutations: Mutex::new(()),
                 completion_mutations: Mutex::new(()),
@@ -1236,6 +1296,7 @@ impl Default for MonitorService {
                 ready,
                 activated: AtomicBool::new(false),
                 shutdown,
+                stop_fences: crate::monitor_stop_fence::MonitorStopFences::default(),
             }),
         }
     }
@@ -1256,6 +1317,56 @@ impl MonitorService {
         self.inner.completion_mutations.lock().await
     }
 
+    /// Final obligation validation/admission is serialized with every
+    /// registry mutation (including stop, client/tool remove and deletion).
+    pub(crate) async fn admission_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.mutations.lock().await
+    }
+
+    /// The caller holds `admission_lock` across capture, durable stop claim
+    /// and fence installation. Do not reacquire it through `client_list`.
+    pub(crate) async fn stop_monitor_ids(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        _admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Vec<String>, MonitorError> {
+        self.adopt_session_locked(hub, session).await?;
+        let mut ids = self
+            .inner
+            .registry
+            .snapshot(session)
+            .into_iter()
+            .map(|monitor| monitor.monitor_id)
+            .collect::<Vec<_>>();
+        // Client registrations are session-owned (run=None). An expired
+        // one-shot can still own a retained follow-up, so the live registry
+        // alone cannot define this stop's immutable monitor incarnation.
+        let journal = crate::completion::load(hub, session)
+            .await
+            .map_err(|error| MonitorError::Delivery(error.to_string()))?;
+        ids.extend(
+            journal
+                .projection
+                .pending
+                .values()
+                .filter(|obligation| {
+                    obligation.source == haider_protocol::completion::CompletionSource::Monitor
+                })
+                .filter_map(|obligation| journal.reports.get(&obligation.obligation_id))
+                .map(|report| report.monitor_id.clone()),
+        );
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Admission fence shared by explicit subagent stops, monitor
+    /// registration and monitor wakes.
+    pub(crate) fn stop_fences(&self) -> &crate::monitor_stop_fence::MonitorStopFences {
+        &self.inner.stop_fences
+    }
+
     pub(crate) fn has_active_monitors(&self) -> bool {
         self.inner.registry.has_active_monitors()
     }
@@ -1266,6 +1377,16 @@ impl MonitorService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(session)
+    }
+
+    /// The activated session hub, if it is still alive.
+    fn session_hub(&self) -> Option<SessionHub> {
+        self.inner
+            .hub
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .and_then(|weak| weak.upgrade())
     }
 
     pub(crate) fn activate(&self, hub: WeakSessionHub) {
@@ -1282,6 +1403,11 @@ impl MonitorService {
         }
         *self
             .inner
+            .hub
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hub.clone());
+        *self
+            .inner
             .sink
             .write()
             .unwrap_or_else(PoisonError::into_inner) =
@@ -1292,6 +1418,8 @@ impl MonitorService {
         )];
         for source in [
             MonitorSourceKind::Sms,
+            MonitorSourceKind::Task,
+            MonitorSourceKind::Agent,
             MonitorSourceKind::Process,
             MonitorSourceKind::File,
             MonitorSourceKind::Poll,
@@ -2241,6 +2369,175 @@ impl MonitorService {
         }
     }
 
+    /// Resolve watch ownership from the immutable claim and original
+    /// registration envelopes. Updates cannot transfer a captured watch.
+    async fn stop_owned_monitor_ids(
+        &self,
+        hub: &SessionHub,
+        target: &crate::delegation::StopIncarnation,
+    ) -> Result<HashSet<String>, haider_protocol::error::HaiderError> {
+        let session = &target.session_id;
+        let mut owned = target.monitors.iter().cloned().collect::<HashSet<_>>();
+        let mut tool_monitors = HashSet::new();
+        let mut registrations = HashMap::new();
+        let mut cursor = 0;
+        loop {
+            let page = hub
+                .read_internal_session_for(
+                    haider_platform::phase_trace::StoreReadCaller::Monitor,
+                    session,
+                    cursor,
+                    256,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |e| e.seq);
+            for event in page {
+                let captured_run = event
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run| target.runs.contains(run));
+                // Older tool registrations omitted the owner coordinate.
+                // Their deterministic watch ID still binds them to the exact
+                // tool call, including calls inside tool_script. Never infer
+                // ownership from the current run, agent, or session alone.
+                if captured_run
+                    && let Ok(haider_protocol::EventPayload::Item(
+                        haider_protocol::item::ItemEvent::Started {
+                            item: haider_protocol::item::TurnItem::ToolCall { call_id, .. },
+                            ..
+                        },
+                    )) = event.payload.decode_event()
+                    && let Some(run) = event.run_id.as_ref()
+                {
+                    let operation = monitor_tool_operation_id(session, run, &call_id);
+                    tool_monitors.insert(format!("monitor-{}", &operation[..20]));
+                }
+                if let Some(MonitorJournalEvent::MonitorRegistered { registration }) =
+                    MonitorJournalEvent::from_value(&event.payload)
+                {
+                    let owner = event.run_id.as_ref().map(RunId::as_str).or_else(|| {
+                        event
+                            .payload
+                            .get("monitor_owner_run_id")
+                            .and_then(serde_json::Value::as_str)
+                    });
+                    // Updates retain the watch ID. Only its first durable
+                    // registration establishes ownership; a later updater
+                    // cannot transfer an independent watch to this stop.
+                    registrations.entry(registration.monitor_id).or_insert((
+                        owner.is_some_and(|owner| {
+                            target.runs.iter().any(|run| run.as_str() == owner)
+                        }),
+                        owner.is_none(),
+                    ));
+                }
+            }
+        }
+        for (id, (captured_run, legacy)) in registrations {
+            if captured_run || (legacy && tool_monitors.contains(&id)) {
+                owned.insert(id);
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Admission is held across claim recovery and fence installation, so
+    /// neither a registration nor a report can cross this ownership snapshot.
+    pub(crate) async fn fence_stop_incarnation(
+        &self,
+        hub: &SessionHub,
+        target: &crate::delegation::StopIncarnation,
+        _admission: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<crate::monitor_stop_fence::MonitorStopFence, haider_protocol::error::HaiderError>
+    {
+        let monitors = self.stop_owned_monitor_ids(hub, target).await?;
+        Ok(self.stop_fences().fence(
+            &target.session_id,
+            &target.runs,
+            &monitors.into_iter().collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Durably removes the monitors owned by a claimed stop incarnation.
+    /// A later independent run's registrations are never retargeted by retry.
+    pub(crate) async fn remove_for_stop_incarnation(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        command_prefix: &str,
+        incarnation: &crate::delegation::StopIncarnation,
+    ) -> Result<u64, haider_protocol::error::HaiderError> {
+        let owned = self.stop_owned_monitor_ids(hub, incarnation).await?;
+        let listed = self.client_list(hub, session.clone()).await;
+        let haider_rpc::MonitorListOutcomeWire::Listed { monitors } = listed.outcome else {
+            return Err(haider_protocol::error::HaiderError::new(
+                haider_protocol::error::ErrorCode::Internal,
+                "helper monitor listing did not finish",
+                true,
+            ));
+        };
+        let mut removed = 0_u64;
+        for monitor in monitors {
+            if !owned.contains(&monitor.monitor_id) {
+                continue;
+            }
+            let command_id = haider_rpc::CommandId::new(format!(
+                "{command_prefix}-monitor-{}",
+                &stable_digest(&[session.as_str(), &monitor.monitor_id])[..24]
+            ));
+            let receipt = self
+                .client_remove(
+                    hub,
+                    command_id,
+                    session.clone(),
+                    hub.worker_generation(),
+                    monitor.monitor_id.clone(),
+                )
+                .await;
+            match receipt.outcome {
+                haider_rpc::MonitorRemoveOutcomeWire::Removed { .. } => {
+                    removed = removed.saturating_add(1);
+                }
+                haider_rpc::MonitorRemoveOutcomeWire::Rejected {
+                    rejection: haider_rpc::MonitorControlRejectionWire::NotFound { .. },
+                } => {} // A terminal one-shot can leave the live registry first.
+                _ => {
+                    return Err(haider_protocol::error::HaiderError::new(
+                        haider_protocol::error::ErrorCode::Internal,
+                        "helper monitor removal did not finish",
+                        true,
+                    ));
+                }
+            }
+        }
+        let _admission = self.admission_lock().await;
+        let journal = crate::completion::load(hub, session).await?;
+        for obligation in journal.projection.pending.values() {
+            if obligation.source != haider_protocol::completion::CompletionSource::Monitor {
+                continue;
+            }
+            let Some(report) = journal.reports.get(&obligation.obligation_id) else {
+                continue;
+            };
+            if !owned.contains(&report.monitor_id) {
+                continue;
+            }
+            crate::completion::append(
+                hub,
+                obligation,
+                haider_protocol::completion::CompletionEvent::CompletionDismissed {
+                    obligation_id: obligation.obligation_id.clone(),
+                    attempt: obligation.attempt,
+                },
+            )
+            .await?;
+        }
+        Ok(removed)
+    }
+
     pub(crate) async fn client_register(
         &self,
         hub: &SessionHub,
@@ -2573,6 +2870,33 @@ impl MonitorService {
                 },
             );
         };
+
+        if let Some(rejection) = monitor_source_rejection(hub, &session_id, &source).await {
+            let receipt =
+                monitor_register_rejected(command_id, session_id, current_generation, rejection);
+            let body = StoredMonitorClientReceiptBody::Register {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_register_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
 
         if source.resolved_argv().is_some() {
             let receipt = monitor_register_rejected(
@@ -3560,6 +3884,35 @@ impl MonitorService {
             };
         };
 
+        if let Some(source) = parsed.source()
+            && let Some(rejection) = monitor_source_rejection(hub, &session_id, source).await
+        {
+            let receipt =
+                monitor_mutate_rejected(command_id, session_id, current_generation, rejection);
+            let body = StoredMonitorClientReceiptBody::Mutate {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_mutate_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
+
         let (outcome, fact, projection, pending) = match parsed {
             MonitorRequest::Update {
                 source,
@@ -4036,7 +4389,7 @@ impl MonitorService {
                 message: "monitor service is stopped for this session".into(),
             });
         }
-        let _mutation = self.inner.mutations.lock().await;
+        let mutation = self.inner.mutations.lock().await;
         if *self.inner.shutdown.borrow() || self.is_retired(store.session_id()) {
             return Err(ToolError::Runtime {
                 message: "monitor service is stopped for this session".into(),
@@ -4049,12 +4402,11 @@ impl MonitorService {
             message: format!("cannot encode monitor tool request: {error}"),
         })?;
         let request_digest = blake3::hash(&request_bytes).to_hex().to_string();
-        let operation_id = stable_digest(&[
-            store.session_id().as_str(),
-            coordinates.run_id.as_str(),
+        let operation_id = monitor_tool_operation_id(
+            store.session_id(),
+            &coordinates.run_id,
             &coordinates.call_id,
-            "monitor-tool",
-        ]);
+        );
         match request {
             MonitorRequest::Register {
                 source,
@@ -4068,6 +4420,24 @@ impl MonitorService {
                     .await?
                 {
                     return Ok(result);
+                }
+                // Checked under the mutation lock every stop listing also
+                // takes: a registration either commits before a stop lists
+                // this session's monitors or observes the stop's fence.
+                if self
+                    .inner
+                    .stop_fences
+                    .registration_fenced(store.session_id(), &coordinates.run_id)
+                {
+                    return Ok(tool_result(
+                        json!({
+                            "status": "subagent_stopping",
+                            "source": source.kind(),
+                            "message": "this subagent is being stopped; the monitor was not registered",
+                        }),
+                        ToolResultStatus::Rejected,
+                        Some("monitor registration refused: this subagent is being stopped".into()),
+                    ));
                 }
                 let command_unapproved =
                     source.resolved_argv().is_some() && coordinates.approved_command.is_none();
@@ -4085,6 +4455,27 @@ impl MonitorService {
                         }),
                         ToolResultStatus::Rejected,
                         Some("monitor source approval is required".into()),
+                    );
+                    self.persist_tool_receipt_locked(
+                        store,
+                        &coordinates,
+                        &operation_id,
+                        &request_digest,
+                        &result,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
+                let owned = monitor_source_owned(hub, store.session_id(), &source)
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: error.to_string(),
+                    })?;
+                if !owned {
+                    let result = tool_result(
+                        json!({"status":"rejected", "kind":"source_not_owned", "source":source.kind()}),
+                        ToolResultStatus::Rejected,
+                        Some("monitor source id is not owned by this session".into()),
                     );
                     self.persist_tool_receipt_locked(
                         store,
@@ -4167,6 +4558,10 @@ impl MonitorService {
                         result: result.clone(),
                     },
                 };
+                // Keep private journal facts outside the worker run-envelope
+                // vocabulary. Older readers ignore this additive coordinate.
+                let mut registration_value = fact.to_value().map_err(monitor_tool_error)?;
+                registration_value["monitor_owner_run_id"] = json!(coordinates.run_id);
                 let mut envelopes = [
                     monitor_envelope(
                         store.session_id(),
@@ -4176,7 +4571,7 @@ impl MonitorService {
                         &format!("monitor-registered-{}", &operation_id[..24]),
                         coordinates.device_id.clone(),
                         store.worker_generation(),
-                        fact.to_value().map_err(monitor_tool_error)?,
+                        registration_value,
                     ),
                     monitor_envelope(
                         store.session_id(),
@@ -4211,6 +4606,12 @@ impl MonitorService {
                 attempt,
                 evidence_event_ids,
             } => {
+                // Wakes own completion before registry admission. Follow-up
+                // control needs only completion serialization; never wait for
+                // it while holding the registry mutex in the opposite order.
+                drop(mutation);
+                #[cfg(test)]
+                crate::completion::astra22_boundary_hook::after_attempt(store.session_id()).await;
                 let receipt = crate::completion::control(
                     hub,
                     store,
@@ -4279,6 +4680,27 @@ impl MonitorService {
                     .await?;
                     return Ok(result);
                 };
+                let owned = monitor_source_owned(hub, store.session_id(), &source)
+                    .await
+                    .map_err(|error| ToolError::Runtime {
+                        message: error.to_string(),
+                    })?;
+                if !owned {
+                    let result = tool_result(
+                        json!({"status":"rejected", "kind":"source_not_owned", "source":source.kind()}),
+                        ToolResultStatus::Rejected,
+                        Some("monitor source id is not owned by this session".into()),
+                    );
+                    self.persist_tool_receipt_locked(
+                        store,
+                        &coordinates,
+                        &operation_id,
+                        &request_digest,
+                        &result,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
                 let command_unapproved =
                     source.resolved_argv().is_some() && coordinates.approved_command.is_none();
                 let file_unapproved = !external_file_approval_matches(
@@ -5860,6 +6282,106 @@ impl MonitorService {
     }
 }
 
+/// Outcome of one poll of a task or delegated-child handle.
+enum HandlePoll {
+    Pending,
+    Completed(MonitorEventPayload),
+}
+
+/// Polls a `task`/`agent` source until the handle's durable terminal digest
+/// exists, publishes it once, and ends the runner.
+async fn watch_handle_completion(
+    service: &MonitorService,
+    registration: &MonitorRegistration,
+    cancelled: &mut oneshot::Receiver<()>,
+) {
+    loop {
+        let Some(hub) = service.session_hub() else {
+            return;
+        };
+        let poll = match &registration.source {
+            MonitorSource::Task { task_id } => task_completion(&hub, registration, task_id),
+            MonitorSource::Agent { agent_id } => {
+                agent_completion(&hub, registration, agent_id).await
+            }
+            _ => return,
+        };
+        match poll {
+            HandlePoll::Completed(payload) => {
+                let _ = service.publish_runner_event(registration, payload);
+                return;
+            }
+            HandlePoll::Pending => {}
+        }
+        tokio::select! {
+            () = tokio::time::sleep(MONITOR_HANDLE_POLL_INTERVAL) => {}
+            _ = &mut *cancelled => return,
+        }
+    }
+}
+
+fn task_completion(
+    hub: &SessionHub,
+    registration: &MonitorRegistration,
+    task_id: &str,
+) -> HandlePoll {
+    let Some(completed) = hub
+        .task_registry()
+        .monitor_completion(&registration.owner_session_id, &TaskId::new(task_id))
+    else {
+        return HandlePoll::Pending;
+    };
+    let payload = serde_json::to_string(&completed)
+        .unwrap_or_else(|_| "task completed without an encodable digest".into());
+    HandlePoll::Completed(MonitorEventPayload::Task { payload })
+}
+
+async fn agent_completion(
+    hub: &SessionHub,
+    registration: &MonitorRegistration,
+    agent_id: &str,
+) -> HandlePoll {
+    let agent = AgentId::new(agent_id);
+    let record = match hub.delegation(agent.clone()).await {
+        Ok(Some(record)) if record.parent_session_id == registration.owner_session_id => record,
+        Ok(_) => {
+            return HandlePoll::Completed(MonitorEventPayload::Agent {
+                payload: json!({
+                    "kind": "child_record_missing",
+                    "agent": agent,
+                    "terminal": true,
+                })
+                .to_string(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child");
+            return HandlePoll::Pending;
+        }
+    };
+    match crate::delegation::DelegationHandle::new(hub.clone())
+        .derive_terminal_report(&record)
+        .await
+    {
+        Ok(Some(completion)) => {
+            let payload = json!({
+                "agent": agent,
+                "child_session_id": record.child_session_id,
+                "child_run_id": record.child_run_id,
+                "report": completion.report,
+                "chip": completion.chip,
+            })
+            .to_string();
+            HandlePoll::Completed(MonitorEventPayload::Agent { payload })
+        }
+        Ok(None) => HandlePoll::Pending,
+        Err(error) => {
+            tracing::warn!(monitor = %registration.monitor_id, %error, "agent monitor could not read child report");
+            HandlePoll::Pending
+        }
+    }
+}
+
 async fn run_monitor_source(
     service: MonitorService,
     registration: MonitorRegistration,
@@ -5870,6 +6392,9 @@ async fn run_monitor_source(
     }
     match &registration.source {
         MonitorSource::Sms => {}
+        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => {
+            watch_handle_completion(&service, &registration, &mut cancelled).await;
+        }
         MonitorSource::Timer { interval_ms } => {
             let interval = Duration::from_millis(*interval_ms);
             let mut tick = 0_u64;
@@ -6807,6 +7332,73 @@ impl SessionHub {
         crate::completion::wake_monitor(self, report).await
     }
 
+    /// Retain a direct transport report dismissed during a stop. The caller
+    /// holds the completion lock; source, dismissal and outbox settlement
+    /// commit together so replay cannot turn a discarded report into work.
+    pub(crate) async fn dismiss_unobserved_monitor_report(
+        &self,
+        report: &MonitorReport,
+    ) -> Result<(), MonitorError> {
+        use haider_protocol::completion::{CompletionEvent, CompletionProjection};
+
+        let retained_at_ms = now_ms();
+        let identity = stable_digest(&[
+            report.session_id.as_str(),
+            &report.monitor_id,
+            &report.report_id,
+            "stop-dismissed-direct-report",
+        ]);
+        let fact = |suffix: &str, event: MonitorJournalEvent| {
+            Ok::<_, MonitorError>(monitor_envelope(
+                &report.session_id,
+                None,
+                report.branch_id.as_ref(),
+                report.agent_id.as_ref(),
+                &format!("monitor-direct-{suffix}-{}", &identity[..24]),
+                self.device_id(),
+                self.worker_generation(),
+                event.to_value()?,
+            ))
+        };
+        let observed = fact(
+            "observed",
+            MonitorJournalEvent::MonitorReportPending {
+                pending: PendingMonitorReport {
+                    report: report.clone(),
+                    terminal_reason: None,
+                    queue_order: 0,
+                    queued_at_ms: retained_at_ms,
+                },
+            },
+        )?;
+        let mut projection = CompletionProjection::default();
+        projection.apply(&observed);
+        let id = format!("monitor:{}", report.report_id);
+        let obligation = projection.pending.get(&id).ok_or_else(|| {
+            MonitorError::Store("direct monitor observation has no obligation".into())
+        })?;
+        let dismissed = crate::completion::envelope(
+            self,
+            obligation,
+            &CompletionEvent::CompletionDismissed {
+                obligation_id: id,
+                attempt: 0,
+            },
+        )
+        .map_err(monitor_store_error)?;
+        let delivered = fact(
+            "settled",
+            MonitorJournalEvent::MonitorReportDelivered {
+                report_id: report.report_id.clone(),
+                delivered_at_ms: retained_at_ms,
+            },
+        )?;
+        self.append(&mut [observed, dismissed, delivered])
+            .await
+            .map_err(monitor_store_error)?;
+        Ok(())
+    }
+
     pub(crate) async fn admit_monitor_report(
         &self,
         report: MonitorReport,
@@ -6949,6 +7541,14 @@ pub(crate) fn monitor_source_availability() -> Vec<haider_rpc::MonitorSourceAvai
     let mut sources = vec![
         Row {
             source: Source::Sms,
+            availability: Availability::Available,
+        },
+        Row {
+            source: Source::Task,
+            availability: Availability::Available,
+        },
+        Row {
+            source: Source::Agent,
             availability: Availability::Available,
         },
         Row {
@@ -7206,6 +7806,12 @@ fn monitor_registration_wire(
 fn monitor_source_wire(source: &MonitorSource) -> haider_rpc::MonitorSourceWire {
     match source {
         MonitorSource::Sms => haider_rpc::MonitorSourceWire::Sms,
+        MonitorSource::Task { task_id } => haider_rpc::MonitorSourceWire::Task {
+            task_id: task_id.clone(),
+        },
+        MonitorSource::Agent { agent_id } => haider_rpc::MonitorSourceWire::Agent {
+            agent_id: agent_id.clone(),
+        },
         MonitorSource::Process {
             command,
             cwd,
@@ -7285,6 +7891,8 @@ fn monitor_cli_preset_wire(preset: MonitorCliPreset) -> haider_rpc::MonitorCliPr
 fn monitor_source_kind_wire(source: MonitorSourceKind) -> haider_rpc::MonitorSourceKindWire {
     match source {
         MonitorSourceKind::Sms => haider_rpc::MonitorSourceKindWire::Sms,
+        MonitorSourceKind::Task => haider_rpc::MonitorSourceKindWire::Task,
+        MonitorSourceKind::Agent => haider_rpc::MonitorSourceKindWire::Agent,
         MonitorSourceKind::Process => haider_rpc::MonitorSourceKindWire::Process,
         MonitorSourceKind::File => haider_rpc::MonitorSourceKindWire::File,
         MonitorSourceKind::Poll => haider_rpc::MonitorSourceKindWire::Poll,
@@ -7320,6 +7928,45 @@ fn monitor_filter_wire(filter: &MonitorFilter) -> haider_rpc::MonitorFilterWire 
     }
 }
 
+async fn monitor_source_owned(
+    hub: &SessionHub,
+    session: &SessionId,
+    source: &MonitorSource,
+) -> Result<bool, MonitorError> {
+    match source {
+        MonitorSource::Task { task_id } => {
+            // Client controls can arrive before a worker has adopted tasks.
+            // Consult this owner's journal even while recovery is filling
+            // the registry, without admitting another session's ids.
+            crate::tasks::TaskFacade::new(hub.clone())
+                .owns_task(session, &TaskId::new(task_id))
+                .await
+                .map_err(|error| MonitorError::Store(error.to_string()))
+        }
+        MonitorSource::Agent { agent_id } => hub
+            .delegation(AgentId::new(agent_id))
+            .await
+            .map(|record| record.is_some_and(|record| record.parent_session_id == *session))
+            .map_err(|error| MonitorError::Store(error.to_string())),
+        _ => Ok(true),
+    }
+}
+
+async fn monitor_source_rejection(
+    hub: &SessionHub,
+    session: &SessionId,
+    source: &MonitorSource,
+) -> Option<haider_rpc::MonitorControlRejectionWire> {
+    match monitor_source_owned(hub, session, source).await {
+        Ok(true) => None,
+        Ok(false) => Some(haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+            field: Some("source".into()),
+            detail: "source_not_owned: monitor source id is not owned by this session".into(),
+        }),
+        Err(error) => Some(monitor_store_rejection(error)),
+    }
+}
+
 fn monitor_action_wire(action: &MonitorAction) -> haider_rpc::MonitorActionWire {
     haider_rpc::MonitorActionWire {
         report: action.report,
@@ -7331,6 +7978,13 @@ fn monitor_occurrence_wire(occurrence: MonitorOccurrence) -> haider_rpc::Monitor
     match occurrence {
         MonitorOccurrence::Once => haider_rpc::MonitorOccurrenceWire::Once,
         MonitorOccurrence::Every => haider_rpc::MonitorOccurrenceWire::Every,
+    }
+}
+
+pub(crate) fn pending_monitor_report(value: &serde_json::Value) -> Option<MonitorReport> {
+    match MonitorJournalEvent::from_value(value)? {
+        MonitorJournalEvent::MonitorReportPending { pending } => Some(pending.report),
+        _ => None,
     }
 }
 
@@ -7377,6 +8031,12 @@ pub(crate) fn monitor_delivery_report(
                         body: sms.body,
                         received_at_ms: sms.received_at_ms,
                     },
+                    MonitorEventPayload::Task { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::Task { payload }
+                    }
+                    MonitorEventPayload::Agent { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::Agent { payload }
+                    }
                     MonitorEventPayload::Process {
                         line,
                         structured,
@@ -7602,6 +8262,10 @@ fn monitor_tool_error(error: MonitorError) -> ToolError {
     }
 }
 
+fn monitor_tool_operation_id(session: &SessionId, run: &RunId, call: &str) -> String {
+    stable_digest(&[session.as_str(), run.as_str(), call, "monitor-tool"])
+}
+
 fn stable_digest(parts: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in parts {
@@ -7646,6 +8310,8 @@ fn escape_monitor_attribute(value: &str) -> String {
 fn monitor_source_name(source: MonitorSourceKind) -> &'static str {
     match source {
         MonitorSourceKind::Sms => "sms",
+        MonitorSourceKind::Task => "task",
+        MonitorSourceKind::Agent => "agent",
         MonitorSourceKind::Process => "process",
         MonitorSourceKind::File => "file",
         MonitorSourceKind::Poll => "poll",
@@ -7673,6 +8339,8 @@ fn monitor_runtime_state_name(state: MonitorRuntimeState) -> &'static str {
 fn monitor_source_summary(source: &MonitorSource) -> String {
     match source {
         MonitorSource::Sms => "incoming SMS".into(),
+        MonitorSource::Task { task_id } => format!("task {task_id} completion"),
+        MonitorSource::Agent { agent_id } => format!("agent {agent_id} completion"),
         MonitorSource::Process { restart, .. } => {
             format!(
                 "process · restart {}",
@@ -7716,6 +8384,9 @@ fn next_fire_at_ms(registration: &MonitorRegistration) -> Option<u64> {
             ..
         } => Some(interval_ms.unwrap_or(5_000)),
         MonitorSource::Sms | MonitorSource::Process { .. } | MonitorSource::Cli { .. } => None,
+        MonitorSource::Task { .. } | MonitorSource::Agent { .. } => {
+            u64::try_from(MONITOR_HANDLE_POLL_INTERVAL.as_millis()).ok()
+        }
     }?;
     Some(now_ms().saturating_add(delay))
 }
@@ -7723,6 +8394,9 @@ fn next_fire_at_ms(registration: &MonitorRegistration) -> Option<u64> {
 fn event_summary(payload: &MonitorEventPayload) -> String {
     let summary = match payload {
         MonitorEventPayload::Sms(sms) => format!("SMS from {}", sms.address),
+        MonitorEventPayload::Task { payload } | MonitorEventPayload::Agent { payload } => {
+            payload.clone()
+        }
         MonitorEventPayload::Process {
             line,
             terminal,
@@ -7767,6 +8441,8 @@ fn trigger_payload(registration: &MonitorRegistration) -> MonitorEventPayload {
             body: payload,
             received_at_ms: i64::try_from(now_ms()).unwrap_or(i64::MAX),
         }),
+        MonitorSourceKind::Task => MonitorEventPayload::Task { payload },
+        MonitorSourceKind::Agent => MonitorEventPayload::Agent { payload },
         MonitorSourceKind::Process => MonitorEventPayload::Process {
             line: payload,
             structured: None,
@@ -7820,3 +8496,7 @@ mod completion_tests;
 #[cfg(test)]
 #[path = "monitor_tests.rs"]
 mod monitor_tests;
+
+#[cfg(test)]
+#[path = "stop_watch_ownership_tests.rs"]
+mod stop_watch_ownership_tests;

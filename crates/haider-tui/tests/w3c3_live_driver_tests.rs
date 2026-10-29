@@ -2061,6 +2061,135 @@ fn session_seen_acknowledgement_debounces_per_view_window() {
 }
 
 #[test]
+fn main_chips_chase_parent_events_child_heads_and_reconnect_without_rewinding() {
+    for supported in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("chip-refresh");
+        attach_all(&mut driver, &mut model, 1);
+        model.open_session(&sid(0));
+        model.screen = Screen::Session;
+        if supported {
+            model
+                .daemon_features
+                .insert(haider_rpc::FEATURE_SESSION_FLEET_V1.into());
+        }
+        let mut child =
+            haider_tui::app::ChipModel::from_manifest(&haider_protocol::agent::AgentManifest {
+                agent: AgentId::new("refresh-child"),
+                role: haider_protocol::agent::AgentRole::Subagent,
+                task: "test".into(),
+                callsign: None,
+                model_profile: "fake".into(),
+                grant: haider_protocol::agent::Grant {
+                    tools: vec![],
+                    effect_ceiling: vec![],
+                },
+                budget_tokens: None,
+                placement: haider_protocol::agent::Placement::Local,
+                lease: haider_protocol::ids::LeaseId::new("lease"),
+                fencing_epoch: 1,
+                attempt: 0,
+                parent: None,
+                coordinates: None,
+                cli_scope: None,
+            });
+        child.child_session = Some(sid(1).as_str().into());
+        model.chips = vec![child];
+        model.initial_session = Some(sid(99));
+        assert!(
+            driver
+                .apply(
+                    &mut model,
+                    LiveReply::RosterUpdated {
+                        sessions: vec![summary(2, 0)]
+                    }
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            model.initial_session,
+            Some(sid(99)),
+            "a delta cannot refuse an initial session before its paged baseline"
+        );
+        model.initial_session = None;
+        let event = || LiveReply::Event {
+            attachment: attachment(0),
+            session: sid(0),
+            envelope: Box::new(envelope(&sid(0), 1, &user("later child message"))),
+        };
+        let expected = if supported {
+            vec![LiveCommand::SessionFleet { session: sid(0) }]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            driver.apply(&mut model, event()),
+            expected,
+            "parent facts refresh chips on the main view"
+        );
+        assert!(
+            driver.apply(&mut model, event()).is_empty(),
+            "duplicate envelopes do not refresh"
+        );
+        let commands = driver.apply(
+            &mut model,
+            LiveReply::RosterUpdated {
+                sessions: vec![summary(1, 10)],
+            },
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, LiveCommand::SessionFleet { .. })),
+            "child updates fold while the read is in flight or unsupported"
+        );
+        if supported {
+            let fleet = haider_rpc::SessionFleetSnapshot {
+                session_id: sid(0),
+                generated_at_ms: 1,
+                node_limit: haider_rpc::FLEET_MAX_NODES,
+                depth_limit: haider_rpc::FLEET_MAX_DEPTH,
+                roots: vec![],
+                truncated: false,
+                rollup: haider_rpc::FleetRollupWire {
+                    node_count: 0,
+                    max_depth: 0,
+                    states: Default::default(),
+                    metrics: Default::default(),
+                    metrics_complete: false,
+                    complete: true,
+                },
+            };
+            assert_eq!(
+                driver.apply(
+                    &mut model,
+                    LiveReply::Fleet {
+                        snapshot: Box::new(fleet.clone())
+                    }
+                ),
+                expected,
+                "child-only advances request one chase on reply"
+            );
+            assert!(
+                driver
+                    .apply(
+                        &mut model,
+                        LiveReply::Fleet {
+                            snapshot: Box::new(fleet)
+                        }
+                    )
+                    .is_empty()
+            );
+            let resumed = driver.apply(&mut model, LiveReply::Reconnected);
+            assert!(
+                resumed.contains(&LiveCommand::SessionFleet { session: sid(0) }),
+                "main chips refresh on reconnect too"
+            );
+        }
+    }
+}
+
+#[test]
 fn real_driver_reattach_retains_every_pending_card_and_closes_each_once() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("synthetic-pending");

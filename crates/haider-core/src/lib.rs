@@ -86,12 +86,12 @@ pub use haider_store::{
     SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
     SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
     SessionSelectModelCommand, SessionSelectModelOutcome, SessionWorkspaceSetCommand,
-    SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SwitchedGraph,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus, TurnRetractCommand, TurnRetractOutcome,
-    TypedAgentInstallCancelResult, TypedAgentInstallCas, TypedAgentInstallItemCas,
-    TypedAgentInstallRetryResult, TypedAgentInstallSnapshot, TypedAgentInstallWatchPage,
-    TypedAgentInstallWatchResult,
+    SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, StopOperationClaim,
+    SubagentStopClaim, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    TurnRetractCommand, TurnRetractOutcome, TypedAgentInstallCancelResult, TypedAgentInstallCas,
+    TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
+    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptCompactionPlanRequest, PromptHistoryCache,

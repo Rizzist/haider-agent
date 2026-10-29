@@ -21,6 +21,131 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — subagent handles and stop semantics
+
+Owner decision 2026-09-25 (973-LANES.md, "subagent stop semantics"). All
+changes are additive; `schema_version` remains 1.
+
+- `spawn_subagent` gains optional `background` (return a durable handle at
+  once; the immediate result preview carries `status: "child_spawned"`, the
+  ids and `collect`/`list`/`cancel`/`cancel_all` CLI commands) and `wait_ms`
+  (bounds only the parent's observation, at most 86 400 000; never the child's
+  life). Both are omitted from recorded arguments when absent.
+- `tool_result.result.child_observation` is optional metadata with kind
+  `child_still_running` (fields `agent`, `parent_session_id`, `child_session_id`,
+  `child_run_id`, `progress`, `latest_progress_at_ms`, `wait_limit_ms`,
+  `collect`), returned when a `wait_ms` observation ends before the child; the
+  child keeps running and is collected with `haider agent wait`. It is outside
+  the strict legacy `data` enum so old readers retain the result preview and
+  history. Current readers also accept the earlier lane's `data` encoding;
+  existing `data` variants such as `tools_discovered` keep their wire shape.
+- Monitor sources gain `task` (`task_id`) and `agent` (`agent_id`), and
+  monitor events gain `task`/`agent` (`payload`, a completion digest), in the
+  tool vocabulary and on the wire (`MonitorSourceWire`,
+  `MonitorEventPayloadWire`; old clients decode them as `unknown`). Durable
+  Task/Agent registrations and pending reports with unsupported source/payload
+  variants use an old-readable `monitor_removed` fence (`reason: "removed"`)
+  with the complete replacement event in additive `monitor_v2` metadata in the
+  same envelope. Current readers restore that event; old readers safely omit
+  the unsupported watch and dismiss its obsolete completion actions, including
+  prior pending/coalesced revisions.
+- Stopping the main thread stops ONLY the main thread (TUI Esc,
+  `turn.cancel`, `haider run --stop-main`). Its subagents keep running; a
+  foreground subagent the stopped turn was waiting on continues in the
+  background. New extension item kinds on the parent session:
+  - `subagents_still_running_v1` — journalled by such a stop when subagents
+    live on: `parent_session_id`, `stopped_run_id`, `still_running` (live
+    subagents in the tree), bounded `agents` (`agent`, `task`,
+    `result_pending`) and `agents_truncated`; rendered to the next prompt as a
+    bounded user note.
+  - `detached_child_result_v1` — the detached waited-on child's result when it
+    finishes: `agent`, `task`, `stopped_run_id`, `state`
+    (`done`/`errored`/`cancelled`), `verified`, bounded `summary`,
+    `summary_truncated`. It is accompanied by the ordinary `agent_report`,
+    `agent_chip_state` and `child_result` item. It is steered into an active
+    parent run when one exists (the extension then has prompt=omit); otherwise
+    it is a prompt-visible note. Delivery never starts provider work. Optional
+    `reason` (`observation_ended`) marks a result delivered because a
+    `wait_ms` observation ended before the child; it is omitted for the
+    default `main_stopped`.
+  - `detached_delivery_v1` — the durable delivery obligation, one fact per
+    owed child and never truncated (`agent`, `phase` `owed`/`settled`,
+    optional `reason`); `render.ui` false, prompt=omit. A main-only stop
+    journals `owed` for every foreground child whose result the parent has
+    not recorded (whatever the child's state), as does an ended `wait_ms`
+    observation; startup recovery re-arms every `owed` child without a later
+    `detached_child_result_v1` or `settled` fact. `subagents_still_running_v1`
+    is a display list only.
+- RPC: `headless.run.stop` gains optional request `scope`
+  (`all` default and omitted, `main`, `subagents`); the response gains
+  optional `scope` (echo of a non-default scope) and `subagents`
+  (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`).
+  `haider run --stop` = `all`: the run plus every subagent in its tree,
+  however deep, found by session so children started in later child runs
+  (messaged `run-child-message-*` or monitor-woken) are included; their
+  monitors are removed. `--stop-main` = `main`; `--stop-subagents` =
+  `subagents`. An older daemon ignores `scope` (historical behaviour).
+- RPC: new method `agent.cancel_all` (`command_id`, `session_id`,
+  `worker_generation`) → `{session_id, stopped}`; `haider agent cancel
+  <session> --all`. It stops every subagent in the session's tree and removes
+  their monitors; the session's own runs are untouched. It is receipt-backed
+  (method `agent.cancel_all`): a committed command replays its response, a
+  stale `worker_generation` or a command id reused with other semantics is
+  refused before any monitor removal or cancel. `agent.cancel` likewise
+  validates generation and command identity before any side effect.
+- While a stop is in progress, monitor registration from the stopped
+  subagent's runs is refused (tool result status `subagent_stopping`) and its
+  monitor wakes are dismissed; a final monitor drain runs after the cancelled
+  runs settle.
+  Tool registrations retain their original task in additive
+  `monitor_owner_run_id` fact metadata. Older readers ignore this field.
+  Stops recover older tool registrations through their
+  deterministic tool-call identity, including helpers discovered during
+  settlement and expired sources with pending reports. Updates retain the
+  original ownership; independent client and later-task watches remain
+  separate. This changes no journal tag or schema version.
+- `agent.cancel` now stops only the named subagent (its original run, any
+  later live run, and its own monitors). Its children keep running; this
+  replaces the former recursive descendant sweep.
+- Welcome feature `run_stop_scope_v1` advertises scoped stops and
+  `agent.cancel_all`. Stops converge to terminal (never-launched children are
+  finalized as cancelled) and the `subagents` summary counts confirmed
+  cancellations; an auto-spawned daemon's idle linger is extended while any
+  run or owed delivery is live.
+
+### v0.0.973 — autonomy limits become explicit opt-ins
+
+Owner rule (2026-09-23): no DEFAULT cap stops productive automated work;
+limits exist only as explicit opt-ins, alongside cancellation and real
+no-progress detection. This part adds or removes no field or kind;
+`schema_version` remains 1.
+
+- `tool_script` `limits` (`OrchestrationLimitsV1`): `child_attempts`,
+  `script_wall_ms`, `child_wall_ms` and `no_progress_ms` are absent by default
+  (previously 64 / 120 000 / 30 000 / 30 000) and omitted from admitted
+  records when absent. Explicit values keep their meaning and have no ceiling
+  beyond "positive" (previously 256 / 300 000 / 120 000 / 60 000).
+  `no_progress_ms` now stops a child only when the window passes without the
+  session journal advancing (output, child updates, results); it is no longer
+  folded into the child wall. An ask's `wait_ms` bounds only the permission
+  answer window, not the permitted child's execution. New terminal
+  `reason_code` value `child_no_progress` (status `timed_out`). Activation
+  evidence records `deadline_ms`/`script_deadline_ms` =
+  18446744073709551615 (`u64::MAX`) when no explicit wall applies.
+- Graph templates: built-in and compiled Loom node `max_attempts` default to
+  4294967295 (`u32::MAX`, effectively unbounded; previously 8, Loom 4/3) and
+  validators accept any positive explicit value (previously at most 8). The
+  global 24-conditional-hop runtime bound is removed; only a pinned template's
+  explicit per-node `max_attempts` yields `rounds_exhausted`. The
+  repeated-red-fingerprint `no_progress` block is unchanged. Workflow
+  activation ASTs default `max_back_edge_activations` to 4294967295 and accept
+  any positive explicit value (previously at most 24). Legacy pinned values
+  (for example `max_attempts: 8`) are honoured as explicit bounds.
+- `GraphBrief` prompt text and CLI/TUI graph views print `attempt N` without
+  the former fixed `/8` denominator.
+- Subagent depth is unbounded by default. The `recursion_depth_limit` tool
+  rejection appears only when the operator sets `HAIDER_SUBAGENT_MAX_DEPTH`
+  to a positive integer; its `limit` field reports that configured value.
 ### v0.0.973 — durable run output pair
 
 Additive, UI-hidden and prompt-omitted extension `run_output_pair_pinned_v1` records

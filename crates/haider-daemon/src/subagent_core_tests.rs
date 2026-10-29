@@ -1,5 +1,294 @@
 #![allow(clippy::expect_used)]
 
+/// A client monitor registered after the immutable stop claim belongs to
+/// later independent work and must survive both stop paths. The pause is test-only and fixes the
+/// ordering, so this does not depend on scheduler timing.
+#[tokio::test]
+#[cfg(unix)]
+async fn stop_final_drain_preserves_independent_registration_after_first_listing_in_both_paths() {
+    for scope in ["tree", "named"] {
+        let harness = start_parked_child_with_wait_budgets(
+            &format!("final-drain-{scope}"),
+            ParkedChildMode::ParentWaitTimeoutHang,
+            Duration::from_secs(1),
+            Duration::from_millis(2_250),
+            Duration::from_millis(250),
+            Some(2_250),
+            None,
+        )
+        .await;
+        let child = harness.child.clone();
+        let monitor = harness.hub.inner_monitor();
+        let before = monitor
+            .client_register(
+                &harness.hub,
+                crate::monitor::MonitorClientRegistrationRequest {
+                    command_id: haider_rpc::CommandId::new(format!("before-first-drain-{scope}")),
+                    session_id: child.child_session_id.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    source: haider_rpc::MonitorSourceWire::Sms,
+                    filter: None,
+                    action: haider_rpc::MonitorActionWire {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                    lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                },
+            )
+            .await;
+        assert!(matches!(
+            before.outcome,
+            haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+        ));
+        let (arrived, resume) =
+            crate::delegation::pause_after_first_drain(&child.child_session_id, scope);
+        let hub = harness.hub.clone();
+        let parent = harness.parent_session.clone();
+        let stop = tokio::spawn(async move {
+            let coordinator = crate::delegation::DelegationHandle::new(hub.clone());
+            if scope == "tree" {
+                let stopped = coordinator
+                    .stop_subagent_tree(
+                        crate::delegation::SubagentTreeRoot::Session(parent),
+                        "test-final-drain-tree",
+                    )
+                    .await
+                    .expect("tree stop");
+                assert_eq!(
+                    stopped.monitors_removed, 1,
+                    "only the captured monitor is removed"
+                );
+            } else {
+                let request_json = serde_json::json!({
+                    "session_id": child.child_session_id,
+                    "run_id": child.child_run_id,
+                    "reason": "manual",
+                })
+                .to_string();
+                coordinator
+                    .cancel_single_subagent(
+                        &child,
+                        TurnCancelCommand {
+                            command_id: "test-final-drain-named".into(),
+                            request_digest: blake3::hash(request_json.as_bytes())
+                                .to_hex()
+                                .to_string(),
+                            request_json,
+                            session_id: child.child_session_id.clone(),
+                            worker_generation: hub.worker_generation(),
+                            run_id: child.child_run_id.clone(),
+                            cancelling_event_id: EventId::new("test-final-drain-named-cancelling"),
+                            device_id: hub.device_id(),
+                        },
+                        "test-final-drain-named",
+                    )
+                    .await
+                    .expect("named stop");
+            }
+        });
+        timeout(Duration::from_secs(15), arrived)
+            .await
+            .expect("first drain reached")
+            .expect("pause signalled");
+        assert!(
+            monitor
+                .stop_fences()
+                .session_fenced(&harness.child.child_session_id)
+        );
+        assert!(
+            !monitor
+                .stop_fences()
+                .session_fenced(&harness.parent_session),
+            "a stop fences only its child session, never the root"
+        );
+        let first_drained = monitor
+            .client_list(&harness.hub, harness.child.child_session_id.clone())
+            .await;
+        assert!(
+            matches!(first_drained.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()),
+            "first listing removed its initial monitor"
+        );
+        let receipt = monitor
+            .client_register(
+                &harness.hub,
+                crate::monitor::MonitorClientRegistrationRequest {
+                    command_id: haider_rpc::CommandId::new(format!("after-first-drain-{scope}")),
+                    session_id: harness.child.child_session_id.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    source: haider_rpc::MonitorSourceWire::Sms,
+                    filter: None,
+                    action: haider_rpc::MonitorActionWire {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                    lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                &receipt.outcome,
+                haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+            ),
+            "{scope}: {receipt:?}"
+        );
+        let listed = monitor
+            .client_list(&harness.hub, harness.child.child_session_id.clone())
+            .await;
+        assert!(
+            matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.len() == 1)
+        );
+        resume.send(()).expect("release stop");
+        timeout(Duration::from_secs(20), stop)
+            .await
+            .expect("stop completed")
+            .expect("stop task");
+        timeout(Duration::from_secs(15), async {
+            while monitor.stop_fences().session_fenced(&harness.child.child_session_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            loop {
+                let listed = monitor.client_list(&harness.hub, harness.child.child_session_id.clone()).await;
+                if matches!(listed.outcome, haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.len() == 1) {
+                    assert!(!monitor.stop_fences().session_fenced(&harness.child.child_session_id), "check after settlement");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("independent client monitor survives final drain");
+        harness.manager.shutdown().await.expect("manager shutdown");
+        harness.hub.shutdown().await.expect("hub shutdown");
+        harness.store.close().await.expect("store close");
+    }
+}
+
+/// Replaying the same committed named cancel while its first stop is paused
+/// keeps the session fenced and returns the same durable cancellation receipt.
+#[tokio::test]
+#[cfg(unix)]
+async fn exact_named_cancel_retry_keeps_fence_and_does_not_register_again() {
+    let harness = start_parked_child_with_wait_budgets(
+        "exact-named-stop-retry",
+        ParkedChildMode::ParentWaitTimeoutHang,
+        Duration::from_secs(1),
+        Duration::from_millis(2_250),
+        Duration::from_millis(250),
+        Some(2_250),
+        None,
+    )
+    .await;
+    let child = harness.child.clone();
+    let monitor = harness.hub.inner_monitor();
+    let before = monitor
+        .client_register(
+            &harness.hub,
+            crate::monitor::MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("retry-initial-monitor"),
+                session_id: child.child_session_id.clone(),
+                worker_generation: harness.hub.worker_generation(),
+                source: haider_rpc::MonitorSourceWire::Sms,
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    assert!(matches!(
+        before.outcome,
+        haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+    ));
+    let (arrived, resume) =
+        crate::delegation::pause_after_first_drain(&child.child_session_id, "named");
+    let request_json = serde_json::json!({
+        "session_id": child.child_session_id,
+        "run_id": child.child_run_id,
+        "reason": "manual",
+    })
+    .to_string();
+    let command = TurnCancelCommand {
+        command_id: "retry-exact-named-cancel".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: child.child_session_id.clone(),
+        worker_generation: harness.hub.worker_generation(),
+        run_id: child.child_run_id.clone(),
+        cancelling_event_id: EventId::new("retry-exact-named-cancelling"),
+        device_id: harness.hub.device_id(),
+    };
+    let coordinator = crate::delegation::DelegationHandle::new(harness.hub.clone());
+    let first_coordinator = coordinator.clone();
+    let first_child = child.clone();
+    let first_command = command.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .cancel_single_subagent(&first_child, first_command, "retry-exact-named")
+            .await
+            .expect("first cancel")
+    });
+    timeout(Duration::from_secs(15), arrived)
+        .await
+        .expect("first stop reaches drain")
+        .expect("pause signalled");
+    assert!(
+        monitor
+            .stop_fences()
+            .session_fenced(&child.child_session_id)
+    );
+    let replay = timeout(
+        Duration::from_secs(15),
+        coordinator.cancel_single_subagent(&child, command, "retry-exact-named"),
+    )
+    .await
+    .expect("exact retry completes")
+    .expect("exact retry accepted");
+    assert!(
+        monitor
+            .stop_fences()
+            .session_fenced(&child.child_session_id)
+    );
+    let listed = monitor
+        .client_list(&harness.hub, child.child_session_id.clone())
+        .await;
+    assert!(matches!(
+        listed.outcome,
+        haider_rpc::MonitorListOutcomeWire::Listed { ref monitors } if monitors.is_empty()
+    ));
+    resume.send(()).expect("release first stop");
+    let original = timeout(Duration::from_secs(20), first)
+        .await
+        .expect("first stop completed")
+        .expect("first stop task");
+    assert_eq!(
+        replay, original,
+        "an exact retry replays its committed receipt"
+    );
+    let journal = harness
+        .store
+        .read(&child.child_session_id, 0, 256)
+        .await
+        .expect("child monitor journal");
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|event| {
+                event.payload.get("type").and_then(|value| value.as_str())
+                    == Some("monitor_registered")
+            })
+            .count(),
+        1,
+        "retry must not register a monitor even if another drain could hide it"
+    );
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
 #[tokio::test]
 async fn public_workflow_catalog_human_templates_have_explicit_headless_refusal() {
     let root = tempfile::tempdir().expect("profile");
@@ -218,9 +507,18 @@ async fn public_spawn_establishment_restart(
         .await
         .expect("recovery");
     if parent_cancelled.is_some() {
+        let only_cancelled_delivery = |work: &[crate::turn_recovery::RecoveredWork]| {
+            work.len() <= 1
+                && work.iter().all(|work| {
+                    matches!(work,
+                    crate::turn_recovery::RecoveredWork::DetachedChildren(children)
+                        if children.agents.as_slice() == [(record.agent_id.clone(),
+                            haider_protocol::subagent_stop::DetachedReasonV1::MainStopped)])
+                })
+        };
         assert!(
-            work.is_empty(),
-            "abandoned parent and child must never resume"
+            only_cancelled_delivery(&work),
+            "abandoned parent and child may only collect the exact owed cancellation result"
         );
         let settled = store
             .delegation(record.agent_id.clone())
@@ -265,11 +563,19 @@ async fn public_spawn_establishment_restart(
             .latest_seq(&record.child_session_id)
             .await
             .expect("child head");
-        assert!(
+        let parent_head = store.latest_seq(&parent).await.expect("parent head");
+        let repeated =
             crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
                 .await
-                .expect("idempotent recovery")
-                .is_empty()
+                .expect("idempotent recovery");
+        assert!(
+            only_cancelled_delivery(&repeated),
+            "pending result collection remains recoverable without executable or duplicate work"
+        );
+        assert_eq!(
+            store.latest_seq(&parent).await.expect("parent head"),
+            parent_head,
+            "repeated recovery must not duplicate cancellation or delivery obligations"
         );
         assert_eq!(
             store
@@ -405,8 +711,6 @@ use crate::worker::{
     WorkerManager, WorkerToolContext,
 };
 use async_trait::async_trait;
-#[cfg(unix)]
-use haider_core::DeferredTicket;
 use haider_core::{
     BranchCreateCommand, CancelToken, EventIdGenerator, SessionCreateCommand, SqliteStoreHandle,
     StoreHandle, ToolDispatchResult, TurnAcceptCommand, TurnAdmissionDisposition,
@@ -459,11 +763,9 @@ use tokio::sync::watch;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, timeout};
 
-/// The delegation fallback is one absolute parent-run clock, even when a
-/// headless deadline lies farther away. MUTATION: cap `run_deadline - now` by
-/// 241s at each invocation and the second hop moves the deadline forward 60s.
+/// An explicit parent deadline is the only bound for a delegated wait.
 #[test]
-fn workflow_hops_do_not_refresh_the_delegation_wait_deadline() {
+fn explicit_parent_deadline_is_not_shortened_by_child_fallback() {
     let parent_started_at_ms = 1_000;
     let first_now_unix_ms = parent_started_at_ms;
     let first_now = tokio::time::Instant::now();
@@ -485,7 +787,7 @@ fn workflow_hops_do_not_refresh_the_delegation_wait_deadline() {
         Some(explicit_parent_deadline),
     );
 
-    assert_eq!(first_hop_deadline, first_now + fallback);
+    assert_eq!(first_hop_deadline, explicit_parent_deadline);
     assert_eq!(second_hop_deadline, first_hop_deadline);
 }
 
@@ -1220,6 +1522,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         auto_hermetic: false,
     };
     let request = SpawnSubagent {
+        background: false,
+        wait_ms: None,
         request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
             tranche: 40,
             hard_cap: 96,
@@ -1658,6 +1962,8 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "parser audit".into(),
                 prompt: "inspect the parser state machine".into(),
@@ -1923,6 +2229,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "first pass".into(),
                 prompt: "finish once".into(),
@@ -2207,6 +2515,8 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
                     tranche: 1,
                     hard_cap: 1,
@@ -2397,6 +2707,8 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 },
             },
             SpawnSubagent {
+                background: false,
+                wait_ms: None,
                 request_budget: None,
                 task: "owned child".into(),
                 prompt: "do not cross parents".into(),
@@ -2993,7 +3305,24 @@ async fn wait_for_state(
     session_id: &SessionId,
     expected: impl Fn(&RunState) -> bool,
 ) {
-    let observed = timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+    wait_for_state_within(
+        store,
+        session_id,
+        haider_platform::TEST_WAIT_TIMEOUT,
+        expected,
+    )
+    .await;
+}
+
+/// Multi-level delegation callers can select an explicit observation window.
+/// The caller still asserts the durable state it expects.
+async fn wait_for_state_within(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    within: Duration,
+    expected: impl Fn(&RunState) -> bool,
+) {
+    let observed = timeout(within, async {
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
@@ -3261,9 +3590,12 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
 enum ParkedChildMode {
     Complete,
     StallAfterApproval,
+    ParentWaitTimeout,
+    ParentWaitTimeoutHang,
 }
 
 #[cfg(unix)]
@@ -3292,6 +3624,7 @@ async fn start_parked_child(
         Duration::from_secs(241),
         Duration::from_secs(1),
         None,
+        None,
     )
     .await
 }
@@ -3303,15 +3636,20 @@ async fn start_parked_child_with_wait_budgets(
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    observation_wait_ms: Option<u64>,
     stall_clock: Option<Arc<StallDeadlineTestClock>>,
 ) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut spawn_args = serde_json::json!({"task":"permission","prompt":"run one command"});
+    if let Some(wait_ms) = observation_wait_ms {
+        spawn_args["wait_ms"] = serde_json::json!(wait_ms);
+    }
     let mut script = vec![
         FakeStep::EmitToolCall {
             call_id: format!("{label}-spawn"),
             name: "spawn_subagent".into(),
-            args: serde_json::json!({"task":"permission","prompt":"run one command"}),
+            args: spawn_args,
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
@@ -3329,12 +3667,12 @@ async fn start_parked_child_with_wait_budgets(
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        FakeStep::ExpectToolResult {
-            call_id: format!("{label}-ask"),
-        },
     ];
     match mode {
         ParkedChildMode::Complete => script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-ask"),
+            },
             FakeStep::EmitText {
                 text: "child continued after permission".into(),
             },
@@ -3342,19 +3680,48 @@ async fn start_parked_child_with_wait_budgets(
                 reason: FinishReason::EndTurn,
             },
         ]),
-        ParkedChildMode::StallAfterApproval => script.push(FakeStep::Hang),
+        ParkedChildMode::StallAfterApproval => script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-ask"),
+            },
+            FakeStep::Hang,
+        ]),
+        ParkedChildMode::ParentWaitTimeout | ParkedChildMode::ParentWaitTimeoutHang => {
+            // The child is still parked. The next provider request belongs to
+            // the parent and must consume the bounded spawn observation.
+            script.push(FakeStep::ExpectToolResult {
+                call_id: format!("{label}-spawn"),
+            });
+            if matches!(mode, ParkedChildMode::ParentWaitTimeoutHang) {
+                script.push(FakeStep::Hang);
+            } else {
+                script.extend([
+                    FakeStep::EmitText {
+                        text: "parent received a live child handle".into(),
+                    },
+                    FakeStep::Finish {
+                        reason: FinishReason::EndTurn,
+                    },
+                ]);
+            }
+        }
     }
-    script.extend([
-        FakeStep::ExpectToolResult {
-            call_id: format!("{label}-spawn"),
-        },
-        FakeStep::EmitText {
-            text: "parent collected permission child".into(),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::EndTurn,
-        },
-    ]);
+    if !matches!(
+        mode,
+        ParkedChildMode::ParentWaitTimeout | ParkedChildMode::ParentWaitTimeoutHang
+    ) {
+        script.extend([
+            FakeStep::ExpectToolResult {
+                call_id: format!("{label}-spawn"),
+            },
+            FakeStep::EmitText {
+                text: "parent collected permission child".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]);
+    }
     let provider = Arc::new(FakeProvider::new(script));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let manager = WorkerManager::start(
@@ -3373,6 +3740,7 @@ async fn start_parked_child_with_wait_budgets(
                     settlement_tail_timeout,
                     clock,
                 ),
+                None if observation_wait_ms.is_some() => DelegationHandle::new(hub.clone()),
                 None => DelegationHandle::with_wait_budgets(
                     hub.clone(),
                     stall_deadline,
@@ -3629,6 +3997,38 @@ impl UdsControlClient {
         }
     }
 
+    async fn cancel_turn(
+        &mut self,
+        session_id: SessionId,
+        run_id: RunId,
+        worker_generation: u64,
+    ) -> haider_rpc::CancelStatus {
+        let request_id = RequestId::new("detached-parent-cancel");
+        self.send(WireFrame::Request {
+            request_id: request_id.clone(),
+            body: RequestBody::TurnCancel {
+                command_id: CommandId::new("detached-parent-cancel-command"),
+                session_id,
+                worker_generation,
+                run_id,
+            },
+        })
+        .await;
+        loop {
+            match self.next().await {
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::TurnCancel { status, .. },
+                } if observed == request_id => return status,
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::Error { code, message, .. },
+                } if observed == request_id => panic!("parent cancel failed: {code}: {message}"),
+                _ => {}
+            }
+        }
+    }
+
     async fn answer_question(
         &mut self,
         session_id: SessionId,
@@ -3799,6 +4199,7 @@ async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
         Duration::from_millis(300),
         Duration::from_secs(241),
         Duration::from_secs(1),
+        None,
         Some(Arc::clone(&stall_clock)),
     )
     .await;
@@ -4133,6 +4534,10 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                 .await
                 .expect("recover delegation mirror"),
+            RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
+                .rearm_detached_deliveries(&recovered.agents)
+                .await
+                .expect("re-arm detached deliveries"),
         }
     }
     assert!(recovered_parent && recovered_child);
@@ -4164,6 +4569,18 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
 #[tokio::test]
 #[cfg(unix)]
 async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
+    assert_cancellation_mirror_handoff_recovery(Duration::from_secs(2)).await;
+}
+
+/// An expired legacy handoff is reconciled before startup admits live collectors.
+#[tokio::test]
+#[cfg(unix)]
+async fn expired_cancellation_mirror_handoff_survives_restart() {
+    assert_cancellation_mirror_handoff_recovery(Duration::ZERO).await;
+}
+
+#[cfg(unix)]
+async fn assert_cancellation_mirror_handoff_recovery(budget: Duration) {
     use crate::delegation::DelegationMirrorHandoffPhase;
     use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 
@@ -4186,7 +4603,7 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     first_manager.crash().await;
 
     let handoff = DelegationHandle::new(first_hub.clone())
-        .begin_terminal_mirror_handoff_for_test(&child, Duration::from_secs(2))
+        .begin_terminal_mirror_handoff_for_test(&child, budget)
         .await
         .expect("journal pending terminal-mirror handoff");
     let mut parent_cancelling = [EventEnvelope {
@@ -4243,11 +4660,20 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
             .await
             .expect("first recovered child journal"),
     );
-    assert!(
-        first_child_payloads
-            .iter()
-            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
-    );
+    let cancelled = first_child_payloads
+        .iter()
+        .position(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+        .expect("recovery commits child cancellation");
+    let idle = first_child_payloads
+        .iter()
+        .position(|payload| {
+            matches!(
+                payload,
+                EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. })
+            )
+        })
+        .expect("recovery commits the child idle fence");
+    assert!(idle > cancelled, "child idle follows cancellation");
     drop(first_recovered);
     first_recovered_store
         .close()
@@ -4291,9 +4717,9 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     hub.install_worker_manager(manager.handle())
         .expect("install recovery manager");
     timeout(
-        // Registry #94: the persisted 2s deadline already spent the first
-        // restart + 100ms crash window; 2.5s is only the outer scheduling
-        // allowance and the recovered payload must retain the original bound.
+        // The persisted deadline includes the first restart and crash window.
+        // This is only the outer scheduling watchdog; the recovered handoff
+        // must retain the original deadline, including an already expired one.
         Duration::from_millis(2_500),
         DelegationHandle::new(hub.clone())
             .recover_terminal_mirror_handoff(recovered_mirror.record, recovered_mirror.handoff),
@@ -4338,15 +4764,11 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
     final_store.close().await.expect("final store close");
 }
 
-/// MUTATION CHECK: remove `bounded_wait` around the delegated active wait.
-/// Expected RUNTIME failure: the external fixture watchdog catches a parent
-/// that remains Waiting(LocalChild). Returning token/tool
-/// counters as completion also fails because the typed timeout disappears.
+/// A bounded observation returns a handle while the child remains answerable.
 #[tokio::test(start_paused = true)]
 #[cfg(unix)]
-async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
-    // Real store work must not consume the policy clock during startup or
-    // delivery. The external test runner bounds a genuinely stuck fixture.
+async fn unanswered_delegated_question_returns_child_still_running() {
+    // Keep fixture policy time fixed while real store work settles.
     let clock_guard = tokio::spawn(async {
         loop {
             tokio::task::yield_now().await;
@@ -4355,10 +4777,11 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     let wait_clock = Arc::new(StallDeadlineTestClock::for_paused_wait_deadline());
     let harness = start_parked_child_with_wait_budgets(
         "unanswered-bound",
-        ParkedChildMode::Complete,
+        ParkedChildMode::ParentWaitTimeout,
         Duration::from_secs(1),
         Duration::from_millis(2_250),
         Duration::from_millis(250),
+        Some(2_250),
         Some(wait_clock),
     )
     .await;
@@ -4369,52 +4792,15 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
     )
     .await;
 
-    // Expire the absolute active wait only after the parked child and its
-    // forwarded parent menu are durable, independent of host scheduling.
     tokio::time::advance(Duration::from_millis(2_250)).await;
-
     wait_for_state(&harness.store, &harness.parent_session, |state| {
-        *state == RunState::Errored
+        *state == RunState::Done
     })
     .await;
     wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
-        *state == RunState::Cancelled
+        matches!(state, RunState::InputRequired { .. })
     })
     .await;
-    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
-        loop {
-            let events = harness
-                .store
-                .read(&harness.child.child_session_id, 0, 1024)
-                .await
-                .expect("timed-out child journal");
-            let cancelled = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
-                })
-            });
-            let idle = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(
-                        payload,
-                        EventPayload::SessionState(
-                            haider_protocol::state::SessionState::Idle { .. }
-                        )
-                    )
-                })
-            });
-            if cancelled
-                .zip(idle)
-                .is_some_and(|(cancelled, idle)| idle > cancelled)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("timed-out child is cancelled and reaped to Idle");
-
     let parent_payloads = typed_payloads(
         &harness
             .store
@@ -4422,94 +4808,199 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
             .await
             .expect("timed-out parent journal"),
     );
-    assert!(parent_payloads.iter().any(|payload| matches!(
-        payload,
-        EventPayload::RunFailed { code: ErrorCode::ProviderTimeout, presentation: Some(presentation), .. }
-            if presentation.subcode.as_str() == "delegated-child-wait-timeout"
+    assert!(parent_payloads.iter().any(|payload| matches!(payload,
+        EventPayload::ToolResult { result, .. }
+            if result.preview.contains("child_still_running")
+                && result.preview.contains(harness.child.agent_id.as_str())
+                && matches!(&result.data,
+                    Some(haider_protocol::tool::ToolResultData::ChildStillRunning { agent, collect, .. })
+                        if agent == &harness.child.agent_id && collect.contains("haider agent wait"))
     )));
+    assert!(
+        !parent_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let child_payloads = typed_payloads(
+        &harness
+            .store
+            .read(&harness.child.child_session_id, 0, 1024)
+            .await
+            .expect("detached child journal"),
+    );
+    assert!(
+        !child_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+    );
 
-    harness.manager.shutdown().await.expect("manager shutdown");
-    harness.hub.shutdown().await.expect("hub shutdown");
-    harness.store.close().await.expect("store close");
+    // Completing the parent did not cancel its detached child. Owner
+    // decision 2026-09-25: turn.cancel of that completed run is a main-only
+    // stop and leaves the child running (this assertion previously required
+    // the opposite cascade); the explicit stop-all walk reaches it.
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control.attach_control(harness.parent_session.clone()).await;
+    let status = control
+        .cancel_turn(
+            harness.parent_session.clone(),
+            harness.child.parent_run_id.clone(),
+            harness.hub.worker_generation(),
+        )
+        .await;
+    assert_eq!(status, haider_rpc::CancelStatus::AlreadyTerminal);
+    tokio::time::advance(Duration::from_millis(250)).await;
+    assert!(
+        !typed_payloads(
+            &harness
+                .store
+                .read(&harness.child.child_session_id, 0, 1024)
+                .await
+                .expect("detached child journal"),
+        )
+        .iter()
+        .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled))),
+        "a main-only stop must not cancel the detached child"
+    );
     clock_guard.abort();
     let _ = clock_guard.await;
-}
-
-/// MUTATION CHECK: send the exhausted path through `bounded_wait(0, cancel)`
-/// instead of its nonblocking persist-before-wake enqueue. Expected runtime
-/// failure: Tokio never polls the cancellation future and the child remains
-/// InputRequired rather than reaching Cancelled and the following Idle fence.
-#[tokio::test]
-#[cfg(unix)]
-async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
-    let harness = start_parked_child(
-        "expired-cancel",
-        ParkedChildMode::Complete,
-        Duration::from_secs(30),
-    )
-    .await;
-    let ticket = DeferredTicket {
-        id: harness.child.agent_id.as_str().to_owned(),
-        manifest: harness.child.manifest.clone(),
-    };
-    timeout(
-        // The production run deadline is already zero. This watchdog bounds
-        // the durable handoff receipt without extending the child-wait budget.
-        haider_platform::TEST_WAIT_TIMEOUT,
-        DelegationHandle::new(harness.hub.clone())
-            .cancel_ticket(&ticket, Some(tokio::time::Instant::now())),
-    )
-    .await
-    .expect("expired cleanup handoff returns without extending the run deadline")
-    .expect("expired cleanup handoff is durably owned");
-
+    let stopped = crate::delegation::DelegationHandle::new(harness.hub.clone())
+        .stop_subagent_tree(
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: harness.parent_session.clone(),
+                run_id: harness.child.parent_run_id.clone(),
+            },
+            "test-stop-all",
+        )
+        .await
+        .expect("stop-all walk");
+    assert_eq!(stopped.cancelled_runs, 1);
     wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
         *state == RunState::Cancelled
     })
     .await;
-    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
-        loop {
-            let events = harness
-                .store
-                .read(&harness.child.child_session_id, 0, 1024)
-                .await
-                .expect("expired cancellation child journal");
-            let cancelled = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
-                })
-            });
-            let idle = events.iter().position(|event| {
-                event.payload.decode_event().is_ok_and(|payload| {
-                    matches!(
-                        payload,
-                        EventPayload::SessionState(
-                            haider_protocol::state::SessionState::Idle { .. }
-                        )
-                    )
-                })
-            });
-            if cancelled
-                .zip(idle)
-                .is_some_and(|(cancelled, idle)| idle > cancelled)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("zero-remaining cancellation reaps the live child without restart");
+    control.close().await;
 
     harness.manager.shutdown().await.expect("manager shutdown");
     harness.hub.shutdown().await.expect("hub shutdown");
     harness.store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: remove the nudge step or allow a second nudge. Expected
-/// runtime failure: the exact durable nudge count is not one. MUTATION CHECK:
-/// remove the grace cancellation. Expected runtime failure: the parent never
-/// reaches Done with the stall-reason report.
+#[tokio::test]
+#[cfg(unix)]
+async fn cancelling_parent_after_wait_ms_detach_leaves_child_running() {
+    // Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"):
+    // turn.cancel (TUI Esc) stops ONLY the main thread. This test previously
+    // asserted the opposite cascade (`..._cancels_child`); it now pins that
+    // the wait_ms-detached child keeps running and that the stop journals
+    // the durable still-running marker with the child's result owed.
+    let harness = start_parked_child_with_wait_budgets(
+        "detached-cancel",
+        ParkedChildMode::ParentWaitTimeoutHang,
+        Duration::from_secs(1),
+        Duration::from_millis(2_250),
+        Duration::from_millis(250),
+        Some(2_250),
+        None,
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let payloads = typed_payloads(
+                &harness
+                    .store
+                    .read(&harness.parent_session, 0, 1024)
+                    .await
+                    .expect("parent journal"),
+            );
+            if payloads.iter().any(|payload| matches!(payload,
+                EventPayload::ToolResult { result, .. }
+                    if matches!(&result.data, Some(haider_protocol::tool::ToolResultData::ChildStillRunning { .. }))
+            )) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached handle returned to parent");
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control.attach_control(harness.parent_session.clone()).await;
+    let status = control
+        .cancel_turn(
+            harness.parent_session.clone(),
+            harness.child.parent_run_id.clone(),
+            harness.hub.worker_generation(),
+        )
+        .await;
+    assert_eq!(status, haider_rpc::CancelStatus::Accepted);
+    wait_for_state_within(
+        &harness.store,
+        &harness.parent_session,
+        Duration::from_secs(30),
+        |state| *state == RunState::Cancelled,
+    )
+    .await;
+    let marker = timeout(Duration::from_secs(30), async {
+        loop {
+            let marker = typed_payloads(
+                &harness
+                    .store
+                    .read(&harness.parent_session, 0, 1024)
+                    .await
+                    .expect("parent journal"),
+            )
+            .into_iter()
+            .find_map(|payload| match payload {
+                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                    haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                        &item,
+                    )
+                }
+                _ => None,
+            });
+            if let Some(marker) = marker {
+                break marker;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("still-running marker journalled by the main-only stop");
+    assert_eq!(marker.still_running, 1);
+    assert_eq!(marker.agents.len(), 1);
+    assert_eq!(marker.agents[0].agent, harness.child.agent_id);
+    assert!(marker.agents[0].result_pending);
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let child_live = harness
+        .store
+        .read(&harness.child.child_session_id, 0, 1024)
+        .await
+        .expect("child journal")
+        .iter()
+        .rev()
+        .find_map(|envelope| match envelope.payload.decode_event() {
+            Ok(EventPayload::RunState(state)) => Some(state),
+            _ => None,
+        })
+        .is_some_and(|state| !state.is_terminal() && state != RunState::Cancelling);
+    assert!(
+        child_live,
+        "the detached child must keep running after a main-only stop"
+    );
+    control.close().await;
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
+// Owner decision 2026-09-25: the parent-cleanup cancellation path
+// (`cancel_ticket` / "cleanup_fallback" handoff) was removed — a stopped
+// parent detaches its children instead of cancelling them — so the former
+// `expired_cancellation_handoff_reaps_live_child_without_restart` pin has no
+// production path left. Legacy recovery is covered with both live and expired
+// deadlines by `assert_cancellation_mirror_handoff_recovery`.
+
 #[tokio::test]
 #[cfg(unix)]
 async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() {
@@ -4604,6 +5095,111 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
         )
     }));
 
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn default_stall_nudge_is_once_and_never_cancels_child() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "nudge-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"stall","prompt":"stay active"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Hang,
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: delegation_tool_factory(),
+            delegation: Some(DelegationHandle::with_nudge_deadline(
+                hub.clone(),
+                Duration::from_millis(35),
+            )),
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let parent = SessionId::new("nudge-only-parent");
+    let run = RunId::new("nudge-only-run");
+    manager
+        .handle()
+        .submit(accept_parent(&hub, &parent, &run, "nudge-only").await)
+        .await
+        .expect("submit parent");
+    let child = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = hub
+                .delegations_for_parent_run(parent.clone(), run.clone())
+                .await
+                .expect("delegations")
+                .pop()
+            {
+                let payloads = typed_payloads(
+                    &store
+                        .read(&child.child_session_id, 0, 1024)
+                        .await
+                        .expect("child journal"),
+                );
+                if payloads.iter().any(|payload| matches!(payload,
+                    EventPayload::UserMessage { text, .. } if text == "report your status or conclude"
+                )) {
+                    break child;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("production nudge");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let payloads = typed_payloads(
+        &store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child journal"),
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload,
+                EventPayload::UserMessage { text, .. } if text == "report your status or conclude"
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+    );
+    let request_json =
+        serde_json::json!({"session_id":parent,"run_id":run,"reason":"test-cleanup"}).to_string();
+    hub.cancel_internal_turn(TurnCancelCommand {
+        command_id: "nudge-only-cleanup".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: parent,
+        worker_generation: hub.worker_generation(),
+        run_id: run,
+        cancelling_event_id: EventId::new("nudge-only-cancelling"),
+        device_id: DeviceId::new("nudge-only-device"),
+    })
+    .await
+    .expect("cancel parent");
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
@@ -4957,12 +5553,23 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: remove the coordinator's cancellation sweep or the bound
-/// around terminal mirroring's first wait. Expected runtime failure: the
-/// parent reaches Cancelled while its child remains Streaming, or the mirror
-/// task exceeds its production bound below.
+/// Owner decision 2026-09-25 (973-LANES.md "subagent stop semantics"): this
+/// test previously required a parent cancel to cancel the waited-on child
+/// through the `cleanup_fallback` handoff. A parent stop now DETACHES the
+/// child: the parent cancel completes, the child keeps running, and the
+/// durable owed-delivery fact and still-running marker are journalled.
+/// The explicit stop-all walk then cancels the child, whose terminal metrics
+/// still mirror to the parent through the detached-delivery watcher.
+///
+/// MUTATION CHECK: restore the cancel cascade in `detach_outstanding_deferred`
+/// or drop the watcher's terminal mirror tail. Expected runtime failure: the
+/// child is Cancelled by the parent stop, or no terminal metrics mirror.
 #[tokio::test]
-async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
+async fn cancel_while_waiting_on_child_detaches_it_within_bound() {
+    use haider_protocol::subagent_stop::{
+        DetachedDeliveryPhaseV1, DetachedDeliveryV1, DetachedReasonV1,
+    };
+
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -5022,8 +5629,8 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     })
     .to_string();
     timeout(
-        // Observe cancellation completion independently of scheduler delay;
-        // the configured one-second terminal-mirror tail remains unchanged.
+        // Observe the main-only stop without making it wait for the live
+        // child; this deadline bounds the fixture's scheduling wait.
         haider_platform::TEST_WAIT_TIMEOUT,
         hub.cancel_internal_turn(TurnCancelCommand {
             command_id: "cancel-w6c-parent".into(),
@@ -5037,56 +5644,94 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
         }),
     )
     .await
-    .expect("parent cancellation completes inside the terminal-mirror bound")
+    .expect("parent cancellation completes without waiting for its child")
     .expect("cancel parent");
-    timeout(
-        // The production cleanup fallback keeps its one-second terminal
-        // tail. Observe its durable completion independently of scheduling.
-        haider_platform::TEST_WAIT_TIMEOUT,
-        async {
-            loop {
-                let events = store
-                    .read(&child.child_session_id, 0, 1024)
-                    .await
-                    .expect("production fallback handoff journal");
-                let mut pending = std::collections::HashSet::new();
-                let mut completed = std::collections::HashSet::new();
-                for event in events {
-                    let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                        event.payload.decode_event()
-                    else {
-                        continue;
-                    };
-                    let Some(handoff) =
-                        crate::delegation::DelegationMirrorHandoff::from_item(&item)
-                    else {
-                        continue;
-                    };
-                    if handoff.source != "cleanup_fallback" {
-                        continue;
+    timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        loop {
+            let owed = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("parent detached-delivery journal")
+                .iter()
+                .filter_map(|event| match event.payload.decode_event() {
+                    Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                        DetachedDeliveryV1::from_extension_item(&item)
                     }
-                    match handoff.phase {
-                        crate::delegation::DelegationMirrorHandoffPhase::Pending => {
-                            pending.insert(handoff.handoff_id);
-                        }
-                        crate::delegation::DelegationMirrorHandoffPhase::Completed => {
-                            completed.insert(handoff.handoff_id);
-                        }
-                    }
-                }
-                if pending.iter().any(|id| completed.contains(id)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
+                    _ => None,
+                })
+                .any(|delivery| {
+                    delivery.agent == child.agent_id
+                        && delivery.phase == DetachedDeliveryPhaseV1::Owed
+                        && delivery.reason == DetachedReasonV1::MainStopped
+                });
+            if owed {
+                break;
             }
-        },
-    )
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("production cleanup mirror commits completion inside its bound");
+    .expect("main-only stop durably owes the detached child's result");
     wait_for_state(&store, &parent_session, |state| {
         *state == RunState::Cancelled
     })
     .await;
+    let marker = timeout(Duration::from_secs(5), async {
+        loop {
+            let found = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("parent journal")
+                .iter()
+                .find_map(|event| match event.payload.decode_event() {
+                    Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) => {
+                        haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                            &item,
+                        )
+                    }
+                    _ => None,
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("main-only stop journals the still-running marker");
+    assert_eq!(marker.still_running, 1);
+    assert!(
+        marker
+            .agents
+            .iter()
+            .any(|agent| agent.agent == child.agent_id && agent.result_pending)
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child journal")
+            .iter()
+            .any(|event| event.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::RunState(RunState::Cancelling | RunState::Cancelled)
+                )
+            })),
+        "a parent stop must not cancel the waited-on child"
+    );
+    let stopped = crate::delegation::DelegationHandle::new(hub.clone())
+        .stop_subagent_tree(
+            crate::delegation::SubagentTreeRoot::Run {
+                session_id: parent_session.clone(),
+                run_id: RunId::new("w6c-cancel-parent-run"),
+            },
+            "w6c-stop-all",
+        )
+        .await
+        .expect("explicit stop-all");
+    assert_eq!(stopped.cancelled_runs, 1);
     wait_for_state(&store, &child.child_session_id, |state| {
         *state == RunState::Cancelled
     })
@@ -5168,12 +5813,13 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
     store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: reset depth to one for recursive children, remove the cap,
-/// or return a dispatcher error at the cap. Expected runtime failure: the
-/// ancestry chain/depths differ, a fourth delegation appears, or the root
-/// turn does not reach Done after receiving the typed cap result.
+/// MUTATION CHECK: reset depth to one for recursive children, ignore the
+/// explicit opt-in cap, or return a dispatcher error at the cap. Expected
+/// runtime failure: the ancestry chain/depths differ, a fourth delegation
+/// appears, or the root turn does not reach Done after receiving the typed
+/// cap result. Depth is unbounded by default; this pins the OPT-IN cap.
 #[tokio::test]
-async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error() {
+async fn opt_in_depth_cap_three_rejects_depth_four_as_a_typed_continuable_error() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -5255,7 +5901,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
                 provider: provider.clone(),
             }),
             tool_factory: delegation_tool_factory(),
-            delegation: None,
+            delegation: Some(DelegationHandle::with_max_depth(hub.clone(), Some(3))),
             web_search: None,
         },
         false,
@@ -5267,7 +5913,10 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
     let parent_run = RunId::new("w6c-recursion-root-run");
     let accepted = accept_parent(&hub, &parent_session, &parent_run, "w6c-recursion").await;
     manager_handle.submit(accepted).await.expect("submit root");
-    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+    wait_for_state_within(&store, &parent_session, Duration::from_secs(60), |state| {
+        *state == RunState::Done
+    })
+    .await;
 
     let depth_one = hub
         .delegations_for_parent_run(parent_session.clone(), parent_run)
@@ -5324,6 +5973,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
                     Block::ToolResult { call_id, preview, .. }
                         if call_id == "depth-4-rejected"
                             && preview.contains("recursion_depth_limit")
+                            && preview.contains("\"limit\":3")
                 )
             })
         })
@@ -5332,6 +5982,135 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// OWNER RULE (no default caps for automated agents): with no opt-in cap,
+/// a five-deep delegation chain establishes every level, each child reports
+/// to its parent, and the root turn completes productively.
+/// MUTATION CHECK: restore any default depth ceiling below five. Expected
+/// failure: a level is missing and the root never merges the chain.
+#[tokio::test]
+async fn default_subagent_depth_is_unbounded_five_deep_chain_completes() {
+    const DEPTH: u32 = 5;
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut steps = Vec::new();
+    for level in 1..=DEPTH {
+        steps.push(FakeStep::EmitToolCall {
+            call_id: format!("depth-{level}"),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": format!("depth-{level}"),
+                "prompt": format!("work at depth {level}")
+            }),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        });
+    }
+    steps.push(FakeStep::EmitText {
+        text: format!("depth {DEPTH} leaf report"),
+    });
+    steps.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    for level in (1..=DEPTH).rev() {
+        steps.push(FakeStep::ExpectToolResult {
+            call_id: format!("depth-{level}"),
+        });
+        steps.push(FakeStep::EmitText {
+            text: format!("merged depth {level}"),
+        });
+        steps.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: delegation_tool_factory(),
+            delegation: Some(DelegationHandle::with_max_depth(hub.clone(), None)),
+            web_search: None,
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new("depth-unbounded-root");
+    let parent_run = RunId::new("depth-unbounded-root-run");
+    let accepted = accept_parent(&hub, &parent_session, &parent_run, "depth-unbounded").await;
+    manager_handle.submit(accepted).await.expect("submit root");
+    wait_for_state_within(&store, &parent_session, Duration::from_secs(60), |state| {
+        *state == RunState::Done
+    })
+    .await;
+
+    let (mut session, mut run) = (parent_session.clone(), parent_run.clone());
+    let mut parent_agent = None;
+    for level in 1..=DEPTH {
+        let row = hub
+            .delegations_for_parent_run(session.clone(), run.clone())
+            .await
+            .expect("level rows")
+            .pop()
+            .unwrap_or_else(|| panic!("depth {level} delegation must exist"));
+        assert_eq!(row.depth, level);
+        assert_eq!(row.root_session_id, parent_session);
+        assert_eq!(row.parent_agent_id, parent_agent);
+        assert!(
+            row.report.is_some(),
+            "depth {level} must report to its parent"
+        );
+        parent_agent = Some(row.agent_id.clone());
+        session = row.child_session_id;
+        run = row.child_run_id;
+    }
+    assert!(
+        hub.delegations_for_parent_run(session, run)
+            .await
+            .expect("leaf children")
+            .is_empty()
+    );
+    let requests = provider.requests();
+    for level in 1..=DEPTH {
+        let call = format!("depth-{level}");
+        assert!(
+            requests.iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message.blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            Block::ToolResult { call_id, preview, .. }
+                                if *call_id == call && !preview.contains("recursion_depth_limit")
+                        )
+                    })
+                })
+            }),
+            "depth {level} must return a child report, not a depth rejection"
+        );
+    }
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[test]
+fn subagent_max_depth_env_is_an_explicit_opt_in() {
+    use crate::delegation::configured_max_depth;
+    assert_eq!(configured_max_depth(None), None);
+    assert_eq!(configured_max_depth(Some("")), None);
+    assert_eq!(configured_max_depth(Some("0")), None);
+    assert_eq!(configured_max_depth(Some("not-a-number")), None);
+    assert_eq!(configured_max_depth(Some(" 7 ")), Some(7));
+    assert_eq!(configured_max_depth(Some("64")), Some(64));
 }
 
 /// HARD-CAP E2 LAW: after 512 durable live children across unrelated trees,
@@ -5703,6 +6482,10 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                 .await
                 .expect("recover delegation mirror"),
+            RecoveredWork::DetachedChildren(recovered) => DelegationHandle::new(hub.clone())
+                .rearm_detached_deliveries(&recovered.agents)
+                .await
+                .expect("re-arm detached deliveries"),
             RecoveredWork::RouteWait(recovered) => manager_handle
                 .recover_route_wait(
                     recovered.accepted,
@@ -6071,6 +6854,8 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         auto_hermetic: false,
     };
     let request = SpawnSubagent {
+        background: false,
+        wait_ms: None,
         request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
             tranche: 40,
             hard_cap: 96,
@@ -6315,6 +7100,335 @@ async fn activity_typed_spawn_freezes_display_identity_in_the_replayed_manifest(
     drop(delegation);
     hub.shutdown().await.expect("shutdown");
     store.close().await.expect("close store");
+}
+
+#[cfg(unix)]
+mod subagent_monitor_boundary_tests {
+    use super::*;
+
+    // Astra's ordering regressions and controls, retained as library tests.
+    #[cfg(unix)]
+    async fn astra22_queued_monitor_boundary(scope: &str, once: bool, stale_snapshot: bool) {
+        let label = format!(
+            "a22-queue-{scope}-{}-{}",
+            if once { "once" } else { "every" },
+            if stale_snapshot { "snapshot" } else { "queued" }
+        );
+        let harness = start_parked_child_with_wait_budgets(
+            &label,
+            ParkedChildMode::ParentWaitTimeoutHang,
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            Duration::from_millis(250),
+            Some(2_250),
+            None,
+        )
+        .await;
+        let child = harness.child.clone();
+        let monitor = harness.hub.inner_monitor();
+        let registered = monitor
+            .client_register(
+                &harness.hub,
+                crate::monitor::MonitorClientRegistrationRequest {
+                    command_id: haider_rpc::CommandId::new(format!("{label}-register")),
+                    session_id: child.child_session_id.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    source: haider_rpc::MonitorSourceWire::Sms,
+                    filter: None,
+                    action: haider_rpc::MonitorActionWire {
+                        report: true,
+                        follow_up: None,
+                    },
+                    occurrence: if once {
+                        haider_rpc::MonitorOccurrenceWire::Once
+                    } else {
+                        haider_rpc::MonitorOccurrenceWire::Every
+                    },
+                    lifetime: haider_rpc::MonitorLifetimeWire::Session,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                registered.outcome,
+                haider_rpc::MonitorRegisterOutcomeWire::Registered { .. }
+            ),
+            "{registered:?}"
+        );
+        // A different completion operation can own this existing production lock.
+        // Hold it before the report arrives, then stop after durable outbox enqueue.
+        let mut completion_guard = Some(monitor.completion_lock().await);
+        let barrier = stale_snapshot
+            .then(|| crate::completion::astra22_boundary_hook::install(&child.child_session_id));
+        crate::monitor::publish_sms_incoming(
+            &harness.hub.monitor_source_hub(),
+            "+15550000000",
+            "synthetic boundary probe",
+            1,
+        )
+        .expect("synthetic event");
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let events = harness
+                    .store
+                    .read(&child.child_session_id, 0, 2048)
+                    .await
+                    .expect("child events");
+                if events.iter().any(|e| {
+                    e.payload.get("type").and_then(|v| v.as_str()) == Some("monitor_report_pending")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("durable pending report before stop");
+        let resume = if let Some((arrived, resume)) = barrier {
+            drop(completion_guard.take());
+            timeout(Duration::from_secs(20), arrived)
+                .await
+                .expect("wake reached post-attempt barrier")
+                .expect("barrier sender");
+            Some(resume)
+        } else {
+            None
+        };
+        let coordinator = crate::delegation::DelegationHandle::new(harness.hub.clone());
+        if scope == "main" {
+            let request_json = serde_json::json!({"session_id": harness.parent_session, "run_id": child.parent_run_id, "reason": "manual"}).to_string();
+            harness
+                .hub
+                .cancel_internal_turn(TurnCancelCommand {
+                    command_id: format!("{label}-main-cancel"),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: harness.parent_session.clone(),
+                    worker_generation: harness.hub.worker_generation(),
+                    run_id: child.parent_run_id.clone(),
+                    cancelling_event_id: EventId::new(format!("{label}-main-cancelling")),
+                    device_id: harness.hub.device_id(),
+                })
+                .await
+                .expect("main-only stop must preserve child monitor wake");
+        } else if scope == "tree" {
+            timeout(
+                Duration::from_secs(30),
+                coordinator.stop_subagent_tree(
+                    crate::delegation::SubagentTreeRoot::Session(harness.parent_session.clone()),
+                    &label,
+                ),
+            )
+            .await
+            .expect("tree stop while delivery queued")
+            .expect("tree stop");
+        } else if scope == "named" {
+            let request_json = serde_json::json!({"session_id": child.child_session_id, "run_id": child.child_run_id, "reason": "manual"}).to_string();
+            timeout(
+                Duration::from_secs(30),
+                coordinator.cancel_single_subagent(
+                    &child,
+                    TurnCancelCommand {
+                        command_id: format!("{label}-cancel"),
+                        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                        request_json,
+                        session_id: child.child_session_id.clone(),
+                        worker_generation: harness.hub.worker_generation(),
+                        run_id: child.child_run_id.clone(),
+                        cancelling_event_id: EventId::new(format!("{label}-cancelling")),
+                        device_id: harness.hub.device_id(),
+                    },
+                    &label,
+                ),
+            )
+            .await
+            .expect("named stop while delivery queued")
+            .expect("named stop");
+        }
+        timeout(Duration::from_secs(30), async {
+            while monitor
+                .stop_fences()
+                .session_fenced(&child.child_session_id)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stop fence released");
+        let before = harness
+            .store
+            .read(&child.child_session_id, 0, 2048)
+            .await
+            .expect("before release");
+        let monitor_users = |events: &[RawEnvelope]| {
+            events
+                .iter()
+                .filter_map(|e| {
+                    if e.event_id.as_str().starts_with("monitor-user-") {
+                        e.run_id.as_ref().map(ToString::to_string)
+                    } else if e.payload.get("type").and_then(|v| v.as_str())
+                        == Some("completion_admitted")
+                        && e.payload
+                            .get("obligation_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id.starts_with("monitor:"))
+                    {
+                        e.payload
+                            .get("run_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        assert_eq!(
+            monitor_users(&before),
+            0,
+            "lock must block monitor admission"
+        );
+        drop(completion_guard.take());
+        if let Some(resume) = resume {
+            resume.send(()).expect("resume wake after completed stop");
+        }
+        let mut after = before.clone();
+        for _ in 0..500 {
+            after = harness
+                .store
+                .read(&child.child_session_id, 0, 2048)
+                .await
+                .expect("after release");
+            if monitor_users(&after) > 0
+                || after.iter().any(|e| {
+                    e.payload.get("type").and_then(|v| v.as_str())
+                        == Some("monitor_report_delivered")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let admitted = monitor_users(&after);
+        let delivery_observed = admitted > 0
+            || after.iter().any(|e| {
+                e.payload.get("type").and_then(|v| v.as_str()) == Some("monitor_report_delivered")
+            });
+        let timeline = after
+            .iter()
+            .filter(|e| {
+                e.payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| {
+                        t.starts_with("monitor_")
+                            || t.starts_with("completion_")
+                            || t == "run_state"
+                            || t == "user_message"
+                    })
+            })
+            .map(|e| serde_json::json!({"seq":e.seq,"run":e.run_id,"payload":e.payload}))
+            .collect::<Vec<_>>();
+        println!(
+            "ASTRA22_BOUNDARY {}",
+            serde_json::json!({"scope":scope,"once":once,"stale_snapshot":stale_snapshot,"monitor_runs_admitted_after_release":admitted,"delivery_observed":delivery_observed,"timeline":timeline})
+        );
+        harness.manager.shutdown().await.expect("manager shutdown");
+        harness.hub.shutdown().await.expect("hub shutdown");
+        harness.store.close().await.expect("store close");
+        assert!(
+            delivery_observed,
+            "no completed report delivery observed; do not count a vacuous pass"
+        );
+        if scope == "control" || scope == "main" {
+            assert!(
+                admitted > 0,
+                "negative control must admit the real queued report"
+            );
+        } else {
+            assert_eq!(
+                admitted, 0,
+                "a pre-stop durable monitor report must not create work after the stop settles"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_control_every() {
+        astra22_queued_monitor_boundary("control", false, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_after_tree_stop_every() {
+        astra22_queued_monitor_boundary("tree", false, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_after_named_stop_every() {
+        astra22_queued_monitor_boundary("named", false, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_after_tree_stop_once() {
+        astra22_queued_monitor_boundary("tree", true, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_after_named_stop_once() {
+        astra22_queued_monitor_boundary("named", true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_stale_snapshot_control() {
+        astra22_queued_monitor_boundary("control", false, true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_stale_snapshot_tree_every() {
+        astra22_queued_monitor_boundary("tree", false, true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_stale_snapshot_named_every() {
+        astra22_queued_monitor_boundary("named", false, true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_stale_snapshot_tree_once() {
+        astra22_queued_monitor_boundary("tree", true, true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_stale_snapshot_named_once() {
+        astra22_queued_monitor_boundary("named", true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_main_only_every_queued() {
+        astra22_queued_monitor_boundary("main", false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_main_only_every_snapshot() {
+        astra22_queued_monitor_boundary("main", false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_main_only_once_queued() {
+        astra22_queued_monitor_boundary("main", true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn astra22_queued_monitor_main_only_once_snapshot() {
+        astra22_queued_monitor_boundary("main", true, true).await;
+    }
 }
 // Review-only fixture: exact pre-b444 child receipt JSON omits max_tokens_source.
 #[tokio::test]

@@ -370,14 +370,15 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        123,
-        "typed SSH setup errors add one feature to the existing \
-         122-feature set"
+        125,
+        "merged stop and typed SSH capabilities extend the served feature set"
     );
     assert_eq!(
         welcome_features(),
         BTreeSet::from([
             haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned(),
+            haider_rpc::FEATURE_RUN_STOP_SCOPE_V1.to_owned(),
+            haider_rpc::FEATURE_HELPER_STOP_V1.to_owned(),
             haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
             FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
@@ -572,8 +573,21 @@ fn activity_token_requires_hello_request_and_follows_newer_withholding() {
             .features
             .contains(FEATURE_SESSION_ACTIVITY_V1)
     );
-    let withheld = encode_welcome_for_peer(welcome, newest_withheld.bytes.len() - 5)
-        .expect("activity withheld after the newer token");
+    let mut retained = newest_withheld.features.clone();
+    let mut next_limit = newest_withheld.bytes.len() - 5;
+    for newer in [
+        haider_rpc::FEATURE_HELPER_STOP_V1,
+        haider_rpc::FEATURE_RUN_STOP_SCOPE_V1,
+    ] {
+        let next = encode_welcome_for_peer(welcome.clone(), next_limit)
+            .expect("next merged token withheld before activity");
+        assert!(retained.remove(newer));
+        assert_eq!(next.features, retained, "withholding {newer}");
+        assert!(next.features.contains(FEATURE_SESSION_ACTIVITY_V1));
+        next_limit = next.bytes.len() - 5;
+    }
+    let withheld = encode_welcome_for_peer(welcome, next_limit)
+        .expect("activity withheld after all newer tokens");
     assert!(!withheld.features.contains(FEATURE_SESSION_ACTIVITY_V1));
     assert!(
         withheld
@@ -762,6 +776,42 @@ fn tight_welcome_preserves_all_64_wave56_replies() {
         "previous connection capability list changed: {failures:?}"
     );
     assert_unadvertised_fleet_identity_is_byte_identical();
+}
+
+/// Each merged additive token must leave the preceding capabilities intact.
+/// Activity was already supported by wave 56 and cannot be removed first.
+#[test]
+fn tight_welcome_withholds_new_stop_and_ssh_tokens_before_wave56_features() {
+    for row in previous_welcomes()
+        .into_iter()
+        .filter(|row| row.withheld_count == 0)
+    {
+        let current = current_welcome(&row);
+        let full = uds_codec::encode(&WireFrame::Welcome(current.clone()), usize::MAX)
+            .expect("full merged Welcome");
+        let ample = encode_welcome_for_peer(current.clone(), full.len() - 4)
+            .expect("ample peer retains all merged capabilities");
+        assert_eq!(ample.bytes.as_slice(), full);
+        assert_eq!(ample.features, current.features);
+
+        let mut preceding = current.clone();
+        let mut preceding_len = full.len() - 4;
+        for token in [
+            FEATURE_SSH_TYPED_SETUP_ERRORS_V1,
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_RUN_STOP_SCOPE_V1,
+        ] {
+            assert!(preceding.features.remove(token));
+            let expected = uds_codec::encode(&WireFrame::Welcome(preceding.clone()), usize::MAX)
+                .expect("preceding merged Welcome");
+            let encoded = encode_welcome_for_peer(current.clone(), preceding_len - 1)
+                .expect("tight peer retains preceding capabilities");
+            assert_eq!(encoded.bytes.as_slice(), expected, "withholding {token}");
+            assert_eq!(encoded.features, preceding.features);
+            preceding_len = expected.len() - 4;
+        }
+        assert_eq!(preceding, previous_welcome(&row));
+    }
 }
 
 #[test]

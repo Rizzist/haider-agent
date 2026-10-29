@@ -421,7 +421,7 @@ fn graph_facts_render_quiet_transcript_notes() {
     assert!(
         notes
             .iter()
-            .any(|n| n.contains("BUILD attempt 2/8") && n.contains("stale")),
+            .any(|n| n.contains("BUILD attempt 2 ") && n.contains("stale")),
         "{notes:?}"
     );
     // Evidence detail is flattened single-line (no embedded newline).

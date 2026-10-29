@@ -167,6 +167,9 @@ fn accepted_turn() -> (LiveDriver, AppModel) {
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_HELPER_STOP_V1.to_owned());
     let mut driver = LiveDriver::new("escretract-test");
     driver.apply(
         &mut model,
@@ -775,7 +778,10 @@ fn a_daemon_that_drops_the_retract_frame_still_gets_one_cancel() {
     };
     assert_eq!(
         haider_tui::link::command_required_features(&commands[0]),
-        &[haider_rpc::FEATURE_TURN_RETRACT_V1],
+        &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_TURN_RETRACT_V1,
+        ],
         "the command declares the gate that can reject it"
     );
 
@@ -877,7 +883,10 @@ fn an_older_daemon_that_cannot_retract_gets_the_cancel_it_understands() {
             run_id: RunId::new(RUN),
             branch: None,
         }),
-        &[haider_rpc::FEATURE_TURN_RETRACT_V1],
+        &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_TURN_RETRACT_V1,
+        ],
         "and the command declares the gate it needs"
     );
 }

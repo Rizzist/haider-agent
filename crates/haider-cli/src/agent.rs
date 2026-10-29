@@ -109,6 +109,13 @@ impl Options {
                     break;
                 }
                 "--json" if !options.json => options.json = true,
+                "--all"
+                    if family == "agent"
+                        && verb == "cancel"
+                        && !options.flags.contains_key("--all") =>
+                {
+                    options.flags.insert("--all".into(), String::new());
+                }
                 "--no-spawn" if !options.no_spawn => options.no_spawn = true,
                 "--timeout" | "--command-id" | "--task" | "--prompt" | "--provider" | "--model"
                 | "--agent-type" | "--cwd" | "--workflow" | "--trigger" => {
@@ -143,6 +150,7 @@ impl Options {
             ("agent", "spawn") => usize::from(!options.flags.contains_key("--prompt")),
             ("workflow", "run") => 1 + usize::from(!options.flags.contains_key("--prompt")),
             ("agent", "message") => 3,
+            ("agent", "cancel") if options.flags.contains_key("--all") => 1,
             ("agent", "cancel" | "wait") => 2,
             ("workflow", "list") => 0,
             _ => 1,
@@ -192,6 +200,7 @@ impl Options {
 struct Connection {
     client: RpcClient,
     drain: tokio::task::JoinHandle<()>,
+    no_spawn: bool,
 }
 
 impl Drop for Connection {
@@ -237,16 +246,24 @@ impl Connection {
         // Attach grants control only. Consume its replay continuously, keeping
         // memory bounded; public results use independently paged session.read.
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        Ok(Self { client, drain })
+        Ok(Self {
+            client,
+            drain,
+            no_spawn: options.no_spawn,
+        })
     }
 
     fn require(&self, feature: &'static str) -> Result<(), Failure> {
         if self.client.welcome().features.contains(feature) {
             Ok(())
         } else {
-            Err(Failure::protocol(format!(
-                "daemon does not advertise {feature}"
-            )))
+            Err(Failure::protocol(
+                if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+                    helper_stop_remedy(self.no_spawn).to_owned()
+                } else {
+                    format!("daemon does not advertise {feature}")
+                },
+            ))
         }
     }
 
@@ -320,6 +337,14 @@ impl Connection {
     }
 }
 
+fn helper_stop_remedy(no_spawn: bool) -> &'static str {
+    if no_spawn {
+        haider_rpc::HELPER_STOP_UNSUPPORTED_NO_SPAWN_MESSAGE
+    } else {
+        haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE
+    }
+}
+
 pub(crate) async fn command(family: &str, args: &[String]) -> ExitCode {
     let flag_args = &args[..args
         .iter()
@@ -327,7 +352,7 @@ pub(crate) async fn command(family: &str, args: &[String]) -> ExitCode {
         .unwrap_or(args.len())];
     if flag_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         let help = if family == "agent" {
-            "haider agent spawn <prompt> [--task NAME] [--provider NAME] [--model NAME] [--agent-type ID] [--cwd PATH]\nhaider agent list <parent-session-id>\nhaider agent message <parent-session-id> <agent-id> <message>\nhaider agent cancel <parent-session-id> <agent-id>\nhaider agent wait <parent-session-id> <agent-id> [--timeout DURATION]\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Mutations: [--command-id ID]. Spawn also accepts --prompt/-p and --workflow ID --trigger REASON."
+            "haider agent spawn <prompt> [--task NAME] [--provider NAME] [--model NAME] [--agent-type ID] [--cwd PATH]\nhaider agent list <parent-session-id>\nhaider agent message <parent-session-id> <agent-id> <message>\nhaider agent cancel <parent-session-id> <agent-id>   (stops that subagent only; its children keep running)\nhaider agent cancel <parent-session-id> --all        (stops every subagent in the session's tree)\nhaider agent wait <parent-session-id> <agent-id> [--timeout DURATION]\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Mutations: [--command-id ID]. Spawn also accepts --prompt/-p and --workflow ID --trigger REASON."
         } else {
             "haider workflow run <workflow-id> <prompt> --trigger REASON [--provider NAME] [--model NAME] [--cwd PATH]\nhaider workflow status <child-session-id>\nhaider workflow list\nAll verbs: [--json] [--no-spawn] [--timeout DURATION]. Run also accepts --prompt/-p and --command-id ID."
         };
@@ -408,7 +433,38 @@ async fn execute(options: &Options) -> Result<(Value, u8), Failure> {
                 _ => Err(Failure::protocol("session.fleet response mismatch")),
             }
         }
+        ("agent", "cancel") if options.flags.contains_key("--all") => {
+            connection.require(haider_rpc::FEATURE_HELPER_STOP_V1)?;
+            // Owner decision 2026-09-25: the explicit "stop all" — every
+            // subagent in the session's tree, however deep, including
+            // children started by messaged or monitor-woken child turns.
+            // `agent.cancel_all` is advertised by `run_stop_scope_v1`; an
+            // older daemon refuses here, before any request is sent.
+            connection.require(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1)?;
+            let session_id = SessionId::new(&options.positional[0]);
+            let worker_generation = connection.control(&session_id, deadline).await?;
+            match connection
+                .request(
+                    RequestBody::AgentCancelAll {
+                        command_id: CommandId::new(options.command_id()),
+                        session_id,
+                        worker_generation,
+                    },
+                    deadline,
+                )
+                .await?
+            {
+                ResponseBody::AgentCancelAll {
+                    session_id,
+                    stopped,
+                } => Ok((json!({"session_id":session_id,"stopped":stopped}), 0)),
+                _ => Err(Failure::protocol("agent.cancel_all response mismatch")),
+            }
+        }
         ("agent", "message" | "cancel") => {
+            if options.verb == "cancel" {
+                connection.require(haider_rpc::FEATURE_HELPER_STOP_V1)?;
+            }
             connection.require(if options.verb == "message" {
                 haider_rpc::FEATURE_AGENT_MESSAGE_V1
             } else {
@@ -753,6 +809,7 @@ async fn wait(
     let mut child_session_id = None;
     let mut child_run_id = None;
     let mut original_run_id = None;
+    let mut background_handle = false;
     let mut target_frozen = false;
     let mut child_text = String::new();
     let mut terminal: Option<(RunState, u64)> = None;
@@ -773,6 +830,12 @@ async fn wait(
             };
             match payload {
                 EventPayload::AgentSpawned(manifest) if manifest.agent == agent_id => {
+                    background_handle = manifest
+                        .coordinates
+                        .as_ref()
+                        .and_then(|coordinates| coordinates.get("background"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     child_session_id = Some(child_session(&manifest)?);
                 }
                 EventPayload::Item(ItemEvent::Completed {
@@ -842,23 +905,14 @@ async fn wait(
         }
         target_frozen = true;
         let original = child_run_id == original_run_id;
-        let selected_report = if original {
-            report
-                .as_ref()
-                .map(|(report, seq)| (report.clone(), Some(*seq)))
-        } else {
-            terminal.as_ref().map(|_| {
-                (
-                    ChildReport {
-                        agent: agent_id.clone(),
-                        summary: child_text.clone(),
-                        verified: ReportVerification::Unverified,
-                        workspace_revision: None,
-                    },
-                    None,
-                )
-            })
-        };
+        let selected_report = select_wait_report(
+            &agent_id,
+            terminal.as_ref().map(|(state, _)| state),
+            &child_text,
+            report.as_ref(),
+            original,
+            background_handle,
+        );
         if let (Some((state, terminal_seq)), Some((report, child_result_seq))) =
             (&terminal, selected_report)
         {
@@ -869,7 +923,7 @@ async fn wait(
             };
             let result = json!({"session_id":session_id,"agent_id":agent_id,"child_session_id":child_session,
                 "child_run_id":child_run_id,"state":name,"terminal_seq":terminal_seq,"child_result_seq":child_result_seq,
-                "report_source":if original {"child_result"} else {"child_journal"},"report":report});
+                "report_source":if child_result_seq.is_some() {"child_result"} else {"child_journal"},"report":report});
             if exit != 0 {
                 let mut failure = Failure::new(
                     if exit == 130 {
@@ -891,6 +945,32 @@ async fn wait(
         }
         pause(deadline,json!({"session_id":session_id,"agent_id":agent_id,"child_session_id":child_session_id,"child_run_id":child_run_id})).await?;
     }
+}
+
+/// A blocking spawn's original result belongs to the parent's durable
+/// ChildResult. Background children and later child turns have no such item.
+fn select_wait_report(
+    agent: &AgentId,
+    terminal: Option<&RunState>,
+    child_text: &str,
+    parent_report: Option<&(ChildReport, u64)>,
+    original: bool,
+    background_handle: bool,
+) -> Option<(ChildReport, Option<u64>)> {
+    if original && !background_handle {
+        return parent_report.map(|(report, seq)| (report.clone(), Some(*seq)));
+    }
+    terminal.map(|state| {
+        (
+            ChildReport {
+                agent: agent.clone(),
+                summary: child_text.to_owned(),
+                verified: ReportVerification::from_terminal_run_state(state),
+                workspace_revision: None,
+            },
+            None,
+        )
+    })
 }
 
 fn write_json(document: &Value) -> io::Result<()> {

@@ -45,6 +45,7 @@ fn pending_interaction(action: &str) -> crate::orchestration::PendingCallV1 {
         deadline_ms: 2,
         started: true,
         approval_waiting: true,
+        approval_deadline_ms: None,
     }
 }
 
@@ -1167,4 +1168,270 @@ async fn orchestration_recovery_matrix_never_replays_dispatched_or_effectless_ch
     assert_recovery_boundary("orch-crash-outcome", CrashBoundary::Outcome, false).await;
     assert_recovery_boundary("orch-crash-result", CrashBoundary::ToolResult, false).await;
     assert_recovery_boundary("orch-crash-actor", CrashBoundary::Started, true).await;
+}
+
+/// `args.len()` sequential calls of one tool chained through `after_prior`;
+/// the exit returns the last await. Every args object holds string fields.
+fn chained_tool_script(
+    tool: &str,
+    args: &[serde_json::Value],
+    limits: Option<serde_json::Value>,
+) -> String {
+    let entry = registered_tool_by_name(tool).expect("registry entry");
+    let wrapper_digest = orchestration_wrapper_digest(entry);
+    let factory = BrokerToolFactory::with_mobile_backend(Arc::new(FakeMobileBackend::default()));
+    let child_tools = orchestration_entry_child_tools(&factory, None, None, &[], false);
+    let catalog_digest =
+        orchestration_catalog_digest_for_names(registered_tools(), Some(&child_tools));
+    let mut nodes = Vec::new();
+    let mut previous_await = None;
+    for (ordinal, value) in args.iter().enumerate() {
+        let fields = value
+            .as_object()
+            .expect("args object")
+            .iter()
+            .map(|(name, field)| {
+                let bytes = field.as_str().expect("string field").len().max(1);
+                (
+                    name.clone(),
+                    serde_json::json!({"kind":"string","max_bytes":bytes}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let value_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":value_slot,"evidence_type":"OrchValueV1",
+            "config":{
+                "operator":"literal",
+                "type":{"kind":"record","fields":fields},
+                "operand_config":{"value":value},
+                "region":[],"origin":[ordinal]
+            },
+            "ports":[]
+        }));
+        let argument_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":argument_slot,"evidence_type":"OrchArgumentV1",
+            "config":{"tool":tool,"wrapper_digest":wrapper_digest,"region":[],"origin":[ordinal]},
+            "ports":[{"role":"data","port":"args","source_slot":value_slot,"output":"value"}]
+        }));
+        let retry_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":retry_slot,"evidence_type":"OrchRetryPolicyV1",
+            "config":{"max_attempts":1},"ports":[]
+        }));
+        let ask_slot = nodes.len();
+        let call_slot = ask_slot + 1;
+        let mut ask_ports = vec![serde_json::json!({
+            "role":"data","port":"args","source_slot":argument_slot,"output":"value"
+        })];
+        if let Some(previous) = previous_await {
+            ask_ports.push(serde_json::json!({
+                "role":"control","port":"after_prior","source_slot":previous,"output":"settled"
+            }));
+        }
+        nodes.push(serde_json::json!({
+            "slot":ask_slot,"evidence_type":"OrchAskPauseV1",
+            "config":{
+                "tool":tool,"wrapper_digest":wrapper_digest,
+                "owner_call_slot":call_slot,"wait_ms":120000,
+                "region":[],"origin":[ordinal]
+            },
+            "ports":ask_ports
+        }));
+        nodes.push(serde_json::json!({
+            "slot":call_slot,"evidence_type":"OrchCallV1",
+            "config":{"tool":tool,"wrapper_digest":wrapper_digest,"region":[],"origin":[ordinal]},
+            "ports":[
+                {"role":"data","port":"args","source_slot":argument_slot,"output":"value"},
+                {"role":"control","port":"permit","source_slot":ask_slot,"output":"permit"},
+                {"role":"config","port":"retry","source_slot":retry_slot,"output":"policy"}
+            ]
+        }));
+        let await_slot = nodes.len();
+        nodes.push(serde_json::json!({
+            "slot":await_slot,"evidence_type":"OrchAwaitV1",
+            "config":{"on_error":"stop","region":[],"origin":[ordinal]},
+            "ports":[{"role":"data","port":"operation","source_slot":call_slot,"output":"operation"}]
+        }));
+        previous_await = Some(await_slot);
+    }
+    let exit_slot = nodes.len();
+    nodes.push(serde_json::json!({
+        "slot":exit_slot,"evidence_type":"OrchExitV1",
+        "config":{"mode":"return","region":[]},
+        "ports":[{"role":"data","port":"value","source_slot":previous_await.expect("one call"),"output":"value"}]
+    }));
+    let mut request = serde_json::json!({
+        "version":1,
+        "transport":haider_protocol::orchestration::ORCHESTRATION_TRANSPORT,
+        "catalog_digest":catalog_digest,
+        "graph":{"kind":"inline","parameters":[],"nodes":nodes,"exits":[exit_slot],"read_groups":[]},
+        "inputs":[]
+    });
+    if let Some(limits) = limits {
+        request["limits"] = limits;
+    }
+    request.to_string()
+}
+
+async fn run_script(
+    fixture: &MobileDispatcherFixture,
+    label: &str,
+    script: String,
+) -> BoundedResult {
+    let result = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new(format!("{label}-item")),
+            &format!("{label}-call"),
+            "tool_script",
+            serde_json::Value::String(script),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("execute script");
+    let ToolDispatchResult::Completed(result) = result else {
+        panic!("{label}: script unexpectedly requested approval");
+    };
+    result
+}
+
+/// OWNER RULE (no default caps): with no explicit limits a script runs more
+/// than the former 64-attempt default, and no call carries a default wall
+/// (every persisted operation deadline is the no-deadline sentinel).
+/// MUTATION CHECK: restore the 64-child default or a 30 s/120 s default wall.
+/// Expected failure: admission rejects the graph or a finite deadline appears.
+#[tokio::test]
+async fn default_limits_run_seventy_children_without_any_wall() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-seventy",
+        "exercise an unbounded script",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        true,
+    )
+    .await;
+    let path = std::path::Path::new(&fixture.cwd).join("input.txt");
+    std::fs::write(&path, "seventy children\n").expect("write fixture");
+    let path = path.to_string_lossy().into_owned();
+    let args = (0..70)
+        .map(|_| serde_json::json!({"path": path}))
+        .collect::<Vec<_>>();
+    let result = run_script(
+        &fixture,
+        "seventy",
+        chained_tool_script("fs_read", &args, None),
+    )
+    .await;
+    assert_eq!(
+        result.status,
+        ToolResultStatus::Completed,
+        "{}",
+        result.preview
+    );
+    let terminal = result.orchestration.expect("terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::Completed);
+    assert_eq!(terminal.counts.calls, 70);
+    assert_eq!(terminal.counts.attempts, 70);
+    let clocks = orchestration_activation_clocks(&fixture).await;
+    assert_eq!(clocks.len(), 70);
+    assert!(
+        clocks
+            .iter()
+            .all(|clock| clock.2 == crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS),
+        "no call may carry a default wall: {clocks:?}"
+    );
+    close_fixture(fixture).await;
+}
+
+/// An EXPLICIT `child_wall_ms` is still honoured as an opt-in stop.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_child_wall_still_stops_a_long_child() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-explicit-wall",
+        "exercise an explicit wall",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        true,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let result = run_script(
+        &fixture,
+        "explicit-wall",
+        chained_tool_script(
+            "process_exec",
+            &[serde_json::json!({"command": "sleep 20"})],
+            Some(serde_json::json!({"child_wall_ms": 400})),
+        ),
+    )
+    .await;
+    let terminal = result.orchestration.expect("terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::TimedOut);
+    assert_eq!(terminal.reason_code.as_deref(), Some("child_wall_timeout"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    close_fixture(fixture).await;
+}
+
+/// `no_progress_ms` measures observed progress, not wall time: a child that
+/// keeps producing output runs well past the window and completes, while a
+/// silent child is stopped with the typed `child_no_progress` code.
+/// MUTATION CHECK: treat `no_progress_ms` as a fixed wall again. Expected
+/// failure: the productive child is stopped after ~500 ms.
+#[cfg(unix)]
+#[tokio::test]
+async fn no_progress_window_tracks_output_not_wall_time() {
+    let fixture = mobile_dispatcher_fixture_with_policy(
+        "orchestration-no-progress",
+        "exercise progress-based supervision",
+        Arc::new(FakeMobileBackend::default()),
+        None,
+        true,
+    )
+    .await;
+    let limits = serde_json::json!({"no_progress_ms": 500});
+    let started = std::time::Instant::now();
+    let productive = run_script(
+        &fixture,
+        "productive",
+        chained_tool_script(
+            "process_exec",
+            &[serde_json::json!({
+                "command": "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo tick $i; sleep 0.1; done"
+            })],
+            Some(limits.clone()),
+        ),
+    )
+    .await;
+    let productive_elapsed = started.elapsed();
+    assert_eq!(
+        productive.status,
+        ToolResultStatus::Completed,
+        "{}",
+        productive.preview
+    );
+    assert!(
+        productive_elapsed >= std::time::Duration::from_millis(1_500),
+        "the productive child must outlive the 500 ms window: {productive_elapsed:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let stuck = run_script(
+        &fixture,
+        "stuck",
+        chained_tool_script(
+            "process_exec",
+            &[serde_json::json!({"command": "sleep 20"})],
+            Some(limits),
+        ),
+    )
+    .await;
+    let terminal = stuck.orchestration.expect("terminal");
+    assert_eq!(terminal.status, ScriptTerminalStatusV1::TimedOut);
+    assert_eq!(terminal.reason_code.as_deref(), Some("child_no_progress"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    close_fixture(fixture).await;
 }

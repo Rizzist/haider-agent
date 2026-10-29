@@ -26,8 +26,6 @@ pub const ORCHESTRATION_NODE_DEFAULT: usize = 2_048;
 pub const ORCHESTRATION_NODE_MAX: usize = 8_192;
 pub const ORCHESTRATION_EDGE_DEFAULT: usize = 8_192;
 pub const ORCHESTRATION_EDGE_MAX: usize = 32_768;
-pub const ORCHESTRATION_CHILD_DEFAULT: u32 = 64;
-pub const ORCHESTRATION_CHILD_MAX: u32 = 256;
 pub const ORCHESTRATION_CONCURRENCY_MAX: u8 = 4;
 pub const ORCHESTRATION_RETURN_DEFAULT_BYTES: u32 = 32 * 1024;
 pub const ORCHESTRATION_RETURN_MAX_BYTES: u32 = 64 * 1024;
@@ -189,6 +187,17 @@ pub enum ScriptGraphV1 {
     },
 }
 
+/// Per-script limits. Owner rule (2026-09-23): automated work has no DEFAULT
+/// cap that stops it. `child_attempts`, `script_wall_ms`, `child_wall_ms` and
+/// `no_progress_ms` are absent by default (unbounded) and are honoured only
+/// as explicit opt-ins, with no hard ceiling beyond "positive":
+/// - `child_attempts` caps the graph's static worst-case child attempts;
+/// - `script_wall_ms` / `child_wall_ms` are explicit wall-clock stops;
+/// - `no_progress_ms` stops a child only when that window passes with no
+///   observable journal progress (it is not a wall-clock limit).
+///
+/// The remaining fields bound definition size, returned bytes and
+/// interaction budgets (structural/resource limits) and keep their defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestrationLimitsV1 {
@@ -219,10 +228,10 @@ impl Default for OrchestrationLimitsV1 {
         Self {
             definition_nodes: Some(ORCHESTRATION_NODE_DEFAULT as u32),
             parent_entries: Some(ORCHESTRATION_EDGE_DEFAULT as u32),
-            child_attempts: Some(ORCHESTRATION_CHILD_DEFAULT),
-            script_wall_ms: Some(120_000),
-            child_wall_ms: Some(30_000),
-            no_progress_ms: Some(30_000),
+            child_attempts: None,
+            script_wall_ms: None,
+            child_wall_ms: None,
+            no_progress_ms: None,
             returned_bytes: Some(ORCHESTRATION_RETURN_DEFAULT_BYTES),
             decision_points: Some(ORCHESTRATION_DECISION_DEFAULT),
             control_actions: Some(ORCHESTRATION_CONTROL_DEFAULT),
@@ -633,14 +642,15 @@ fn validate_limits(limits: Option<&OrchestrationLimitsV1>) -> Result<(), Orchest
         ORCHESTRATION_EDGE_MAX as u64,
         "parent_entries",
     )?;
+    // Explicit opt-in stops: any positive value is honoured (no ceiling).
     positive(
         limits.child_attempts.map(u64::from),
-        ORCHESTRATION_CHILD_MAX as u64,
+        u64::from(u32::MAX),
         "child_attempts",
     )?;
-    positive(limits.script_wall_ms, 300_000, "script_wall_ms")?;
-    positive(limits.child_wall_ms, 120_000, "child_wall_ms")?;
-    positive(limits.no_progress_ms, 60_000, "no_progress_ms")?;
+    positive(limits.script_wall_ms, u64::MAX, "script_wall_ms")?;
+    positive(limits.child_wall_ms, u64::MAX, "child_wall_ms")?;
+    positive(limits.no_progress_ms, u64::MAX, "no_progress_ms")?;
     positive(
         limits.returned_bytes.map(u64::from),
         ORCHESTRATION_RETURN_MAX_BYTES as u64,
@@ -679,9 +689,9 @@ pub fn validate_inline_dag(
     let edge_limit = limits
         .and_then(|limits| limits.parent_entries)
         .unwrap_or(ORCHESTRATION_EDGE_DEFAULT as u32) as usize;
-    let child_limit = limits
-        .and_then(|limits| limits.child_attempts)
-        .unwrap_or(ORCHESTRATION_CHILD_DEFAULT);
+    // Absent = unbounded; the worst case is still structurally finite
+    // (node count x per-call retry attempts).
+    let child_limit = limits.and_then(|limits| limits.child_attempts);
     if nodes.is_empty() || nodes.len() > node_limit {
         return Err(invalid(
             "node_count",
@@ -762,7 +772,9 @@ pub fn validate_inline_dag(
         ));
     }
     validate_call_families(nodes, &retry_attempts, &mut attempt_bound)?;
-    if attempt_bound > child_limit {
+    if let Some(child_limit) = child_limit
+        && attempt_bound > child_limit
+    {
         return Err(invalid(
             "child_attempt_count",
             format!("worst-case {attempt_bound} attempts exceeds {child_limit}"),
@@ -2831,6 +2843,181 @@ mod tests {
                 .code,
             "non_dense_slot"
         );
+    }
+
+    /// `calls` sequential fs_read call families chained through
+    /// `after_prior`; the exit returns the last await's value.
+    fn chained_call_graph(calls: u32) -> (Vec<InlineNodeV1>, u32) {
+        let digest = format!("blake3:{}", "0".repeat(64));
+        let mut nodes = vec![InlineNodeV1 {
+            slot: 0,
+            evidence_type: "OrchValueV1".into(),
+            config: StrictJson(serde_json::json!({
+                "operator": "literal",
+                "type": {"kind":"record","fields":{}},
+                "operand_config": {"value": {}},
+                "region": []
+            })),
+            ports: vec![],
+        }];
+        let mut previous_await = None;
+        for _ in 0..calls {
+            let argument = nodes.len() as u32;
+            nodes.push(InlineNodeV1 {
+                slot: argument,
+                evidence_type: "OrchArgumentV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![port(OrchPortRoleV1::Data, "args", 0, "value")],
+            });
+            let retry = argument + 1;
+            nodes.push(InlineNodeV1 {
+                slot: retry,
+                evidence_type: "OrchRetryPolicyV1".into(),
+                config: StrictJson(serde_json::json!({"max_attempts":1})),
+                ports: vec![],
+            });
+            let ask = retry + 1;
+            let call = ask + 1;
+            let mut ask_ports = vec![port(OrchPortRoleV1::Data, "args", argument, "value")];
+            if let Some(previous) = previous_await {
+                ask_ports.push(port(
+                    OrchPortRoleV1::Control,
+                    "after_prior",
+                    previous,
+                    "settled",
+                ));
+            }
+            nodes.push(InlineNodeV1 {
+                slot: ask,
+                evidence_type: "OrchAskPauseV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,
+                    "owner_call_slot":call,"wait_ms":120000,"region":[]
+                })),
+                ports: ask_ports,
+            });
+            nodes.push(InlineNodeV1 {
+                slot: call,
+                evidence_type: "OrchCallV1".into(),
+                config: StrictJson(serde_json::json!({
+                    "tool":"fs_read","wrapper_digest":digest,"region":[]
+                })),
+                ports: vec![
+                    port(OrchPortRoleV1::Data, "args", argument, "value"),
+                    port(OrchPortRoleV1::Control, "permit", ask, "permit"),
+                    port(OrchPortRoleV1::Config, "retry", retry, "policy"),
+                ],
+            });
+            let wait = call + 1;
+            nodes.push(InlineNodeV1 {
+                slot: wait,
+                evidence_type: "OrchAwaitV1".into(),
+                config: StrictJson(serde_json::json!({"on_error":"stop","region":[]})),
+                ports: vec![port(OrchPortRoleV1::Data, "operation", call, "operation")],
+            });
+            previous_await = Some(wait);
+        }
+        let exit = nodes.len() as u32;
+        nodes.push(InlineNodeV1 {
+            slot: exit,
+            evidence_type: "OrchExitV1".into(),
+            config: StrictJson(serde_json::json!({"mode":"return","region":[]})),
+            ports: vec![port(
+                OrchPortRoleV1::Data,
+                "value",
+                previous_await.expect("at least one call"),
+                "value",
+            )],
+        });
+        (nodes, exit)
+    }
+
+    /// OWNER RULE (no default caps): the former 64-attempt default and
+    /// 256/300 s/120 s/60 s hard ceilings are gone. Absent limits are
+    /// unbounded; explicit values of any positive size are honoured.
+    /// MUTATION CHECK: restore any default or ceiling. Expected failure: the
+    /// 70-call graph or a large explicit limit is rejected.
+    #[test]
+    fn autonomy_limits_are_unbounded_by_default_and_explicit_values_are_honoured() {
+        let defaults = OrchestrationLimitsV1::default();
+        assert_eq!(defaults.child_attempts, None);
+        assert_eq!(defaults.script_wall_ms, None);
+        assert_eq!(defaults.child_wall_ms, None);
+        assert_eq!(defaults.no_progress_ms, None);
+        // Absent autonomy limits serialize away entirely (additive wire).
+        let wire = serde_json::to_value(&defaults).expect("serialize defaults");
+        for absent in [
+            "child_attempts",
+            "script_wall_ms",
+            "child_wall_ms",
+            "no_progress_ms",
+        ] {
+            assert!(wire.get(absent).is_none(), "{absent} must be omitted");
+        }
+
+        let (nodes, exit) = chained_call_graph(70);
+        let validated = validate_inline_dag(&[], &nodes, &[exit], &[], None)
+            .expect("a 70-call graph needs no opt-in");
+        assert_eq!(validated.call_attempt_bound, 70);
+        validate_inline_dag(&[], &nodes, &[exit], &[], Some(&defaults))
+            .expect("default limits do not cap child attempts");
+
+        let explicit = OrchestrationLimitsV1 {
+            child_attempts: Some(10_000),
+            script_wall_ms: Some(24 * 60 * 60 * 1_000),
+            child_wall_ms: Some(6 * 60 * 60 * 1_000),
+            no_progress_ms: Some(60 * 60 * 1_000),
+            ..defaults.clone()
+        };
+        validate_limits(Some(&explicit)).expect("large explicit limits are honoured");
+        validate_inline_dag(&[], &nodes, &[exit], &[], Some(&explicit))
+            .expect("explicit cap above the worst case admits");
+
+        let capped = OrchestrationLimitsV1 {
+            child_attempts: Some(64),
+            ..defaults.clone()
+        };
+        assert_eq!(
+            validate_inline_dag(&[], &nodes, &[exit], &[], Some(&capped))
+                .expect_err("an explicit opt-in cap still binds")
+                .code,
+            "child_attempt_count"
+        );
+        for zero in [
+            OrchestrationLimitsV1 {
+                child_attempts: Some(0),
+                ..defaults.clone()
+            },
+            OrchestrationLimitsV1 {
+                script_wall_ms: Some(0),
+                ..defaults.clone()
+            },
+            OrchestrationLimitsV1 {
+                child_wall_ms: Some(0),
+                ..defaults.clone()
+            },
+            OrchestrationLimitsV1 {
+                no_progress_ms: Some(0),
+                ..defaults.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_limits(Some(&zero))
+                    .expect_err("explicit limits must be positive")
+                    .code,
+                "limit"
+            );
+        }
+        // Old clients' explicit values keep their meaning.
+        let legacy: OrchestrationLimitsV1 = serde_json::from_str(
+            r#"{"child_attempts":64,"script_wall_ms":120000,"child_wall_ms":30000,"no_progress_ms":30000}"#,
+        )
+        .expect("legacy explicit limits parse");
+        assert_eq!(legacy.child_attempts, Some(64));
+        assert_eq!(legacy.script_wall_ms, Some(120_000));
+        validate_limits(Some(&legacy)).expect("legacy explicit limits remain valid");
     }
 
     #[test]

@@ -117,7 +117,10 @@ const CHECKPOINT_SHAPE_VERSION: u32 = 1;
 // ordinal 1 before the first model request.
 // v9 retains direct operator delegation pins, which must never resume a
 // parent provider request after a restart.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v9";
+// v10 reduces durable detached-delivery obligations (per-child facts and
+// `child_still_running` observation results), so an older checkpoint that
+// dropped such a terminal run is rescanned.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v10";
 
 pub(crate) enum RecoveredWork {
     Queued(RecoveredQueued),
@@ -129,6 +132,18 @@ pub(crate) enum RecoveredWork {
     AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
+    /// A main-only stop detached this run's children; re-arm delivery of
+    /// their results (owner decision 2026-09-25).
+    DetachedChildren(RecoveredDetachedChildren),
+}
+
+pub(crate) struct RecoveredDetachedChildren {
+    /// Every owed agent not yet delivered or settled, with why its result
+    /// is delivered detached. Never bounded by the display marker.
+    pub(crate) agents: Vec<(
+        haider_protocol::ids::AgentId,
+        haider_protocol::subagent_stop::DetachedReasonV1,
+    )>,
 }
 
 pub(crate) struct RecoveredQueued {
@@ -233,6 +248,19 @@ struct RunReduction {
     latest_provider_response_seq: Option<u64>,
     #[serde(default)]
     delegation_mirror_handoffs: HashMap<String, DelegationMirrorHandoff>,
+    /// Detached waited-on children whose result delivery is still owed
+    /// (owner decision 2026-09-25). Keeps a terminal run in recovery scope
+    /// until every delivery fact is journalled.
+    #[serde(default)]
+    detached_pending: std::collections::BTreeSet<String>,
+    /// The subset of `detached_pending` owed because a `wait_ms`
+    /// observation ended (not a main-thread stop).
+    #[serde(default)]
+    detached_observed: std::collections::BTreeSet<String>,
+    /// Agents whose detached delivery was journalled or settled; an owed
+    /// fact is pending only without one of these, in any order.
+    #[serde(default)]
+    detached_done: std::collections::BTreeSet<String>,
     route_replay_epoch: u64,
     #[serde(default)]
     route_replay_events: Vec<StreamEvent>,
@@ -442,6 +470,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             reductions.retain(|_, reduction| {
                 reduction.branch_mismatch
                     || !reduction.delegation_mirror_handoffs.is_empty()
+                    || !reduction.detached_pending.is_empty()
                     || !reduction
                         .state
                         .as_ref()
@@ -487,6 +516,28 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     format!("run {run_id} has a malformed provider request-attempt marker"),
                     false,
                 ));
+            }
+            // Owed detached deliveries do not depend on the run's own state
+            // being in this scan: an obligation journalled after the run
+            // went terminal (and after a checkpoint dropped it) still
+            // re-arms (Astra 13-final B3).
+            if !reduction.detached_pending.is_empty() {
+                recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
+                    agents: reduction
+                        .detached_pending
+                        .iter()
+                        .map(|agent| {
+                            (
+                                haider_protocol::ids::AgentId::new(agent),
+                                if reduction.detached_observed.contains(agent) {
+                                    haider_protocol::subagent_stop::DetachedReasonV1::ObservationEnded
+                                } else {
+                                    haider_protocol::subagent_stop::DetachedReasonV1::MainStopped
+                                },
+                            )
+                        })
+                        .collect(),
+                }));
             }
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
@@ -917,10 +968,165 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
         }
         visitor.finish_session(store, &session_id).await?;
     }
+    // Reconstruct missing ownership from cancelled parent/delegation truth,
+    // independent of the reducer checkpoint (terminal runs can be pruned).
+    // This also repairs a prior daemon's drain window and a worker's direct
+    // shutdown cancellation that did not go through the public cancel RPC.
+    let mut rearmed = recovered
+        .iter()
+        .filter_map(|work| match work {
+            RecoveredWork::DetachedChildren(children) => {
+                Some(children.agents.iter().map(|(agent, _)| agent.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+    for parent in store.session_ids().await? {
+        let mut checked = HashSet::new();
+        let mut stopped = HashSet::new();
+        let mut reserved = HashSet::new();
+        let mut truth = None;
+        let mut agents = Vec::new();
+        for record in store.delegations_for_parent_session(parent.clone()).await? {
+            let background = record
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|c| c.get("background"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if background || record.state == haider_core::DelegationState::Collected {
+                continue;
+            }
+            if checked.insert(record.parent_run_id.clone())
+                && matches!(
+                    latest_run_state(
+                        store,
+                        &parent,
+                        &record.parent_run_id,
+                        record.parent_branch_id.as_ref()
+                    )
+                    .await?,
+                    Some(RunState::Cancelling | RunState::Cancelled)
+                )
+            {
+                stopped.insert(record.parent_run_id.clone());
+            }
+            if !stopped.contains(&record.parent_run_id) {
+                continue;
+            }
+            if truth.is_none() {
+                truth = Some(cancelled_parent_delivery_truth(store, &parent).await?);
+            }
+            let (owed, done) = truth.as_ref().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "cancelled parent delivery truth is unavailable",
+                    true,
+                )
+            })?;
+            if done.contains(&record.agent_id) {
+                continue;
+            }
+            if !owed.contains_key(&record.agent_id) && reserved.insert(record.parent_run_id.clone())
+            {
+                let json = serde_json::json!({"session": parent, "run": record.parent_run_id,
+                        "reason": "recover-foreground-delivery"})
+                .to_string();
+                let outcome = store
+                    .cancel_turn(haider_core::TurnCancelCommand {
+                        command_id: format!(
+                            "recover-delivery-{}-{}-{}",
+                            parent,
+                            record.parent_run_id,
+                            store.worker_generation()
+                        ),
+                        request_digest: blake3::hash(json.as_bytes()).to_hex().to_string(),
+                        request_json: json,
+                        session_id: parent.clone(),
+                        run_id: record.parent_run_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        device_id: device_id.clone(),
+                        cancelling_event_id: EventId::new(format!(
+                            "recover-delivery-cancelling-{}-{}",
+                            parent, record.parent_run_id
+                        )),
+                    })
+                    .await?;
+                if matches!(outcome, haider_core::TurnCancelOutcome::Committed { ref delivery_obligations, .. } if !delivery_obligations.is_empty())
+                    && !touched_sessions.contains(&parent)
+                {
+                    touched_sessions.push(parent.clone());
+                }
+            }
+            if rearmed.insert(record.agent_id.clone()) {
+                agents.push((
+                    record.agent_id.clone(),
+                    owed.get(&record.agent_id)
+                        .copied()
+                        .unwrap_or(haider_protocol::subagent_stop::DetachedReasonV1::MainStopped),
+                ));
+            }
+        }
+        if !agents.is_empty() {
+            recovered.push(RecoveredWork::DetachedChildren(RecoveredDetachedChildren {
+                agents,
+            }));
+        }
+    }
     Ok(StartupTurnRecovery {
         work: recovered,
         touched_sessions,
     })
+}
+
+/// Full durable terminal-delivery truth, independent of pruned run checkpoints.
+async fn cancelled_parent_delivery_truth(
+    store: &SqliteStoreHandle,
+    parent: &SessionId,
+) -> Result<
+    (
+        HashMap<AgentId, haider_protocol::subagent_stop::DetachedReasonV1>,
+        HashSet<AgentId>,
+    ),
+    HaiderError,
+> {
+    use haider_protocol::subagent_stop::{
+        DetachedChildResultV1, DetachedDeliveryPhaseV1, DetachedDeliveryV1,
+    };
+    let mut cursor = 0;
+    let mut owed = HashMap::new();
+    let mut done = HashSet::new();
+    loop {
+        let page = store.read(parent, cursor, PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |event| event.seq);
+        for event in page {
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                event.payload.decode_event()
+            else {
+                continue;
+            };
+            if let Some(result) = DetachedChildResultV1::from_extension_item(&item) {
+                done.insert(result.agent);
+            } else if let TurnItem::ChildResult { report } = &item {
+                done.insert(report.agent.clone());
+            } else if let Some(delivery) = DetachedDeliveryV1::from_extension_item(&item) {
+                match delivery.phase {
+                    DetachedDeliveryPhaseV1::Owed => {
+                        owed.entry(delivery.agent).or_insert(delivery.reason);
+                    }
+                    DetachedDeliveryPhaseV1::Settled => {
+                        done.insert(delivery.agent);
+                    }
+                }
+            }
+        }
+    }
+    Ok((owed, done))
 }
 
 async fn load_recovery_checkpoint(
@@ -1495,6 +1701,50 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 Ok(None) => {}
                 Err(_) => reduction.provider_request_attempt_corrupt = true,
             }
+            // The still-running marker is a bounded DISPLAY list; delivery
+            // obligations are the per-child `detached_delivery_v1` facts
+            // (Astra 13-final B3).
+            if haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(&item)
+                .is_some()
+            {
+                reduction.open_items.remove(&item_id);
+                return;
+            }
+            if let Some(delivered) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(&item)
+            {
+                reduction.detached_pending.remove(delivered.agent.as_str());
+                reduction.detached_observed.remove(delivered.agent.as_str());
+                reduction
+                    .detached_done
+                    .insert(delivered.agent.as_str().to_owned());
+                reduction.open_items.remove(&item_id);
+                return;
+            }
+            if let Some(delivery) =
+                haider_protocol::subagent_stop::DetachedDeliveryV1::from_extension_item(&item)
+            {
+                let agent = delivery.agent.as_str().to_owned();
+                match delivery.phase {
+                    haider_protocol::subagent_stop::DetachedDeliveryPhaseV1::Owed => {
+                        if !reduction.detached_done.contains(&agent) {
+                            if delivery.reason
+                                == haider_protocol::subagent_stop::DetachedReasonV1::ObservationEnded
+                            {
+                                reduction.detached_observed.insert(agent.clone());
+                            }
+                            reduction.detached_pending.insert(agent);
+                        }
+                    }
+                    haider_protocol::subagent_stop::DetachedDeliveryPhaseV1::Settled => {
+                        reduction.detached_pending.remove(&agent);
+                        reduction.detached_observed.remove(&agent);
+                        reduction.detached_done.insert(agent);
+                    }
+                }
+                reduction.open_items.remove(&item_id);
+                return;
+            }
             if let Some(handoff) = DelegationMirrorHandoff::from_item(&item) {
                 match handoff.phase {
                     DelegationMirrorHandoffPhase::Pending => {
@@ -1592,6 +1842,18 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             reduction.menu = None;
         }
         EventPayload::ToolResult { call_id, result } => {
+            // A `wait_ms` observation that ended before the child did is
+            // itself the durable detach: the parent is owed the child's
+            // terminal result (Astra 13-final B2).
+            if let Some(haider_protocol::tool::ToolResultData::ChildStillRunning { agent, .. }) =
+                &result.data
+                && !reduction.detached_done.contains(agent.as_str())
+            {
+                reduction
+                    .detached_observed
+                    .insert(agent.as_str().to_owned());
+                reduction.detached_pending.insert(agent.as_str().to_owned());
+            }
             reduction.tool_results.insert(call_id.clone());
             reduction.tool_result_values.insert(call_id, result);
         }
@@ -2392,7 +2654,7 @@ mod composite_recovery_tests {
             serde_json::from_value(serde_json::to_value(reduction).expect("encode"))
                 .expect("decode");
         assert!(restored.direct_agent_spawn);
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v10");
     }
 
     #[test]
@@ -2608,7 +2870,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v10");
         assert_eq!(
             recovered
                 .workflow_deferral

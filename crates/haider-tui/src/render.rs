@@ -1357,8 +1357,32 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Loom
         | Screen::Sessions => 1,
     };
-    let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
+    // A compatibility refusal contains a literal recovery command. Give
+    // that notice its own wrapped rows so the remedy survives narrow TUI
+    // sizes on every stop surface, including Esc and reconnect failures.
+    let helper_stop_notice = model
+        .flash
+        .as_deref()
+        .filter(|flash| flash.contains(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE));
+    let notice_height = if let Some(notice) = helper_stop_notice
+        && status_height > 0
+    {
+        u16::try_from(
+            Paragraph::new(notice)
+                .wrap(Wrap { trim: false })
+                .line_count(area.width),
+        )
+        .unwrap_or(0)
+        .min(area.height.saturating_sub(6))
+    } else {
+        0
+    };
+    let [body, notice, status] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(notice_height),
+        Constraint::Length(status_height),
+    ])
+    .areas(area);
     // 971 F2: the frame publishes the bottom geometry it actually produced
     // (the `scroll_max` discipline). `render_composer` stamps the composer
     // rect; a surface that draws none leaves it cleared.
@@ -1418,6 +1442,16 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         _ => {}
     }
     if status_height > 0 {
+        if let Some(notice_text) = helper_stop_notice
+            && notice_height > 0
+        {
+            frame.render_widget(
+                Paragraph::new(notice_text)
+                    .wrap(Wrap { trim: false })
+                    .style(theme.dim_style()),
+                notice,
+            );
+        }
         render_status_bar(model, theme, frame, status, &mut hits);
     }
     hits.retain(|(_, hit)| model.hit_owned(hit));
@@ -1678,8 +1712,11 @@ fn voice_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>
 /// The computer-use presence chip (owner 2026-09-24, "show it like
 /// ChatGPT/Codex"): `[ ◉ controlling screen · esc stop ]` while the current
 /// run has driven the desktop (or `phone`) within the shared idle window.
-/// Esc is the existing turn cancel, which the daemon routes to the same
-/// cancellation as the overlay's own Stop button.
+/// Esc is the existing turn cancel: it stops this session's main-thread run
+/// only (owner decision 2026-09-25) — the run whose own `computer`/`mobile`
+/// calls light this chip. A subagent driving the screen keeps running and is
+/// stopped by the overlay Stop or `agent cancel --all`; `run --stop`
+/// addresses runs launched through the headless run API.
 fn cu_presence_header_chip<'a>(model: &AppModel, theme: &Theme) -> Option<Vec<Span<'a>>> {
     let surface = model.projection.cu_presence()?;
     Some(chip_two_tone(
@@ -9034,6 +9071,7 @@ fn subtree_counts(model: &AppModel) -> String {
     let mut working = 0;
     let mut done = 0;
     let mut failed = 0;
+    let mut cancelled = 0;
     let mut idle = 0;
     let mut closing = 0;
     for (_, chip) in &rows {
@@ -9048,6 +9086,7 @@ fn subtree_counts(model: &AppModel) -> String {
             S::Running | S::Tool | S::Thinking | S::Streaming => working += 1,
             S::Done => done += 1,
             S::Error => failed += 1,
+            S::Cancelled => cancelled += 1,
             S::Idle => idle += 1,
         }
     }
@@ -9058,6 +9097,7 @@ fn subtree_counts(model: &AppModel) -> String {
         (working, "◐ {} working"),
         (done, "✓ {} done"),
         (failed, "✗ {} failed"),
+        (cancelled, "⊘ {} cancelled"),
         (idle, "○ {} idle"),
         (closing, "⊘ {} closing"),
     ] {
@@ -10536,7 +10576,7 @@ fn render_graph(
             theme.faint_style(),
         ));
         spans.push(Span::styled(
-            format!(" · attempt {}/8", node.current_attempt.unwrap_or(0)),
+            format!(" · attempt {}", node.current_attempt.unwrap_or(0)),
             theme.dim_style(),
         ));
         // D2: a Loom node names its specialist and task, in the type accent.
@@ -11049,7 +11089,7 @@ fn render_fleet(
                 if model.fleet.kill_armed.as_ref() == Some(&node.agent_id) {
                     lines.push(Line::styled(
                         format!(
-                            "  destroy {}? press d again to confirm · esc cancels",
+                            "  d confirms · esc cancels — end {} only?",
                             fleet::callsign(node)
                         ),
                         theme.err_style(),
@@ -11060,7 +11100,7 @@ fn render_fleet(
                         Hit::FleetKill(node.agent_id.as_str().to_owned()),
                     ));
                     lines.push(Line::styled(
-                        "  ✕ destroy this subagent (d)",
+                        "  ✕ destroy this subagent only (d) · its subagents keep running",
                         theme.dim_style(),
                     ));
                 }
@@ -15789,7 +15829,13 @@ fn render_status_bar(
         .as_ref()
         .filter(|session| model.resyncing.contains(*session))
         .map(|_| "· resyncing…".to_owned());
-    let right = if let Some(flash) = resync_notice.as_ref().or(model.flash.as_ref()) {
+    let right = if model
+        .flash
+        .as_deref()
+        .is_some_and(|flash| flash.contains(haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE))
+    {
+        String::new() // The complete recovery notice has its own wrapped rows.
+    } else if let Some(flash) = resync_notice.as_ref().or(model.flash.as_ref()) {
         flash.clone()
     } else if let Some(update_hint) = update_hint {
         update_hint
@@ -15801,7 +15847,13 @@ fn render_status_bar(
     } else {
         String::new()
     };
-    let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
+    // Reserve the badge's complete chrome and a separating cell before
+    // allocating a flash. Character counts mismeasure wide glyphs.
+    let badge_width =
+        u16::try_from(Line::from(format!(" [ {badge} ] ")).width()).unwrap_or(area.width);
+    let right_width = u16::try_from(Line::from(right.as_str()).width())
+        .unwrap_or(area.width)
+        .min(area.width.saturating_sub(badge_width));
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
     // 970 owner item 1: this strip carries NO clickable segment any more —
@@ -17381,6 +17433,26 @@ fn item_lines<'a>(
                 // A non-terminal steer: gold like a budget checkpoint.
                 lines.push(Line::styled(
                     format!("  {}", note.summary()),
+                    theme.gold_style(),
+                ));
+            } else if let Some(marker) =
+                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                // Owner decision 2026-09-25: Esc stops the main thread only;
+                // say plainly what is still running and how to stop it.
+                lines.push(Line::styled(
+                    format!("  ⧗ {}", marker.summary()),
+                    theme.gold_style(),
+                ));
+            } else if let Some(result) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                lines.push(Line::styled(
+                    format!("  ↩ {}", result.summary_line()),
                     theme.gold_style(),
                 ));
             } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {

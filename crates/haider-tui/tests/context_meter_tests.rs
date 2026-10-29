@@ -1452,3 +1452,61 @@ fn a_fact_switch_learns_the_committed_budget_from_session_metadata() {
     );
     assert_eq!(model.context_meter().auto_compact_at, Some(50_000));
 }
+
+/// The incremental helper roster and the paged meter baseline share route
+/// hydration, while a delta cannot claim the baseline is complete.
+#[test]
+fn helper_roster_hydrates_meter_selection_without_completing_initial_list() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let listed = session_id("s-roster-meter");
+    model.initial_session = Some(session_id("still-on-next-page"));
+    let mut summary = listed_summary(&listed, "anthropic-oauth", "claude-sonnet-4-6", 30_000);
+    summary.head_seq = 12;
+    summary.metadata.as_mut().expect("metadata").selection_epoch = Some(12);
+    driver.apply(
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![summary],
+        },
+    );
+    assert_eq!(
+        model.initial_session,
+        Some(session_id("still-on-next-page"))
+    );
+    model.open_session(&listed);
+    assert_eq!(model.identity.model_short, "claude-sonnet-4-6");
+    assert_eq!(model.meter_epoch.selection_epoch, Some(12));
+    assert!(status_left_string(&model, 118).contains("of 200k"));
+}
+
+/// A delayed helper roster from an older worker cannot rewind the selected
+/// route or meter, even when it carries a larger journal watermark.
+#[test]
+fn helper_roster_rejects_older_worker_before_meter_hydration() {
+    let (mut model, mut driver) = two_attached_sessions();
+    let listed = session_id("s-roster-generation");
+    let mut current = listed_summary(&listed, "anthropic-oauth", "claude-sonnet-4-6", 30_000);
+    current.head_seq = 12;
+    current.worker_generation = 8;
+    current.metadata.as_mut().expect("metadata").selection_epoch = Some(12);
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![current],
+            next_cursor: None,
+        },
+    );
+    let mut stale = listed_summary(&listed, "anthropic-oauth", "claude-opus-5-5", 50_000);
+    stale.head_seq = 20;
+    stale.worker_generation = 7;
+    stale.metadata.as_mut().expect("metadata").selection_epoch = Some(20);
+    driver.apply(
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![stale],
+        },
+    );
+    model.open_session(&listed);
+    assert_eq!(model.identity.model_short, "claude-sonnet-4-6");
+    assert_eq!(model.meter_epoch.selection_epoch, Some(12));
+}

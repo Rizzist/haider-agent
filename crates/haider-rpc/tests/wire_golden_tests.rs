@@ -42,6 +42,131 @@ fn fixture_path() -> PathBuf {
         .join("wire_transcript.json")
 }
 
+#[test]
+fn monitor_handle_sources_are_additive_wire_variants() {
+    let pinned: Value =
+        serde_json::from_str(include_str!("fixtures/monitor_handle_sources_v1.json"))
+            .expect("monitor handle wire fixture");
+    let sources = [
+        haider_rpc::MonitorSourceWire::Task {
+            task_id: "task-fixture".into(),
+        },
+        haider_rpc::MonitorSourceWire::Agent {
+            agent_id: "agent-fixture".into(),
+        },
+    ];
+    let events = [
+        haider_rpc::MonitorEventPayloadWire::Task {
+            payload: "{\"output_digest\":\"ok\"}".into(),
+        },
+        haider_rpc::MonitorEventPayloadWire::Agent {
+            payload: "{\"report\":\"done\"}".into(),
+        },
+    ];
+    assert_eq!(
+        serde_json::to_value(&sources).expect("encode sources"),
+        pinned["sources"]
+    );
+    assert_eq!(
+        serde_json::to_value(&events).expect("encode events"),
+        pinned["events"]
+    );
+    for source in sources {
+        let value = serde_json::to_value(&source).expect("encode source");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorSourceWire>(value).expect("decode source"),
+            source
+        );
+    }
+    for event in events {
+        let value = serde_json::to_value(&event).expect("encode event");
+        assert_eq!(
+            serde_json::from_value::<haider_rpc::MonitorEventPayloadWire>(value)
+                .expect("decode event"),
+            event
+        );
+    }
+}
+
+/// Owner decision 2026-09-25: `headless.run.stop` gains an additive
+/// `scope` (absent = `all`, byte-identical to the historical request) and the
+/// response an additive `scope` echo plus `subagents` summary.
+///
+/// MUTATION CHECK: serialize `scope` for the default, rename a scope or a
+/// summary field. Expected runtime failure: the pinned JSON differs.
+#[test]
+fn headless_run_stop_scope_is_additive_and_default_absent() {
+    let default_stop = RequestBody::HeadlessRunStop {
+        command_id: haider_rpc::CommandId::new("command-stop"),
+        run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+        scope: haider_rpc::RunStopScopeWire::All,
+    };
+    assert_eq!(
+        serde_json::to_value(&default_stop).expect("encode stop"),
+        serde_json::json!({"method":"headless.run.stop","command_id":"command-stop","run_id":"run-1"})
+    );
+    for (scope, name) in [
+        (haider_rpc::RunStopScopeWire::Main, "main"),
+        (haider_rpc::RunStopScopeWire::Subagents, "subagents"),
+    ] {
+        let request = RequestBody::HeadlessRunStop {
+            command_id: haider_rpc::CommandId::new("command-stop"),
+            run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+            scope,
+        };
+        let value = serde_json::to_value(&request).expect("encode scoped stop");
+        assert_eq!(value["scope"], name);
+        assert_eq!(
+            serde_json::from_value::<RequestBody>(value).expect("decode scoped stop"),
+            request
+        );
+    }
+    let legacy: RequestBody = serde_json::from_value(serde_json::json!({
+        "method":"headless.run.stop","command_id":"command-stop","run_id":"run-1"
+    }))
+    .expect("decode legacy stop");
+    assert!(matches!(
+        legacy,
+        RequestBody::HeadlessRunStop {
+            scope: haider_rpc::RunStopScopeWire::All,
+            ..
+        }
+    ));
+    let response = ResponseBody::HeadlessRunStop {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        run_id: haider_rpc::haider_protocol::ids::RunId::new("run-1"),
+        status: CancelStatus::Accepted,
+        terminal_seq: None,
+        scope: Some(haider_rpc::RunStopScopeWire::Main),
+        subagents: Some(haider_rpc::SubagentStopSummaryWire {
+            cancelled_runs: 0,
+            sessions: 2,
+            monitors_removed: 0,
+            still_running: 2,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(&response).expect("encode stop response"),
+        serde_json::json!({
+            "method":"headless.run.stop","session_id":"session-1","run_id":"run-1",
+            "status":"accepted","scope":"main",
+            "subagents":{"cancelled_runs":0,"sessions":2,"monitors_removed":0,"still_running":2}
+        })
+    );
+    let legacy_response: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method":"headless.run.stop","session_id":"session-1","run_id":"run-1","status":"accepted"
+    }))
+    .expect("decode legacy stop response");
+    assert!(matches!(
+        legacy_response,
+        ResponseBody::HeadlessRunStop {
+            scope: None,
+            subagents: None,
+            ..
+        }
+    ));
+}
+
 /// Earlier append laws still pin their exact 184-frame history. The new
 /// subscription response is separately pinned by the full golden test.
 fn frozen_pre_subscription_transcript() -> Vec<WireFrame> {
@@ -714,6 +839,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "account.source_remove",
         "account.source_scan",
         "agent.cancel",
+        "agent.cancel_all",
         "agent.message",
         "artifact.put",
         "branch.create",
@@ -837,8 +963,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        136,
-        "133 merged methods plus turn.retract and two peer injection methods"
+        137,
+        "133 merged methods plus turn.retract, two peer injection methods and agent.cancel_all"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -890,8 +1016,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        68,
-        "the supplemental fixture must contain the 68 methods absent from the union transcript"
+        69,
+        "the supplemental fixture must contain the 69 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);

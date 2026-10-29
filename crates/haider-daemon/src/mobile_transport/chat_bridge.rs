@@ -407,6 +407,12 @@ fn monitor_report_chat_text(report: &MonitorReport) -> String {
                     truncate_chars(payload, TOOL_PREVIEW_CHARS),
                 ));
             }
+            MonitorEventPayload::Task { payload } | MonitorEventPayload::Agent { payload } => {
+                text.push_str(&format!(
+                    "\nCompletion event:\n{}\n",
+                    truncate_chars(payload, TOOL_PREVIEW_CHARS)
+                ));
+            }
             MonitorEventPayload::Poll { payload } => {
                 text.push_str(&format!(
                     "\nPoll event:\n{}\n",

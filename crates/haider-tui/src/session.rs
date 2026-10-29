@@ -785,7 +785,8 @@ fn chip_or_session(chips: &[ChipModel], agent: Option<&AgentId>) -> Destination 
 /// Chip-tree bookkeeping for the three agent payloads (report R11 cut 2).
 ///
 /// `AgentSpawned` creates the chip from its manifest (idempotent under
-/// replay), `AgentChipState` is the SOLE chip-state authority, and
+/// replay), `AgentChipState` supplies state until a sealed child-session
+/// snapshot supersedes it, and
 /// `AgentReport` contributes ONLY summary/verification content — never
 /// state. Shared by the attached and background routes. `at_ms` is the
 /// envelope's `committed_at_ms`: the spawn instant on `AgentSpawned`, an
@@ -824,7 +825,9 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, a
             }
         }
         EventPayload::AgentChipState { agent, chip } => {
-            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str()) {
+            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str())
+                && model.state_child_head_seq.is_none()
+            {
                 // S4: through the shared transition law — a terminal flip
                 // freezes the chip's clock at this envelope's timestamp.
                 model.set_state_at(crate::script::ChipDisplayState::from_protocol(chip), at_ms);
