@@ -214,6 +214,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
@@ -253,6 +255,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-roster"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
@@ -1920,6 +1924,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-workspace"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: SessionId::new("session-workspace"),
                     head_seq: 17,
@@ -2517,6 +2523,8 @@ fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: Sessi
         },
         WireFrame::SessionRosterDelta {
             summaries: vec![SessionSummary {
+                owner_agent_id: None,
+                launch_origin: None,
                 latest_context_footprint: None,
                 session_id: child_session_id,
                 head_seq: 58,

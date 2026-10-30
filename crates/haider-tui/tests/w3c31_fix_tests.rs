@@ -45,6 +45,8 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(n),
         head_seq,

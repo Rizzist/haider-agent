@@ -37,6 +37,8 @@ fn summary(
     title: Option<&str>,
 ) -> haider_rpc::SessionSummary {
     haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: session_id.clone(),
         head_seq,
