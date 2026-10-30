@@ -2806,6 +2806,8 @@ fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
 #[test]
 fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
     let current = haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: haider_protocol::ids::SessionId::new("session-workspace"),
         head_seq: 17,
@@ -4669,6 +4671,8 @@ fn session_rename_frames_are_additive_and_golden() {
     // SessionSummary.title is additive: absent stays OFF the wire, and a
     // summary WITH a title round-trips.
     let bare = serde_json::to_value(SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
         head_seq: 9,
@@ -5538,6 +5542,8 @@ fn session_descendant_stream_is_additive_tagged_and_golden() {
 #[test]
 fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
     let child = haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: haider_protocol::ids::SessionId::new("session-lineage-child"),
         head_seq: 4,
@@ -5574,6 +5580,8 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
     assert_eq!(value["parent_session_id"], "session-lineage-parent");
 
     let root = haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         parent_session_id: None,
         kind: Some(haider_rpc::SessionKindWire::Root),

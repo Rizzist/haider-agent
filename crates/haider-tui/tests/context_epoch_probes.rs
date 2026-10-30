@@ -1394,6 +1394,8 @@ fn listed_summary(
         created_at_ms: 1,
     };
     haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: session.clone(),
         head_seq: 3,

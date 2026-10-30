@@ -421,6 +421,8 @@ fn chip_clock_is_monotone_and_stops_at_terminal() {
 
 fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionSummary {
     haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: SessionId::new(session_id),
         head_seq,
@@ -820,6 +822,8 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
     note_child_metrics(&mut model, &child);
     let main = snapshot(None, sid().as_str(), 11, false, AuthMethod::ApiKey, 130_000);
     model.note_summary_counts(&haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(),
         head_seq: 11,

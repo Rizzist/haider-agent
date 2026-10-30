@@ -5094,9 +5094,10 @@ impl Store {
         let Some(json) = metadata else {
             return Ok(None);
         };
-        let Some(metadata) = decode_session_metadata(session_id, &json)? else {
+        let Some(mut metadata) = decode_session_metadata(session_id, &json)? else {
             return Ok(None);
         };
+        metadata.launch_origin = recovered_launch_origin(&connection, session_id, Some(&metadata))?;
         if metadata.selection_epoch.is_some() {
             return Ok(Some(metadata));
         }
@@ -5122,6 +5123,8 @@ impl Store {
                 )
                 .map_err(map_sqlite_error)?;
         }
+        metadata.launch_origin =
+            recovered_launch_origin(&transaction, session_id, Some(&metadata))?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(Some(metadata))
     }
@@ -9778,6 +9781,9 @@ impl Store {
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
         metadata.budget_clamp_notice_epoch = None;
+        // A fork inherits history, not a claim that the parent's TUI opened
+        // the child. The child's first foreground open starts at revision 0.
+        metadata.launch_origin = None;
         // Explicit account and endpoint choices are part of the copied
         // session configuration. Unpinned parents still follow the mutable
         // provider default because their account_alias is already None.
@@ -11205,12 +11211,8 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(map_sqlite_error)?;
-        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)?
-            && metadata.launch_origin.is_some()
-        {
-            return Ok(metadata.launch_origin);
-        }
-        latest_launch_origin_event(&connection, session_id)
+        let metadata = decode_session_metadata(session_id, &metadata_json)?;
+        recovered_launch_origin(&connection, session_id, metadata.as_ref())
     }
 
     /// Atomically applies one launch-origin registration: revision CAS,
@@ -11270,15 +11272,9 @@ impl Store {
             .map_err(map_sqlite_error)?;
         // Legacy `{}` metadata stays `{}`: the event alone carries origin.
         let metadata = decode_session_metadata(&command.session_id, &metadata_json)?;
-        let current_revision = match &metadata {
-            Some(metadata) => match &metadata.launch_origin {
-                Some(origin) => origin.revision,
-                None => latest_launch_origin_event(&transaction, &command.session_id)?
-                    .map_or(0, |origin| origin.revision),
-            },
-            None => latest_launch_origin_event(&transaction, &command.session_id)?
-                .map_or(0, |origin| origin.revision),
-        };
+        let current_revision =
+            recovered_launch_origin(&transaction, &command.session_id, metadata.as_ref())?
+                .map_or(0, |origin| origin.revision);
         if command.expected_revision != current_revision {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -22357,6 +22353,19 @@ fn stale_generation(provided: u64, current: u64) -> HaiderError {
     )
 }
 
+/// The same own-subject snapshot feeds list/observe, attach and revision CAS.
+/// A missing or foreign projection does not erase an own journal fact.
+fn recovered_launch_origin(
+    connection: &Connection,
+    session_id: &SessionId,
+    metadata: Option<&SessionMetadataV1>,
+) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+    match metadata.and_then(|metadata| metadata.launch_origin.as_ref()) {
+        Some(origin) => Ok(Some(origin.clone())),
+        None => latest_launch_origin_event(connection, session_id),
+    }
+}
+
 fn decode_session_metadata(
     session_id: &SessionId,
     json: &str,
@@ -22369,11 +22378,23 @@ fn decode_session_metadata(
     if value.as_object().is_some_and(serde_json::Map::is_empty) {
         return Ok(None);
     }
-    serde_json::from_value(value).map(Some).map_err(|error| {
+    let mut metadata: SessionMetadataV1 = serde_json::from_value(value).map_err(|error| {
         corrupt(format!(
             "session {session_id} metadata does not match SessionMetadataV1: {error}"
         ))
-    })
+    })?;
+    // Older fork writers copied this projection along with session config.
+    // Its revision is authority only for its subject, just like origin facts
+    // in the journal. Discard a foreign claim on every metadata read so list,
+    // attach and origin CAS agree for existing children as well as new ones.
+    if metadata
+        .launch_origin
+        .as_ref()
+        .is_some_and(|origin| origin.subject_session_id != session_id.as_str())
+    {
+        metadata.launch_origin = None;
+    }
+    Ok(Some(metadata))
 }
 
 #[derive(Debug)]

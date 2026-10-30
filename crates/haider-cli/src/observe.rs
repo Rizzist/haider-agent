@@ -217,6 +217,9 @@ pub(crate) struct SessionSummaryView {
     /// lineage, this carries the exact source-prompt sequence selected as the
     /// child's editable draft.
     pub forked_from: Option<SessionForkProvenance>,
+    /// Origin and owning agent from the authoritative roster snapshot.
+    pub owner_agent_id: Option<haider_protocol::ids::AgentId>,
+    pub launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -389,6 +392,12 @@ impl ObserveJson for SessionSummaryView {
         }
         if let Some(needs_input) = &self.needs_input {
             object["needs_input"] = serde_json::to_value(needs_input).unwrap_or(Value::Null);
+        }
+        if let Some(owner) = &self.owner_agent_id {
+            object["owner_agent_id"] = json!(owner);
+        }
+        if let Some(origin) = &self.launch_origin {
+            object["launch_origin"] = json!(origin);
         }
         if let Some(provenance) = &self.forked_from {
             object["forked_from"] = json!({
@@ -989,6 +998,8 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         waiting_why: None,
         needs_input: None,
         forked_from: None,
+        owner_agent_id: None,
+        launch_origin: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
@@ -1091,6 +1102,8 @@ pub(crate) fn merge_roster_summary(
     view.waiting_why = summary.waiting_why.clone();
     view.needs_input = summary.needs_input.clone();
     view.forked_from = summary.forked_from.clone();
+    view.owner_agent_id = summary.owner_agent_id.clone();
+    view.launch_origin = summary.launch_origin.clone();
 }
 
 pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
@@ -1605,6 +1618,8 @@ mod roster_scalar_tests {
             waiting_why: None,
             needs_input: None,
             forked_from: None,
+            owner_agent_id: None,
+            launch_origin: None,
         }
     }
 

@@ -97,6 +97,8 @@ fn listed(n: usize) -> LiveReply {
     LiveReply::Listed {
         sessions: (0..n)
             .map(|index| SessionSummary {
+                owner_agent_id: None,
+                launch_origin: None,
                 latest_context_footprint: None,
                 session_id: sid(index),
                 head_seq: 0,
