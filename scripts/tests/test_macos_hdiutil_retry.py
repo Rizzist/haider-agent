@@ -1,5 +1,6 @@
 """Exercise the real macOS installer builder with injected hdiutil busy errors."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -216,9 +217,11 @@ native_hdiutil "$@"
                 raise RuntimeError('hdiutil attachment inventory remained incomplete')
             time.sleep(0.1 * (attempt + 1))
 
-    def disk_image_mountpoints(self):
+    def disk_image_mountpoints(self, images=None):
+        if images is None:
+            images = self.disk_image_inventory()
         return {Path(entity['mount-point']).resolve()
-                for image in self.disk_image_inventory()
+                for image in images
                 for entity in image.get('system-entities', [])
                 if 'mount-point' in entity}
 
@@ -316,43 +319,69 @@ native_hdiutil "$@"
     def remove_clear_directory(self, directory, inventory, label):
         if not directory.exists():
             return
-        root = directory.resolve()
-        def image_is_inside(image):
-            path = Path(image['image-path']).resolve()
-            if path.is_relative_to(root):
-                return True
-            # realpath does not normalize filesystem case/Unicode aliases.
-            # An aliased parent can still be this exact directory, even when
-            # an attached image's backing file has already been removed.
-            for parent in path.parents:
-                try:
-                    if parent.samefile(root):
-                        return True
-                except OSError:
-                    pass
-            return False
-        # Protect even foreign backing files whose volumes are already unmounted.
-        self.assertFalse(any(image_is_inside(image) for image in self.disk_image_inventory()
-                             if 'image-path' in image),
-                         f'attached image inside {label}')
-        self.assertFalse(any(mount.is_relative_to(directory.resolve()) for mount in inventory),
-                         f'unrecorded mount inside {label}')
-        device = directory.stat().st_dev
-        self.assertEqual(device, directory.parent.stat().st_dev,
-                         f'mounted filesystem at {label}')
+        with ExitStack() as pins:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            pins.callback(os.close, descriptor)
+            original = os.fstat(descriptor)
+            root = directory.resolve()
 
-        def fail_walk(error):
-            raise error
+            def require_original_directory():
+                current = directory.lstat()
+                self.assertEqual((current.st_dev, current.st_ino),
+                                 (original.st_dev, original.st_ino),
+                                 f'directory identity changed; retaining {label}')
 
-        # Check before deleting any files. This also catches mounts omitted from
-        # the inventory or represented there with a different case/Unicode alias.
-        for current, names, _ in os.walk(directory, onerror=fail_walk, followlinks=False):
-            for name in names:
-                child = Path(current) / name
-                if not child.is_symlink():
-                    self.assertEqual(child.stat().st_dev, device,
-                                     f'mounted filesystem inside {label}')
-        shutil.rmtree(directory)
+            def image_is_inside(image):
+                path = Path(image['image-path']).resolve()
+                if path.is_relative_to(root):
+                    return True
+                # realpath does not normalize filesystem case/Unicode aliases.
+                # An aliased parent can still be this exact directory, even when
+                # an attached image's backing file has already been removed.
+                for parent in path.parents:
+                    try:
+                        if parent.samefile(root):
+                            return True
+                    except OSError:
+                        pass
+                return False
+
+            # A successful detach can precede a clear inventory. Refresh both
+            # views before refusing cleanup; no device entry, live or departed,
+            # grants permission to remove an inventoried backing directory.
+            for attempt in range(4):
+                require_original_directory()
+                images = self.disk_image_inventory()
+                mounts = self.disk_image_mountpoints(images)
+                if attempt == 0:
+                    mounts |= set(inventory)
+                require_original_directory()
+                attached = any(image_is_inside(image) for image in images if 'image-path' in image)
+                mounted = any(mount.is_relative_to(root) for mount in mounts)
+                if not attached and not mounted:
+                    break
+                if attempt == 3:
+                    self.assertFalse(attached, f'attached image inside {label}')
+                    self.assertFalse(mounted, f'unrecorded mount inside {label}')
+                time.sleep(.1 * (attempt + 1))
+
+            device = original.st_dev
+            self.assertEqual(device, directory.parent.stat().st_dev,
+                             f'mounted filesystem at {label}')
+
+            def fail_walk(error):
+                raise error
+
+            # Check before deleting any files. This also catches mounts omitted from
+            # the inventory or represented there with a different case/Unicode alias.
+            for current, names, _ in os.walk(directory, onerror=fail_walk, followlinks=False):
+                for name in names:
+                    child = Path(current) / name
+                    if not child.is_symlink():
+                        self.assertEqual(child.stat().st_dev, device,
+                                         f'mounted filesystem inside {label}')
+            require_original_directory()
+            shutil.rmtree(directory)
 
     def cleanup_fixtures(self):
         # Keep fixtures if detach/audit fails: deleting them can traverse a mount.
@@ -2447,6 +2476,191 @@ native_hdiutil "$@"
         self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), changed['after_sha256'])
         self.assertEqual(image.with_suffix('.dmg.sha256').read_text().split()[0], changed['after_sha256'])
         self.assert_no_test_mounts()
+
+
+@unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS fixture directory checks')
+class MacOSFixtureDirectoryTests(unittest.TestCase):
+    """Replay post-detach inventory changes without operating a disk device."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.directory = self.base / 'work-\u00e9'
+        self.case = MacOSHdiutilRetryTests()
+        self.reset_directory()
+
+    def reset_directory(self):
+        self.directory.mkdir()
+        self.marker = self.directory / 'keep.txt'
+        self.marker.write_text('fixture data\n')
+
+    def remove(self, inventory=()):
+        self.case.remove_clear_directory(self.directory, inventory, 'fixture directory')
+
+    def test_transient_image_entries_recover_through_fourth_observation(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        for observations in (1, 2, 3):
+            with self.subTest(observations=observations):
+                if not self.directory.exists():
+                    self.reset_directory()
+                with patch.object(self.case, 'disk_image_inventory',
+                                  side_effect=[[image]] * observations + [[]]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()) as mounts, \
+                        patch.object(time, 'sleep') as backoff:
+                    self.remove()
+                self.assertEqual(images.call_count, observations + 1)
+                self.assertEqual(mounts.call_count, observations + 1)
+                self.assertEqual([call.args[0] for call in backoff.call_args_list],
+                                 [.1 * (attempt + 1) for attempt in range(observations)])
+                self.assertFalse(self.directory.exists())
+
+    def test_transient_mount_entries_refresh_the_callers_snapshot(self):
+        point = (self.directory / 'mount').resolve()
+        for observations in (1, 2, 3):
+            with self.subTest(observations=observations):
+                if not self.directory.exists():
+                    self.reset_directory()
+                with patch.object(self.case, 'disk_image_inventory', return_value=[]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints',
+                                     side_effect=[set()] + [{point}] * (observations - 1) + [set()]) as mounts, \
+                        patch.object(time, 'sleep'):
+                    self.remove({point})
+                self.assertEqual(images.call_count, observations + 1)
+                self.assertEqual(mounts.call_count, observations + 1)
+                self.assertFalse(self.directory.exists())
+
+    def test_persistent_image_entries_retain_data_without_device_authority(self):
+        alias = self.base / 'alias'
+        alias.symlink_to(self.directory, target_is_directory=True)
+        for path, entities in ((self.directory / 'missing.dmg', []),
+                               (self.directory / 'missing.dmg', [{'dev-entry': '/dev/disk973'}]),
+                               (alias / 'missing.dmg', [])):
+            with self.subTest(path=path, entities=entities):
+                image = {'image-path': str(path), 'system-entities': entities}
+                with patch.object(self.case, 'disk_image_inventory', return_value=[image]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()), \
+                        patch.object(time, 'sleep') as backoff, \
+                        patch.object(subprocess, 'run') as native:
+                    with self.assertRaisesRegex(AssertionError, 'attached image inside fixture'):
+                        self.remove()
+                self.assertEqual(images.call_count, 4)
+                self.assertEqual(backoff.call_count, 3)
+                native.assert_not_called()
+                self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_persistent_mount_entries_retain_data_after_four_observations(self):
+        point = (self.directory / 'mount').resolve()
+        with patch.object(self.case, 'disk_image_inventory', return_value=[]) as images, \
+                patch.object(self.case, 'disk_image_mountpoints', return_value={point}) as mounts, \
+                patch.object(time, 'sleep') as backoff:
+            with self.assertRaisesRegex(AssertionError, 'unrecorded mount inside fixture'):
+                self.remove({point})
+        self.assertEqual(images.call_count, 4)
+        self.assertEqual(mounts.call_count, 4)
+        self.assertEqual(backoff.call_count, 3)
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_unavailable_image_inventory_retains_data(self):
+        with patch.object(self.case, 'disk_image_inventory', side_effect=RuntimeError('inventory unavailable')), \
+                patch.object(time, 'sleep') as backoff:
+            with self.assertRaisesRegex(RuntimeError, 'inventory unavailable'):
+                self.remove()
+        backoff.assert_not_called()
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_fresh_unrecorded_mount_is_retained_with_empty_callers_snapshot(self):
+        image = {'image-path': str(self.base / 'other.dmg'),
+                 'system-entities': [{'mount-point': str(self.directory / 'mount')}]}
+        with patch.object(self.case, 'disk_image_inventory', return_value=[image]) as images, \
+                patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(AssertionError, 'unrecorded mount inside fixture'):
+                self.remove()
+        self.assertEqual(images.call_count, 4)
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_unavailable_mount_inventory_during_refresh_retains_data(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        with patch.object(self.case, 'disk_image_inventory', side_effect=[[image], []]), \
+                patch.object(self.case, 'disk_image_mountpoints',
+                             side_effect=[set(), RuntimeError('inventory unavailable')]), \
+                patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'inventory unavailable'):
+                self.remove()
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_directory_replacement_during_wait_or_inventory_is_retained(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        for when in ('wait', 'inventory'):
+            with self.subTest(when=when):
+                original = self.base / ('original-' + when)
+                def replace_directory(*_):
+                    self.directory.rename(original)
+                    self.directory.mkdir()
+                    self.marker.write_text('different directory\n')
+                def observe():
+                    if when == 'inventory':
+                        replace_directory()
+                        return []
+                    return [image]
+                with patch.object(self.case, 'disk_image_inventory', side_effect=observe), \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()), \
+                        patch.object(time, 'sleep', side_effect=replace_directory):
+                    with self.assertRaisesRegex(AssertionError, 'directory identity changed'):
+                        self.remove()
+                self.assertEqual(self.marker.read_text(), 'different directory\n')
+                self.assertEqual((original / 'keep.txt').read_text(), 'fixture data\n')
+                self.marker.write_text('fixture data\n')
+
+    def test_directory_replacement_during_walk_is_retained(self):
+        original = self.base / 'original-walk'
+        def walk(*args, **kwargs):
+            self.directory.rename(original)
+            self.directory.mkdir()
+            self.marker.write_text('different directory\n')
+            return iter(())
+        with patch.object(self.case, 'disk_image_inventory', return_value=[]), \
+                patch.object(os, 'walk', side_effect=walk):
+            with self.assertRaisesRegex(AssertionError, 'directory identity changed'):
+                self.remove()
+        self.assertEqual(self.marker.read_text(), 'different directory\n')
+        self.assertEqual((original / 'keep.txt').read_text(), 'fixture data\n')
+
+    def test_physical_mount_checks_retain_data_with_clear_inventory(self):
+        import stat
+        mount = self.directory / 'mount'
+        mount.mkdir()
+        native_stat = Path.stat
+        for changed in (self.directory.parent, mount):
+            with self.subTest(changed=changed):
+                def observed_stat(path, *args, **kwargs):
+                    observed = native_stat(path, *args, **kwargs)
+                    if path == changed:
+                        values = list(observed)
+                        values[stat.ST_DEV] += 1
+                        return os.stat_result(values)
+                    return observed
+                with patch.object(self.case, 'disk_image_inventory', return_value=[]), \
+                        patch.object(Path, 'stat', observed_stat):
+                    with self.assertRaisesRegex(AssertionError, 'mounted filesystem (at|inside)'):
+                        self.remove()
+                self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_clear_directory_control_preserves_unrelated_entries(self):
+        other = self.base / 'other'
+        other.mkdir()
+        marker = other / 'keep.txt'
+        marker.write_text('other data\n')
+        with patch.object(self.case, 'disk_image_inventory',
+                          return_value=[{'image-path': str(other / 'image.dmg')}]) as images, \
+                patch.object(self.case, 'disk_image_mountpoints', return_value=set()) as mounts, \
+                patch.object(time, 'sleep') as backoff:
+            self.remove({other / 'mount'})
+        self.assertEqual(images.call_count, 1)
+        self.assertEqual(mounts.call_count, 1)
+        backoff.assert_not_called()
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(marker.read_text(), 'other data\n')
 
 
 @unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS backing-file audit')
