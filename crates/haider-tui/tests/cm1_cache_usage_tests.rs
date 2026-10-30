@@ -106,6 +106,8 @@ fn footer_model(reread_basis_points: Option<u32>) -> AppModel {
         }),
     };
     model.note_summary_counts(&haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: session,
         head_seq: 1,

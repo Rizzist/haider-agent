@@ -26,9 +26,10 @@ use crate::identity::UiGeneration;
 use crate::projection::{Admission, MenuScopeOwner, RawOutcome, SessionProjection};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{AgentId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, SessionId};
 
-/// One previous user prompt recalled by the Esc-Esc chooser.
+/// One previous user prompt recalled by the Esc-Esc chooser, with its
+/// owning agent and source branch retained independently of the displayed branch.
 ///
 /// `seq` is the DURABLE journal coordinate of the source `UserMessage`
 /// envelope — the exclusive cut a `session.fork` resolves. It is `Some` only
@@ -40,6 +41,8 @@ use haider_protocol::ids::{AgentId, SessionId};
 pub struct PromptEntry {
     pub text: String,
     pub seq: Option<u64>,
+    pub agent_id: Option<AgentId>,
+    pub branch_id: Option<BranchId>,
 }
 
 impl PromptEntry {
@@ -49,14 +52,79 @@ impl PromptEntry {
         Self {
             text,
             seq: Some(seq),
+            agent_id: None,
+            branch_id: None,
+        }
+    }
+
+    /// Keep the source lane with its journal cut, even after a branch switch.
+    #[must_use]
+    pub fn from_envelope(text: String, envelope: &RawEnvelope) -> Self {
+        Self {
+            text,
+            seq: Some(envelope.seq),
+            agent_id: envelope.agent_id.clone(),
+            branch_id: envelope.branch_id.clone(),
         }
     }
 
     /// A prompt with no durable coordinate (the local demo twin).
     #[must_use]
     pub const fn local(text: String) -> Self {
-        Self { text, seq: None }
+        Self {
+            text,
+            seq: None,
+            agent_id: None,
+            branch_id: None,
+        }
     }
+}
+
+/// Preserve other scopes until ownership metadata catches up with replay.
+/// Keeping these entries also lets a fresh Root snapshot replace delegation
+/// ownership without re-reading the journal or exposing another agent's turns.
+pub(crate) fn record_scoped_prompt(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    owner: Option<&AgentId>,
+    entry: PromptEntry,
+) {
+    if entry.agent_id.as_ref() == owner {
+        history.push_front(entry);
+    } else {
+        pending.push_front(entry);
+    }
+}
+
+pub(crate) fn rescope_prompts(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    owner: Option<&AgentId>,
+) {
+    let mut entries: Vec<_> = history.drain(..).chain(pending.drain(..)).collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+    for entry in entries {
+        if entry.agent_id.as_ref() == owner {
+            history.push_back(entry);
+        } else {
+            pending.push_back(entry);
+        }
+    }
+}
+
+pub(crate) fn forget_scoped_prompt(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    envelope: &RawEnvelope,
+    seq: u64,
+) {
+    let keep = |entry: &PromptEntry| {
+        entry.seq != Some(seq)
+            || entry.agent_id != envelope.agent_id
+            || entry.branch_id != envelope.branch_id
+    };
+    history.retain(keep);
+    pending.retain(keep);
 }
 
 /// One session, fully owned — the sim's `sessions[i]` (tui.js:497-579
@@ -111,6 +179,9 @@ pub struct SessionState {
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
     pub prompt_history: std::collections::VecDeque<PromptEntry>,
+    pub(crate) prompt_pending: std::collections::VecDeque<PromptEntry>,
+    /// Durable owning agent from this session's summary, never inferred from ids.
+    pub prompt_owner: Option<AgentId>,
     pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
@@ -264,6 +335,8 @@ impl SessionState {
             account_request_epoch: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
+            prompt_owner: None,
+            prompt_pending: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
@@ -465,15 +538,20 @@ impl SessionState {
                 // already refused; and a retraction that lands here still has
                 // to drop the prompt from THIS session's chooser, because
                 // nothing re-delivers the fact when the user comes back.
-                if envelope.agent_id.is_none()
-                    && !route_response_boundary(&mut self.projection, envelope)
-                    && let Some(fact) =
-                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
-                            &envelope.payload,
-                        )
+                if envelope.agent_id.as_ref() == self.prompt_owner.as_ref() {
+                    route_response_boundary(&mut self.projection, envelope);
+                }
+                if let Some(fact) =
+                    haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                        &envelope.payload,
+                    )
                 {
-                    self.prompt_history
-                        .retain(|entry| entry.seq != Some(fact.prompt_seq));
+                    forget_scoped_prompt(
+                        &mut self.prompt_history,
+                        &mut self.prompt_pending,
+                        envelope,
+                        fact.prompt_seq,
+                    );
                 }
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The fork this session itself issued: the receipt is
@@ -499,11 +577,13 @@ impl SessionState {
                                     &origin,
                                 );
                             }
-                            if envelope.agent_id.is_none()
-                                && let EventPayload::UserMessage { text, .. } = &payload
-                            {
-                                self.prompt_history
-                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
+                            if let EventPayload::UserMessage { text, .. } = &payload {
+                                record_scoped_prompt(
+                                    &mut self.prompt_history,
+                                    &mut self.prompt_pending,
+                                    self.prompt_owner.as_ref(),
+                                    PromptEntry::from_envelope(text.clone(), envelope),
+                                );
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(&payload, envelope);

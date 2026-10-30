@@ -1,5 +1,25 @@
 # Wave 973 integration resolutions
 
+## ci-winpath integration on 2026-10-30
+
+Integrates wave `5837b85ad9746a3a6adbbad74e1e0f23b106d566` into lane
+candidate `882dca65b27f94e342bab58df2b5aeae4d7707d2`. The only textual
+conflict is the shared test baseline. Both parents' source changes are retained.
+
+The wave's fork prompt history keeps its subject session, owning agent and
+source branch, including delayed ownership snapshots and manifest replay. Its
+launch-origin revision handling and subject-session guard remain intact. The
+merged summary handlers still project path labels through the model's saved
+home context. Raw workspace paths and origin records retain their authority;
+display labels do not replace I/O paths.
+
+The merged source counts 7339 tests by xtask's file/marker rule: the prior lane
+count of 7312 plus the wave's 27 new tests. The actual xtask update/check/count
+must confirm this value under the build scheduler. Validation runs afresh on
+the committed merge. Under the current owner gate-tier rule, the Sol finisher
+runs TARGETED checks; the separate Astra gate owns the full workspace and
+packaging matrix. No earlier candidate receipt is credited to this merge.
+
 ## ci-winpath integration on 2026-10-29
 
 Integrates wave `183a99f63568100539b15d25ae4ceda34618c546` into the lane
