@@ -45,6 +45,8 @@ fn attachment_id() -> AttachmentId {
 
 fn summary() -> SessionSummary {
     SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(),
         head_seq: 0,

@@ -565,6 +565,8 @@ fn roster_row_accent_joins_the_summary_and_falls_back() {
     model.sessions.clear();
     model.upsert_live_session(&sid());
     let summary = haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(),
         head_seq: 4,
