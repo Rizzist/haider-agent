@@ -124,6 +124,8 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
             "summary.cache_reread_hit_basis_points",
         ),
         ("forked_from", "summary.forked_from"),
+        ("owner_agent_id", "summary.owner_agent_id"),
+        ("launch_origin", "summary.launch_origin"),
     ];
 
     let wire = wire_fields(&frame, "SessionSummary");

@@ -154,39 +154,268 @@ fn create_session(store: &Store, session_id: &SessionId) {
         .expect("create source session");
 }
 
+fn register_origin(store: &Store, session: &SessionId, revision: u64, open: &str) {
+    store
+        .register_session_launch_origin(&haider_store::SessionLaunchOriginCommand {
+            command_id: format!("origin-{session}-{open}"),
+            request_digest: format!("origin-digest-{session}-{open}"),
+            request_json:
+                serde_json::json!({"session": session, "open": open, "revision": revision})
+                    .to_string(),
+            session_id: session.clone(),
+            worker_generation: store.worker_generation(),
+            open_id: open.into(),
+            expected_revision: revision,
+            path: haider_protocol::session::LaunchOriginPathV1 {
+                kind: haider_protocol::session::LaunchOriginPathKindV1::HomeRelative,
+                display: Some("~/origin-test".into()),
+            },
+            workspace_materialized: Some(false),
+            event_id: EventId::new(format!("origin-event-{session}-{open}")),
+            device_id: DeviceId::new("origin-test-device"),
+        })
+        .expect("register current session origin");
+}
+
+fn assert_independent_origin(store: &Store, child: &SessionId) {
+    assert!(
+        store
+            .latest_launch_origin(child)
+            .expect("child origin")
+            .is_none()
+    );
+    assert!(
+        store
+            .session_metadata(child)
+            .expect("metadata")
+            .expect("typed")
+            .launch_origin
+            .is_none()
+    );
+    // Check the persisted projection too: filtering reads must not hide a
+    // newly written claim that the parent's TUI opened the child.
+    let connection = rusqlite::Connection::open(store.database_path()).expect("fixture db");
+    let origin: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(meta_json, '$.launch_origin') FROM sessions WHERE id = ?1",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .expect("stored origin");
+    assert!(
+        origin.is_none(),
+        "new child must not persist the parent's origin"
+    );
+    register_origin(store, child, 0, "first");
+    register_origin(store, child, 1, "reopen");
+    let current = store
+        .latest_launch_origin(child)
+        .expect("origin")
+        .expect("registered");
+    assert_eq!(current.subject_session_id, child.as_str());
+    assert_eq!(current.revision, 2);
+    assert_eq!(
+        store
+            .session_metadata(child)
+            .expect("current metadata")
+            .expect("typed child")
+            .launch_origin
+            .as_ref(),
+        Some(&current),
+        "owned origin must reach list and worker metadata, not just journal fallback"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum OriginForkVariant {
+    Exact,
+    Metafork,
+    Prompt,
+    NamedBranch,
+}
+
+fn fork_origin_variant(variant: OriginForkVariant) {
+    let prompt = matches!(variant, OriginForkVariant::Prompt);
+    let meta = matches!(variant, OriginForkVariant::Metafork);
+    let named_branch = matches!(variant, OriginForkVariant::NamedBranch);
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let parent = SessionId::new("origin-parent");
+    create_session(&store, &parent);
+    register_origin(&store, &parent, 0, "parent-first");
+    register_origin(&store, &parent, 1, "parent-reopen");
+    let (_, node, seq, user_seq) = source_turn(&store, &parent, "inherited history");
+    let before = source_bytes(&store, &parent);
+    let branch = named_branch.then(|| BranchId::new("origin-branch"));
+    let (node, seq, user_seq) = if let Some(branch) = branch.as_ref() {
+        store
+            .create_branch(&BranchCreateCommand {
+                command_id: "origin-branch-create".into(),
+                request_digest: "origin-branch-digest".into(),
+                request_json: "{}".into(),
+                session_id: parent.clone(),
+                worker_generation: store.worker_generation(),
+                branch_id: branch.clone(),
+                source_branch_id: None,
+                fork_node_id: node.clone(),
+                fork_seq: seq,
+                name: Some("origin branch".into()),
+                event_id: EventId::new("origin-branch-event"),
+                device_id: DeviceId::new("origin-test-device"),
+            })
+            .expect("create branch");
+        assert_eq!(
+            store
+                .latest_launch_origin(&parent)
+                .expect("branch origin")
+                .expect("same session")
+                .revision,
+            2
+        );
+        let (_, node, seq, user_seq) = source_turn_for_agent(
+            &store,
+            &parent,
+            None,
+            Some(branch.clone()),
+            "named branch history",
+        );
+        (node, seq, user_seq)
+    } else {
+        (node, seq, user_seq)
+    };
+    let child = SessionId::new("origin-child");
+    if prompt {
+        store
+            .fork_session_from_prompt(&SessionPromptForkCommand {
+                command_id: "origin-prompt-fork".into(),
+                request_digest: "origin-prompt-digest".into(),
+                request_json: "{}".into(),
+                source_session_id: parent.clone(),
+                session_id: child.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: branch,
+                prompt_seq: user_seq,
+                name: None,
+                audit_event_id: EventId::new("origin-prompt-audit"),
+                device_id: DeviceId::new("origin-test-device"),
+            })
+            .expect("prompt fork");
+    } else {
+        let metafork = meta.then(|| SessionMetaforkCommit {
+            description: "remove prompt".into(),
+            accepted_proposal_digest: String::new(),
+            model_proposal: SessionMetaforkProposal {
+                removals: vec![SessionMetaforkRemoval {
+                    from_seq: user_seq,
+                    through_seq: user_seq,
+                    reason: "remove prompt".into(),
+                    preview: None,
+                    reviewed_events: Vec::new(),
+                }],
+            },
+        });
+        let mut command = fork_command(
+            &store,
+            "origin-fork",
+            &parent,
+            child.as_str(),
+            node,
+            seq,
+            metafork,
+        );
+        command.source_branch_id = branch;
+        if meta {
+            accept_metafork_review(&mut command);
+        }
+        store.fork_session(&command).expect("fork");
+    }
+    assert_independent_origin(&store, &child);
+    assert_eq!(
+        store
+            .latest_launch_origin(&parent)
+            .expect("parent origin")
+            .expect("parent")
+            .revision,
+        2
+    );
+    if !named_branch {
+        assert_eq!(source_bytes(&store, &parent), before);
+    }
+    // Restart must preserve the child's own revision, never resurrect parent
+    // config from its copied immutable history.
+    drop(store);
+    let store = Store::open(root.path()).expect("restart");
+    assert_eq!(
+        store
+            .latest_launch_origin(&child)
+            .expect("origin after restart")
+            .expect("child")
+            .revision,
+        2
+    );
+}
+
+#[test]
+fn origin_fork_child_starts_independent_and_resumes() {
+    fork_origin_variant(OriginForkVariant::Exact);
+}
+
+#[test]
+fn origin_metafork_child_starts_independent_and_resumes() {
+    fork_origin_variant(OriginForkVariant::Metafork);
+}
+
+#[test]
+fn origin_prompt_fork_child_starts_independent_and_resumes() {
+    fork_origin_variant(OriginForkVariant::Prompt);
+}
+
+#[test]
+fn origin_named_branch_keeps_parent_revision_and_forks_independent_child() {
+    fork_origin_variant(OriginForkVariant::NamedBranch);
+}
+
 fn source_turn(store: &Store, session_id: &SessionId, text: &str) -> (RunId, NodeId, u64, u64) {
-    source_turn_for_agent(store, session_id, None, text)
+    source_turn_for_agent(store, session_id, None, None, text)
 }
 
 fn source_turn_for_agent(
     store: &Store,
     session_id: &SessionId,
     agent_id: Option<AgentId>,
+    branch_id: Option<BranchId>,
     text: &str,
 ) -> (RunId, NodeId, u64, u64) {
-    let run_id = RunId::new(format!("run-{session_id}"));
-    let request_json = serde_json::json!({
+    let turn_key = branch_id.as_ref().map_or_else(
+        || session_id.to_string(),
+        |branch| format!("{session_id}-{branch}"),
+    );
+    let run_id = RunId::new(format!("run-{turn_key}"));
+    let mut request = serde_json::json!({
         "session_id": session_id,
         "worker_generation": store.worker_generation(),
         "text": text,
-    })
-    .to_string();
+    });
+    if let Some(branch) = branch_id.as_ref() {
+        request["branch_id"] = serde_json::json!(branch);
+    }
+    let request_json = request.to_string();
     let TurnAcceptOutcome::Committed { envelopes, .. } = store
         .accept_turn(&TurnAcceptCommand {
-            command_id: format!("turn-{session_id}"),
+            command_id: format!("turn-{turn_key}"),
             request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
             request_json,
             session_id: session_id.clone(),
             worker_generation: store.worker_generation(),
             run_id: run_id.clone(),
             agent_id: agent_id.clone(),
-            branch_id: None,
+            branch_id: branch_id.clone(),
             text: text.into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Queue,
-            queued_event_id: EventId::new(format!("queued-{session_id}")),
-            user_event_id: EventId::new(format!("user-{session_id}")),
-            active_event_id: EventId::new(format!("active-{session_id}")),
+            queued_event_id: EventId::new(format!("queued-{turn_key}")),
+            user_event_id: EventId::new(format!("user-{turn_key}")),
+            active_event_id: EventId::new(format!("active-{turn_key}")),
             device_id: DeviceId::new("session-fork-test-device"),
         })
         .expect("accept source turn")
@@ -216,10 +445,10 @@ fn source_turn_for_agent(
         .expect("user node");
     let mut done = [EventEnvelope {
         schema_version: SCHEMA_VERSION,
-        event_id: EventId::new(format!("done-{session_id}")),
+        event_id: EventId::new(format!("done-{turn_key}")),
         seq: 0,
         session_id: session_id.clone(),
-        branch_id: None,
+        branch_id,
         run_id: Some(run_id.clone()),
         agent_id,
         device_id: DeviceId::new("session-fork-test-device"),
@@ -2144,12 +2373,24 @@ fn fork_from_named_branch_materializes_only_that_lineage_as_child_main() {
 /// invisible from the independent child's ordinary root lane.
 #[test]
 fn delegated_source_owner_lane_becomes_child_root_history() {
+    delegated_source_fork(false);
+}
+
+#[test]
+fn origin_fork_from_delegated_source_starts_independent() {
+    delegated_source_fork(true);
+}
+
+fn delegated_source_fork(with_origin: bool) {
     let root = tempfile::tempdir().expect("profile");
     let store = Store::open(root.path()).expect("store");
     let parent = SessionId::new("delegated-fork-parent");
     let source = SessionId::new("delegated-fork-source");
     create_session(&store, &parent);
     create_session(&store, &source);
+    if with_origin {
+        register_origin(&store, &source, 0, "delegated-source-open");
+    }
     let agent = AgentId::new("delegated-fork-agent");
     store
         .create_delegation(&DelegationRecord {
@@ -2193,6 +2434,7 @@ fn delegated_source_owner_lane_becomes_child_root_history() {
         &store,
         &source,
         Some(agent.clone()),
+        None,
         "delegated history becomes a standalone root",
     );
     let source_before = source_storage_bytes(root.path(), &source);
@@ -2229,6 +2471,9 @@ fn delegated_source_owner_lane_becomes_child_root_history() {
                 .contains("delegated history becomes a standalone root")
     }));
     assert_eq!(source_storage_bytes(root.path(), &source), source_before);
+    if with_origin {
+        assert_independent_origin(&store, &command.session_id);
+    }
 }
 
 /// A run id is not a complete activity coordinate: each agent lane reduces
