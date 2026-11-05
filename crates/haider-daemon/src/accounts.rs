@@ -991,10 +991,9 @@ pub(crate) struct ManagementView {
 }
 
 impl ManagementView {
-    fn catalog_is_account_scoped(summary: &ProviderSummaryWire) -> bool {
-        summary.catalog == haider_rpc::ProviderCatalogKindWire::Authenticated
-            || (summary.catalog == haider_rpc::ProviderCatalogKindWire::Custom
-                && !summary.auth_methods.is_empty())
+    /// Management inventories describe each provider's active account.
+    pub(crate) fn scope_catalogs_for_active_accounts(&mut self) {
+        self.scope_catalogs(None);
     }
 
     pub(crate) fn scope_catalogs_for_session(
@@ -1002,20 +1001,20 @@ impl ManagementView {
         provider: &str,
         account_alias: Option<&str>,
     ) {
+        self.scope_catalogs(account_alias.map(|alias| (provider, alias)));
+    }
+
+    fn scope_catalogs(&mut self, pinned_account: Option<(&str, &str)>) {
         let providers = self
             .providers
             .iter()
             .map(|summary| summary.provider.clone())
             .collect::<Vec<_>>();
         for target in providers {
-            self.scope_catalog_for_account(
-                &target,
-                if target == provider {
-                    account_alias
-                } else {
-                    None
-                },
-            );
+            let alias = pinned_account
+                .filter(|(provider, _)| *provider == target)
+                .map(|(_, alias)| alias);
+            self.scope_catalog_for_account(&target, alias);
         }
     }
 
@@ -1028,7 +1027,7 @@ impl ManagementView {
             .providers
             .iter()
             .find(|summary| summary.provider == provider)?;
-        let account_scoped = Self::catalog_is_account_scoped(summary);
+        let account_scoped = summary.catalog_is_account_scoped();
         if !account_scoped {
             return Some(ProviderModelCacheKey::public(provider));
         }
@@ -1055,7 +1054,7 @@ impl ManagementView {
             .providers
             .iter_mut()
             .find(|row| row.provider == provider)?;
-        let account_scoped = Self::catalog_is_account_scoped(summary);
+        let account_scoped = summary.catalog_is_account_scoped();
         if !account_scoped {
             return account_alias.map(CredentialAlias::new);
         }
@@ -4254,6 +4253,21 @@ fn active_catalog_cache_key(
     catalog_cache_key(provider, auth, accounts.active_for_provider(provider))
 }
 
+/// Global provider mutations use the active account, never an inactive pin's
+/// most recently published remote inventory. Durable replay runs before this.
+fn scope_registry_catalog_to_active_account(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) {
+    if catalog_is_account_scoped(provider, providers)
+        && active_catalog_cache_key(provider, accounts, providers)
+            .is_none_or(|expected| providers.catalog_owners().get(provider) != Some(&expected))
+    {
+        providers.clear_discovered_models(provider);
+    }
+}
+
 /// Single-provider variant for imports whose catalog is offline/seeded.
 /// Compare active identities: changing an inactive alias cannot invalidate
 /// the active account's live inventory.
@@ -5233,9 +5247,9 @@ struct ProviderConfigureRecovery {
     /// journals the same transition even if the profile file was already saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_auth_requirement: Option<ProviderAuthRequirementWire>,
-    /// Public catalog facts already authenticated before the receipt claim.
-    /// Retaining them lets a crash-resume rebuild the durable cache without
-    /// persisting or reusing the ephemeral probe credential.
+    /// Catalog facts validated before the receipt claim. Recovery has no
+    /// captured account owner, so only provider-wide remote metadata can be
+    /// restored without a fresh account-bound discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovered_models: Option<Vec<DiscoveredModel>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5890,6 +5904,7 @@ async fn handle_set_default_model(
             return;
         }
     }
+    scope_registry_catalog_to_active_account(&identity.provider, accounts, providers);
     if let Err(error) = providers.validate_default_model(&identity.provider, &identity.model) {
         respond_management_error(&job.route, &error);
         return;
@@ -6138,6 +6153,7 @@ async fn handle_provider_configure(
             return;
         }
     }
+    scope_registry_catalog_to_active_account(&job.input.provider, accounts, providers);
     let (endpoint_to_validate, validate_repoint_claim) = match accepted_revision_unchanged {
         Some(_) => (None, false),
         None => match providers.get(&job.input.provider) {
@@ -6601,7 +6617,16 @@ async fn handle_provider_configure(
     } else {
         None
     };
-    if let Some(catalog) = discovered_catalog {
+    // A staged credential has not been installed as the active account yet.
+    // Legacy recovery also has no captured account owner. Neither catalog can
+    // be cached or published under the current account's otherwise valid key.
+    let can_bind_catalog = job.probe_secret.is_none() && accepted_revision_unchanged.is_none();
+    if discovered_catalog.is_some()
+        && catalog_is_account_scoped(&profile.provider_id, providers)
+        && !can_bind_catalog
+    {
+        providers.clear_discovered_models(&profile.provider_id);
+    } else if let Some(catalog) = discovered_catalog {
         let models_json = match serde_json::to_string(&catalog.models) {
             Ok(models_json) => models_json,
             Err(error) => {
@@ -7012,6 +7037,7 @@ async fn commit_provider_trust(
     identity: &ProviderSetTrustIdentity,
     previous: ProviderTrustWire,
 ) -> Result<(ProviderReceipt, u64), HaiderError> {
+    scope_registry_catalog_to_active_account(&identity.provider, accounts, providers);
     let receipt = ProviderReceipt {
         provider: providers.preview_trust(
             &identity.provider,
@@ -11546,8 +11572,7 @@ impl AccountsProviderFactory {
         let mut view = self.management.as_ref()?.read()?;
         let alias = Some(descriptor.alias.as_str());
         if view.providers.iter().any(|summary| {
-            summary.provider == descriptor.provider
-                && ManagementView::catalog_is_account_scoped(summary)
+            summary.provider == descriptor.provider && summary.catalog_is_account_scoped()
         }) && view.catalog_key_for_account(&descriptor.provider, alias)
             != Some(ProviderModelCacheKey::for_account(
                 &descriptor.provider,
@@ -11592,7 +11617,7 @@ impl AccountsProviderFactory {
                 if let Some(descriptor) = descriptor
                     && view.providers.iter().any(|summary| {
                         summary.provider == descriptor.provider
-                            && ManagementView::catalog_is_account_scoped(summary)
+                            && summary.catalog_is_account_scoped()
                     })
                     && view.catalog_key_for_account(
                         &descriptor.provider,
@@ -13926,7 +13951,12 @@ async fn reconcile_provider_receipts(
             )
             .await?;
         }
-        if let Some(catalog) = recovered_catalog {
+        if recovered_catalog.is_some() && catalog_is_account_scoped(&profile.provider_id, providers)
+        {
+            // Legacy recovery records do not identify the producing account.
+            // Keep configured model intent, not unowned remote limits/cache rows.
+            providers.clear_discovered_models(&profile.provider_id);
+        } else if let Some(catalog) = recovered_catalog {
             let models_json = serde_json::to_string(&catalog.models).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::StoreCorrupt,

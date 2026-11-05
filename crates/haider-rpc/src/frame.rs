@@ -1601,6 +1601,13 @@ pub struct ProviderSummaryWire {
 }
 
 impl ProviderSummaryWire {
+    /// Whether fetched rows and their limits belong to one credential account.
+    #[must_use]
+    pub fn catalog_is_account_scoped(&self) -> bool {
+        self.catalog == ProviderCatalogKindWire::Authenticated
+            || (self.catalog == ProviderCatalogKindWire::Custom && !self.auth_methods.is_empty())
+    }
+
     /// Whether a pickable row comes from the maintained static catalog.
     #[must_use]
     pub fn has_static_models(&self) -> bool {

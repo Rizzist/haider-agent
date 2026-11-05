@@ -13379,8 +13379,7 @@ impl AppModel {
                 launcher.model_short = model;
             }
             launcher.context_window = self
-                .providers
-                .declared_window(&launcher.provider, &launcher.model_short)
+                .session_declared_window(None, &launcher.provider, &launcher.model_short)
                 .unwrap_or(0);
             self.launcher_identity = launcher;
             self.launcher_identity_pinned |= pin;
@@ -13414,6 +13413,86 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Management catalogs describe active accounts at one revision. Do not
+    /// combine a replacement account with an earlier catalog snapshot.
+    pub(crate) fn provider_inventory_matches_accounts(
+        &self,
+        summary: &haider_rpc::ProviderSummaryWire,
+    ) -> bool {
+        !summary.catalog_is_account_scoped()
+            || self.mode.fabricates_locally()
+            || matches!((self.accounts.revision, self.providers.revision),
+                (Some(accounts), Some(providers)) if accounts == providers)
+    }
+
+    fn session_model_detail(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<&haider_rpc::ModelDetailWire> {
+        let summary = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        let detail = summary
+            .model_details
+            .iter()
+            .find(|detail| detail.name == model)?;
+        // Maintained and manually configured facts belong to the provider.
+        // Only remote/unknown metadata needs the producing account snapshot.
+        if matches!(
+            detail.source,
+            Some(
+                haider_rpc::ModelDetailSourceWire::Static
+                    | haider_rpc::ModelDetailSourceWire::Configured
+            )
+        ) {
+            return Some(detail);
+        }
+        if summary.catalog_is_account_scoped() && !self.mode.fabricates_locally() {
+            if !self.provider_inventory_matches_accounts(summary) {
+                return None;
+            }
+            if let Some(session) = session {
+                let row = self.sessions.iter().find(|row| &row.id == session)?;
+                let account_provider = row.account_provider.as_deref()?;
+                if account_provider == provider
+                    && let Some(pin) = row.account_alias.as_deref()
+                    && !self.accounts.rows.iter().any(|account| {
+                        account.provider == provider && account.selected && account.alias == pin
+                    })
+                {
+                    // The global catalog cannot supply an inactive pin's
+                    // limits. Its own request footprint remains authoritative.
+                    return None;
+                }
+            }
+        }
+        Some(detail)
+    }
+
+    fn session_declared_window(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u64> {
+        self.session_model_detail(session, provider, model)
+            .and_then(|detail| detail.context_window)
+    }
+
+    fn session_declared_output_limit(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u64> {
+        self.session_model_detail(session, provider, model)
+            .and_then(|detail| detail.max_output_tokens)
+    }
+
     /// Re-derives the identity's context window from the discovered catalog
     /// (W5g-1: real limits, never guessed). A provider-declared window
     /// always wins. With none declared, a LIVE identity's window becomes
@@ -13431,9 +13510,11 @@ impl AppModel {
         if self.active_session.is_none() && self.mode.fabricates_locally() {
             self.meter_epoch.pair = Some(pair);
         }
-        let declared = self
-            .providers
-            .declared_window(&self.identity.provider, &self.identity.model_short);
+        let declared = self.session_declared_window(
+            self.active_session.as_ref(),
+            &self.identity.provider,
+            &self.identity.model_short,
+        );
         let window = match declared {
             Some(window) => window,
             None if self.mode.fabricates_locally() => return,
@@ -13460,15 +13541,30 @@ impl AppModel {
         } else {
             self.meter_epoch.snapshot_epoch(latest)
         };
+        let account_scoped = self.providers.providers.iter().any(|summary| {
+            summary.provider == self.identity.provider && summary.catalog_is_account_scoped()
+        });
+        let window = if account_scoped && !self.mode.fabricates_locally() {
+            self.session_declared_window(
+                self.active_session.as_ref(),
+                &self.identity.provider,
+                &self.identity.model_short,
+            )
+            .unwrap_or(0)
+        } else {
+            self.identity.context_window
+        };
         let mut meter = crate::context_meter::ContextMeter::resolve(
             latest,
             self.projection.context_tokens(),
-            self.identity.context_window,
+            window,
             epoch,
             |window| {
-                let output_limit = self
-                    .providers
-                    .declared_output_limit(&self.identity.provider, &self.identity.model_short);
+                let output_limit = self.session_declared_output_limit(
+                    self.active_session.as_ref(),
+                    &self.identity.provider,
+                    &self.identity.model_short,
+                );
                 crate::context_meter::epoch_reserved_output(
                     self.meter_epoch.projected_output_budget(output_limit),
                     output_limit,
@@ -13507,8 +13603,10 @@ impl AppModel {
                 (tokens > 0).then_some(tokens)
             })
             .or_else(|| footprint.map(|item| item.used_tokens))?;
-        let window = self.providers.declared_window(provider, model).unwrap_or(0);
-        let output_limit = self.providers.declared_output_limit(provider, model);
+        let window = self
+            .session_declared_window(Some(&row.id), provider, model)
+            .unwrap_or(0);
+        let output_limit = self.session_declared_output_limit(Some(&row.id), provider, model);
         let mut meter = crate::context_meter::ContextMeter::resolve(
             footprint,
             fallback,
@@ -19831,6 +19929,19 @@ impl AppModel {
     /// rejected, not invented.
     pub fn route_raw(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
         use crate::projection::RawOutcome;
+        let parked_window = self
+            .sessions
+            .iter()
+            .find(|entry| entry.id == envelope.session_id)
+            .and_then(|entry| {
+                entry
+                    .meter_epoch
+                    .pair
+                    .as_ref()
+                    .and_then(|(provider, model)| {
+                        self.session_declared_window(Some(&entry.id), provider, model)
+                    })
+            });
         if self.active_session.as_ref() == Some(&envelope.session_id) {
             let window = self.context_meter().window;
             self.projection.set_compaction_note_window(window);
@@ -19839,11 +19950,7 @@ impl AppModel {
             .iter_mut()
             .find(|entry| entry.id == envelope.session_id)
         {
-            let declared = entry
-                .meter_epoch
-                .pair
-                .as_ref()
-                .and_then(|(provider, model)| self.providers.declared_window(provider, model));
+            let declared = parked_window;
             let footprint = entry.projection.latest_footprint();
             let window = if entry.meter_epoch.snapshot_epoch(footprint)
                 != crate::context_meter::SnapshotEpoch::Previous
@@ -22988,7 +23095,11 @@ impl AppModel {
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: model.clone(),
                     auth,
-                    context_window: self.providers.declared_window(&summary.provider, model),
+                    context_window: self.session_declared_window(
+                        self.selection_surface_session().as_ref(),
+                        &summary.provider,
+                        model,
+                    ),
                     source: summary
                         .model_details
                         .iter()
@@ -23634,8 +23745,9 @@ impl AppModel {
         if viewed_child {
             self.launcher_identity.provider = provider.to_owned();
             self.launcher_identity.model_short = model.to_owned();
-            self.launcher_identity.context_window =
-                self.providers.declared_window(provider, model).unwrap_or(0);
+            self.launcher_identity.context_window = self
+                .session_declared_window(Some(session), provider, model)
+                .unwrap_or(0);
             self.launcher_identity_pinned = true;
             self.model_commits += 1;
             self.model_picker = None;
@@ -23950,6 +24062,9 @@ impl AppModel {
         row.account_provider = Some(rebound.provider.clone());
         row.account_base_url.clone_from(&rebound.base_url);
         row.account_metadata_epoch = epoch;
+        if self.active_session.as_ref() == Some(session) {
+            self.refresh_context_window();
+        }
         self.dirty = true;
     }
 
@@ -24135,6 +24250,9 @@ impl AppModel {
                         .is_none_or(|request| request < reset))
                 .then_some(epoch.selection_epoch)
                 .flatten();
+            }
+            if self.active_session.as_ref() == Some(session) {
+                self.refresh_context_window();
             }
             self.dirty = true;
         }

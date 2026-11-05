@@ -8731,26 +8731,31 @@ impl HubConnection {
         session_id: &SessionId,
         provider: &str,
     ) -> Result<Option<String>, SessionHubError> {
+        let metadata = self.hub.session_metadata(session_id).await?;
+        let account_alias = metadata
+            .as_ref()
+            .filter(|metadata| metadata.provider == provider)
+            .and_then(|metadata| metadata.account_alias.as_deref());
         let facade = self.hub.accounts()?;
         if let Some(facade) = facade.as_ref() {
-            let view = facade.management.read().ok_or_else(|| {
+            let mut view = facade.management.read().ok_or_else(|| {
                 SessionHubError::Task("account management snapshot is poisoned".into())
             })?;
+            view.scope_catalog_for_account(provider, account_alias);
             if let Some(summary) = view
                 .providers
                 .iter()
                 .find(|summary| summary.provider == provider)
             {
+                // Default projection is read-only. The receipted model
+                // selection below owns discovery after its replay preflight.
                 return Ok(summary
                     .default_model
                     .clone()
                     .or_else(|| summary.models.first().cloned()));
             }
         }
-        let metadata_model = self
-            .hub
-            .session_metadata(session_id)
-            .await?
+        let metadata_model = metadata
             .filter(|metadata| metadata.provider == provider)
             .map(|metadata| metadata.model);
         if metadata_model.is_some() || facade.is_some() {
@@ -10983,7 +10988,7 @@ impl HubConnection {
                 },
             });
         };
-        let Some(view) = facade.management.read() else {
+        let Some(mut view) = facade.management.read() else {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_DRAINING,
@@ -10992,6 +10997,7 @@ impl HubConnection {
                 None,
             );
         };
+        view.scope_catalogs_for_active_accounts();
         let descriptors = view
             .descriptors
             .iter()
@@ -11086,7 +11092,7 @@ impl HubConnection {
                 },
             });
         };
-        let Some(view) = facade.management.read() else {
+        let Some(mut view) = facade.management.read() else {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_DRAINING,
@@ -11095,6 +11101,9 @@ impl HubConnection {
                 None,
             );
         };
+        // The TUI uses this inventory's freshness to decide discovery. Never
+        // let a pinned session's A refresh suppress the active B account's fetch.
+        view.scope_catalogs_for_active_accounts();
         let providers = filter_provider_summaries(view.providers, provider.as_deref());
         self.send(WireFrame::Response {
             request_id,

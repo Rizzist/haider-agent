@@ -23047,17 +23047,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
             let ParsedToolOperation::ListModels(filter) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
-            // This is deliberately the same immutable snapshot the TUI model
-            // picker reads. Provider discovery/refresh is an account-actor
-            // command and is never invoked from this tool path.
-            let summaries = self
-                .output
-                .store
-                .hub()
+            // Listing is read-only, but the rows and limits must still belong
+            // to this session's account rather than another session's refresh.
+            let hub = self.output.store.hub();
+            let metadata = hub.session_metadata(self.output.store.session_id()).await?;
+            let summaries = hub
                 .accounts()
                 .map_err(hub_error)?
                 .and_then(|facade| facade.management.read())
-                .map(|view| view.providers)
+                .map(|mut view| {
+                    if let Some(metadata) = metadata.as_ref() {
+                        view.scope_catalogs_for_session(
+                            &metadata.provider,
+                            metadata.account_alias.as_deref(),
+                        );
+                    } else {
+                        view.scope_catalogs_for_active_accounts();
+                    }
+                    view.providers
+                })
                 .unwrap_or_default();
             let mut page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
                 .model_catalog(filter.as_deref(), usize::MAX);

@@ -1128,13 +1128,19 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .collect()
     }
 
-    /// Selection accepts only known catalog entries: fetched remote rows or
-    /// an offline provider's authoritative static/configured catalog.
+    /// Selection accepts fetched rows or provider-wide configured facts.
+    /// Removing a foreign catalog cannot remove an explicit custom model ID;
+    /// an owned fetched empty/hidden inventory still takes precedence.
     fn selectable_slugs(&self, provider: &str) -> Vec<String> {
         let discovered = self.discovered_slugs(provider);
         if discovered.is_empty()
             && let Some(profile) = self.get(provider)
-            && offline_inventory(profile)
+            && (offline_inventory(profile)
+                || (matches!(profile.provenance, ProviderProvenance::Custom)
+                    && matches!(
+                        self.model_source.inventory(provider),
+                        ProviderInventory::NeverFetched
+                    )))
         {
             return configured_rows(profile)
                 .into_iter()

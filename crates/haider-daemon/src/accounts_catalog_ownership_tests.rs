@@ -75,11 +75,20 @@ impl Fixture {
             PROVIDER,
             AuthMethod::OAuth,
             test_provider_registry(),
+            None,
         )
         .await
     }
 
     async fn custom(results: Vec<Result<DiscoveredCatalog, CatalogError>>) -> Self {
+        Self::custom_with_recovery(results, None, false).await
+    }
+
+    async fn custom_with_recovery(
+        results: Vec<Result<DiscoveredCatalog, CatalogError>>,
+        recovery: Option<DiscoveredCatalog>,
+        public: bool,
+    ) -> Self {
         const CUSTOM: &str = "custom-catalog-ownership";
         let profile = ProviderProfileV1 {
             provider_id: CUSTOM.into(),
@@ -90,7 +99,11 @@ impl Fixture {
             chunk_idle_timeout_ms: None,
             semantic_progress_timeout_ms: None,
             enabled: true,
-            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            auth_requirement: if public {
+                ProviderAuthRequirementWire::None
+            } else {
+                ProviderAuthRequirementWire::ApiKey
+            },
             configured_models: vec![MODEL.into()],
             default_model: Some(MODEL.into()),
             promotion_model: None,
@@ -104,7 +117,16 @@ impl Fixture {
             Arc::new(CachedProviderModelSource::default()),
         )
         .expect("custom registry");
-        Self::start(results, None, false, CUSTOM, AuthMethod::ApiKey, providers).await
+        Self::start(
+            results,
+            None,
+            false,
+            CUSTOM,
+            AuthMethod::ApiKey,
+            providers,
+            recovery,
+        )
+        .await
     }
 
     async fn start(
@@ -113,7 +135,8 @@ impl Fixture {
         foreign: bool,
         provider: &'static str,
         auth_method: AuthMethod,
-        providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+        mut providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+        pending_catalog: Option<DiscoveredCatalog>,
     ) -> Self {
         let dir = test_store_dir();
         let store = open_store(dir.path()).await;
@@ -145,9 +168,62 @@ impl Fixture {
                 .put(&CredentialAlias::new(alias), &secret)
                 .expect("fixture vault");
         }
+        if let Some(catalog) = pending_catalog {
+            let input = ProviderConfigureInput {
+                provider: provider.into(),
+                api_family: None,
+                origin: None,
+                auth_requirement: None,
+                enabled: true,
+                models: vec![MODEL.into()],
+                default_model: Some(MODEL.into()),
+                response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
+                trust: None,
+            };
+            let (request_json, request_digest) = command_json(&ProviderConfigureIdentity {
+                input: input.clone(),
+                expected_revision: 0,
+            })
+            .expect("pending configure identity");
+            let recovery = ProviderConfigureRecovery {
+                input,
+                previous_auth_requirement: None,
+                discovered_models: Some(catalog.models),
+                discovered_etag: catalog.etag,
+                revision_unchanged: false,
+                revision_unchanged_response: None,
+            };
+            assert!(matches!(
+                store
+                    .management_claim_receipt::<ProviderReceipt>(
+                        "unowned-recovery".into(),
+                        PROVIDER_CONFIGURE_METHOD.into(),
+                        request_digest,
+                        request_json,
+                        Some(serde_json::to_string(&recovery).expect("pending recovery")),
+                        Some(0),
+                    )
+                    .await
+                    .expect("claim pending configure"),
+                ManagementClaim::Fresh
+            ));
+            // The raw actor does not perform bootstrap reconciliation. Run
+            // the production startup helper before publishing its registry.
+            reconcile_provider_receipts(&store, &accounts, &mut providers)
+                .await
+                .expect("reconcile pending configure");
+        }
         let snapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
-        let management =
-            ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| true));
+        let management = ManagementSnapshot::new(
+            store
+                .management_revision()
+                .await
+                .expect("management revision"),
+            accounts.list().to_vec(),
+            providers.summaries(&|_| true),
+        );
         let discoverer = Arc::new(BlockingModelDiscoverer {
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
@@ -1419,4 +1495,591 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
         "an adapter cache hit must include canonical account identity, not only display identity"
     );
     f.close().await;
+}
+
+async fn default_provider_snapshot(f: &mut Fixture) -> ProviderSummaryWire {
+    f.connection
+        .request(
+            RequestId::new("default-provider-snapshot"),
+            RequestBody::ProviderList {
+                provider: Some(PROVIDER.into()),
+            },
+        )
+        .await
+        .expect("provider snapshot request");
+    let ResponseBody::ProviderList { mut providers, .. } =
+        response_for(&mut f.frames, "default-provider-snapshot").await
+    else {
+        panic!("provider snapshot response");
+    };
+    assert_eq!(providers.len(), 1);
+    providers.pop().expect("provider snapshot")
+}
+
+#[tokio::test]
+async fn catalog_owner_default_provider_snapshot_requires_b_discovery() {
+    let mut f = Fixture::new(vec![Ok(catalog(2048))], None, false).await;
+    f.publish_a().await;
+    let summary = default_provider_snapshot(&mut f).await;
+    // This is the real TUI's cache-hit predicate in provider_model_refreshes.
+    assert!(
+        summary.inventory.needs_refresh(),
+        "A's fresh catalog must not suppress default B discovery"
+    );
+    assert!(!summary.models.iter().any(|model| model == MODEL));
+    assert!(
+        !summary
+            .model_details
+            .iter()
+            .any(|detail| detail.name == MODEL)
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_default_account_snapshot_uses_b_default() {
+    let (mut f, default, _) = maintained_default_fixture().await;
+    f.connection
+        .request(
+            RequestId::new("default-account-snapshot"),
+            RequestBody::AccountList {
+                provider: Some(PROVIDER.into()),
+            },
+        )
+        .await
+        .expect("account snapshot request");
+    let ResponseBody::AccountList {
+        provider_defaults, ..
+    } = response_for(&mut f.frames, "default-account-snapshot").await
+    else {
+        panic!("account snapshot response");
+    };
+    assert_eq!(
+        provider_defaults
+            .iter()
+            .find(|row| row.provider == PROVIDER)
+            .map(|row| row.model.as_str()),
+        Some(default.as_str()),
+        "default account snapshot must not republish A's model ordering for B"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_control_owned_global_snapshot_preserves_fresh_hidden_rows() {
+    let mut f = hidden_catalog_fixture(true).await;
+    let summary = default_provider_snapshot(&mut f).await;
+    assert!(
+        !summary.inventory.needs_refresh(),
+        "an owned active-account catalog remains a valid cache hit"
+    );
+    assert!(summary.models.is_empty());
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
+    assert_eq!(f.discoverer.seen.lock().expect("calls").len(), 1);
+    f.close().await;
+}
+
+async fn global_catalog_mutation(f: &Fixture, kind: &str, model: &str) -> ResponseBody {
+    let expected_revision = f
+        .hub
+        .accounts()
+        .expect("facade")
+        .expect("accounts")
+        .management
+        .read()
+        .expect("view")
+        .revision;
+    let (sink, mut frames) = channel_sink();
+    let route = LoginRoute {
+        request_id: RequestId::new("global-catalog-mutation"),
+        sink,
+    };
+    let command = match kind {
+        "default" => AccountCommand::SetDefaultModel(Box::new(SetDefaultModelJob {
+            command_id: "owned-global-default".into(),
+            provider: f.provider.into(),
+            model: model.into(),
+            expected_revision,
+            route,
+        })),
+        "configure" => AccountCommand::ConfigureProvider(Box::new(ProviderConfigureJob {
+            command_id: "owned-global-configure".into(),
+            input: ProviderConfigureInput {
+                provider: f.provider.into(),
+                api_family: None,
+                origin: None,
+                auth_requirement: None,
+                enabled: true,
+                models: Vec::new(),
+                default_model: Some(model.into()),
+                response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
+                trust: None,
+            },
+            probe_secret: None,
+            expected_revision,
+            route,
+        })),
+        "trust" => AccountCommand::SetProviderTrust(Box::new(ProviderSetTrustJob {
+            command_id: "owned-global-trust".into(),
+            provider: f.provider.into(),
+            trust: haider_rpc::ProviderTrustWire::Lockdown,
+            expected_revision,
+            route,
+        })),
+        _ => panic!("fixture mutation kind"),
+    };
+    f.actor
+        .commands()
+        .send(command)
+        .await
+        .expect("global mutation request");
+    response_for(&mut frames, "global-catalog-mutation").await
+}
+
+fn mutation_summary(response: ResponseBody) -> ProviderSummaryWire {
+    match response {
+        ResponseBody::AccountSetDefaultModel { provider, .. }
+        | ResponseBody::ProviderConfigure { provider, .. }
+        | ResponseBody::ProviderSetTrust { provider, .. } => provider,
+        other => panic!("maintained model mutation must succeed: {other:?}"),
+    }
+}
+
+async fn foreign_global_admission(kind: &str) {
+    let f = Fixture::new(vec![Ok(catalog(2048))], None, false).await;
+    f.publish_a().await;
+    let response = global_catalog_mutation(&f, kind, MODEL).await;
+    assert!(
+        matches!(response, ResponseBody::Error { ref code, .. }
+        if code == ERROR_CODE_INVALID_ARGUMENT),
+        "A's remote-only model cannot admit a global default for active B: {response:?}"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_global_default_rejects_a_only_inventory() {
+    foreign_global_admission("default").await;
+}
+
+#[tokio::test]
+async fn catalog_owner_global_configure_rejects_a_only_inventory() {
+    foreign_global_admission("configure").await;
+}
+
+async fn foreign_global_metadata(kind: &str) {
+    let (f, _, model) = maintained_default_fixture().await;
+    let expected = test_provider_registry()
+        .summary(PROVIDER, &|_| true)
+        .expect("maintained catalog")
+        .model_details
+        .into_iter()
+        .find(|detail| detail.name == model)
+        .expect("maintained detail");
+    let summary = mutation_summary(global_catalog_mutation(&f, kind, &model).await);
+    assert_eq!(
+        summary
+            .model_details
+            .iter()
+            .find(|detail| detail.name == model),
+        Some(&expected),
+        "a global mutation must not return A's limits as B's metadata"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_global_default_excludes_a_metadata() {
+    foreign_global_metadata("default").await;
+}
+
+#[tokio::test]
+async fn catalog_owner_global_configure_excludes_a_metadata() {
+    foreign_global_metadata("configure").await;
+}
+
+#[tokio::test]
+async fn catalog_owner_global_trust_excludes_a_metadata() {
+    foreign_global_metadata("trust").await;
+}
+
+async fn owned_global_mutation(kind: &str) {
+    let f = Fixture::new(vec![Ok(catalog(2048))], None, false).await;
+    let (sink, mut frames) = channel_sink();
+    f.actor
+        .commands()
+        .send(AccountCommand::SetActive(Box::new(SetActiveJob {
+            command_id: "owned-global-active-a".into(),
+            alias: "a".into(),
+            route: LoginRoute {
+                request_id: RequestId::new("owned-global-active-a"),
+                sink,
+            },
+        })))
+        .await
+        .expect("activate A");
+    assert!(matches!(
+        response_for(&mut frames, "owned-global-active-a").await,
+        ResponseBody::AccountSetActive { .. }
+    ));
+    f.publish_a().await;
+    let summary = mutation_summary(global_catalog_mutation(&f, kind, MODEL).await);
+    assert_eq!(
+        summary
+            .model_details
+            .iter()
+            .find(|detail| detail.name == MODEL)
+            .and_then(|detail| detail.max_output_tokens),
+        Some(2048),
+        "an owned global mutation preserves the active account's remote metadata"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_control_owned_global_default_preserves_metadata() {
+    owned_global_mutation("default").await;
+}
+
+#[tokio::test]
+async fn catalog_control_owned_global_configure_preserves_metadata() {
+    owned_global_mutation("configure").await;
+}
+
+#[tokio::test]
+async fn catalog_control_owned_global_trust_preserves_metadata() {
+    owned_global_mutation("trust").await;
+}
+
+#[tokio::test]
+async fn catalog_owner_staged_a_probe_cannot_cache_limits_for_active_b() {
+    let f = Fixture::custom(vec![Ok(catalog(2048))]).await;
+    let (sink, mut frames) = channel_sink();
+    f.actor
+        .commands()
+        .send(AccountCommand::ConfigureProvider(Box::new(
+            ProviderConfigureJob {
+                command_id: "staged-a-catalog".into(),
+                input: ProviderConfigureInput {
+                    provider: f.provider.into(),
+                    api_family: None,
+                    origin: None,
+                    auth_requirement: None,
+                    enabled: true,
+                    models: Vec::new(),
+                    default_model: Some(MODEL.into()),
+                    response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
+                    trust: None,
+                },
+                probe_secret: Some(zeroize::Zeroizing::new(b"a".to_vec())),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("staged-a-catalog"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("staged probe request");
+    tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        f.discoverer.started.notified(),
+    )
+    .await
+    .expect("staged probe started");
+    f.discoverer.release.notify_one();
+    let summary = mutation_summary(response_for(&mut frames, "staged-a-catalog").await);
+    assert!(
+        summary
+            .model_details
+            .iter()
+            .all(|detail| detail.max_output_tokens != Some(2048)),
+        "a staged A credential cannot publish remote limits as active B's metadata"
+    );
+    let descriptor = f
+        .hub
+        .accounts()
+        .expect("facade")
+        .expect("accounts")
+        .management
+        .read()
+        .expect("view")
+        .descriptors
+        .into_iter()
+        .find(|row| row.alias.as_str() == "b")
+        .expect("B descriptor");
+    let key = ProviderModelCacheKey::for_account(f.provider, &descriptor);
+    assert!(
+        f.store
+            .provider_models(key.into())
+            .await
+            .expect("B cache read")
+            .is_none(),
+        "a staged A probe cannot create a B-owned cache row"
+    );
+    f.close().await;
+}
+
+async fn recovered_catalog_is_account_bound(public: bool) {
+    let f = Fixture::custom_with_recovery(Vec::new(), Some(catalog(2048)), public).await;
+    let view = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        loop {
+            let view = f
+                .hub
+                .accounts()
+                .expect("facade")
+                .expect("accounts")
+                .management
+                .read()
+                .expect("view");
+            if view.revision > 0 {
+                break view;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovered management publication");
+    let summary = view
+        .providers
+        .iter()
+        .find(|row| row.provider == f.provider)
+        .expect("recovered provider");
+    assert_eq!(
+        summary
+            .model_details
+            .iter()
+            .find(|detail| detail.name == MODEL)
+            .and_then(|detail| detail.max_output_tokens),
+        public.then_some(2048),
+        "recovery cannot relabel an unowned private catalog as active B's metadata"
+    );
+    let key = if public {
+        ProviderModelCacheKey::public(f.provider)
+    } else {
+        ProviderModelCacheKey::for_account(
+            f.provider,
+            view.descriptors
+                .iter()
+                .find(|row| row.alias.as_str() == "b")
+                .expect("B descriptor"),
+        )
+    };
+    assert_eq!(
+        f.store
+            .provider_models(key.into())
+            .await
+            .expect("recovered cache")
+            .is_some(),
+        public,
+        "only provider-wide recovery can restore a catalog without an account owner"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_recovery_cannot_relabel_a_catalog_as_b() {
+    recovered_catalog_is_account_bound(false).await;
+}
+
+#[tokio::test]
+async fn catalog_control_public_recovery_preserves_remote_metadata() {
+    recovered_catalog_is_account_bound(true).await;
+}
+
+async fn configured_custom_global_default(check_owner: bool) {
+    let f = Fixture::custom(vec![Ok(catalog(2048))]).await;
+    f.publish_a().await;
+    let summary = mutation_summary(global_catalog_mutation(&f, "default", MODEL).await);
+    assert_eq!(
+        summary.default_model.as_deref(),
+        Some(MODEL),
+        "the provider's explicit configured model remains a valid custom default"
+    );
+    if check_owner {
+        assert_eq!(
+            summary
+                .model_details
+                .iter()
+                .find(|detail| detail.name == MODEL)
+                .and_then(|detail| detail.max_output_tokens),
+            None,
+            "a configured B default cannot inherit A's remote output ceiling"
+        );
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_configured_custom_default_excludes_a_metadata() {
+    configured_custom_global_default(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_configured_custom_default_survives_foreign_catalog() {
+    configured_custom_global_default(false).await;
+}
+
+async fn provider_command_uses_owning_default(owned: bool) {
+    let baseline = test_provider_registry()
+        .summaries(&|_| true)
+        .into_iter()
+        .find(|summary| summary.provider == PROVIDER)
+        .expect("maintained provider");
+    let default = baseline.default_model.expect("B default");
+    let alternate = baseline
+        .models
+        .into_iter()
+        .find(|model| model != &default)
+        .expect("alternate");
+    let mut a = catalog(8192);
+    a.models[0].slug = alternate.clone();
+    a.models[0].display_name = alternate.clone();
+    a.models[0].priority = Some(-1000);
+    let mut b = catalog(8192);
+    b.models[0].slug = default.clone();
+    b.models[0].display_name = default.clone();
+    let mut f = Fixture::new(vec![Ok(a), Ok(b)], owned.then_some("a"), false).await;
+    f.publish_a().await;
+    f.discoverer.release.notify_one();
+    f.connection
+        .request(
+            RequestId::new("provider-default"),
+            RequestBody::CommandInvoke {
+                command_id: CommandId::new("provider-default"),
+                command: format!("/provider {PROVIDER}"),
+                session_id: Some(f.session.clone()),
+            },
+        )
+        .await
+        .expect("provider command");
+    let response = response_for(&mut f.frames, "provider-default").await;
+    assert!(
+        matches!(
+            response,
+            ResponseBody::CommandInvoke {
+                outcome: haider_rpc::CommandInvokeOutcomeWire::Receipt { .. }
+            }
+        ),
+        "provider command must complete: {response:?}"
+    );
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("durable read")
+        .expect("session");
+    assert_eq!(
+        metadata.model,
+        if owned { alternate } else { default },
+        "provider command must choose its account's default, not another account's priority"
+    );
+    assert_eq!(metadata.account_alias.as_deref(), owned.then_some("a"));
+    assert_eq!(
+        f.discoverer.seen.lock().expect("calls").len(),
+        if owned { 1 } else { 2 },
+        "foreign default requires B discovery; owned default remains a cache hit"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_provider_command_uses_b_default() {
+    provider_command_uses_owning_default(false).await;
+}
+
+#[tokio::test]
+async fn catalog_control_provider_command_preserves_owned_default() {
+    provider_command_uses_owning_default(true).await;
+}
+
+async fn public_catalog_ignores_account_owner(cached: bool, switch_active: bool) {
+    let mut results = vec![Ok(catalog(2048))];
+    if cached {
+        results.push(Err(CatalogError::NotModified));
+    }
+    let mut f = Fixture::custom_with_recovery(results, None, true).await;
+    if cached {
+        f.publish_a().await;
+    }
+    // Public discovery must ignore even an alias that has no descriptor.
+    let completion = f.begin_refresh_for("not-a-public-account").await;
+    if switch_active {
+        let (sink, mut frames) = channel_sink();
+        f.actor
+            .commands()
+            .send(AccountCommand::SetActive(Box::new(SetActiveJob {
+                command_id: "public-active-change".into(),
+                alias: "a".into(),
+                route: LoginRoute {
+                    request_id: RequestId::new("public-active-change"),
+                    sink,
+                },
+            })))
+            .await
+            .expect("public active switch");
+        assert!(
+            matches!(
+                response_for(&mut frames, "public-active-change").await,
+                ResponseBody::AccountSetActive { .. }
+            ),
+            "active switch must commit during public discovery"
+        );
+    }
+    f.discoverer.release.notify_one();
+    completion
+        .await
+        .expect("public completion")
+        .expect("public catalog is not bound to the ignored account alias");
+    f.connection
+        .request(
+            RequestId::new("public-cached-selection"),
+            f.selection(false, Some(1024)),
+        )
+        .await
+        .expect("public selection");
+    let response = response_for(&mut f.frames, "public-cached-selection").await;
+    assert!(
+        matches!(response, ResponseBody::SessionSelectModel { .. }),
+        "public catalog must remain selectable without account discovery: {response:?}"
+    );
+    {
+        let seen = f.discoverer.seen.lock().expect("public observations");
+        assert_eq!(
+            seen.len(),
+            if cached { 2 } else { 1 },
+            "the public cache remains a hit across account coordinates"
+        );
+        assert!(
+            seen.iter().all(|row| row.1.is_none()),
+            "public discovery never consumes an account credential"
+        );
+    }
+    assert!(
+        f.store
+            .provider_models(ProviderModelCacheKey::public(f.provider).into())
+            .await
+            .expect("public cache")
+            .is_some()
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_control_public_success_ignores_explicit_alias() {
+    public_catalog_ignores_account_owner(false, false).await;
+}
+
+#[tokio::test]
+async fn catalog_control_public_304_ignores_explicit_alias() {
+    public_catalog_ignores_account_owner(true, false).await;
+}
+
+#[tokio::test]
+async fn catalog_control_public_flight_survives_active_account_change() {
+    public_catalog_ignores_account_owner(false, true).await;
 }
