@@ -667,7 +667,7 @@ impl<S: StoreLike> AccountStore<S> {
         // Creation is the first Haider commit, not the latest refresh or
         // re-login. Pre-964 rows deliberately keep their unknown timestamp.
         descriptor.created_at_ms = previous.created_at_ms;
-        descriptor.incarnation = if proven_same_account(previous, &descriptor) {
+        descriptor.incarnation = if proven_same_account(previous, descriptor) {
             previous.incarnation
         } else {
             self.next_incarnation()?
