@@ -31,97 +31,120 @@ refresh_attached_device() {
   # in the trap's operator instruction.
   attached_device=
   device=$(python3 -c '
-import importlib.util, json, pathlib, plistlib, re, subprocess, sys, time
-spec = importlib.util.spec_from_file_location("image_identity", sys.argv[7])
-helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
-expected = helper.expected_identity(pathlib.Path(sys.argv[8]))
-image_path = pathlib.Path(sys.argv[1]).resolve()
-record = pathlib.Path(sys.argv[2])
-before = pathlib.Path(sys.argv[5])
-snapshot = sys.argv[6] == "snapshot"
-saved = json.loads(record.read_text()) if record.exists() and not snapshot else None
-attach_devices = []
-if saved is None and not snapshot:
-    try:
-        attached = plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
-        attach_devices = [entity["dev-entry"] for entity in attached["system-entities"]
-                          if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
-    except (OSError, ValueError, KeyError):
-        pass  # No plist: only new same-path devices can belong to this attach.
-previous = set(json.loads(before.read_text())) if before.exists() else set()
-def same_path(path, other):
-    if path == other:
-        return True
-    try:
-        return path.samefile(other)
-    except OSError:
-        return False
-for attempt in range(4):
-    result = subprocess.run(["hdiutil", "info", "-plist"], capture_output=True)
-    if result.returncode:
-        sys.stderr.buffer.write(result.stderr)
-        sys.exit("hdiutil attachment inventory failed (exit %s)" % result.returncode)
-    images = plistlib.loads(result.stdout).get("images", [])
-    incomplete = b"cannot get IO media array" in result.stderr
-    backing = {entity["dev-entry"]: image for image in images
-               for entity in image.get("system-entities", []) if "dev-entry" in entity}
-    verified = {}
-    def is_expected(device):
-        image = backing[device]
-        pid = image.get("hdid-pid")
-        if pid not in verified:
-            verified[pid] = helper.backing_identity(image, expected)
-        if verified[pid] is None:
-            if not pathlib.Path(device).exists():
-                return False
-            sys.exit("backing inode unavailable; retaining recorded device " + device)
-        return verified[pid]
-    identities = [(pathlib.Path(image["image-path"]).resolve(), entity["dev-entry"])
-                  for image in images if "image-path" in image
-                  for entity in image.get("system-entities", [])
-                  if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
-    inventory_devices = {device for path, device in identities}
-    if snapshot:
-        owned = []
-    elif saved is not None:
-        owned = [(path, device) for path, device in identities
-                 if any(device == item["device"] and same_path(path, pathlib.Path(item["image"]))
-                        for item in saved) and is_expected(device)]
-    elif attach_devices:
-        # Native plists supply devices, not paths. Bind each to the expected
-        # open backing vnode; a recycled device cannot establish ownership.
-        owned = [(path, device) for path, device in identities
-                 if device in attach_devices and device not in previous and is_expected(device)]
-    else:
-        owned = [(path, device) for path, device in identities
-                 if same_path(path, image_path) and device not in previous and is_expected(device)]
-    known_devices = [item["device"] for item in saved] if saved is not None else attach_devices
-    if any(pathlib.Path(device).exists() and device not in inventory_devices for device in known_devices):
-        incomplete = True
-    if not owned and not snapshot:
-        point = pathlib.Path(sys.argv[4])
+import importlib.util, json, pathlib, plistlib, re, sys, time
+def main():
+    spec = importlib.util.spec_from_file_location("image_identity", sys.argv[7])
+    helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+    expected = helper.expected_identity(pathlib.Path(sys.argv[8]))
+    image_path = pathlib.Path(sys.argv[1]).resolve()
+    record = pathlib.Path(sys.argv[2])
+    before = pathlib.Path(sys.argv[5])
+    snapshot = sys.argv[6] == "snapshot"
+    saved = json.loads(record.read_text()) if record.exists() and not snapshot else None
+    attach_devices = []
+    if saved is None and not snapshot:
         try:
-            if point.stat().st_dev != point.parent.stat().st_dev:
-                incomplete = True
-        except FileNotFoundError:
+            attached = plistlib.loads(pathlib.Path(sys.argv[3]).read_bytes())
+            attach_devices = [entity["dev-entry"] for entity in attached["system-entities"]
+                              if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
+        except Exception:
+            # Missing, malformed or undecodable attach metadata grants no device
+            # ownership. The complete inventory and backing inode must prove it.
             pass
-    if incomplete:
-        if attempt == 3:
-            sys.stderr.buffer.write(result.stderr)
-            sys.exit("hdiutil attachment inventory remained incomplete; recorded devices: %s" %
-                     ", ".join(known_devices))
-        time.sleep(0.1 * (attempt + 1))
-        continue
-    if snapshot:
-        before.write_text(json.dumps([device for path, device in identities if same_path(path, image_path)]))
-    else:
-        if saved is None and not owned and any(device not in previous for path, device in identities
-                if device in attach_devices or same_path(path, image_path)):
-            sys.exit("cannot attribute attachment to the created backing inode; keeping everything")
-        record.write_text(json.dumps([{ "image": str(image_path), "device": device, "identity": expected} for path, device in owned]))
-        for path, device in owned:
-            print(device)
-    sys.exit(0)
+    previous = set(json.loads(before.read_text())) if before.exists() else set()
+    def same_path(path, other):
+        if path == other:
+            return True
+        try:
+            return path.samefile(other)
+        except OSError:
+            return False
+    for attempt in range(4):
+        try:
+            images = helper.inventory_snapshot()
+        except helper.InventoryError as error:
+            if not error.retryable or attempt == 3:
+                sys.exit(str(error))
+            time.sleep(0.1 * (attempt + 1))
+            continue
+        incomplete = False
+        backing = {entity["dev-entry"]: image for image in images
+                   for entity in image.get("system-entities", []) if "dev-entry" in entity}
+        verified = {}
+        unavailable = set()
+        departed = set()
+        def is_expected(device):
+            image = backing[device]
+            pid = image.get("hdid-pid")
+            if pid not in verified:
+                verified[pid] = helper.backing_identity(image, expected)
+            if verified[pid] is None:
+                if not pathlib.Path(device).exists():
+                    departed.add(device)
+                    return False
+                unavailable.add(device)
+                return False
+            return verified[pid]
+        identities = [(pathlib.Path(image["image-path"]).resolve(), entity["dev-entry"])
+                      for image in images if "image-path" in image
+                      for entity in image.get("system-entities", [])
+                      if re.fullmatch(r"/dev/disk[0-9]+", entity.get("dev-entry", ""))]
+        inventory_devices = {device for path, device in identities}
+        if snapshot:
+            owned = []
+        elif saved is not None:
+            owned = [(path, device) for path, device in identities
+                     if any(device == item["device"] and same_path(path, pathlib.Path(item["image"]))
+                            for item in saved) and is_expected(device)]
+        elif attach_devices:
+            # Native plists supply devices, not paths. Bind each to the expected
+            # open backing vnode; a recycled device cannot establish ownership.
+            owned = [(path, device) for path, device in identities
+                     if device in attach_devices and device not in previous and is_expected(device)]
+        else:
+            owned = [(path, device) for path, device in identities
+                     if same_path(path, image_path) and device not in previous and is_expected(device)]
+        known_devices = [item["device"] for item in saved] if saved is not None else attach_devices
+        # hdiutil can publish a live device before lsof can observe its backing
+        # vnode. Requery both inventories; an unknown observation never grants
+        # detach authority or overwrites the last ownership record.
+        if unavailable:
+            if attempt == 3:
+                sys.exit("backing inode unavailable; retaining recorded devices: " +
+                         ", ".join(sorted(unavailable)))
+            time.sleep(0.1 * (attempt + 1))
+            continue
+        if any(pathlib.Path(device).exists() and device not in inventory_devices for device in known_devices):
+            incomplete = True
+        if not owned and not snapshot:
+            point = pathlib.Path(sys.argv[4])
+            try:
+                if point.stat().st_dev != point.parent.stat().st_dev:
+                    incomplete = True
+            except FileNotFoundError:
+                pass
+        if incomplete:
+            if attempt == 3:
+                sys.exit("hdiutil attachment inventory remained incomplete; retaining recorded devices: %s" %
+                         ", ".join(known_devices))
+            time.sleep(0.1 * (attempt + 1))
+            continue
+        if snapshot:
+            before.write_text(json.dumps([device for path, device in identities
+                                         if same_path(path, image_path) and pathlib.Path(device).exists()]))
+        else:
+            if saved is None and not owned and any(device not in previous for path, device in identities
+                    if device not in departed and (device in attach_devices or same_path(path, image_path))):
+                sys.exit("cannot attribute attachment to the created backing inode; keeping everything")
+            record.write_text(json.dumps([{ "image": str(image_path), "device": device, "identity": expected} for path, device in owned]))
+            for path, device in owned:
+                print(device)
+        sys.exit(0)
+
+try:
+    main()
+except Exception as error:
+    sys.exit("hdiutil attachment inventory unavailable; retaining image output: " + str(error))
 ' "$dmg" "$work/attached-image.json" "$work/attach.plist" "$work/mount" "$work/before-attach.json" "${1:-refresh}" "$here/macos-image-identity.py" "$work/image-identity.json") || return 1
   attached_device=$device
 }
@@ -178,7 +201,9 @@ cleanup() {
     python3 "$here/macos-image-identity.py" withdraw "$pkg" "$work/pkg-identity.json" || true
   fi
   if [ "$publication_complete" = 0 ] && [ -f "$work/image-identity.json" ]; then
-    if ! python3 "$here/macos-image-identity.py" withdraw-image "$dmg" "$work/image-identity.json" >"$work/image-withdrawal.log" 2>&1; then
+    # This shell pins the image as fd 9; the helper excludes only that
+    # declared descriptor, confirmed through its inherited copy.
+    if ! HAIDER_IMAGE_PARENT_FDS=9 python3 "$here/macos-image-identity.py" withdraw-image "$dmg" "$work/image-identity.json" >"$work/image-withdrawal.log" 2>&1; then
       keep_work=1
     fi
   fi

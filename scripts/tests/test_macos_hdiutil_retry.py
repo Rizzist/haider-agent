@@ -1,5 +1,6 @@
 """Exercise the real macOS installer builder with injected hdiutil busy errors."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -116,24 +118,31 @@ for post_attempt in range(4):
                for entity in attached.get('system-entities', []) if 'dev-entry' in entity}
     incomplete = b'cannot get IO media array' in query.stderr or any(
         pathlib.Path(device).exists() and device not in backing for device in devices)
-    if not incomplete:
+    verified = {}
+    unavailable = set()
+    def is_expected(device):
+        if device not in backing:
+            return False
+        attached = backing[device]; pid = attached.get('hdid-pid')
+        if pid not in verified: verified[pid] = helper.backing_identity(attached, expected)
+        if verified[pid] is None:
+            if pathlib.Path(device).exists(): unavailable.add(device)
+            return False
+        return verified[pid]
+    candidates = devices if devices else {
+        entity['dev-entry'] for attached in info.get('images', [])
+        if same_image(attached.get('image-path', ''))
+        for entity in attached.get('system-entities', [])
+        if re.fullmatch(r'/dev/disk[0-9]+', entity.get('dev-entry', ''))}
+    owned = [device for device in candidates if device not in previous and is_expected(device)]
+    if not incomplete and not unavailable:
+        for device in owned:
+            append(device)
         break
     if post_attempt == 3:
-        sys.exit('incomplete post-attach inventory; keeping everything')
+        sys.exit('backing inode unavailable; keeping everything' if unavailable else
+                 'incomplete post-attach inventory; keeping everything')
     time.sleep(0.1 * (post_attempt + 1))
-verified = {}
-def is_expected(device):
-    if device not in backing:
-        if pathlib.Path(device).exists():
-            sys.exit('live attach device missing from post-attach inventory; keeping everything')
-        return False
-    attached = backing[device]; pid = attached.get('hdid-pid')
-    if pid not in verified: verified[pid] = helper.backing_identity(attached, expected)
-    if verified[pid] is None: sys.exit("backing inode unavailable; keeping everything")
-    return verified[pid]
-for device in (devices if devices else inventory_devices() - previous):
-    if device not in previous and is_expected(device):
-        append(device)
 sys.exit(result.returncode)
 TRACE_PY
 }
@@ -208,9 +217,11 @@ native_hdiutil "$@"
                 raise RuntimeError('hdiutil attachment inventory remained incomplete')
             time.sleep(0.1 * (attempt + 1))
 
-    def disk_image_mountpoints(self):
+    def disk_image_mountpoints(self, images=None):
+        if images is None:
+            images = self.disk_image_inventory()
         return {Path(entity['mount-point']).resolve()
-                for image in self.disk_image_inventory()
+                for image in images
                 for entity in image.get('system-entities', [])
                 if 'mount-point' in entity}
 
@@ -308,43 +319,69 @@ native_hdiutil "$@"
     def remove_clear_directory(self, directory, inventory, label):
         if not directory.exists():
             return
-        root = directory.resolve()
-        def image_is_inside(image):
-            path = Path(image['image-path']).resolve()
-            if path.is_relative_to(root):
-                return True
-            # realpath does not normalize filesystem case/Unicode aliases.
-            # An aliased parent can still be this exact directory, even when
-            # an attached image's backing file has already been removed.
-            for parent in path.parents:
-                try:
-                    if parent.samefile(root):
-                        return True
-                except OSError:
-                    pass
-            return False
-        # Protect even foreign backing files whose volumes are already unmounted.
-        self.assertFalse(any(image_is_inside(image) for image in self.disk_image_inventory()
-                             if 'image-path' in image),
-                         f'attached image inside {label}')
-        self.assertFalse(any(mount.is_relative_to(directory.resolve()) for mount in inventory),
-                         f'unrecorded mount inside {label}')
-        device = directory.stat().st_dev
-        self.assertEqual(device, directory.parent.stat().st_dev,
-                         f'mounted filesystem at {label}')
+        with ExitStack() as pins:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            pins.callback(os.close, descriptor)
+            original = os.fstat(descriptor)
+            root = directory.resolve()
 
-        def fail_walk(error):
-            raise error
+            def require_original_directory():
+                current = directory.lstat()
+                self.assertEqual((current.st_dev, current.st_ino),
+                                 (original.st_dev, original.st_ino),
+                                 f'directory identity changed; retaining {label}')
 
-        # Check before deleting any files. This also catches mounts omitted from
-        # the inventory or represented there with a different case/Unicode alias.
-        for current, names, _ in os.walk(directory, onerror=fail_walk, followlinks=False):
-            for name in names:
-                child = Path(current) / name
-                if not child.is_symlink():
-                    self.assertEqual(child.stat().st_dev, device,
-                                     f'mounted filesystem inside {label}')
-        shutil.rmtree(directory)
+            def image_is_inside(image):
+                path = Path(image['image-path']).resolve()
+                if path.is_relative_to(root):
+                    return True
+                # realpath does not normalize filesystem case/Unicode aliases.
+                # An aliased parent can still be this exact directory, even when
+                # an attached image's backing file has already been removed.
+                for parent in path.parents:
+                    try:
+                        if parent.samefile(root):
+                            return True
+                    except OSError:
+                        pass
+                return False
+
+            # A successful detach can precede a clear inventory. Refresh both
+            # views before refusing cleanup; no device entry, live or departed,
+            # grants permission to remove an inventoried backing directory.
+            for attempt in range(4):
+                require_original_directory()
+                images = self.disk_image_inventory()
+                mounts = self.disk_image_mountpoints(images)
+                if attempt == 0:
+                    mounts |= set(inventory)
+                require_original_directory()
+                attached = any(image_is_inside(image) for image in images if 'image-path' in image)
+                mounted = any(mount.is_relative_to(root) for mount in mounts)
+                if not attached and not mounted:
+                    break
+                if attempt == 3:
+                    self.assertFalse(attached, f'attached image inside {label}')
+                    self.assertFalse(mounted, f'unrecorded mount inside {label}')
+                time.sleep(.1 * (attempt + 1))
+
+            device = original.st_dev
+            self.assertEqual(device, directory.parent.stat().st_dev,
+                             f'mounted filesystem at {label}')
+
+            def fail_walk(error):
+                raise error
+
+            # Check before deleting any files. This also catches mounts omitted from
+            # the inventory or represented there with a different case/Unicode alias.
+            for current, names, _ in os.walk(directory, onerror=fail_walk, followlinks=False):
+                for name in names:
+                    child = Path(current) / name
+                    if not child.is_symlink():
+                        self.assertEqual(child.stat().st_dev, device,
+                                         f'mounted filesystem inside {label}')
+            require_original_directory()
+            shutil.rmtree(directory)
 
     def cleanup_fixtures(self):
         # Keep fixtures if detach/audit fails: deleting them can traverse a mount.
@@ -754,6 +791,26 @@ exec /usr/bin/cmp "$@"
         self.assertFalse((self.base / 'comparison-ran').exists())
         self.assert_no_test_mounts()
 
+    def test_builder_withdraws_its_pinned_image_after_a_failed_comparison(self):
+        # The exit trap runs while this shell still pins the image as fd 9. The
+        # helper excludes only that declared descriptor, so the unchanged,
+        # detached image is withdrawn instead of being retained as in use.
+        (self.shim / 'cmp').write_text('''#!/bin/bash
+/usr/sbin/lsof -a -p "$PPID" -d 9 -Fn > "$HDIUTIL_TEST_DIR/comparison-pin"
+exit 1
+''')
+        (self.shim / 'cmp').chmod(0o755)
+        output = self.base / 'failed-comparison-output'
+        result = self.run_builder(output)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('macOS installer gate PASS', result.stdout)
+        self.assertIn('haider-v' + VERSION + '-' + TARGET + '.dmg',
+                      (self.base / 'comparison-pin').read_text())
+        self.assertFalse(list(output.glob('*.dmg')), result.stderr)
+        self.assertFalse(list(output.glob('*.pkg')), result.stderr)
+        self.assertNotIn('Retaining', result.stderr)
+        self.assert_no_test_mounts()
+
     def test_builder_pins_created_dmg_until_attachment_finishes(self):
         (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
 if [ "$1" = attach ]; then
@@ -1099,6 +1156,92 @@ exec /usr/bin/mktemp "$@"
         self.assertTrue(all(image.is_file() for image in images))
         self.detach_leftover_test_mounts()
         self.assert_no_test_mounts()
+
+    def test_builder_inventory_busy_recovery_uses_four_attempts(self):
+        for phase in ('snapshot', 'attached'):
+            with self.subTest(phase=phase):
+                (self.base / 'inventory-count').unlink(missing_ok=True)
+                (self.base / 'inventory-parents').unlink(missing_ok=True)
+                (self.base / 'attachments').unlink(missing_ok=True)
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = info ] && { [ "$INVENTORY_PHASE" = snapshot ] || [ -f "$HDIUTIL_TEST_DIR/attachments" ]; }; then
+  count=0
+  [ ! -f "$HDIUTIL_TEST_DIR/inventory-count" ] || count=$(cat "$HDIUTIL_TEST_DIR/inventory-count")
+  if [ "$count" -lt 4 ]; then
+    count=$((count + 1))
+    echo "$count" > "$HDIUTIL_TEST_DIR/inventory-count"
+    echo "$PPID" >> "$HDIUTIL_TEST_DIR/inventory-parents"
+    if [ "$count" -lt 4 ]; then echo 'Resource busy' >&2; exit 1; fi
+  fi
+fi
+native_hdiutil "$@"
+''')
+                result = self.run_builder(self.base / ('inventory-recovery-' + phase), INVENTORY_PHASE=phase)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.base / 'inventory-count').read_text().strip(), '4')
+                self.assertEqual(len(set((self.base / 'inventory-parents').read_text().splitlines())), 1,
+                                 'inventory retries escaped the original attachment audit')
+                self.assertIn('macOS installer gate PASS', result.stdout)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assert_no_test_mounts()
+
+    def test_builder_malformed_attach_plists_use_verified_inventory_fallback(self):
+        cases = [
+            ('date', '<plist><dict><key>date</key><date>invalid</date></dict></plist>'),
+            ('truncated', '<plist><dict>'),
+            ('scalar', plistlib.dumps(['invalid']).decode()),
+            ('entity', plistlib.dumps({'system-entities': [1]}).decode()),
+            ('valid-date', ''),
+        ]
+        for label, body in cases:
+            with self.subTest(plist=label):
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = attach ]; then
+  native_hdiutil "$@" > "$HDIUTIL_TEST_DIR/native-attach.plist" || exit $?
+  if [ "$ATTACH_CASE" = valid-date ]; then
+    python3 - "$HDIUTIL_TEST_DIR/native-attach.plist" <<'PLIST'
+import datetime, pathlib, plistlib, sys
+attached = plistlib.loads(pathlib.Path(sys.argv[1]).read_bytes())
+attached['checked-at'] = datetime.datetime(2026, 10, 20)
+sys.stdout.buffer.write(plistlib.dumps(attached))
+PLIST
+  else
+    printf '%s\\n' "$ATTACH_PLIST"
+  fi
+  exit 0
+fi
+native_hdiutil "$@"
+''')
+                try:
+                    result = self.run_builder(self.base / ('attach-plist-' + label),
+                                              ATTACH_CASE=label, ATTACH_PLIST=body)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('macOS installer gate PASS', result.stdout)
+                finally:
+                    self.detach_leftover_test_mounts()
+                    self.assert_no_test_mounts()
+
+    def test_builder_failed_snapshot_retains_output_without_attaching(self):
+        for status, diagnostic in ((16, 'Resource busy'), (9, 'Invalid argument'), (0, 'invalid plist')):
+            with self.subTest(status=status):
+                (self.base / 'calls').unlink(missing_ok=True)
+                (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + '''
+if [ "$1" = info ]; then
+  echo "$INVENTORY_DIAGNOSTIC" >&''' + ('1' if status == 0 else '2') + '''
+  exit "$INVENTORY_STATUS"
+fi
+native_hdiutil "$@"
+''')
+                output = self.base / ('failed-snapshot-' + str(status))
+                result = self.run_builder(output, INVENTORY_STATUS=str(status), INVENTORY_DIAGNOSTIC=diagnostic)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('retaining', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertNotIn('attach', (self.base / 'calls').read_text().splitlines())
+                self.assertTrue(list(output.glob('*.dmg')), 'uncertain image was deleted')
+                self.assertFalse(list(output.glob('*.sha256')))
+                self.assert_no_test_mounts()
 
     def test_incomplete_inventory_is_requeried(self):
         info = plistlib.dumps({'images': []})
@@ -1953,9 +2096,20 @@ native_hdiutil "$@"
                         ledger.unlink()
 
     def test_create_alias_and_incomplete_inventory_preserve_attached_backing(self):
-        for alias, mode in (('case', 'none'), ('unicode', 'none'), ('same', 'late'), ('case', 'always'), ('unicode', 'busy')):
+        python = self.shim / 'python3'
+        python.write_text('''#!/bin/bash
+if [[ "$1" == */macos-image-identity.py ]]; then
+  export HDIUTIL_TEST_IDENTITY_ACTION="$2"
+fi
+exec "$HDIUTIL_REAL_PYTHON" "$@"
+''')
+        python.chmod(0o755)
+        for alias, mode in (('case', 'none'), ('unicode', 'none'), ('same', 'late'),
+                            ('case', 'always'), ('same', 'path-loop'), ('unicode', 'busy')):
             for mounted in (False, True):
                 with self.subTest(alias=alias, mode=mode, mounted=mounted):
+                    (self.base / 'busy-info-count').unlink(missing_ok=True)
+                    (self.base / 'clone.json').unlink(missing_ok=True)
                     (self.shim / 'hdiutil').write_text(HDIUTIL_TRACE + """
 if [ "$1" = create ]; then
   native_hdiutil "$@" || exit $?
@@ -1978,26 +2132,41 @@ else:
 attached = subprocess.run(args, capture_output=True, check=True)
 (root / 'clone.plist').write_bytes(attached.stdout)
 (root / 'clone.json').write_text(json.dumps({
-    'path': str(image), 'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
+    'path': str(image), 'identity': [image.stat().st_dev, image.stat().st_ino],
+    'sha256': hashlib.sha256(image.read_bytes()).hexdigest()}))
 CLONE
   if [ "$INVENTORY_MODE" = busy ]; then echo 'Resource busy' >&2; exit 16; fi
   exit 0
 fi
 if [ "$1" = info ] && [ -f "$HDIUTIL_TEST_DIR/clone.json" ]; then
+  if [ "$INVENTORY_MODE" = busy ]; then
+    count=0
+    [ ! -f "$HDIUTIL_TEST_DIR/busy-info-count" ] || count=$(cat "$HDIUTIL_TEST_DIR/busy-info-count")
+    echo "$((count + 1))" > "$HDIUTIL_TEST_DIR/busy-info-count"
+    echo 'Resource busy' >&2
+    exit 16
+  fi
   python3 - "$HDIUTIL_TEST_DIR" "$INVENTORY_MODE" <<'OMIT'
 import json, os, pathlib, plistlib, subprocess, sys
 root = pathlib.Path(sys.argv[1]); mode = sys.argv[2]
 p = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], capture_output=True)
-# The shell shim is the parent; its parent is the finish/clean helper.
-ppid = subprocess.check_output(['/bin/ps', '-o', 'ppid=', '-p', str(os.getppid())], text=True).strip()
-parent = subprocess.check_output(['/bin/ps', '-o', 'command=', '-p', ppid], text=True)
-if mode in ('always', 'busy') or (mode == 'late' and 'macos-image-identity.py clean ' in parent):
+if p.returncode:
+    sys.stderr.buffer.write(p.stderr)
+    sys.exit(p.returncode)
+if mode in ('always', 'busy', 'path-loop') or (mode == 'late' and os.environ.get('HDIUTIL_TEST_IDENTITY_ACTION') == 'clean'):
     raw = pathlib.Path(json.loads((root / 'clone.json').read_text())['path'])
     info = plistlib.loads(p.stdout)
     def same_file(image):
         try: return pathlib.Path(image.get('image-path', '')).samefile(raw)
         except OSError: return False
-    info['images'] = [i for i in info.get('images', []) if not same_file(i)]
+    if mode == 'path-loop':
+        loop = root / 'inventory-path-loop'
+        loop.unlink(missing_ok=True)
+        loop.symlink_to(loop.name)
+        for image in info.get('images', []):
+            if same_file(image): image['image-path'] = str(loop)
+    else:
+        info['images'] = [i for i in info.get('images', []) if not same_file(i)]
     p.stdout = plistlib.dumps(info)
 sys.stdout.buffer.write(p.stdout); sys.stderr.buffer.write(p.stderr); sys.exit(p.returncode)
 OMIT
@@ -2010,18 +2179,30 @@ native_hdiutil "$@"
                     mktemp.chmod(0o755)
                     try:
                         result = self.run_builder(self.base / f'clone-output-{alias}-{mode}-{mounted}',
-                                                  FOREIGN_MOUNTED=str(int(mounted)), ALIAS=alias, INVENTORY_MODE=mode)
+                                                  FOREIGN_MOUNTED=str(int(mounted)), ALIAS=alias, INVENTORY_MODE=mode,
+                                                  HDIUTIL_REAL_PYTHON=sys.executable)
                         self.assertNotEqual(result.returncode, 0, result.stderr)
                         self.assertIn('retaining', result.stderr)
+                        self.assertNotIn('Traceback', result.stderr)
+                        if mode == 'busy':
+                            self.assertEqual(result.returncode, 16, result.stderr)
+                            # remove and the exit trap's withdraw-image each
+                            # exhaust exactly four inventory attempts.
+                            self.assertEqual((self.base / 'busy-info-count').read_text().strip(), '8')
                         self.assertNotIn('macOS installer gate PASS', result.stdout)
                         record = json.loads((self.base / 'clone.json').read_text())
                         image = Path(record['path'])
+                        retained_stat = image.stat()
+                        self.assertEqual([retained_stat.st_dev, retained_stat.st_ino], record['identity'])
                         self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), record['sha256'])
                         attached = plistlib.loads((self.base / 'clone.plist').read_bytes())
                         for entity in attached['system-entities']:
                             device = entity.get('dev-entry', '')
                             if re.fullmatch(r'/dev/disk[0-9]+', device):
-                                self.assertTrue(self.image_for_device(device), 'foreign clone ejected')
+                                current = self.image_for_device(device)
+                                self.assertIsNotNone(current, 'foreign clone ejected')
+                                self.assertTrue(Path(current['image-path']).samefile(image),
+                                                'retained device now refers to another image')
                         self.assert_no_test_mounts()
                     finally:
                         ledger = self.base / 'clone.plist'
@@ -2295,6 +2476,495 @@ native_hdiutil "$@"
         self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), changed['after_sha256'])
         self.assertEqual(image.with_suffix('.dmg.sha256').read_text().split()[0], changed['after_sha256'])
         self.assert_no_test_mounts()
+
+
+@unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS fixture directory checks')
+class MacOSFixtureDirectoryTests(unittest.TestCase):
+    """Replay post-detach inventory changes without operating a disk device."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.directory = self.base / 'work-\u00e9'
+        self.case = MacOSHdiutilRetryTests()
+        self.reset_directory()
+
+    def reset_directory(self):
+        self.directory.mkdir()
+        self.marker = self.directory / 'keep.txt'
+        self.marker.write_text('fixture data\n')
+
+    def remove(self, inventory=()):
+        self.case.remove_clear_directory(self.directory, inventory, 'fixture directory')
+
+    def test_transient_image_entries_recover_through_fourth_observation(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        for observations in (1, 2, 3):
+            with self.subTest(observations=observations):
+                if not self.directory.exists():
+                    self.reset_directory()
+                with patch.object(self.case, 'disk_image_inventory',
+                                  side_effect=[[image]] * observations + [[]]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()) as mounts, \
+                        patch.object(time, 'sleep') as backoff:
+                    self.remove()
+                self.assertEqual(images.call_count, observations + 1)
+                self.assertEqual(mounts.call_count, observations + 1)
+                self.assertEqual([call.args[0] for call in backoff.call_args_list],
+                                 [.1 * (attempt + 1) for attempt in range(observations)])
+                self.assertFalse(self.directory.exists())
+
+    def test_transient_mount_entries_refresh_the_callers_snapshot(self):
+        point = (self.directory / 'mount').resolve()
+        for observations in (1, 2, 3):
+            with self.subTest(observations=observations):
+                if not self.directory.exists():
+                    self.reset_directory()
+                with patch.object(self.case, 'disk_image_inventory', return_value=[]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints',
+                                     side_effect=[set()] + [{point}] * (observations - 1) + [set()]) as mounts, \
+                        patch.object(time, 'sleep'):
+                    self.remove({point})
+                self.assertEqual(images.call_count, observations + 1)
+                self.assertEqual(mounts.call_count, observations + 1)
+                self.assertFalse(self.directory.exists())
+
+    def test_persistent_image_entries_retain_data_without_device_authority(self):
+        alias = self.base / 'alias'
+        alias.symlink_to(self.directory, target_is_directory=True)
+        for path, entities in ((self.directory / 'missing.dmg', []),
+                               (self.directory / 'missing.dmg', [{'dev-entry': '/dev/disk973'}]),
+                               (alias / 'missing.dmg', [])):
+            with self.subTest(path=path, entities=entities):
+                image = {'image-path': str(path), 'system-entities': entities}
+                with patch.object(self.case, 'disk_image_inventory', return_value=[image]) as images, \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()), \
+                        patch.object(time, 'sleep') as backoff, \
+                        patch.object(subprocess, 'run') as native:
+                    with self.assertRaisesRegex(AssertionError, 'attached image inside fixture'):
+                        self.remove()
+                self.assertEqual(images.call_count, 4)
+                self.assertEqual(backoff.call_count, 3)
+                native.assert_not_called()
+                self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_persistent_mount_entries_retain_data_after_four_observations(self):
+        point = (self.directory / 'mount').resolve()
+        with patch.object(self.case, 'disk_image_inventory', return_value=[]) as images, \
+                patch.object(self.case, 'disk_image_mountpoints', return_value={point}) as mounts, \
+                patch.object(time, 'sleep') as backoff:
+            with self.assertRaisesRegex(AssertionError, 'unrecorded mount inside fixture'):
+                self.remove({point})
+        self.assertEqual(images.call_count, 4)
+        self.assertEqual(mounts.call_count, 4)
+        self.assertEqual(backoff.call_count, 3)
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_unavailable_image_inventory_retains_data(self):
+        with patch.object(self.case, 'disk_image_inventory', side_effect=RuntimeError('inventory unavailable')), \
+                patch.object(time, 'sleep') as backoff:
+            with self.assertRaisesRegex(RuntimeError, 'inventory unavailable'):
+                self.remove()
+        backoff.assert_not_called()
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_fresh_unrecorded_mount_is_retained_with_empty_callers_snapshot(self):
+        image = {'image-path': str(self.base / 'other.dmg'),
+                 'system-entities': [{'mount-point': str(self.directory / 'mount')}]}
+        with patch.object(self.case, 'disk_image_inventory', return_value=[image]) as images, \
+                patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(AssertionError, 'unrecorded mount inside fixture'):
+                self.remove()
+        self.assertEqual(images.call_count, 4)
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_unavailable_mount_inventory_during_refresh_retains_data(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        with patch.object(self.case, 'disk_image_inventory', side_effect=[[image], []]), \
+                patch.object(self.case, 'disk_image_mountpoints',
+                             side_effect=[set(), RuntimeError('inventory unavailable')]), \
+                patch.object(time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'inventory unavailable'):
+                self.remove()
+        self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_directory_replacement_during_wait_or_inventory_is_retained(self):
+        image = {'image-path': str(self.directory / 'unfinished.dmg')}
+        for when in ('wait', 'inventory'):
+            with self.subTest(when=when):
+                original = self.base / ('original-' + when)
+                def replace_directory(*_):
+                    self.directory.rename(original)
+                    self.directory.mkdir()
+                    self.marker.write_text('different directory\n')
+                def observe():
+                    if when == 'inventory':
+                        replace_directory()
+                        return []
+                    return [image]
+                with patch.object(self.case, 'disk_image_inventory', side_effect=observe), \
+                        patch.object(self.case, 'disk_image_mountpoints', return_value=set()), \
+                        patch.object(time, 'sleep', side_effect=replace_directory):
+                    with self.assertRaisesRegex(AssertionError, 'directory identity changed'):
+                        self.remove()
+                self.assertEqual(self.marker.read_text(), 'different directory\n')
+                self.assertEqual((original / 'keep.txt').read_text(), 'fixture data\n')
+                self.marker.write_text('fixture data\n')
+
+    def test_directory_replacement_during_walk_is_retained(self):
+        original = self.base / 'original-walk'
+        def walk(*args, **kwargs):
+            self.directory.rename(original)
+            self.directory.mkdir()
+            self.marker.write_text('different directory\n')
+            return iter(())
+        with patch.object(self.case, 'disk_image_inventory', return_value=[]), \
+                patch.object(os, 'walk', side_effect=walk):
+            with self.assertRaisesRegex(AssertionError, 'directory identity changed'):
+                self.remove()
+        self.assertEqual(self.marker.read_text(), 'different directory\n')
+        self.assertEqual((original / 'keep.txt').read_text(), 'fixture data\n')
+
+    def test_physical_mount_checks_retain_data_with_clear_inventory(self):
+        import stat
+        mount = self.directory / 'mount'
+        mount.mkdir()
+        native_stat = Path.stat
+        for changed in (self.directory.parent, mount):
+            with self.subTest(changed=changed):
+                def observed_stat(path, *args, **kwargs):
+                    observed = native_stat(path, *args, **kwargs)
+                    if path == changed:
+                        values = list(observed)
+                        values[stat.ST_DEV] += 1
+                        return os.stat_result(values)
+                    return observed
+                with patch.object(self.case, 'disk_image_inventory', return_value=[]), \
+                        patch.object(Path, 'stat', observed_stat):
+                    with self.assertRaisesRegex(AssertionError, 'mounted filesystem (at|inside)'):
+                        self.remove()
+                self.assertEqual(self.marker.read_text(), 'fixture data\n')
+
+    def test_clear_directory_control_preserves_unrelated_entries(self):
+        other = self.base / 'other'
+        other.mkdir()
+        marker = other / 'keep.txt'
+        marker.write_text('other data\n')
+        with patch.object(self.case, 'disk_image_inventory',
+                          return_value=[{'image-path': str(other / 'image.dmg')}]) as images, \
+                patch.object(self.case, 'disk_image_mountpoints', return_value=set()) as mounts, \
+                patch.object(time, 'sleep') as backoff:
+            self.remove({other / 'mount'})
+        self.assertEqual(images.call_count, 1)
+        self.assertEqual(mounts.call_count, 1)
+        backoff.assert_not_called()
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(marker.read_text(), 'other data\n')
+
+
+@unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS backing-file audit')
+class MacOSRetryIdentityTests(unittest.TestCase):
+    """Replay native-tool races without creating or operating any disk device."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.work = self.base / 'work'
+        self.work.mkdir()
+        (self.work / 'mount').mkdir()
+        self.image = self.base / 'image.dmg'
+        self.state = self.base / 'state.json'
+        self.shim = self.base / 'shim'
+        self.shim.mkdir()
+        self.helper = self.base / 'helper'
+        self.helper.mkdir()
+        # Exercise the actual parser on incomplete/complete lsof records. Only
+        # the fixture PID and fixture device are simulated; path identities and
+        # publication/staging cleanup still use the production helper.
+        helper = (ROOT / 'packaging/installers/macos-image-identity.py').read_text()
+        injection = '''
+_fixture_state = Path(os.environ['RETRY_FIXTURE_STATE'])
+_native_run = subprocess.run
+_native_exists = Path.exists
+def _fixture_exists(path):
+    if str(path) == '/dev/disk973':
+        return json.loads(_fixture_state.read_text())['attached']
+    return _native_exists(path)
+Path.exists = _fixture_exists
+def _fixture_run(command, *args, **kwargs):
+    if command[:4] != ['/usr/sbin/lsof', '-a', '-p', '973']:
+        return _native_run(command, *args, **kwargs)
+    state = json.loads(_fixture_state.read_text())
+    unknown = state['armed'] and state['unknown'] < state['failures']
+    state['unknown'] += int(unknown)
+    state['audits'].append({'pid': os.getpid(), 'result': 'unknown' if unknown else 'proof'})
+    _fixture_state.write_text(json.dumps(state))
+    output = b'p973\\0\\nf3\\0tREG\\0'
+    if not unknown:
+        observed = identity(Path(state['image']).stat())
+        if state['foreign']:
+            observed[1] += 1
+        output += ('D%x\\0i%d\\0n%s\\0' % (*observed, state['image'])).encode()
+    return subprocess.CompletedProcess(command, 0, output + b'\\n', b'')
+subprocess.run = _fixture_run
+'''
+        (self.helper / 'macos-image-identity.py').write_text(
+            helper.replace("if __name__ == '__main__':", injection + "\nif __name__ == '__main__':"))
+        tool = self.shim / 'hdiutil'
+        tool.write_text('#!' + sys.executable + '\n' + '''
+import json, os, pathlib, plistlib, sys
+ledger = pathlib.Path(os.environ['RETRY_FIXTURE_STATE'])
+s = json.loads(ledger.read_text())
+action = sys.argv[1]
+s['calls'].append(action)
+count = s['calls'].count(action)
+failed = action == s['operation'] and count == 1
+if action == 'create':
+    s['create_directory'] = str(pathlib.Path(sys.argv[-1]).parent)
+    if not failed or s['partial'] != 'absent':
+        pathlib.Path(sys.argv[-1]).write_bytes(b'' if failed and s['partial'] == 'empty' else b'fixture image')
+    if failed and s['partial'] == 'absent':
+        if s['absent_variant'] in ('attachment', 'attachment-alias'):
+            s['attached'] = True
+            s['attachment_image'] = sys.argv[-1]
+            if s['absent_variant'] == 'attachment-alias':
+                directory = pathlib.Path(sys.argv[-1]).parent
+                alias = directory.parent / 'create-alias'
+                alias.symlink_to(directory, target_is_directory=True)
+                s['attachment_image'] = str(alias / 'IMAGE.DMG')
+        elif s['absent_variant'] == 'foreign-entry':
+            (pathlib.Path(sys.argv[-1]).parent / 'unrelated').write_bytes(b'keep me')
+        elif s['absent_variant'] == 'directory-change':
+            directory = pathlib.Path(sys.argv[-1]).parent
+            directory.rename(str(directory) + '.original')
+            directory.mkdir()
+            s['replacement_identity'] = [directory.stat().st_dev, directory.stat().st_ino]
+elif action == 'attach':
+    s['attached'] = not (failed and s['no_device'])
+    s['stale'] = failed and s['no_device'] and s['stale_device']
+    if s['attached']:
+        plistlib.dump({'system-entities': [{'dev-entry': '/dev/disk973'}]}, sys.stdout.buffer)
+elif action == 'detach':
+    # A synthetic device must never be ejected before a positive vnode audit.
+    ledger.write_text(json.dumps(s))
+    if not s['audits'] or s['audits'][-1]['result'] != 'proof':
+        sys.exit('fixture detach without backing proof')
+    if not failed or s['no_device']:
+        s['attached'] = False
+elif action == 'info':
+    if s['absent_variant'] == 'directory-change-inventory' and not s.get('replacement_identity'):
+        directory = pathlib.Path(s['create_directory'])
+        directory.rename(str(directory) + '.original')
+        directory.mkdir()
+        s['replacement_identity'] = [directory.stat().st_dev, directory.stat().st_ino]
+    if s['absent_variant'] == 'inventory-error':
+        sys.exit(5)
+    images = [{'image-path': s.get('attachment_image', s['image']), 'hdid-pid': 973,
+               'system-entities': [{'dev-entry': '/dev/disk973'}]}] if s['attached'] or s['stale'] else []
+    plistlib.dump({'images': images}, sys.stdout.buffer)
+else:
+    sys.exit('unexpected fixture operation')
+if failed:
+    s['armed'] = True
+ledger.write_text(json.dumps(s))
+if failed:
+    print('simulated ' + s['error'], file=sys.stderr)
+    sys.exit(s['status'])
+''')
+        tool.chmod(0o755)
+        # The production backoff remains covered by native tests. Avoid seven
+        # seconds of shell sleep in each deterministic permanent-error control.
+        (self.shim / 'sleep').write_text('#!/bin/sh\nexit 0\n')
+        (self.shim / 'sleep').chmod(0o755)
+
+    def replay(self, operation, *, failures=1, partial='empty', no_device=False,
+               foreign=False, busy=True, absent_variant='clear', stale_device=False):
+        state = dict(operation=operation, partial=partial, no_device=no_device,
+                     foreign=foreign, failures=failures, unknown=0, armed=False, absent_variant=absent_variant,
+                     attached=False, stale=False, stale_device=stale_device, image=str(self.image), calls=[], audits=[],
+                     error='Resource busy' if busy else 'Invalid argument',
+                     status=16 if busy else 5)
+        self.state.write_text(json.dumps(state))
+        source = BUILD.read_text()
+        functions = source[source.index('mount_is_clear()'):source.index('cleanup()')]
+        functions += source[source.index('run_hdiutil()'):
+                            source.index('hdiutil_retry create remove_partial_dmg -volname')]
+        script = '''set -euo pipefail
+work=$1
+here=$2
+dmg=$3
+mounted=0
+attached_device=
+create_started=0
+name=fixture
+'''+ functions + '''
+hdiutil_retry create remove_partial_dmg -volname fixture "$dmg"
+exec 9< "$dmg"
+hdiutil_retry attach detach_partial_mount "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
+hdiutil_retry detach no_cleanup
+'''
+        result = subprocess.run(['bash', '-c', script, 'retry-fixture', str(self.work),
+                                 str(self.helper), str(self.image)],
+                                capture_output=True, text=True, timeout=30,
+                                env=dict(os.environ, RETRY_FIXTURE_STATE=str(self.state),
+                                         PATH=str(self.shim) + os.pathsep + os.environ['PATH']))
+        return result, json.loads(self.state.read_text())
+
+    def assert_recovered(self, result, state, operation):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(state['calls'].count(operation), 2)
+        self.assertFalse(state['attached'])
+        self.assertEqual(self.image.read_bytes(), b'fixture image')
+        self.assertEqual(state['unknown'], state['failures'])
+        self.assertNotIn('retaining', result.stderr)
+
+    def test_transient_create_then_unavailable_backing_identity_recovers(self):
+        result, state = self.replay('create')
+        self.assert_recovered(result, state, 'create')
+        self.assertEqual([a['result'] for a in state['audits'][:2]], ['unknown', 'proof'])
+        self.assertEqual(len({a['pid'] for a in state['audits'][:2]}), 1)
+
+    def test_transient_attach_then_unavailable_backing_identity_recovers(self):
+        result, state = self.replay('attach', failures=3)
+        self.assert_recovered(result, state, 'attach')
+        self.assertEqual(len({a['pid'] for a in state['audits'][:4]}), 1,
+                         'unknown attach ownership escaped the original audit')
+
+    def test_transient_detach_then_unavailable_backing_identity_recovers(self):
+        result, state = self.replay('detach', failures=3)
+        self.assert_recovered(result, state, 'detach')
+        first = next(i for i, audit in enumerate(state['audits']) if audit['result'] == 'unknown')
+        self.assertEqual(len({a['pid'] for a in state['audits'][first:first + 4]}), 1)
+
+    def test_busy_create_without_partial_backing_file_recovers(self):
+        result, state = self.replay('create', partial='absent', failures=0)
+        self.assert_recovered(result, state, 'create')
+        self.assertEqual(len(list(self.work.glob('create.*'))), 1)
+
+    def test_absent_create_output_with_attachment_is_retained(self):
+        result, state = self.replay('create', partial='absent', failures=0,
+                                    absent_variant='attachment')
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(state['calls'].count('create'), 1)
+        self.assertEqual(state['calls'].count('detach'), 0)
+        self.assertTrue(state['attached'])
+        self.assertTrue((self.work / 'retain-create').exists())
+        self.assertTrue(Path(state['attachment_image']).parent.exists())
+
+    def test_absent_create_output_with_foreign_entry_is_retained(self):
+        result, state = self.replay('create', partial='absent', failures=0,
+                                    absent_variant='foreign-entry')
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(state['calls'].count('create'), 1)
+        self.assertTrue((self.work / 'retain-create').exists())
+        self.assertEqual(next(self.work.glob('create.*/unrelated')).read_bytes(), b'keep me')
+
+    def test_absent_create_output_with_aliased_attachment_is_retained(self):
+        result, state = self.replay('create', partial='absent', failures=0,
+                                    absent_variant='attachment-alias')
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(state['calls'].count('create'), 1)
+        self.assertEqual(state['calls'].count('detach'), 0)
+        self.assertTrue(state['attached'])
+        self.assertTrue((self.work / 'retain-create').exists())
+        self.assertTrue(next(self.work.glob('create.*')).is_dir())
+
+    def test_absent_create_output_with_unknown_inventory_is_retained(self):
+        result, state = self.replay('create', partial='absent', failures=0,
+                                    absent_variant='inventory-error')
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertEqual(state['calls'].count('create'), 1)
+        self.assertTrue((self.work / 'retain-create').exists())
+
+    def test_absent_create_output_with_replaced_directory_is_retained(self):
+        for variant in ('directory-change', 'directory-change-inventory'):
+            with self.subTest(variant=variant):
+                case = type(self)()
+                case.setUp()
+                try:
+                    result, state = case.replay('create', partial='absent', failures=0,
+                                                absent_variant=variant)
+                    self.assertEqual(result.returncode, 16, result.stderr)
+                    self.assertEqual(state['calls'].count('create'), 1)
+                    self.assertTrue((case.work / 'retain-create').exists())
+                    self.assertEqual(len(list(case.work.glob('create.*'))), 2)
+                    directory = Path(state['create_directory'])
+                    self.assertEqual([directory.stat().st_dev, directory.stat().st_ino],
+                                     state['replacement_identity'])
+                finally:
+                    case.doCleanups()
+
+    def test_busy_create_with_nonempty_partial_backing_file_recovers(self):
+        result, state = self.replay('create', partial='nonempty', failures=0)
+        self.assert_recovered(result, state, 'create')
+
+    def test_busy_attach_without_device_recovers(self):
+        result, state = self.replay('attach', no_device=True, failures=0)
+        self.assert_recovered(result, state, 'attach')
+
+    def test_busy_attach_with_departed_device_and_unknown_backing_recovers(self):
+        result, state = self.replay('attach', no_device=True, stale_device=True)
+        self.assert_recovered(result, state, 'attach')
+        self.assertEqual(state['calls'].count('detach'), 1,
+                         'departed unowned device was sent to detach')
+
+    def test_busy_detach_after_device_disappears_succeeds(self):
+        result, state = self.replay('detach', no_device=True, failures=0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(state['calls'].count('detach'), 1)
+        self.assertFalse(state['attached'])
+
+    def test_permanently_unknown_backing_identity_retains_attachment(self):
+        for operation in ('create', 'attach', 'detach'):
+            with self.subTest(operation=operation):
+                # Independent fixture state for each operation.
+                case = type(self)()
+                case.setUp()
+                try:
+                    result, state = case.replay(operation, failures=100)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(state['calls'].count('detach'), int(operation == 'detach'))
+                    self.assertTrue(state['attached'])
+                    self.assertTrue(case.image.is_file())
+                    self.assertIn('backing inode unavailable', result.stderr)
+                    if operation == 'detach':
+                        saved = json.loads((case.work / 'attached-image.json').read_text())
+                        self.assertEqual([item['device'] for item in saved], ['/dev/disk973'])
+                        self.assertEqual(saved[0]['identity'],
+                                         [case.image.stat().st_dev, case.image.stat().st_ino])
+                    parents = {}
+                    for audit in state['audits']:
+                        parents[audit['pid']] = parents.get(audit['pid'], 0) + 1
+                    self.assertLessEqual(max(parents.values()), 4)
+                finally:
+                    case.doCleanups()
+
+    def test_foreign_backing_identity_never_grants_detach_authority(self):
+        result, state = self.replay('create', failures=0, foreign=True)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(state['attached'])
+        self.assertTrue(self.image.exists())
+        self.assertEqual(state['calls'].count('detach'), 0)
+
+    def test_nonbusy_create_error_is_not_retried(self):
+        result, state = self.replay('create', failures=0, busy=False)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual(state['calls'].count('create'), 1)
+        self.assertFalse(state['attached'])
+
+    def test_nonbusy_attach_error_is_not_retried(self):
+        result, state = self.replay('attach', failures=0, busy=False)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual(state['calls'].count('attach'), 1)
+        self.assertFalse(state['attached'])
+
+    def test_nonbusy_detach_error_is_not_retried(self):
+        result, state = self.replay('detach', failures=0, busy=False)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual(state['calls'].count('detach'), 1)
+        self.assertTrue(state['attached'])
 
 
 if __name__ == '__main__':
