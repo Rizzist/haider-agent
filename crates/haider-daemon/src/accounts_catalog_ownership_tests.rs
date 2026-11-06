@@ -2718,3 +2718,59 @@ async fn catalog_control_inactive_corrupt_304_preserves_live_registry() {
         "a corrupt inactive A 304 cannot restore A's rejection over B's valid catalog"
     );
 }
+
+async fn saved_static_admission_respects_its_accounts_rejection(rejected: bool) {
+    let mut results = vec![Ok(catalog(8192))];
+    if rejected {
+        results.push(Err(CatalogError::Unauthorized));
+    }
+    let (_registry_dir, f) = inactive_failure_fixture(results, Some("a")).await;
+    let b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    b.await.expect("B completion").expect("B catalog");
+    if rejected {
+        let a = f.begin_refresh_for("a").await;
+        f.discoverer.release.notify_one();
+        assert!(a.await.expect("A rejection").is_err());
+    }
+    let facade = f.hub.accounts().expect("facade").expect("accounts");
+    let factory = AccountsProviderFactory::new_with_management(
+        facade.snapshot.clone(),
+        facade.management.clone(),
+        VaultProvision::Unsupported,
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("read saved selection")
+        .expect("saved selection");
+    assert_eq!(metadata.account_alias.as_deref(), Some("a"));
+    assert!(
+        haider_provider::subscription_static_model_ids(PROVIDER).contains(&metadata.model.as_str())
+    );
+    let admission = factory.admit_persisted_model(&metadata);
+    f.close().await;
+    if rejected {
+        assert!(
+            admission.is_err(),
+            "A's rejection must block its saved static model even when B's catalog is healthy"
+        );
+    } else {
+        assert!(
+            admission.is_ok(),
+            "healthy inactive A retains admission for its saved static model: {admission:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_owner_inactive_rejection_blocks_saved_static_model() {
+    saved_static_admission_respects_its_accounts_rejection(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_healthy_inactive_saved_static_model_is_admitted() {
+    saved_static_admission_respects_its_accounts_rejection(false).await;
+}

@@ -29,6 +29,7 @@ impl haider_daemon::ProviderModelDiscoverer for SyntheticCatalog {
     async fn discover(
         &self,
         _source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         access: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
@@ -377,6 +378,7 @@ impl haider_daemon::ProviderModelDiscoverer for DeniedRecoveryCatalog {
     async fn discover(
         &self,
         _source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         _access: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
@@ -552,6 +554,7 @@ impl haider_daemon::ProviderModelDiscoverer for SyntheticApiBoundary {
     async fn discover(
         &self,
         source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         access: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
@@ -1004,6 +1007,7 @@ impl haider_daemon::ProviderModelDiscoverer for SourceRaceCatalog {
     async fn discover(
         &self,
         _source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         access: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
