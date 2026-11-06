@@ -9,6 +9,7 @@ use haider_rpc::{AttachMode, Capability, CommandId, RequestBody};
 const PROVIDER: &str = OPENAI_OAUTH_PROVIDER_NAME;
 const MODEL: &str = "account-owned-model";
 const INITIAL_MODEL: &str = "gpt-6-sol";
+const CUSTOM: &str = "custom-catalog-ownership";
 
 async fn response_for(
     frames: &mut mpsc::UnboundedReceiver<WireFrame>,
@@ -90,7 +91,19 @@ impl Fixture {
         recovery: Option<DiscoveredCatalog>,
         public: bool,
     ) -> Self {
-        const CUSTOM: &str = "custom-catalog-ownership";
+        Self::start(
+            results,
+            None,
+            false,
+            CUSTOM,
+            AuthMethod::ApiKey,
+            Self::custom_registry(public),
+            recovery,
+        )
+        .await
+    }
+
+    fn custom_registry(public: bool) -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
         let profile = ProviderProfileV1 {
             catalog_selection_key: None,
 
@@ -113,23 +126,13 @@ impl Fixture {
             provenance: crate::provider_registry::ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         };
-        let providers = ProviderRegistry::new(
+        ProviderRegistry::new(
             Box::new(TestProviderStore(StdMutex::new(vec![profile])))
                 as Box<dyn ProviderRegistryStoreLike>,
             Vec::new(),
             Arc::new(CachedProviderModelSource::default()),
         )
-        .expect("custom registry");
-        Self::start(
-            results,
-            None,
-            false,
-            CUSTOM,
-            AuthMethod::ApiKey,
-            providers,
-            recovery,
-        )
-        .await
+        .expect("custom registry")
     }
 
     async fn start(
@@ -1293,7 +1296,9 @@ async fn catalog_control_owned_hidden_rows_remain_unavailable() {
 
 #[tokio::test]
 async fn catalog_owner_removed_alias_cannot_serve_a_stale_cached_model() {
-    let mut f = Fixture::new(vec![Ok(catalog(2048)), Ok(catalog(2048))], Some("a"), false).await;
+    let mut hidden = catalog(2048);
+    hidden.models[0].visible = false;
+    let mut f = Fixture::new(vec![Ok(hidden), Ok(catalog(2048))], Some("a"), false).await;
     f.publish_a().await;
     // Advance only freshness of the actor's actually published catalog. Its
     // rows and owning account still come from the real successful completion.
@@ -1364,6 +1369,22 @@ async fn catalog_owner_removed_alias_cannot_serve_a_stale_cached_model() {
     f.close().await;
 }
 
+async fn complete_explicit_b_listing_refusal(f: &Fixture) {
+    let refreshed = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    assert!(refreshed.await.expect("explicit B completion").is_err());
+}
+
+fn configured_custom_baseline_detail() -> haider_rpc::ModelDetailWire {
+    Fixture::custom_registry(false)
+        .summary(CUSTOM, &|_| true)
+        .expect("configuration-only provider")
+        .model_details
+        .into_iter()
+        .find(|detail| detail.name == MODEL)
+        .expect("configured baseline model")
+}
+
 async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
     let mut first = catalog(2048);
     if !other_account_catalog {
@@ -1371,8 +1392,8 @@ async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
     }
     let mut f = Fixture::custom(vec![
         Ok(first),
-        Err(CatalogError::Unavailable {
-            reason: "synthetic advisory outage".into(),
+        Err(CatalogError::Unsupported {
+            reason: "synthetic listing refusal".into(),
         }),
     ])
     .await;
@@ -1381,6 +1402,7 @@ async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
         .await;
     f.discoverer.release.notify_one();
     receiver.await.expect("completion").expect("catalog");
+    complete_explicit_b_listing_refusal(&f).await;
     let mut request = f.creation(true, 4096);
     if let RequestBody::SessionCreateWithPermissionOverrides {
         model,
@@ -1391,7 +1413,11 @@ async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
         model.clear();
         *resolve_model = true;
     }
-    let response = f.admit(request).await;
+    f.connection
+        .request(RequestId::new("configured-default-after-refusal"), request)
+        .await
+        .expect("configured selection request");
+    let response = response_for(&mut f.frames, "configured-default-after-refusal").await;
     let ResponseBody::SessionCreate { metadata, .. } = response else {
         panic!("configured advisory default must survive discovery failure: {response:?}");
     };
@@ -1404,7 +1430,7 @@ async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
     assert_eq!(
         f.discoverer.seen.lock().expect("calls").len(),
         2,
-        "one initial catalog and exactly one B admission probe"
+        "one initial catalog and exactly one explicit B probe"
     );
     f.close().await;
 }
@@ -1428,21 +1454,33 @@ async fn catalog_owner_stale_resolved_descriptor_cannot_use_replacement_catalog(
 }
 
 async fn resolved_retry_uses_its_own_catalog(replaced: bool) {
-    let f = Fixture::new(vec![Ok(catalog(8192))], Some("a"), false).await;
+    let f = Fixture::start_with_replacement(
+        vec![Ok(catalog(8192))],
+        Some("a"),
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        test_provider_registry(),
+        None,
+        replaced,
+    )
+    .await;
     f.publish_a().await;
     let facade = f.hub.accounts().expect("facade").expect("accounts");
-    let mut descriptor = facade
-        .snapshot
-        .lock()
-        .expect("accounts")
-        .iter()
-        .find(|row| row.alias.as_str() == if replaced { "a" } else { "b" })
-        .expect("resolved account")
-        .clone();
-    if replaced {
-        descriptor.identity = "previous-incarnation".into();
-        descriptor.account_identity = None;
-    }
+    let descriptor = if replaced {
+        f.retired_a
+            .clone()
+            .expect("real retired account descriptor")
+    } else {
+        facade
+            .snapshot
+            .lock()
+            .expect("accounts")
+            .iter()
+            .find(|row| row.alias.as_str() == "b")
+            .expect("resolved B")
+            .clone()
+    };
     let factory = AccountsProviderFactory::new_with_management(
         facade.snapshot.clone(),
         facade.management.clone(),
@@ -1940,6 +1978,7 @@ async fn catalog_owner_staged_a_probe_cannot_cache_limits_for_active_b() {
 }
 
 async fn recovered_catalog_is_account_bound(public: bool) {
+    let baseline = configured_custom_baseline_detail();
     let f = Fixture::custom_with_recovery(Vec::new(), Some(catalog(2048)), public).await;
     let view = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
@@ -1970,9 +2009,23 @@ async fn recovered_catalog_is_account_bound(public: bool) {
             .iter()
             .find(|detail| detail.name == MODEL)
             .and_then(|detail| detail.max_output_tokens),
-        public.then_some(2048),
+        if public {
+            Some(2048)
+        } else {
+            baseline.max_output_tokens
+        },
         "recovery cannot relabel an unowned private catalog as active B's metadata"
     );
+    if !public {
+        assert_eq!(
+            summary
+                .model_details
+                .iter()
+                .find(|detail| detail.name == MODEL),
+            Some(&baseline),
+            "unowned recovery retains configuration-only metadata"
+        );
+    }
     let key = if public {
         ProviderModelCacheKey::public(f.provider)
     } else {
@@ -2007,8 +2060,16 @@ async fn catalog_control_public_recovery_preserves_remote_metadata() {
 }
 
 async fn configured_custom_global_default(check_owner: bool) {
-    let f = Fixture::custom(vec![Ok(catalog(2048))]).await;
+    let baseline = configured_custom_baseline_detail();
+    let f = Fixture::custom(vec![
+        Ok(catalog(2048)),
+        Err(CatalogError::Unsupported {
+            reason: "synthetic B listing refusal".into(),
+        }),
+    ])
+    .await;
     f.publish_a().await;
+    complete_explicit_b_listing_refusal(&f).await;
     let summary = mutation_summary(global_catalog_mutation(&f, "default", MODEL).await);
     assert_eq!(
         summary.default_model.as_deref(),
@@ -2022,8 +2083,18 @@ async fn configured_custom_global_default(check_owner: bool) {
                 .iter()
                 .find(|detail| detail.name == MODEL)
                 .and_then(|detail| detail.max_output_tokens),
-            None,
+            baseline.max_output_tokens,
             "a configured B default cannot inherit A's remote output ceiling"
+        );
+    }
+    if check_owner {
+        assert_eq!(
+            summary
+                .model_details
+                .iter()
+                .find(|detail| detail.name == MODEL),
+            Some(&baseline),
+            "B's own listing refusal keeps configuration-only metadata"
         );
     }
     f.close().await;

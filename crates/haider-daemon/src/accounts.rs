@@ -2853,6 +2853,7 @@ async fn run_account_actor(
             }
             AccountCommand::SetDefaultModel(job) => {
                 handle_set_default_model(
+                    &profile_id,
                     &store,
                     &accounts,
                     management.as_ref(),
@@ -2893,6 +2894,7 @@ async fn run_account_actor(
             }
             AccountCommand::SetProviderTrust(job) => {
                 handle_provider_set_trust(
+                    &profile_id,
                     &store,
                     &accounts,
                     management.as_ref(),
@@ -4819,16 +4821,25 @@ fn active_catalog_cache_key(
 /// Global provider mutations use the active account, never an inactive pin's
 /// most recently published remote inventory. Durable replay runs before this.
 fn scope_registry_catalog_to_active_account(
+    profile_id: &str,
     provider: &str,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-) {
-    if catalog_is_account_scoped(provider, providers)
-        && active_catalog_cache_key(provider, accounts, providers)
-            .is_none_or(|expected| providers.catalog_owners().get(provider) != Some(&expected))
+) -> Result<(), HaiderError> {
+    if !catalog_is_account_scoped(provider, providers) {
+        return Ok(());
+    }
+    if active_catalog_cache_key(provider, accounts, providers)
+        .is_none_or(|expected| providers.catalog_owners().get(provider) != Some(&expected))
     {
         providers.clear_discovered_models(provider);
     }
+    // Retire foreign rows without losing the active account's own rejection
+    // or unsupported-listing proof when a global mutation reads its summary.
+    if let Some(producer) = catalog_producer(profile_id, provider, accounts, providers) {
+        providers.restore_catalog_evidence(provider, &catalog_evidence_scope(&producer))?;
+    }
+    Ok(())
 }
 
 /// Single-provider variant for imports whose catalog is offline/seeded.
@@ -6740,6 +6751,7 @@ async fn handle_remove_account(
 }
 
 async fn handle_set_default_model(
+    profile_id: &str,
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     management: Option<&ManagementSnapshot>,
@@ -6789,7 +6801,15 @@ async fn handle_set_default_model(
             return;
         }
     }
-    scope_registry_catalog_to_active_account(&identity.provider, accounts, providers);
+    if let Err(error) = scope_registry_catalog_to_active_account(
+        profile_id,
+        &identity.provider,
+        accounts,
+        providers,
+    ) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
     if let Some(summary) = catalog_summary(&identity.provider, accounts, providers)
         .filter(|summary| !summary.model_is_selectable(&identity.model))
     {
@@ -7086,7 +7106,15 @@ async fn handle_provider_configure(
             return;
         }
     }
-    scope_registry_catalog_to_active_account(&job.input.provider, accounts, providers);
+    if let Err(error) = scope_registry_catalog_to_active_account(
+        profile_id,
+        &job.input.provider,
+        accounts,
+        providers,
+    ) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
     let (endpoint_to_validate, validate_repoint_claim) = match accepted_revision_unchanged {
         Some(_) => (None, false),
         None => match providers.get(&job.input.provider) {
@@ -7351,8 +7379,9 @@ async fn handle_provider_configure(
             if job.probe_secret.is_some() {
                 // A staged secret is only a probe. It has no committed account
                 // incarnation, so its private rows cannot become the active
-                // account's fetched inventory or durable catalog.
-                discovered_slugs = Some(job.input.models.clone());
+                // account's fetched inventory or durable catalog. Normal validation
+                // retains only scoped facts and existing explicit deployments.
+                discovered_slugs = None;
             } else {
                 catalog_producer = auth_requirement.and_then(|auth| {
                     configure_catalog_producer(
@@ -7905,6 +7934,7 @@ async fn handle_provider_remove(
 }
 
 async fn handle_provider_set_trust(
+    profile_id: &str,
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     management: Option<&ManagementSnapshot>,
@@ -7995,6 +8025,7 @@ async fn handle_provider_set_trust(
     };
     let previous_trust = recovered_previous.unwrap_or(previous_before_claim);
     let (receipt, revision) = match commit_provider_trust(
+        profile_id,
         store,
         accounts,
         providers,
@@ -8029,6 +8060,7 @@ async fn handle_provider_set_trust(
 }
 
 async fn commit_provider_trust(
+    profile_id: &str,
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
@@ -8036,7 +8068,7 @@ async fn commit_provider_trust(
     identity: &ProviderSetTrustIdentity,
     previous: ProviderTrustWire,
 ) -> Result<(ProviderReceipt, u64), HaiderError> {
-    scope_registry_catalog_to_active_account(&identity.provider, accounts, providers);
+    scope_registry_catalog_to_active_account(profile_id, &identity.provider, accounts, providers)?;
     let receipt = ProviderReceipt {
         provider: providers.preview_trust(
             &identity.provider,
@@ -15336,6 +15368,7 @@ async fn reconcile_provider_receipts(
                             )
                         })?;
                     commit_provider_trust(
+                        profile_id,
                         store,
                         accounts,
                         providers,

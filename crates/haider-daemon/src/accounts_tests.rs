@@ -17886,6 +17886,7 @@ async fn run_provider_trust_test_command(
 ) -> WireFrame {
     let (sink, mut frames) = channel_sink();
     handle_provider_set_trust(
+        "test",
         store,
         &memory_accounts(),
         Some(management),
