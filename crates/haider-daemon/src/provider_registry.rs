@@ -206,6 +206,24 @@ pub(crate) struct CatalogEvidenceV1 {
     unsupported: bool,
 }
 
+impl CatalogEvidenceV1 {
+    pub(crate) fn is_for_provider(&self, provider: &str) -> bool {
+        self.provider == provider
+    }
+
+    pub(crate) fn inventory(&self) -> ProviderInventory {
+        if self.unsupported {
+            ProviderInventory::Unsupported {
+                reason: self.reason.clone(),
+            }
+        } else {
+            ProviderInventory::Rejected {
+                reason: self.reason.clone(),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 enum ProviderRegistryFileV1 {
@@ -632,11 +650,14 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
     }
 }
 
+pub(crate) type CatalogEvidenceCache = Arc<std::sync::Mutex<BTreeMap<String, CatalogEvidenceV1>>>;
+
 #[allow(dead_code)]
 pub(crate) struct ProviderRegistry<S> {
     store: S,
     profiles: Vec<ProviderProfileV1>,
     model_source: Arc<dyn ProviderModelSourceLike>,
+    catalog_evidence: CatalogEvidenceCache,
     resilience: ProviderResilienceConfigV1,
     injected_providers: std::collections::BTreeSet<String>,
 }
@@ -717,6 +738,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             store,
             profiles,
             model_source,
+            catalog_evidence: Arc::new(std::sync::Mutex::new(document.catalog_evidence)),
             resilience,
             injected_providers: std::collections::BTreeSet::new(),
         })
@@ -778,6 +800,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|profile| self.summary_profile(profile, has_credential))
     }
 
+    /// Shared only with revision-stamped management projections; never read
+    /// the registry file from a connection or provider factory.
+    pub(crate) fn catalog_evidence_cache(&self) -> CatalogEvidenceCache {
+        self.catalog_evidence.clone()
+    }
+
     pub(crate) fn models_rejected(&self, provider: &str, reason: String) {
         self.model_source
             .replace(provider.to_owned(), ProviderInventory::Rejected { reason });
@@ -818,14 +846,29 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         reason: String,
         unsupported: bool,
     ) -> Result<(), HaiderError> {
-        self.store.set_catalog_evidence(
-            scope,
-            Some(CatalogEvidenceV1 {
-                provider: provider.into(),
-                reason,
-                unsupported,
-            }),
-        )
+        // A discovery-capability response is uncertainty about listing, not
+        // proof that this same credential recovered from authentication failure.
+        if unsupported
+            && self
+                .catalog_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(scope)
+                .is_some_and(|row| row.provider == provider && !row.unsupported)
+        {
+            return Ok(());
+        }
+        let next = CatalogEvidenceV1 {
+            provider: provider.into(),
+            reason,
+            unsupported,
+        };
+        self.store.set_catalog_evidence(scope, Some(next.clone()))?;
+        self.catalog_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(scope.to_owned(), next);
+        Ok(())
     }
 
     pub(crate) fn restore_catalog_evidence(
@@ -833,12 +876,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         provider: &str,
         scope: &str,
     ) -> Result<bool, HaiderError> {
-        let document = self.store.load_document()?;
-        let Some(evidence) = document
+        let evidence = self
             .catalog_evidence
-            .get(scope)
-            .filter(|row| row.provider == provider)
-        else {
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(evidence) = evidence.get(scope).filter(|row| row.provider == provider) else {
             return Ok(false);
         };
         if evidence.unsupported {
@@ -850,9 +892,15 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn clear_catalog_evidence(&self, scope: &str) -> Result<(), HaiderError> {
-        self.store.set_catalog_evidence(scope, None)
+        self.store.set_catalog_evidence(scope, None)?;
+        self.catalog_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(scope);
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_discovered_models(
         &self,
         provider: String,
@@ -1569,7 +1617,7 @@ pub(crate) fn summary_without_discovery(
     project_inventory_summary(profile, ProviderInventory::NeverFetched, has_credential)
 }
 
-fn project_inventory_summary(
+pub(crate) fn project_inventory_summary(
     profile: &ProviderProfileV1,
     inventory: ProviderInventory,
     has_credential: bool,

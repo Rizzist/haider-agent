@@ -1425,8 +1425,7 @@ async fn oauth_relogin_reuses_stable_identity_alias_and_makes_it_active() {
         &selected,
         &bundle,
         None,
-        true,
-        None,
+        OAuthBundleIntake::Interactive,
     )
     .await
     .expect("interactive OAuth commit");

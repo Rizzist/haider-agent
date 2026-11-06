@@ -994,6 +994,13 @@ pub(crate) struct ManagementSnapshot {
     /// the removal-reconciliation problem that forces roster watchers to
     /// occasionally re-list.
     changes: watch::Sender<u64>,
+    catalog_evidence: Arc<StdMutex<Option<CatalogEvidenceContext>>>,
+}
+
+#[derive(Clone)]
+struct CatalogEvidenceContext {
+    profile: String,
+    cache: crate::provider_registry::CatalogEvidenceCache,
 }
 
 #[derive(Clone, Default)]
@@ -1005,6 +1012,8 @@ pub(crate) struct ManagementView {
     /// Registry configuration rebuilds the entire summary after foreign
     /// catalog removal, including defaults, availability and configured rows.
     pub catalog_profiles: HashMap<String, ProviderProfileV1>,
+    /// Exact producer's durable negative evidence, frozen at this revision.
+    catalog_evidence: HashMap<ProviderModelCacheKey, crate::provider_registry::CatalogEvidenceV1>,
 }
 
 impl ManagementView {
@@ -1098,19 +1107,35 @@ impl ManagementView {
                     })
                 })
         });
-        if !owned
-            && matches!(
+        let credential_ready = descriptor.is_some_and(|descriptor| {
+            matches!(
+                descriptor.status,
+                CredentialStatus::Ok | CredentialStatus::Limited { .. }
+            )
+        });
+        if let Some(evidence) = expected
+            .as_ref()
+            .and_then(|key| self.catalog_evidence.get(key))
+            && let Some(profile) = self.catalog_profiles.get(provider)
+        {
+            *summary = crate::provider_registry::project_inventory_summary(
+                profile,
+                evidence.inventory(),
+                credential_ready,
+            );
+            summary.catalog_scope = catalog_scope_for_descriptor(profile, descriptor);
+            self.catalog_owners.remove(provider);
+        } else if !owned
+            && (matches!(
                 summary.inventory,
                 haider_rpc::ModelInventoryWire::Fetched { .. }
                     | haider_rpc::ModelInventoryWire::Stale { .. }
-            )
+            ) || (summary.catalog_scope.is_some()
+                && matches!(
+                    summary.inventory,
+                    haider_rpc::ModelInventoryWire::Unavailable { .. }
+                )))
         {
-            let credential_ready = descriptor.is_some_and(|descriptor| {
-                matches!(
-                    descriptor.status,
-                    CredentialStatus::Ok | CredentialStatus::Limited { .. }
-                )
-            });
             if let Some(profile) = self.catalog_profiles.get(provider) {
                 *summary =
                     crate::provider_registry::summary_without_discovery(profile, credential_ready);
@@ -1162,9 +1187,59 @@ impl ManagementSnapshot {
                 providers,
                 catalog_owners: HashMap::new(),
                 catalog_profiles: HashMap::new(),
+                catalog_evidence: HashMap::new(),
             })),
             changes: watch::Sender::new(revision),
+            catalog_evidence: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    fn bind_catalog_evidence(&self, config: &AccountActorConfig) {
+        *self
+            .catalog_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CatalogEvidenceContext {
+            profile: config.profile_id.clone(),
+            cache: config.providers.catalog_evidence_cache(),
+        });
+        if let Ok(mut view) = self.inner.lock() {
+            view.catalog_profiles = config.providers.catalog_profiles();
+            view.catalog_evidence =
+                self.project_catalog_evidence(&view.descriptors, &view.catalog_profiles);
+        }
+    }
+
+    fn project_catalog_evidence(
+        &self,
+        descriptors: &[CredentialDescriptor],
+        profiles: &HashMap<String, ProviderProfileV1>,
+    ) -> HashMap<ProviderModelCacheKey, crate::provider_registry::CatalogEvidenceV1> {
+        let context = self
+            .catalog_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(context) = context else {
+            return HashMap::new();
+        };
+        let evidence = context
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let profile = profiles.get(&descriptor.provider)?;
+                let producer =
+                    catalog_producer_for_profile(&context.profile, profile, Some(descriptor))?;
+                producer.alias.as_ref()?;
+                let row = evidence
+                    .get(&catalog_evidence_scope(&producer))
+                    .filter(|row| row.is_for_provider(&descriptor.provider))?
+                    .clone();
+                Some((producer.cache_key, row))
+            })
+            .collect()
     }
 
     /// Observe published revisions. The current value is the revision at
@@ -1192,6 +1267,8 @@ impl ManagementSnapshot {
     fn publish_accounts(&self, revision: u64, descriptors: Vec<CredentialDescriptor>) {
         if let Ok(mut view) = self.inner.lock() {
             view.revision = revision;
+            view.catalog_evidence =
+                self.project_catalog_evidence(&descriptors, &view.catalog_profiles);
             view.descriptors = descriptors;
         }
         self.changes.send_replace(revision);
@@ -1205,6 +1282,7 @@ impl ManagementSnapshot {
         catalog_owners: HashMap<String, ProviderModelCacheKey>,
         catalog_profiles: HashMap<String, ProviderProfileV1>,
     ) {
+        let catalog_evidence = self.project_catalog_evidence(&descriptors, &catalog_profiles);
         if let Ok(mut view) = self.inner.lock() {
             *view = ManagementView {
                 revision,
@@ -1212,6 +1290,7 @@ impl ManagementSnapshot {
                 providers,
                 catalog_owners,
                 catalog_profiles,
+                catalog_evidence,
             };
         }
         self.changes.send_replace(revision);
@@ -1978,6 +2057,9 @@ fn spawn_account_actor(
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) -> AccountActorHandle {
+    if let Some(management) = &config.management {
+        management.bind_catalog_evidence(&config);
+    }
     let claude_native: Arc<dyn ClaudeNativeCredentialStore> =
         Arc::new(ClaudeNativeCredentialAccess::new(claude_native));
     let task = tokio::spawn(run_account_actor(
@@ -4092,13 +4174,14 @@ async fn finish_provider_models_refresh(
     };
     // An explicit account's own credential failure is reported to its caller
     // but must not mark the provider unavailable while another account works.
-    let foreign_live_owner = providers
-        .catalog_owners()
-        .get(&provider)
-        .is_some_and(|owner| owner != &cache_key);
+    let live_owner = providers.catalog_owners().get(&provider).cloned();
+    let owns_live_catalog = live_owner.as_ref() == Some(&cache_key);
+    let foreign_live_owner = live_owner.as_ref().is_some_and(|owner| owner != &cache_key);
+    let foreign_active_owner = active_catalog_cache_key(&provider, accounts, providers)
+        .is_some_and(|owner| owner != cache_key);
     let preserve_global_inventory = explicit_account
-        && failure_reason.is_some()
         && (foreign_live_owner
+            || foreign_active_owner
             || (result.is_account_specific_failure()
                 && account_alias.is_some_and(|selected| {
                     providers.get(&provider).is_some_and(|profile| {
@@ -4140,6 +4223,11 @@ async fn finish_provider_models_refresh(
         ) && !haider_provider::has_subscription_static_catalog(&provider))
             || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable);
         let evidence_result = if preserve_global_inventory {
+            if owns_live_catalog && !unsupported && !rejected {
+                // This producer's transient failure may stale its own rows;
+                // their owner still keeps them out of the other account's view.
+                providers.models_unavailable(&provider, reason.clone());
+            }
             if rejected {
                 let _ = store.delete_provider_models(cache_key.clone().into()).await;
             }
@@ -4501,11 +4589,15 @@ async fn publish_inventory_states(
         return;
     };
     let summaries = catalog_summaries(accounts, providers);
-    if management.read().is_some_and(|view| {
+    let profiles = providers.catalog_profiles();
+    let evidence = management.project_catalog_evidence(accounts.list(), &profiles);
+    if management.inspect(|view| {
         view.providers == summaries
             && view.catalog_owners == providers.catalog_owners()
-            && view.catalog_profiles == providers.catalog_profiles()
-    }) {
+            && view.catalog_profiles == profiles
+            && view.catalog_evidence == evidence
+    }) == Some(true)
+    {
         return;
     }
     if let Ok(revision) = store.advance_management_revision().await {
@@ -4616,7 +4708,16 @@ fn catalog_producer_for_account(
     descriptor: Option<&CredentialDescriptor>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Option<CatalogProducer> {
-    let (source, auth) = catalog_source(provider, providers)?;
+    catalog_producer_for_profile(profile, providers.get(provider)?, descriptor)
+}
+
+fn catalog_producer_for_profile(
+    profile: &str,
+    provider_profile: &ProviderProfileV1,
+    descriptor: Option<&CredentialDescriptor>,
+) -> Option<CatalogProducer> {
+    let provider = provider_profile.provider_id.as_str();
+    let (source, auth) = crate::provider_registry::catalog_source_for_profile(provider_profile)?;
     let descriptor = match auth {
         ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
             Some(descriptor.filter(|row| row.provider == provider)?)
@@ -4629,9 +4730,7 @@ fn catalog_producer_for_account(
         profile: profile.to_owned(),
         provider: provider.to_owned(),
         source,
-        origin: providers
-            .get(provider)
-            .and_then(|profile| profile.base_url.clone()),
+        origin: provider_profile.base_url.clone(),
         auth,
         alias: descriptor.map(|row| row.alias.clone()),
         incarnation: descriptor.map(|row| row.incarnation),
@@ -8988,8 +9087,7 @@ async fn handle_oauth_add(
         &alias,
         &bundle,
         prior_secret,
-        true,
-        None,
+        OAuthBundleIntake::Interactive,
     )
     .await
     {
@@ -10788,6 +10886,11 @@ async fn delete_oauth_staging(
         })?
 }
 
+enum OAuthBundleIntake {
+    Interactive,
+    Import { credential_digest: String },
+}
+
 async fn persist_oauth_bundle(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
@@ -10795,8 +10898,7 @@ async fn persist_oauth_bundle(
     alias: &CredentialAlias,
     bundle: &haider_accounts::OAuthTokenBundleV1,
     prior_secret: Option<SecretHandle>,
-    activate: bool,
-    intake_digest: Option<String>,
+    intake: OAuthBundleIntake,
 ) -> Result<(), HaiderError> {
     // The STORE is the authority on whether the descriptor row exists —
     // not `prior_secret`. A vanished prior secret (a Keychain→file-vault
@@ -10804,6 +10906,10 @@ async fn persist_oauth_bundle(
     // that row must be REPLACED, not add-rejected as a duplicate. Rollback
     // below still keys off `prior_secret`: with none, a failed save deletes
     // what we just wrote rather than restoring bytes that were already gone.
+    let (activate, intake_digest) = match intake {
+        OAuthBundleIntake::Interactive => (true, None),
+        OAuthBundleIntake::Import { credential_digest } => (false, Some(credential_digest)),
+    };
     let replacing = accounts.get(alias).is_some();
     let active = activate
         || accounts.get(alias).map_or_else(
@@ -10872,8 +10978,9 @@ async fn persist_oauth_import_material(
             alias,
             &material.bundle,
             prior_secret,
-            false,
-            Some(intake_digest),
+            OAuthBundleIntake::Import {
+                credential_digest: intake_digest,
+            },
         )
         .await;
     };
@@ -10904,8 +11011,9 @@ async fn persist_oauth_import_material(
         alias,
         &material.bundle,
         prior_secret,
-        false,
-        Some(intake_digest),
+        OAuthBundleIntake::Import {
+            credential_digest: intake_digest,
+        },
     )
     .await
     {

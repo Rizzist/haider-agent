@@ -2281,3 +2281,440 @@ async fn catalog_owner_inactive_rejection_persists_without_poisoning_active_cata
     );
     fixture.close().await;
 }
+
+// Failed explicit discovery preserves the serving account and its producer facts.
+async fn inactive_failure_fixture_with_source(
+    results: Vec<Result<DiscoveredCatalog, CatalogError>>,
+    pin: Option<&str>,
+) -> (tempfile::TempDir, Fixture, Arc<CachedProviderModelSource>) {
+    let registry_dir = test_store_dir();
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let providers = ProviderRegistry::new(
+        Box::new(crate::provider_registry::JsonProviderRegistryStore::new(
+            registry_dir.path(),
+        )) as Box<dyn ProviderRegistryStoreLike>,
+        crate::provider_registry::initial_provider_profiles(
+            &std::collections::BTreeSet::from([PROVIDER.to_owned()]),
+            INITIAL_MODEL,
+        ),
+        model_source.clone(),
+    )
+    .expect("unseeded production registry");
+    let fixture = Fixture::start(
+        results,
+        pin,
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        providers,
+        None,
+    )
+    .await;
+    (registry_dir, fixture, model_source)
+}
+
+async fn inactive_failure_fixture(
+    results: Vec<Result<DiscoveredCatalog, CatalogError>>,
+    pin: Option<&str>,
+) -> (tempfile::TempDir, Fixture) {
+    let (directory, fixture, _) = inactive_failure_fixture_with_source(results, pin).await;
+    (directory, fixture)
+}
+
+async fn assert_inactive_failure_preserves_default_inventory(error: CatalogError) {
+    let (_registry_dir, f) = inactive_failure_fixture(vec![Err(error)], None).await;
+    let receiver = f.begin_refresh_for("a").await;
+    let facade = f.hub.accounts().expect("facade").expect("accounts");
+    let before = facade.management.read().expect("before");
+    assert_eq!(
+        before
+            .descriptors
+            .iter()
+            .find(|row| row.active)
+            .expect("active")
+            .alias
+            .as_str(),
+        "b",
+        "fixture starts with B selected"
+    );
+    let before_inventory = before
+        .providers
+        .iter()
+        .find(|row| row.provider == PROVIDER)
+        .expect("before provider")
+        .inventory
+        .clone();
+    assert!(
+        !matches!(
+            before_inventory,
+            haider_rpc::ModelInventoryWire::Fetched { .. }
+                | haider_rpc::ModelInventoryWire::Stale { .. }
+        ),
+        "fixture must not have fetched B's catalog"
+    );
+    f.discoverer.release.notify_one();
+    // Unsupported enumeration and a permission refusal can be informational;
+    // this probe checks ownership of the published inventory, not its response.
+    let _ = receiver.await.expect("A refresh completion");
+    let after_inventory = facade
+        .management
+        .read()
+        .expect("after")
+        .providers
+        .into_iter()
+        .find(|row| row.provider == PROVIDER)
+        .expect("after provider")
+        .inventory;
+    f.close().await;
+    assert_eq!(
+        after_inventory, before_inventory,
+        "inactive A failure must not replace B's not-yet-fetched inventory"
+    );
+}
+
+#[tokio::test]
+async fn catalog_owner_inactive_empty_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Empty).await;
+}
+#[tokio::test]
+async fn catalog_owner_inactive_unsupported_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Unsupported {
+        reason: "synthetic unsupported listing".into(),
+    })
+    .await;
+}
+#[tokio::test]
+async fn catalog_owner_inactive_transport_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Transport {
+        reason: "synthetic transport outage".into(),
+    })
+    .await;
+}
+#[tokio::test]
+async fn catalog_owner_inactive_invalid_body_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::InvalidBody {
+        reason: "synthetic invalid model document".into(),
+    })
+    .await;
+}
+#[tokio::test]
+async fn catalog_owner_inactive_unavailable_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Unavailable {
+        reason: "synthetic listing unavailable".into(),
+    })
+    .await;
+}
+#[tokio::test]
+async fn catalog_control_inactive_unauthorized_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Unauthorized).await;
+}
+#[tokio::test]
+async fn catalog_control_inactive_304_without_cache_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::NotModified).await;
+}
+#[tokio::test]
+async fn catalog_control_inactive_permission_refusal_preserves_unfetched_active_catalog() {
+    assert_inactive_failure_preserves_default_inventory(CatalogError::Unavailable {
+        reason: format!(
+            "{} (403)",
+            haider_provider::MODEL_LIST_REFUSED_FOR_CREDENTIAL
+        ),
+    })
+    .await;
+}
+
+async fn assert_failed_refresh_does_not_borrow_other_catalog(error: CatalogError) {
+    let (_registry_dir, mut f) =
+        inactive_failure_fixture(vec![Ok(catalog(8192)), Err(error)], Some("a")).await;
+    let published_b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    published_b
+        .await
+        .expect("B completion")
+        .expect("B successful catalog");
+    let request = f.selection(false, Some(4096));
+    {
+        let selection = f
+            .connection
+            .request(RequestId::new("r26-failure-select"), request);
+        tokio::pin!(selection);
+        tokio::select! {
+            _ = f.discoverer.started.notified() => {},
+            result = &mut selection => panic!("A selection must refresh instead of using B's catalog: {result:?}"),
+        }
+        assert_eq!(
+            f.discoverer
+                .seen
+                .lock()
+                .expect("calls")
+                .last()
+                .expect("A call")
+                .1
+                .as_deref(),
+            Some("a")
+        );
+        f.discoverer.release.notify_one();
+        selection.await.expect("selection RPC");
+    }
+    let response = response_for(&mut f.frames, "r26-failure-select").await;
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    f.close().await;
+    assert!(
+        matches!(response, ResponseBody::Error { .. }),
+        "A failure cannot admit a model known only to B: {response:?}"
+    );
+    assert_ne!(
+        metadata.model, MODEL,
+        "A failure cannot store B's catalog-only model"
+    );
+}
+
+#[tokio::test]
+async fn catalog_owner_inactive_unsupported_reply_cannot_admit_foreign_model() {
+    assert_failed_refresh_does_not_borrow_other_catalog(CatalogError::Unsupported {
+        reason: "synthetic unsupported listing".into(),
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_owner_inactive_permission_reply_cannot_admit_foreign_model() {
+    assert_failed_refresh_does_not_borrow_other_catalog(CatalogError::Unavailable {
+        reason: format!(
+            "{} (403)",
+            haider_provider::MODEL_LIST_REFUSED_FOR_CREDENTIAL
+        ),
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_control_inactive_unsupported_cannot_weaken_credential_rejection() {
+    let (registry_dir, f) = inactive_failure_fixture(
+        vec![
+            Ok(catalog(8192)),
+            Err(CatalogError::Unauthorized),
+            Err(CatalogError::Unsupported {
+                reason: "synthetic unsupported listing".into(),
+            }),
+        ],
+        None,
+    )
+    .await;
+    let b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    b.await.expect("B completion").expect("B catalog");
+    for _ in 0..2 {
+        let a = f.begin_refresh_for("a").await;
+        f.discoverer.release.notify_one();
+        let _ = a.await.expect("A completion");
+    }
+    let document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(registry_dir.path().join("providers.json")).expect("synthetic registry"),
+    )
+    .expect("registry JSON");
+    let weakened_rejection = document
+        .get("catalog_evidence")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(|entries| entries.values())
+        .any(|entry| {
+            entry.get("provider").and_then(serde_json::Value::as_str) == Some(PROVIDER)
+                && entry
+                    .get("unsupported")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
+    f.close().await;
+    assert!(
+        !weakened_rejection,
+        "an inactive unsupported response cannot downgrade its prior credential rejection"
+    );
+}
+
+#[tokio::test]
+async fn catalog_control_inactive_corrupt_304_preserves_published_catalog() {
+    let (_registry_dir, f) = inactive_failure_fixture(
+        vec![
+            Ok(catalog(8192)),
+            Err(CatalogError::Unauthorized),
+            Err(CatalogError::NotModified),
+        ],
+        None,
+    )
+    .await;
+    let b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    b.await.expect("B completion").expect("B catalog");
+    let a = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    assert!(a.await.expect("A rejection").is_err());
+    let facade = f.hub.accounts().expect("facade").expect("accounts");
+    let before = facade.management.read().expect("before");
+    let descriptor = before
+        .descriptors
+        .iter()
+        .find(|row| row.alias.as_str() == "a")
+        .expect("A");
+    f.store
+        .put_provider_models(
+            ProviderModelCacheKey::for_account(PROVIDER, descriptor).into(),
+            "not a valid model JSON document".into(),
+            Some("corrupt-A-cache".into()),
+            1,
+        )
+        .await
+        .expect("synthetic corrupt private A cache");
+    let a = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    assert!(a.await.expect("A corrupt-cache response").is_err());
+    let after = facade.management.read().expect("after");
+    f.close().await;
+    assert_eq!(
+        after.providers, before.providers,
+        "a corrupt inactive A 304 cannot restore A's rejection over B's valid catalog"
+    );
+}
+
+async fn assert_static_selection_respects_credential_rejection(rejected: bool) {
+    let mut results = vec![Ok(catalog(8192))];
+    if rejected {
+        results.push(Err(CatalogError::Unauthorized));
+        results.push(Err(CatalogError::Unauthorized));
+    } else {
+        results.push(Err(CatalogError::Unavailable {
+            reason: format!(
+                "{} (403)",
+                haider_provider::MODEL_LIST_REFUSED_FOR_CREDENTIAL
+            ),
+        }));
+    }
+    let (_registry_dir, mut f) = inactive_failure_fixture(results, Some("a")).await;
+    let b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    b.await.expect("B completion").expect("B catalog");
+    if rejected {
+        let a = f.begin_refresh_for("a").await;
+        f.discoverer.release.notify_one();
+        assert!(a.await.expect("A rejection").is_err());
+    }
+    let model = haider_provider::subscription_static_model_ids(PROVIDER)
+        .first()
+        .expect("maintained provider fact")
+        .to_string();
+    let mut request = f.selection(false, Some(4096));
+    let RequestBody::SessionSelectModel {
+        model: selected_model,
+        ..
+    } = &mut request
+    else {
+        panic!("selection request");
+    };
+    *selected_model = model.clone();
+    {
+        let selection = f
+            .connection
+            .request(RequestId::new("r26-static-select"), request);
+        tokio::pin!(selection);
+        tokio::select! {
+            _ = f.discoverer.started.notified() => {
+                f.discoverer.release.notify_one();
+                selection.await.expect("selection RPC after refresh");
+            },
+            result = &mut selection => { result.expect("selection RPC"); },
+        }
+    }
+    let response = response_for(&mut f.frames, "r26-static-select").await;
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("metadata")
+        .expect("typed metadata");
+    f.close().await;
+    if rejected {
+        assert!(
+            matches!(response, ResponseBody::Error { .. }),
+            "a known A credential rejection cannot disappear behind B's catalog: {response:?}"
+        );
+        assert_ne!(
+            metadata.model, model,
+            "a rejected account cannot commit a new model selection"
+        );
+    } else {
+        assert!(
+            matches!(response, ResponseBody::SessionSelectModel { .. }),
+            "healthy inactive A keeps legitimate static provider facts: {response:?}"
+        );
+        assert_eq!(metadata.model, model);
+    }
+}
+
+#[tokio::test]
+async fn catalog_owner_rejected_inactive_account_cannot_select_static_model() {
+    assert_static_selection_respects_credential_rejection(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_healthy_inactive_account_keeps_static_models() {
+    assert_static_selection_respects_credential_rejection(false).await;
+}
+
+#[tokio::test]
+async fn catalog_control_inactive_corrupt_304_preserves_live_registry() {
+    let (_registry_dir, f, model_source) = inactive_failure_fixture_with_source(
+        vec![
+            Ok(catalog(8192)),
+            Err(CatalogError::Unauthorized),
+            Err(CatalogError::NotModified),
+        ],
+        None,
+    )
+    .await;
+    let b = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    b.await.expect("B completion").expect("B catalog");
+    let a = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    assert!(a.await.expect("A rejection").is_err());
+    let facade = f.hub.accounts().expect("facade").expect("accounts");
+    let before = facade.management.read().expect("before");
+    let before_models = model_source.models(PROVIDER);
+    assert!(
+        before_models.is_some(),
+        "B has the only successful remote catalog"
+    );
+    let descriptor = before
+        .descriptors
+        .iter()
+        .find(|row| row.alias.as_str() == "a")
+        .expect("A");
+    f.store
+        .put_provider_models(
+            ProviderModelCacheKey::for_account(PROVIDER, descriptor).into(),
+            "not a valid model JSON document".into(),
+            Some("corrupt-A-cache".into()),
+            1,
+        )
+        .await
+        .expect("synthetic corrupt private A cache");
+    let a = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    assert!(a.await.expect("A corrupt-cache response").is_err());
+    let after = facade.management.read().expect("after");
+    let after_models = model_source.models(PROVIDER);
+    f.close().await;
+    assert_eq!(
+        after_models, before_models,
+        "a corrupt inactive A 304 cannot replace B in the live registry before later publication"
+    );
+    assert_eq!(
+        after.providers, before.providers,
+        "a corrupt inactive A 304 cannot restore A's rejection over B's valid catalog"
+    );
+}
