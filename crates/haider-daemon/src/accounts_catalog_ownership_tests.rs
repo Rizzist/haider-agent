@@ -1382,8 +1382,12 @@ async fn complete_explicit_b_listing_refusal(f: &Fixture) {
         "listing refusal retains B's configured deployment"
     );
     assert!(
-        matches!(summary.inventory, haider_rpc::ModelInventoryWire::Unavailable { ref reason } if reason.contains("listing refusal")),
-        "B's listing refusal remains informational inventory"
+        summary.inventory == haider_rpc::ModelInventoryWire::Configured
+            && summary
+                .availability_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("listing refusal")),
+        "B's configured listing refusal remains informational: {summary:?}"
     );
 }
 
