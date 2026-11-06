@@ -3041,6 +3041,7 @@ async fn explicit_account_inventory_refresh_retries_after_concurrent_session_upd
             summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
                 reason: "synthetic default failed".into(),
             };
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
             summary
         };
         let (commands, mut mailbox) = mpsc::channel(2);
@@ -3156,6 +3157,7 @@ async fn explicit_account_inventory_refresh_retries_after_concurrent_session_upd
             let mut refreshed = provider_summary(&provider);
             refreshed.models = vec!["selected-model".into()];
             refreshed.inventory = haider_rpc::ModelInventoryWire::Static;
+            refreshed.availability = haider_rpc::ProviderAvailabilityWire::Available;
             let crate::accounts::ProviderModelsRefreshCompletion::Internal(sender) = completed
             else {
                 panic!("internal completion required");

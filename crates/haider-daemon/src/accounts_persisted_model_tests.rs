@@ -84,9 +84,21 @@ fn factory(
         .put(&alias, b"synthetic-test-key")
         .expect("test credential");
     let provider = Arc::new(haider_provider::FakeProvider::new(Vec::new()));
+    // This fixture supplies the catalog for this exact credential account.
+    // Private inventories require an owner, just as actor publication does.
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let owner = ProviderModelCacheKey::for_account(&summary.provider, &descriptor);
+    let provider_id = summary.provider.clone();
+    management.publish(
+        1,
+        vec![descriptor.clone()],
+        vec![summary],
+        HashMap::from([(provider_id, owner)]),
+        HashMap::new(),
+    );
     let factory = AccountsProviderFactory::new_with_management(
-        Arc::new(StdMutex::new(vec![descriptor.clone()])),
-        ManagementSnapshot::new(1, vec![descriptor], vec![summary]),
+        Arc::new(StdMutex::new(vec![descriptor])),
+        management,
         VaultProvision::Available(vault),
         Arc::new(RecordingBuilder(provider.clone())),
     );

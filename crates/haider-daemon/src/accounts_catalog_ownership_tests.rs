@@ -1372,7 +1372,19 @@ async fn catalog_owner_removed_alias_cannot_serve_a_stale_cached_model() {
 async fn complete_explicit_b_listing_refusal(f: &Fixture) {
     let refreshed = f.begin_refresh_for("b").await;
     f.discoverer.release.notify_one();
-    assert!(refreshed.await.expect("explicit B completion").is_err());
+    let summary = refreshed
+        .await
+        .expect("explicit B completion")
+        .expect("configured B deployment survives unsupported listing");
+    assert_eq!(
+        summary.availability,
+        ProviderAvailabilityWire::Available,
+        "listing refusal retains B's configured deployment"
+    );
+    assert!(
+        matches!(summary.inventory, haider_rpc::ModelInventoryWire::Unavailable { ref reason } if reason.contains("listing refusal")),
+        "B's listing refusal remains informational inventory"
+    );
 }
 
 fn configured_custom_baseline_detail() -> haider_rpc::ModelDetailWire {

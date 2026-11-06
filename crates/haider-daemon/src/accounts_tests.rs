@@ -23901,9 +23901,23 @@ fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds(
                 ProviderAvailabilityWire::Unavailable
             };
             summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
-            let management = ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]);
+            let descriptor = a18_descriptor("configured-owner", "synthetic", "configured owner");
+            if catalog == haider_rpc::ProviderCatalogKindWire::Authenticated {
+                summary.auth_methods = vec![AuthMethod::OAuth];
+            }
+            let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+            management.publish(
+                1,
+                vec![descriptor.clone()],
+                vec![summary.clone()],
+                HashMap::from([(
+                    summary.provider.clone(),
+                    ProviderModelCacheKey::for_account(&summary.provider, &descriptor),
+                )]),
+                HashMap::new(),
+            );
             let factory = AccountsProviderFactory::new_with_management(
-                Arc::new(StdMutex::new(Vec::new())),
+                Arc::new(StdMutex::new(vec![descriptor])),
                 management.clone(),
                 VaultProvision::Unsupported,
                 Arc::new(ProductionAccountBuilder::default()),
@@ -23920,7 +23934,7 @@ fn daemon_turn_and_new_session_admission_agree_across_configured_provider_kinds(
                     .is_ok(),
                 available
             );
-            management.publish(1, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+            management.publish(2, Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
             assert!(
                 factory.admit_persisted_model(&metadata).is_err(),
                 "provider removal is definitive for {catalog:?}"
