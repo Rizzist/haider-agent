@@ -186,6 +186,8 @@ async fn check_variant(scope: &str, direct: bool, known_before_claim: bool, vari
         cwd: root.path().display().to_string(),
         provider: "fake".into(),
         model: "fake-v1".into(),
+        resolved_model: None,
+        model_catalog_key: None,
         max_output_tokens: 64,
         effort: None,
         fast: false,

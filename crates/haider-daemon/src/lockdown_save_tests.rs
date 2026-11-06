@@ -506,6 +506,8 @@ async fn replaced_and_retired_worker_leases_cannot_register_late_saves() {
         .unwrap();
     let session = SessionId::new("late-settings-save");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
+        model_catalog_key: None,
         command_id: "create-late-save".into(),
         request_digest: "create-late-save-digest".into(),
         request_json: "{}".into(),

@@ -40,11 +40,7 @@ pub(crate) async fn pin_headless_turn_metadata(
                 "headless run has no admission boundary",
             )
         })?;
-    pair.restore_route(metadata)?;
-    metadata.provider = pair.provider;
-    metadata.model = pair.model;
-    metadata.max_tokens = pair.max_tokens;
-    metadata.max_tokens_source = pair.source;
+    pair.restore_metadata(metadata)?;
     metadata.effort.clone_from(&spec.effort);
     metadata.fast = spec.fast;
     Ok(())
@@ -208,6 +204,9 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .clone();
         // Model/effort selection retains its existing next-turn contract.
         // This lever changes only the explicitly bound route coordinates.
+        if metadata.model != current_model {
+            metadata.resolved_model = None;
+        }
         metadata.model = current_model.to_owned();
         let reasoning: serde_json::Value =
             serde_json::from_str(reasoning_settings).unwrap_or(serde_json::Value::Null);
@@ -229,6 +228,9 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         if let Some(pair) = active_pair.as_ref() {
             pair.restore_route(&mut metadata)?;
             metadata.provider.clone_from(&pair.provider);
+            metadata
+                .model_catalog_key
+                .clone_from(&pair.model_catalog_key);
         }
         if metadata.provider_rebind_id.is_none()
             || previous.provider_rebind_id == metadata.provider_rebind_id
@@ -241,7 +243,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
             .as_ref()
             .map_or(0, |pair| pair.latest_rebind_seq);
         let recorded_active = active_pair
-            .filter(|pair| pair.model == current_model)
+            .filter(|pair| pair.model_coordinate() == current_model)
             .map(
                 |pair| haider_protocol::output_budget::SessionOutputBudgetV1 {
                     max_tokens: pair.max_tokens,
@@ -264,7 +266,7 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         {
             let selection = crate::model_select::ModelSelectionAuthority::new(
                 self.store.hub().creatable_providers().map_err(hub_error)?,
-                view.providers,
+                Some(view.providers),
             )
             .validate_selection_with_status(
                 &previous.provider,

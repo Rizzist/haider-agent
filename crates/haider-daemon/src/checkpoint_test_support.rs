@@ -45,12 +45,14 @@ pub(crate) async fn seed_checkpoint_change(
     let session = SessionId::new(format!("recovered-{label}"));
     store
         .create_session(haider_store::SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("seed-{label}"),
             request_digest: format!("seed-{label}"),
             request_json: "{}".into(),
             session_id: session.clone(),
             cwd: cwd.display().to_string(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

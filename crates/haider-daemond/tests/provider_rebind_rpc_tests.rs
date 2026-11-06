@@ -240,6 +240,7 @@ impl Client {
                     command_id: CommandId::new(format!("create-{suffix}")),
                     cwd: workspace.display().to_string(),
                     provider: PROVIDER.into(),
+                    expected_catalog_key: None,
                     model: MODEL.into(),
                     max_tokens: 4096,
                     permission_overrides: None,
@@ -671,8 +672,11 @@ async fn configure_with_auth(client: &mut Client, origin: &str, auth: ProviderAu
                 origin: Some(origin.into()),
                 auth_requirement: Some(auth),
                 enabled: true,
-                models: vec![MODEL.into()],
-                default_model: Some(MODEL.into()),
+                // Routing uses an explicitly typed advisory wire ID. A
+                // configured deployment would require catalog eligibility
+                // belonging to each new endpoint/account, a separate contract.
+                models: Vec::new(),
+                default_model: None,
                 response_open_timeout_ms: Some(OPEN_TIMEOUT_MS),
                 chunk_idle_timeout_ms: None,
                 semantic_progress_timeout_ms: None,
@@ -685,6 +689,24 @@ async fn configure_with_auth(client: &mut Client, origin: &str, auth: ProviderAu
     assert!(
         matches!(response, ResponseBody::ProviderConfigure { .. }),
         "configure: {response:?}"
+    );
+    // Configuration names deployments; the real loopback catalog establishes
+    // their availability before this routing fixture creates a session.
+    let refreshed = client
+        .request(
+            "refresh",
+            RequestBody::ProviderModelsRefresh {
+                provider: PROVIDER.into(),
+            },
+        )
+        .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("refresh: {refreshed:?}");
+    };
+    assert!(provider.models.iter().any(|model| model == MODEL));
+    assert_eq!(
+        provider.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
     );
 }
 
@@ -778,6 +800,8 @@ async fn provider_rebind_selects_named_account_and_rejects_provider_mismatch() {
         ("other-account", "different-proxy", true),
     ]
     .map(|(alias, provider, active)| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,

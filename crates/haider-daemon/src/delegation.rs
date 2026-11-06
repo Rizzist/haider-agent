@@ -540,14 +540,27 @@ impl DelegationHandle {
                     false,
                 )
             })?
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
-        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+            .map(|facade| {
+                facade
+                    .management
+                    .read()
+                    .map(|view| view.providers)
+                    .unwrap_or_default()
+            });
         let explicit_provider = request
             .provider
             .as_deref()
             .is_some_and(|provider| !provider.trim().is_empty());
+        let explicit_model = request
+            .model
+            .as_deref()
+            .is_some_and(|model| !model.trim().is_empty());
+        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority = if explicit_provider {
+            authority
+        } else {
+            authority.scoped_to_session_route(parent, &parent.provider)
+        };
         Ok(authority
             .resolve_child_selector(
                 &parent.provider,
@@ -557,33 +570,31 @@ impl DelegationHandle {
             )
             .and_then(|(provider, model)| {
                 let mut child = parent.clone();
-                if explicit_provider || child.provider != provider || child.model != model {
+                if explicit_model {
                     let validated = authority.validate_selection_with_status(
                         &parent.provider,
                         Some(&provider),
                         &model,
                     )?;
                     let budget =
-                        haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
-                            parent.max_tokens_source,
-                            parent.max_tokens,
-                        )
-                        .apply(
-                            validated.max_output_tokens,
-                            validated.explicit_max_output_tokens,
-                        );
+                        crate::session_hub::rpc::reapply_session_output_budget(parent, &validated);
+                    // Explicit choices get their own row and settings provenance.
+                    // Only implicit model inheritance retains the parent's owner.
+                    child.model_catalog_key =
+                        authority.model_catalog_key(&provider, &model).or_else(|| {
+                            authority.model_settings_catalog_key(&provider, &model, &budget)
+                        });
                     child.max_tokens = budget.max_tokens;
                     child.max_tokens_source = Some(budget.source);
-                    // This is the child's own explicit selection, rather than
-                    // inheritance of an already-started parent's provenance.
+                    child.budget_clamp_notice_epoch = budget.clamped.map(|_| 0);
+                    child.resolved_model = None;
                     child.selection_epoch = Some(0);
                     child.route_reset_epoch = Some(0);
                     child.resolved_route_alias = None;
                     child.resolved_route_seen = false;
                 }
                 if explicit_provider || child.provider != provider {
-                    // An explicit provider pick starts under that provider's
-                    // own account and endpoint, even when the pair is unchanged.
+                    // An explicit provider uses its own route, even for the same pair.
                     child.account_alias = None;
                     child.provider_base_url = None;
                     child.provider_rebind_id = None;
@@ -1067,12 +1078,14 @@ impl DelegationHandle {
         self.hub
             .create_internal_session_with_interaction_mode(
                 SessionCreateCommand {
+                    resolved_model: coordinates.metadata.resolved_model.clone(),
                     command_id: format!("delegation-session-{identity}"),
                     request_digest: create_digest,
                     request_json: create_json,
                     session_id: child_session_id.clone(),
                     cwd: coordinates.metadata.cwd.clone(),
                     provider: coordinates.metadata.provider.clone(),
+                    model_catalog_key: coordinates.metadata.model_catalog_key.clone(),
                     model: coordinates.metadata.model.clone(),
                     max_tokens: coordinates.metadata.max_tokens,
                     max_tokens_source: coordinates.metadata.max_tokens_source,
@@ -4741,3 +4754,7 @@ mod toolshape_tests {
         assert!(marker.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_model_owner_tests.rs"]
+mod model_owner_tests;

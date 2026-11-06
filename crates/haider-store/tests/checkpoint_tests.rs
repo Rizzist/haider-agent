@@ -16,12 +16,14 @@ use haider_store::{EventStore, SessionCreateCommand, Store};
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "checkpoint-create-session".into(),
             request_digest: "checkpoint-create-digest".into(),
             request_json: r#"{"session":"checkpoint-projection"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,

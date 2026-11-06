@@ -148,6 +148,7 @@ async fn drive_turns(
             command_id: CommandId::new("memdaemon-create"),
             cwd: workspace.to_string_lossy().into_owned(),
             provider: "fake".into(),
+            expected_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 0,
             permission_overrides: Some(SessionPermissionOverridesV1 {

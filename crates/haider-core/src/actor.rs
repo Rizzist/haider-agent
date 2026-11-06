@@ -3612,6 +3612,9 @@ pub struct ProviderDerivedRequestState {
 /// after [`ProviderPairSwitchCommitter`] confirms the metadata mutation.
 #[derive(Clone)]
 pub struct ProviderPairSwitchTarget {
+    pub model_catalog_key: Option<String>,
+    /// Budget reapplied to the target row; absent for injected legacy lanes.
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub provider: Arc<dyn Provider>,
     pub account: CredentialAlias,
     pub account_incarnation: Option<u64>,
@@ -3646,6 +3649,8 @@ impl std::fmt::Debug for ProviderPairSwitchTarget {
 /// receipted `session.select_model` actor path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPairSwitch {
+    pub model_catalog_key: Option<String>,
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub run_id: RunId,
     pub switch_ordinal: u32,
     /// Explicit route generation used to resolve this target. Ordinary
@@ -10025,6 +10030,8 @@ impl HarnessActor {
             ))
         })?;
         let switch = ProviderPairSwitch {
+            model_catalog_key: target.model_catalog_key.clone(),
+            output_budget: target.output_budget,
             run_id: run_id.clone(),
             switch_ordinal: *provider_pair_switch_ordinal,
             source_rebind_seq: self.config.provider_rebind_seq,
@@ -10075,6 +10082,10 @@ impl HarnessActor {
             &messages[..(*stable_history_end).min(messages.len())],
         );
         self.config.model = target.model.clone();
+        if let Some(budget) = target.output_budget {
+            self.config.max_tokens = budget.max_tokens;
+            self.config.reserved_output_tokens = budget.max_tokens;
+        }
         self.config.context_window = target.context_window;
         self.config.cached_input_is_subset = target.cached_input_is_subset;
         self.config
@@ -10157,23 +10168,24 @@ impl HarnessActor {
         self.commit_ui_extension_marker(run_id, &kind, data)
             .await
             .map_err(DriveError::Store)?;
-        self.commit_ui_extension_marker(
-            run_id,
-            "provider_pair_switch_v1",
-            serde_json::json!({
-                "source_rebind_seq": switch.source_rebind_seq,
-                "from_provider": switch.from_provider,
-                "from_model": switch.from_model,
-                "to_provider": switch.to_provider,
-                "to_model": switch.to_model,
-                // The target was already resolved for this run. Preserve
-                // its observation without changing the request-start epoch.
-                "resolved_alias": target.account.as_str(),
-                "why": switch.cause.as_str(),
-            }),
-        )
-        .await
-        .map_err(DriveError::Store)
+        let mut switch_fact = serde_json::json!({
+            "source_rebind_seq": switch.source_rebind_seq,
+            "resolved_alias": target.account.as_str(),
+            "from_provider": switch.from_provider,
+            "from_model": switch.from_model,
+            "to_provider": switch.to_provider,
+            "to_model": switch.to_model,
+            "why": switch.cause.as_str(),
+        });
+        if let Some(key) = &switch.model_catalog_key {
+            switch_fact["model_catalog_key"] = serde_json::json!(key);
+        }
+        if let Some(budget) = switch.output_budget {
+            switch_fact["output_budget"] = serde_json::json!(budget);
+        }
+        self.commit_ui_extension_marker(run_id, "provider_pair_switch_v1", switch_fact)
+            .await
+            .map_err(DriveError::Store)
     }
 
     fn reset_cache_boundaries_after_compaction(

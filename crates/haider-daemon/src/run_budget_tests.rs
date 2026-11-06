@@ -130,10 +130,12 @@ fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope
 
 fn headless_spec() -> HeadlessRunSpecV1 {
     HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "budget-workspace".to_owned(),
         provider: "fake".to_owned(),
+        model_catalog_key: None,
         model: "budget-model".to_owned(),
         max_output_tokens: 64,
         effort: None,
@@ -990,12 +992,14 @@ async fn run_provider_budget_case_inner(
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("{label}-create"),
         request_digest: format!("{label}-create-digest"),
         request_json: format!(r#"{{"session":"{label}"}}"#),
         session_id: session_id.clone(),
         cwd: cwd.clone(),
         provider: provider_name.to_owned(),
+        model_catalog_key: None,
         model: model.to_owned(),
         max_tokens: max_output_tokens,
         max_tokens_source: None,
@@ -1010,10 +1014,12 @@ async fn run_provider_budget_case_inner(
     .await
     .expect("create session");
     let spec = HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: provider_name.to_owned(),
+        model_catalog_key: None,
         model: model.to_owned(),
         max_output_tokens,
         effort: None,
@@ -1894,12 +1900,14 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("{label}-create"),
         request_digest: format!("{label}-create-digest"),
         request_json: format!(r#"{{"session":"{label}"}}"#),
         session_id: parent_session.clone(),
         cwd: cwd.clone(),
         provider: "openai".into(),
+        model_catalog_key: None,
         model: "gpt-5.6-sol".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1914,10 +1922,12 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
     .await
     .expect("create parent session");
     let spec = HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: "openai".into(),
+        model_catalog_key: None,
         model: "gpt-5.6-sol".into(),
         max_output_tokens: 4096,
         effort: None,
@@ -2218,12 +2228,14 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "deadline-provider-create".into(),
         request_digest: "deadline-provider-create-digest".into(),
         request_json: r#"{"session":"deadline-provider"}"#.into(),
         session_id: session_id.clone(),
         cwd: cwd.clone(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -2239,10 +2251,12 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     .expect("create session");
     let request_deadline_unix_ms = clock.now_ms().saturating_add(3_000);
     let spec = HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_output_tokens: 64,
         effort: None,

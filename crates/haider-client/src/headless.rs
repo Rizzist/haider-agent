@@ -3305,6 +3305,7 @@ async fn run_headless_inner(
             command_id: CommandId::new(command_id("headless-create")),
             cwd: request.cwd.clone(),
             provider: create_provider.clone(),
+            expected_catalog_key: None,
             model: create_model.clone(),
             max_tokens: request.max_tokens,
             permission_overrides: (!request.permission_overrides.is_empty())
@@ -3405,9 +3406,11 @@ async fn run_headless_inner(
         // original generation remains part of the durable command identity even if
         // reconnecting observes a newer worker generation.
         let spec = HeadlessRunSpecV1 {
+            resolved_model: created_metadata.resolved_model.clone(),
             agent_spawn: None,
             cwd: created_metadata.cwd.clone(),
             provider: provider.clone(),
+            model_catalog_key: created_metadata.model_catalog_key.clone(),
             model: model.clone(),
             max_output_tokens: created_metadata.max_tokens,
             effort: session_config.effort.clone(),

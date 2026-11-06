@@ -12,6 +12,8 @@ pub(super) async fn create_child_route_parent(
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
+        model_catalog_key: None,
         command_id: format!("create-{session}"),
         request_digest: format!("create-digest-{session}"),
         request_json: "{}".into(),
@@ -102,6 +104,8 @@ pub(super) async fn inherited_session(
     if kind == "create" || kind == "endpoint_only" {
         hub.create_internal_session_with_interaction_mode(
             haider_core::SessionCreateCommand {
+                resolved_model: None,
+                model_catalog_key: None,
                 command_id: format!("create-{child}"),
                 request_digest: format!("create-{child}"),
                 request_json: "{}".into(),
@@ -247,6 +251,7 @@ pub(super) async fn append_legacy_same_epoch_observation(
         .await
         .expect("lease");
     let payload = haider_protocol::session::ModelSelected {
+        model_catalog_key: None,
         provider: metadata.provider.clone(),
         model: metadata.model.clone(),
         selection_epoch: metadata.selection_epoch,
@@ -354,6 +359,7 @@ pub(super) async fn setup_opaque_selection(
     binding: &str,
 ) {
     hub.select_session_model(haider_store::SessionSelectModelCommand {
+        model_catalog_key: None,
         command_id: "opaque-before".into(),
         request_digest: "opaque-before".into(),
         // A model-shaped opaque body still does not record the account setter.

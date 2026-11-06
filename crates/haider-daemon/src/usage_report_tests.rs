@@ -49,6 +49,8 @@ const ANTHROPIC_LIVE_BODY: &str = r#"{"five_hour":{"utilization":60.0,"resets_at
 
 fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,
@@ -950,6 +952,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         ModelSelected {
             selection_epoch: None,
             provider: "openai".into(),
+            model_catalog_key: None,
             model: "gpt-5.2".into(),
             route_only: false,
             cleared_account_pin: None,

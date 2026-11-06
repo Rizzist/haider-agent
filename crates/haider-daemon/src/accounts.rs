@@ -383,6 +383,7 @@ async fn validate_openai_compatible_catalog_key(
                 }
                 CatalogError::NotModified
                 | CatalogError::Unavailable { .. }
+                | CatalogError::Unsupported { .. }
                 | CatalogError::Transport { .. }
                 | CatalogError::InvalidBody { .. }
                 | CatalogError::Empty => ValidationFailureKind::Unavailable,
@@ -418,6 +419,7 @@ async fn validate_deepseek_api_key(secret: &[u8]) -> Result<ValidatedIdentity, V
                 }
                 CatalogError::NotModified
                 | CatalogError::Unavailable { .. }
+                | CatalogError::Unsupported { .. }
                 | CatalogError::Transport { .. }
                 | CatalogError::InvalidBody { .. }
                 | CatalogError::Empty => ValidationFailureKind::Unavailable,
@@ -531,7 +533,15 @@ fn custom_login_target(
     // compatible card, family + endpoint identifies custom rows without a
     // provenance field on the wire.
     let origin = profile.endpoint?;
-    Some((origin, profile.default_model, profile.api_family))
+    // A fresh credential must not inherit the previous account's fetched
+    // default, even as a validation/receipt hint. Explicit deployments are
+    // user configuration and can still supply their wire spelling.
+    let configured_default = profile.default_model.filter(|model| {
+        profile.model_details.iter().any(|row| {
+            row.name == *model && row.source == Some(haider_rpc::ModelDetailSourceWire::Configured)
+        })
+    });
+    Some((origin, configured_default, profile.api_family))
 }
 
 /// An enterprise builtin's login target (G4b): the bedrock/vertex profile's
@@ -715,6 +725,13 @@ impl StoreLike for DescriptorStore {
         match self {
             Self::Json(store) => store.save(descriptors),
             Self::Injected(store) => store.save(descriptors),
+        }
+    }
+
+    fn reserve_incarnation(&self, floor: u64) -> Result<u64, HaiderError> {
+        match self {
+            Self::Json(store) => store.reserve_incarnation(floor),
+            Self::Injected(store) => store.reserve_incarnation(floor),
         }
     }
 }
@@ -1005,7 +1022,7 @@ impl ManagementSnapshot {
             let mut view = view.clone();
             let now = unix_ms_after(Duration::ZERO);
             for provider in &mut view.providers {
-                provider.inventory = provider.inventory.clone().at_time(now);
+                provider.project_inventory_at_time(now, &view.descriptors);
             }
             view
         })
@@ -1107,21 +1124,19 @@ impl DeviceDiscoverySnapshot {
 /// fallbacks require an active account whose credential is valid: `Ok`, or
 /// `Limited` (a temporary quota window is not a broken credential, and the
 /// rotation ladder may still serve the turn). Expired, revoked and
-/// attention-needing credentials are not ready. The older offline catalogs
-/// retain their descriptor-presence rule. Catalog fetch health is separate.
+/// attention-needing credentials are not ready for any provider. Catalog
+/// fetch health is separate.
 pub(crate) fn provider_credential_ready_for_summary<'a>(
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
 ) -> impl Fn(&str) -> bool + 'a {
     move |provider| {
-        let subscription = haider_provider::has_subscription_static_catalog(provider);
         accounts.list().iter().any(|descriptor| {
             descriptor.provider == provider
-                && (!subscription
-                    || (descriptor.active
-                        && matches!(
-                            &descriptor.status,
-                            CredentialStatus::Ok | CredentialStatus::Limited { .. }
-                        )))
+                && descriptor.active
+                && matches!(
+                    &descriptor.status,
+                    CredentialStatus::Ok | CredentialStatus::Limited { .. }
+                )
         })
     }
 }
@@ -1458,6 +1473,9 @@ pub(crate) enum AccountCommand {
         completed: LoginRoute,
     },
     ReconcileSources,
+    RetryCatalogAfterSourceReconcile {
+        provider: String,
+    },
     ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
     SetLabel(Box<SetLabelJob>),
@@ -1474,6 +1492,7 @@ pub(crate) enum AccountCommand {
     },
     ProviderModelsRefreshCompleted {
         provider: String,
+        producer: CatalogProducer,
         cache_key: ProviderModelCacheKey,
         cached: Option<haider_core::CachedModels>,
         result: ProviderModelsRefreshResult,
@@ -1790,6 +1809,10 @@ async fn run_account_actor(
     let _source_watcher = (!crate::android_policy::enabled())
         .then(|| CredentialSourceWatcher::new(&source_registry, source_event_tx.clone()));
     let _source_event_tx = source_event_tx;
+    let mut catalog_refresh_tick = tokio::time::interval(Duration::from_secs(5));
+    catalog_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    catalog_refresh_tick.tick().await;
+    let mut catalog_retry = HashMap::<String, (Instant, Duration)>::new();
     let mut draining = false;
     if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
         refresh_resolver_snapshot(&snapshot, &accounts);
@@ -1829,6 +1852,8 @@ async fn run_account_actor(
                     &store,
                     &accounts,
                     &providers,
+                    &profile_id,
+                    &source_registry,
                     broker.as_ref(),
                     &model_discoverer,
                     &commands,
@@ -1899,6 +1924,24 @@ async fn run_account_actor(
                 }
                 continue;
             }
+            _ = catalog_refresh_tick.tick(), if !draining => {
+                let now = Instant::now();
+                for summary in catalog_summaries(&accounts, &providers) {
+                    if !summary.enabled || !matches!(summary.inventory, haider_rpc::ModelInventoryWire::Stale { .. }) {
+                        catalog_retry.remove(&summary.provider);
+                        continue;
+                    }
+                    if !refreshing_providers.contains(&summary.provider)
+                        && catalog_retry.get(&summary.provider).is_none_or(|(due, _)| now >= *due) {
+                        let delay = catalog_retry.get(&summary.provider)
+                            .map_or(Duration::from_secs(5), |(_, delay)| (*delay * 2).min(Duration::from_secs(300)));
+                        catalog_retry.insert(summary.provider.clone(), (now + delay, delay));
+                        pending_catalog_discoveries.enqueue(summary.provider);
+                    }
+                }
+                publish_inventory_states(&store, management.as_ref(), &accounts, &providers).await;
+                continue;
+            }
             _ = source_reconcile.tick(), if !draining && !crate::android_policy::enabled() => AccountCommand::ReconcileSources,
             changed = source_events.changed(), if !draining && !crate::android_policy::enabled() => {
                 if changed.is_err() {
@@ -1916,13 +1959,14 @@ async fn run_account_actor(
             AccountCommand::Login(job) => {
                 pending.retain(|_, entry| entry.claimed_at.elapsed() < SECRET_TTL);
                 handle_login(
+                    &refresh_fences,
                     &store,
                     &mut accounts,
                     vault.as_ref(),
                     validator.as_ref(),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &profile_id,
                     &default_model,
                     &mut pending,
@@ -1934,12 +1978,13 @@ async fn run_account_actor(
             }
             AccountCommand::AddOAuth(job) => {
                 handle_oauth_add(
+                    &refresh_fences,
                     &store,
                     &mut accounts,
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     &profile_id,
                     &reserved_aliases,
@@ -1975,7 +2020,7 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
@@ -2073,26 +2118,40 @@ async fn run_account_actor(
                     })
                     .and_then(|mut registry| {
                         let enrolled = registry.enroll(kind, &job.root, job.label.as_deref())?;
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(enrolled.id)
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(source_id) => {
-                        finish_catalog_account_mutation(
-                            &store,
-                            &before,
-                            &accounts,
-                            &providers,
-                            &mut pending_catalog_discoveries,
-                        )
-                        .await;
-                        refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2126,6 +2185,7 @@ async fn run_account_actor(
                 }
             }
             AccountCommand::SourceRemove(job) => {
+                let before = accounts.list().to_vec();
                 let result = source_registry
                     .lock()
                     .map_err(|_| {
@@ -2158,6 +2218,7 @@ async fn run_account_actor(
                                     reason: CredentialAttentionReason::SourceGone,
                                 },
                             )?;
+                            accounts.invalidate_incarnation(&alias)?;
                         }
                         removed.enabled = false;
                         removed.health = CredentialSourceHealth::SourceGone;
@@ -2165,14 +2226,35 @@ async fn run_account_actor(
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
                         Ok(())
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(()) => {
-                        refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2206,26 +2288,40 @@ async fn run_account_actor(
                         )
                     })
                     .and_then(|mut registry| {
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(())
                     });
+                // Descriptor writes can commit before a later source-metadata
+                // write fails. Retire their former catalogs on either outcome.
+                finish_catalog_account_mutation(
+                    &store,
+                    &before,
+                    &accounts,
+                    &mut providers,
+                    &mut pending_catalog_discoveries,
+                )
+                .await;
+                refresh_resolver_snapshot(&snapshot, &accounts);
+                if result.is_err() && before != accounts.list() {
+                    let _ = publish_next_management_revision_with_inventory(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                        &providers,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(()) => {
-                        finish_catalog_account_mutation(
-                            &store,
-                            &before,
-                            &accounts,
-                            &providers,
-                            &mut pending_catalog_discoveries,
-                        )
-                        .await;
-                        refresh_resolver_snapshot(&snapshot, &accounts);
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2247,7 +2343,7 @@ async fn run_account_actor(
                     .lock()
                     .map(|sources| sources.clone())
                     .unwrap_or_default();
-                let reconciled = source_registry
+                let _reconciled = source_registry
                     .lock()
                     .map_err(|_| {
                         HaiderError::new(
@@ -2257,32 +2353,43 @@ async fn run_account_actor(
                         )
                     })
                     .and_then(|mut registry| {
-                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        let reconciled = reconcile_credential_sources(&mut registry, &mut accounts);
                         publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        reconciled?;
                         Ok(())
                     });
                 let sources_changed = source_snapshot
                     .lock()
                     .map(|sources| source_metadata_changed(&before_sources, &sources))
                     .unwrap_or(false);
-                if reconciled.is_ok() && (before != accounts.list() || sources_changed) {
+                if before != accounts.list() || sources_changed {
                     finish_catalog_account_mutation(
                         &store,
                         &before,
                         &accounts,
-                        &providers,
+                        &mut providers,
                         &mut pending_catalog_discoveries,
                     )
                     .await;
                     refresh_resolver_snapshot(&snapshot, &accounts);
-                    let _ = publish_next_management_revision(
+                    let _ = publish_next_management_revision_with_inventory(
                         &store,
                         &snapshot,
                         management.as_ref(),
                         &accounts,
+                        &providers,
                     )
                     .await;
                 }
+            }
+            AccountCommand::RetryCatalogAfterSourceReconcile { provider } => {
+                retry_catalog_after_source_reconcile(
+                    &provider,
+                    &accounts,
+                    &providers,
+                    &source_registry,
+                    &mut pending_catalog_discoveries,
+                );
             }
             AccountCommand::ImportDevice(job) => {
                 handle_device_import(
@@ -2291,7 +2398,7 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     &reserved_aliases,
                     &refresh_fences,
@@ -2311,6 +2418,11 @@ async fn run_account_actor(
                     vault.as_ref(),
                     &snapshot,
                     management.as_ref(),
+                    RefreshIdentityCatalogContext {
+                        providers: &mut providers,
+                        pending: &mut pending_catalog_discoveries,
+                        source_registry: &source_registry,
+                    },
                     *job,
                 )
                 .await;
@@ -2321,7 +2433,7 @@ async fn run_account_actor(
                     &mut accounts,
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     *job,
                 )
@@ -2334,7 +2446,7 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     &mut reserved_aliases,
                     &refresh_fences,
@@ -2355,8 +2467,10 @@ async fn run_account_actor(
             AccountCommand::ConfigureProvider(job) => {
                 handle_provider_configure(
                     ProviderConfigureContext {
+                        profile_id: &profile_id,
                         store: &store,
-                        accounts: &accounts,
+                        accounts: &mut accounts,
+                        snapshot: &snapshot,
                         vault: vault.as_ref(),
                         management: management.as_ref(),
                         providers: &mut providers,
@@ -2428,6 +2542,8 @@ async fn run_account_actor(
                     &store,
                     &accounts,
                     &providers,
+                    &profile_id,
+                    &source_registry,
                     broker.as_ref(),
                     &model_discoverer,
                     &commands,
@@ -2443,15 +2559,14 @@ async fn run_account_actor(
             }
             AccountCommand::ProviderModelsRefreshCompleted {
                 provider,
+                producer,
                 cache_key,
                 cached,
                 result,
                 completed,
             } => {
                 refreshing_providers.remove(&provider);
-                if active_catalog_cache_key(&provider, &accounts, &providers).as_ref()
-                    != Some(&cache_key)
-                {
+                if !refresh_completion_is_current(&producer, &profile_id, &accounts, &providers) {
                     // A switch happened during the network flight. Its new
                     // discovery remains queued; never publish the old rows.
                     let completed = ProviderModelsRefreshCompletion::with_followers(
@@ -2478,8 +2593,10 @@ async fn run_account_actor(
                         .remove(&provider)
                         .unwrap_or_default(),
                 );
+                reconcile_catalog_selection_scope(&provider, &accounts, &mut providers);
                 finish_provider_models_refresh(
                     ProviderModelsRefreshContext {
+                        profile_id: &profile_id,
                         store: &store,
                         accounts: &accounts,
                         management: management.as_ref(),
@@ -2538,25 +2655,29 @@ async fn run_account_actor(
                             )
                         })
                         .and_then(|mut registry| {
-                            reconcile_credential_sources(&mut registry, &mut accounts)?;
+                            let reconciled =
+                                reconcile_credential_sources(&mut registry, &mut accounts);
                             publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                            reconciled?;
                             refresh_resolver_snapshot(&snapshot, &accounts);
                             Ok(OAuthImportHealResult::LiveOwnerStore { source: source_id })
                         });
-                    if reconciled.is_ok() && before != accounts.list() {
+                    if before != accounts.list() {
+                        refresh_resolver_snapshot(&snapshot, &accounts);
                         finish_catalog_account_mutation(
                             &store,
                             &before,
                             &accounts,
-                            &providers,
+                            &mut providers,
                             &mut pending_catalog_discoveries,
                         )
                         .await;
-                        if let Err(error) = publish_next_management_revision(
+                        if let Err(error) = publish_next_management_revision_with_inventory(
                             &store,
                             &snapshot,
                             management.as_ref(),
                             &accounts,
+                            &providers,
                         )
                         .await
                         {
@@ -2571,7 +2692,7 @@ async fn run_account_actor(
                         Arc::clone(&vault),
                         &snapshot,
                         management.as_ref(),
-                        &providers,
+                        &mut providers,
                         &mut pending_catalog_discoveries,
                         &reserved_aliases,
                         &refresh_fences,
@@ -2633,7 +2754,7 @@ async fn run_account_actor(
                     vault.as_ref(),
                     &snapshot,
                     management.as_ref(),
-                    &providers,
+                    &mut providers,
                     &mut pending_catalog_discoveries,
                     &provider,
                     failure,
@@ -2713,22 +2834,15 @@ async fn backfill_oauth_identities(
                     .flatten()
             })
             .or_else(|| {
-                (provider == ANTHROPIC_OAUTH_PROVIDER_NAME).then(|| {
-                    let suffix = bundle
-                        .identity
-                        .subject_hash
-                        .chars()
-                        .take(16)
-                        .collect::<String>();
-                    AccountIdentity {
-                        email: None,
-                        display_name: Some(bundle.identity.display_identity.clone()),
-                        account_id: Some(format!("anthropic:{suffix}")),
-                        plan: None,
-                        issuer: Some(bundle.issuer.clone()),
-                        captured_at: unix_ms_after(Duration::ZERO),
-                        verified: false,
-                    }
+                // Same rule as a fresh login without an account coordinate:
+                // the grant identity is the account boundary.
+                grant_identity_backfill(&provider).then(|| {
+                    crate::oauth::grant_account_identity(
+                        &provider,
+                        &bundle.issuer,
+                        &bundle.identity,
+                        unix_ms_after(Duration::ZERO),
+                    )
                 })
             });
         if let Some(identity) = identity
@@ -2740,6 +2854,17 @@ async fn backfill_oauth_identities(
         }
     }
     changed
+}
+
+/// Registered token-endpoint-grant providers whose logins carry no account
+/// coordinate of their own.
+fn grant_identity_backfill(provider: &str) -> bool {
+    matches!(
+        provider,
+        ANTHROPIC_OAUTH_PROVIDER_NAME
+            | haider_provider::KIMI_OAUTH_PROVIDER_NAME
+            | haider_provider::GROK_OAUTH_PROVIDER_NAME
+    )
 }
 
 fn adoption_notice(
@@ -2955,6 +3080,9 @@ fn redact_probe_error(error: CatalogError, secret: Option<&str>) -> CatalogError
         CatalogError::Transport { reason } => CatalogError::Transport {
             reason: reason.replace(secret, "<redacted>"),
         },
+        CatalogError::Unsupported { reason } => CatalogError::Unsupported {
+            reason: reason.replace(secret, "<redacted>"),
+        },
         CatalogError::Unavailable { reason } => CatalogError::Unavailable {
             reason: reason.replace(secret, "<redacted>"),
         },
@@ -2965,11 +3093,65 @@ fn redact_probe_error(error: CatalogError, secret: Option<&str>) -> CatalogError
     }
 }
 
+fn linked_catalog_credential(
+    source: &CredentialSourceRecord,
+    descriptor: &CredentialDescriptor,
+) -> Result<[u8; 32], HaiderError> {
+    let material = crate::device_discovery::read_linked_source(source).map_err(|_| {
+        HaiderError::new(
+            ErrorCode::CredentialMissing,
+            "linked credential changed before catalog discovery",
+            true,
+        )
+    })?;
+    if material.credential_digest != descriptor.credential_digest {
+        return Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            "linked credential changed before catalog discovery",
+            true,
+        ));
+    }
+    let encoded = material.encoded_bundle.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::CredentialMissing,
+            "linked credential has no usable access bundle",
+            false,
+        )
+    })?;
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(&encoded)?;
+    Ok(*blake3::hash(bundle.access_token()).as_bytes())
+}
+
+fn linked_source_for_catalog(
+    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+    descriptor: Option<&CredentialDescriptor>,
+) -> Result<Option<CredentialSourceRecord>, HaiderError> {
+    let Some(descriptor) = descriptor else {
+        return Ok(None);
+    };
+    let registry = source_registry.lock().map_err(|_| {
+        HaiderError::new(
+            ErrorCode::CredentialMissing,
+            "linked credential source registry is unavailable",
+            true,
+        )
+    })?;
+    Ok(registry
+        .records()
+        .iter()
+        .find(|source| {
+            source.enabled && source.account_alias.as_deref() == Some(descriptor.alias.as_str())
+        })
+        .cloned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn begin_provider_models_refresh(
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    profile_id: &str,
+    source_registry: &Arc<StdMutex<CredentialSourceRegistry>>,
     broker: Option<&CredentialBroker>,
     model_discoverer: &Arc<dyn ProviderModelDiscoverer>,
     commands: &mpsc::Sender<AccountCommand>,
@@ -3078,6 +3260,31 @@ async fn begin_provider_models_refresh(
         || ProviderModelCacheKey::public(&provider),
         |descriptor| ProviderModelCacheKey::for_account(&provider, descriptor),
     );
+    let producer = CatalogProducer {
+        profile: profile_id.to_owned(),
+        provider: provider.clone(),
+        source: source.clone(),
+        origin: providers
+            .get(&provider)
+            .and_then(|profile| profile.base_url.clone()),
+        auth: auth_requirement,
+        alias: descriptor.as_ref().map(|row| row.alias.clone()),
+        incarnation: descriptor.as_ref().map(|row| row.incarnation),
+        cache_key: cache_key.clone(),
+    };
+    let linked_source = match linked_source_for_catalog(source_registry, descriptor.as_ref()) {
+        Ok(source) => source,
+        Err(error) => {
+            respond_model_refresh_error(
+                &completed,
+                ERROR_CODE_CREDENTIAL_MISSING,
+                &error.message,
+                error.retryable,
+                None,
+            );
+            return;
+        }
+    };
     let cached = match store.provider_models(cache_key.clone().into()).await {
         Ok(cached) => cached,
         Err(error) => {
@@ -3098,35 +3305,67 @@ async fn begin_provider_models_refresh(
     let model_discoverer = Arc::clone(model_discoverer);
     let task_provider = provider.clone();
     let task_cache_key = cache_key;
+    let task_producer = producer;
     let task_completed = completed.clone();
     let refresh_task = refresh_tasks.spawn(async move {
+        let mut source_mismatch = false;
         let result = match (broker, descriptor) {
-            (Some(broker), Some(descriptor)) => match broker.resolve(&descriptor).await {
-                Ok(access_token) => {
-                    let access_token =
-                        std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
-                            let message = if descriptor.auth_method == AuthMethod::OAuth {
-                                "OAuth access token is not valid UTF-8"
-                            } else {
-                                "API key is not valid UTF-8"
-                            };
-                            HaiderError::new(ErrorCode::CredentialMissing, message, false)
-                        });
-                    match access_token {
-                        Ok(access_token) => ProviderModelsRefreshResult::Discovery(
-                            discover_provider_models_bounded(
-                                model_discoverer.as_ref(),
-                                source,
-                                Some(access_token),
-                                etag.as_deref(),
-                            )
-                            .await,
-                        ),
-                        Err(error) => ProviderModelsRefreshResult::Credential(error),
+            (Some(broker), Some(descriptor)) => {
+                let linked_snapshot = linked_source
+                    .as_ref()
+                    .map(|source| linked_catalog_credential(source, &descriptor))
+                    .transpose();
+                match linked_snapshot {
+                    Err(error) => {
+                        source_mismatch = true;
+                        ProviderModelsRefreshResult::Credential(error)
                     }
+                    Ok(expected_access) => match broker.resolve(&descriptor).await {
+                        Ok(access_token) => {
+                            if expected_access.is_some_and(|digest| {
+                                *blake3::hash(access_token.expose_secret()).as_bytes() != digest
+                            }) {
+                                source_mismatch = true;
+                                ProviderModelsRefreshResult::Credential(HaiderError::new(
+                                    ErrorCode::CredentialMissing,
+                                    "linked credential changed before catalog discovery",
+                                    true,
+                                ))
+                            } else {
+                                let access_token = std::str::from_utf8(
+                                    access_token.expose_secret(),
+                                )
+                                .map_err(|_| {
+                                    let message = if descriptor.auth_method == AuthMethod::OAuth {
+                                        "OAuth access token is not valid UTF-8"
+                                    } else {
+                                        "API key is not valid UTF-8"
+                                    };
+                                    HaiderError::new(ErrorCode::CredentialMissing, message, false)
+                                });
+                                match access_token {
+                                    Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                                        discover_provider_models_bounded(
+                                            model_discoverer.as_ref(),
+                                            source,
+                                            Some(access_token),
+                                            etag.as_deref(),
+                                        )
+                                        .await,
+                                    ),
+                                    Err(error) => ProviderModelsRefreshResult::Credential(error),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if linked_source.is_some() {
+                                source_mismatch = true;
+                            }
+                            ProviderModelsRefreshResult::Credential(error)
+                        }
+                    },
                 }
-                Err(error) => ProviderModelsRefreshResult::Credential(error),
-            },
+            }
             (None, None) => ProviderModelsRefreshResult::Discovery(
                 discover_provider_models_bounded(
                     model_discoverer.as_ref(),
@@ -3144,13 +3383,23 @@ async fn begin_provider_models_refresh(
         };
         let _ = commands
             .send(AccountCommand::ProviderModelsRefreshCompleted {
-                provider: task_provider,
+                provider: task_provider.clone(),
+                producer: task_producer,
                 cache_key: task_cache_key,
                 cached,
                 result,
                 completed: task_completed,
             })
             .await;
+        if source_mismatch {
+            tokio::time::sleep(SOURCE_EVENT_COALESCE).await;
+            let _ = commands.send(AccountCommand::ReconcileSources).await;
+            let _ = commands
+                .send(AccountCommand::RetryCatalogAfterSourceReconcile {
+                    provider: task_provider,
+                })
+                .await;
+        }
     });
     refresh_routes.insert(refresh_task.id(), (provider, completed, true));
 }
@@ -3178,6 +3427,7 @@ fn catalog_refresh_etag(
 }
 
 struct ProviderModelsRefreshContext<'a> {
+    profile_id: &'a str,
     store: &'a SqliteStoreHandle,
     accounts: &'a AccountStore<Box<dyn StoreLike>>,
     management: Option<&'a ManagementSnapshot>,
@@ -3193,12 +3443,30 @@ async fn finish_provider_models_refresh(
     result: ProviderModelsRefreshResult,
 ) {
     let ProviderModelsRefreshContext {
+        profile_id,
         store,
         accounts,
         management,
         providers,
         completed,
     } = context;
+    let evidence_scope = catalog_producer(profile_id, &provider, accounts, providers)
+        .map(|producer| catalog_evidence_scope(&producer));
+    // Account selection can retire the live slot. Restore this exact owner's
+    // evidence before uncertainty is applied, so reactivation cannot turn a
+    // known rejection into configured-unverified availability.
+    if let Some(scope) = evidence_scope.as_deref()
+        && let Err(error) = providers.restore_catalog_evidence(&provider, scope)
+    {
+        respond_model_refresh_error(
+            completed,
+            ERROR_CODE_PROVIDER_ERROR,
+            &error.message,
+            error.retryable,
+            None,
+        );
+        return;
+    }
     let failure_reason = match &result {
         ProviderModelsRefreshResult::Discovery(Ok(_))
         | ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => None,
@@ -3206,8 +3474,49 @@ async fn finish_provider_models_refresh(
         ProviderModelsRefreshResult::Credential(error) => Some(error.message.clone()),
     };
     if let Some(reason) = failure_reason {
-        providers.models_unavailable(&provider, reason);
+        let evidence_result = if matches!(
+            &result,
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { .. }))
+        ) {
+            if let Some(scope) = evidence_scope.as_deref() {
+                providers.record_catalog_unsupported(&provider, scope, reason)
+            } else {
+                providers.models_unsupported(&provider, reason);
+                Ok(())
+            }
+        } else if matches!(
+            &result,
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized))
+        ) || (matches!(
+            &result,
+            ProviderModelsRefreshResult::Discovery(Err(CatalogError::Empty))
+        ) && !haider_provider::has_subscription_static_catalog(&provider))
+            || matches!(&result, ProviderModelsRefreshResult::Credential(error) if !error.retryable)
+        {
+            // Retire durable positive evidence too: a restart cannot resurrect
+            // a listing whose credential was explicitly rejected.
+            let _ = store.delete_provider_models(cache_key.clone().into()).await;
+            if let Some(scope) = evidence_scope.as_deref() {
+                providers.record_catalog_rejection(&provider, scope, reason)
+            } else {
+                providers.models_rejected(&provider, reason);
+                Ok(())
+            }
+        } else {
+            providers.models_unavailable(&provider, reason);
+            Ok(())
+        };
         publish_inventory_states(store, management, accounts, providers).await;
+        if let Err(error) = evidence_result {
+            respond_model_refresh_error(
+                completed,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+                None,
+            );
+            return;
+        }
     }
     match result {
         ProviderModelsRefreshResult::Discovery(Ok(catalog)) => {
@@ -3246,8 +3555,22 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
+            // Commit fresh positive evidence before retiring its durable negative
+            // marker. A failed cache write or interrupted clear remains fenced.
+            if let Some(scope) = evidence_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_evidence(scope)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+                return;
+            }
             providers.replace_discovered_models(provider.clone(), catalog.models, fetched_at_ms);
-            let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
+            let summaries = catalog_summaries(accounts, providers);
             let Some(summary) = summaries
                 .iter()
                 .find(|summary| summary.provider == provider)
@@ -3311,6 +3634,18 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
+            if let Some(scope) = evidence_scope.as_deref()
+                && let Err(error) = providers.clear_catalog_evidence(scope)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+                return;
+            }
             providers.replace_discovered_models(provider.clone(), models, fetched_at_ms);
             let revision = match store.management_revision().await {
                 Ok(revision) => revision,
@@ -3325,7 +3660,7 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
-            let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
+            let summaries = catalog_summaries(accounts, providers);
             let Some(summary) = summaries
                 .iter()
                 .find(|summary| summary.provider == provider)
@@ -3346,14 +3681,26 @@ async fn finish_provider_models_refresh(
                 revision,
             });
         }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { reason })) => {
+            if let Some(summary) = catalog_summary(&provider, accounts, providers)
+                && matches!(summary.availability, ProviderAvailabilityWire::Available)
+                && let Ok(revision) = store.management_revision().await
+            {
+                completed.complete(ResponseBody::ProviderModelsRefresh {
+                    provider: summary,
+                    revision,
+                });
+            } else {
+                respond_provider_models_unavailable(completed, &provider, &reason);
+            }
+        }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unavailable { reason })) => {
             // A subscription may authorize inference while refusing model
             // enumeration. The fallback remains selectable and the failed
             // fetch is retained in inventory as informational provenance.
             if haider_provider::model_list_forbidden(&reason)
                 && haider_provider::has_subscription_static_catalog(&provider)
-                && let Some(summary) =
-                    providers.summary(&provider, &provider_credential_ready_for_summary(accounts))
+                && let Some(summary) = catalog_summary(&provider, accounts, providers)
                 && let Ok(revision) = store.management_revision().await
             {
                 completed.complete(ResponseBody::ProviderModelsRefresh {
@@ -3458,7 +3805,7 @@ async fn publish_inventory_states(
     let Some(management) = management else {
         return;
     };
-    let summaries = providers.summaries(&provider_credential_ready_for_summary(accounts));
+    let summaries = catalog_summaries(accounts, providers);
     if management
         .read()
         .is_some_and(|view| view.providers == summaries)
@@ -3488,42 +3835,9 @@ fn catalog_source(
     provider: &str,
     providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Option<(CatalogSource, ProviderAuthRequirementWire)> {
-    match haider_provider::provider_catalog_definition(provider) {
-        haider_provider::ProviderCatalogDefinition::Public { source } => {
-            Some((source, ProviderAuthRequirementWire::None))
-        }
-        haider_provider::ProviderCatalogDefinition::Authenticated { source } => {
-            Some((source, providers.get(provider)?.auth_requirement))
-        }
-        haider_provider::ProviderCatalogDefinition::Offline { .. } => None,
-        haider_provider::ProviderCatalogDefinition::Adapter => {
-            let profile = providers.get(provider)?;
-            if profile.provenance != ProviderProvenance::Custom
-                || !matches!(
-                    profile.api_family,
-                    ProviderApiFamilyWire::OpenAiChatCompletions
-                        | ProviderApiFamilyWire::AnthropicMessages
-                )
-                || !matches!(
-                    profile.auth_requirement,
-                    ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::None
-                )
-            {
-                return None;
-            }
-            let origin = profile.base_url.clone()?;
-            let source = match profile.api_family {
-                ProviderApiFamilyWire::OpenAiChatCompletions => {
-                    CatalogSource::OpenAiCompatible { origin }
-                }
-                ProviderApiFamilyWire::AnthropicMessages => {
-                    CatalogSource::AnthropicCompatible { origin }
-                }
-                _ => return None,
-            };
-            Some((source, profile.auth_requirement))
-        }
-    }
+    providers
+        .get(provider)
+        .and_then(crate::provider_registry::catalog_source_for_profile)
 }
 
 /// The single daemon-side rule mapping a provider's catalog authentication
@@ -3544,6 +3858,133 @@ fn catalog_cache_key(
         ProviderAuthRequirementWire::None => Some(ProviderModelCacheKey::public(provider)),
         _ => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogProducer {
+    profile: String,
+    provider: String,
+    source: CatalogSource,
+    origin: Option<String>,
+    auth: ProviderAuthRequirementWire,
+    alias: Option<CredentialAlias>,
+    incarnation: Option<u64>,
+    cache_key: ProviderModelCacheKey,
+}
+
+fn catalog_evidence_scope(producer: &CatalogProducer) -> String {
+    let identity = serde_json::json!({
+        "v": 1,
+        "profile": &producer.profile,
+        "provider": &producer.provider,
+        "source": format!("{:?}", producer.source),
+        "origin": &producer.origin,
+        "auth": producer.auth,
+        "alias": &producer.alias,
+        "incarnation": producer.incarnation,
+        "cache_key": String::from(producer.cache_key.clone()),
+    });
+    blake3::hash(identity.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn catalog_producer(
+    profile: &str,
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<CatalogProducer> {
+    let (_, auth) = catalog_source(provider, providers)?;
+    let descriptor = match auth {
+        ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
+            Some(accounts.active_for_provider(provider)?)
+        }
+        ProviderAuthRequirementWire::None => None,
+        _ => return None,
+    };
+    catalog_producer_for_account(profile, provider, descriptor, providers)
+}
+
+/// A discovery attempt names its account explicitly. Publication remains
+/// gated by `refresh_completion_is_current`, including for inactive accounts.
+fn catalog_producer_for_account(
+    profile: &str,
+    provider: &str,
+    descriptor: Option<&CredentialDescriptor>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<CatalogProducer> {
+    let (source, auth) = catalog_source(provider, providers)?;
+    let descriptor = match auth {
+        ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
+            Some(descriptor.filter(|row| row.provider == provider)?)
+        }
+        ProviderAuthRequirementWire::None => None,
+        _ => return None,
+    };
+    let cache_key = catalog_cache_key(provider, auth, descriptor)?;
+    Some(CatalogProducer {
+        profile: profile.to_owned(),
+        provider: provider.to_owned(),
+        source,
+        origin: providers
+            .get(provider)
+            .and_then(|profile| profile.base_url.clone()),
+        auth,
+        alias: descriptor.map(|row| row.alias.clone()),
+        incarnation: descriptor.map(|row| row.incarnation),
+        cache_key,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ConfigureCatalogProducer {
+    profile: String,
+    provider: String,
+    origin: Option<String>,
+    auth: ProviderAuthRequirementWire,
+    alias: Option<CredentialAlias>,
+    incarnation: Option<u64>,
+    cache_key: String,
+}
+
+fn configure_catalog_producer(
+    profile: &str,
+    provider: &str,
+    origin: Option<&str>,
+    auth: ProviderAuthRequirementWire,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Option<ConfigureCatalogProducer> {
+    let descriptor = match auth {
+        ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::OAuth => {
+            Some(accounts.active_for_provider(provider)?)
+        }
+        ProviderAuthRequirementWire::None => None,
+        _ => return None,
+    };
+    let key = catalog_cache_key(provider, auth, descriptor)?;
+    Some(ConfigureCatalogProducer {
+        profile: profile.to_owned(),
+        provider: provider.to_owned(),
+        origin: origin.map(str::to_owned),
+        auth,
+        alias: descriptor.map(|row| row.alias.clone()),
+        incarnation: descriptor.map(|row| row.incarnation),
+        cache_key: key.into(),
+    })
+}
+
+/// Late-refresh fence: a completed catalog flight may publish only when the
+/// producer it was started under is still the serving account and endpoint.
+/// A switch, re-login, repoint or same-source replacement rejects the flight.
+fn refresh_completion_is_current(
+    started_under: &CatalogProducer,
+    profile: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> bool {
+    catalog_producer(profile, &started_under.provider, accounts, providers).as_ref()
+        == Some(started_under)
 }
 
 /// Whether `provider`'s catalog rows are keyed by account (never by the
@@ -3577,11 +4018,110 @@ fn clear_catalog_if_active_identity_changed(
     provider: &str,
     previous: Option<ProviderModelCacheKey>,
     accounts: &AccountStore<Box<dyn StoreLike>>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) {
     if active_catalog_cache_key(provider, accounts, providers) != previous {
         providers.clear_discovered_models(provider);
+        reconcile_catalog_selection_scope(provider, accounts, providers);
     }
+}
+
+fn catalog_selection_scope(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<String> {
+    let profile = providers.get(provider)?;
+    // Release-owned public catalogs and their defaults have no account owner.
+    // Their bare cache keys survive account changes without a scope write.
+    if profile.provenance == ProviderProvenance::BuiltIn
+        && matches!(
+            haider_provider::provider_catalog_definition(provider),
+            haider_provider::ProviderCatalogDefinition::Public { .. }
+        )
+    {
+        return None;
+    }
+    let key = active_catalog_cache_key(provider, accounts, providers)?;
+    Some(format!(
+        "{}|{:?}|{:?}",
+        String::from(key),
+        profile.auth_requirement,
+        profile.base_url
+    ))
+}
+
+/// Attach the catalog producer to every management projection. Global
+/// revisions cannot identify the owner of a single-provider refresh.
+fn catalog_summary(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<ProviderSummaryWire> {
+    let summary = providers.summary(provider, &provider_credential_ready_for_summary(accounts))?;
+    Some(with_catalog_scope(summary, accounts, providers))
+}
+
+fn with_catalog_scope(
+    mut summary: ProviderSummaryWire,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> ProviderSummaryWire {
+    let provider = &summary.provider;
+    summary.catalog_scope = catalog_selection_scope(provider, accounts, providers).map(|key| {
+        let account = catalog_is_account_scoped(provider, providers)
+            .then(|| accounts.active_for_provider(provider))
+            .flatten();
+        haider_rpc::ProviderCatalogScopeWire {
+            key: blake3::hash(key.as_bytes()).to_hex().to_string(),
+            account_alias: account.map(|row| row.alias.as_str().to_owned()),
+            account_incarnation: account.map(|row| row.incarnation),
+        }
+    });
+    summary
+}
+
+fn catalog_summaries(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Vec<ProviderSummaryWire> {
+    providers
+        .summaries(&provider_credential_ready_for_summary(accounts))
+        .into_iter()
+        .map(|summary| with_catalog_scope(summary, accounts, providers))
+        .collect()
+}
+
+fn reconcile_catalog_selection_scope(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) {
+    let key = catalog_selection_scope(provider, accounts, providers);
+    if let Err(error) = providers.reconcile_catalog_scope(provider, key) {
+        tracing::warn!(
+            ?error,
+            "catalog selection persistence failed; scope is fenced in memory and on restart"
+        );
+    }
+}
+
+fn mint_provider_incarnations(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+) -> Result<(), HaiderError> {
+    // An endpoint/auth-mode edit applies to inactive aliases too. Their old
+    // rows must stay unreadable when one is selected later.
+    let aliases = accounts
+        .list()
+        .iter()
+        .filter(|row| row.provider == provider)
+        .map(|row| row.alias.clone())
+        .collect::<Vec<_>>();
+    for alias in aliases {
+        accounts.mint_incarnation(&alias)?;
+    }
+    Ok(())
 }
 
 /// Remove durable catalogs whose account identity no longer exists, plus
@@ -3600,6 +4140,7 @@ async fn prune_catalog_cache(
     let keep = accounts
         .list()
         .iter()
+        .filter(|descriptor| catalog_is_account_scoped(&descriptor.provider, providers))
         .map(|descriptor| {
             ProviderModelCacheKey::for_account(&descriptor.provider, descriptor).into()
         })
@@ -3629,7 +4170,7 @@ async fn prune_catalog_cache(
 fn clear_catalogs_after_account_change(
     before: &[CredentialDescriptor],
     accounts: &AccountStore<Box<dyn StoreLike>>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending: &mut AutomaticCatalogDiscoveryQueue,
 ) {
     let provider_ids = before
@@ -3648,6 +4189,17 @@ fn clear_catalogs_after_account_change(
         let current = catalog_cache_key(provider, auth, accounts.active_for_provider(provider));
         if previous != current {
             providers.clear_discovered_models(provider);
+            reconcile_catalog_selection_scope(provider, accounts, providers);
+            enqueue_catalog_discovery(provider, providers, pending);
+        } else if previous_active
+            .zip(accounts.active_for_provider(provider))
+            .is_some_and(|(old, new)| {
+                old.credential_digest != new.credential_digest || old.status != new.status
+            })
+            && accounts
+                .active_for_provider(provider)
+                .is_some_and(|row| matches!(row.status, CredentialStatus::Ok))
+        {
             enqueue_catalog_discovery(provider, providers, pending);
         }
     }
@@ -3657,7 +4209,7 @@ async fn finish_catalog_account_mutation(
     store: &SqliteStoreHandle,
     before: &[CredentialDescriptor],
     accounts: &AccountStore<Box<dyn StoreLike>>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending: &mut AutomaticCatalogDiscoveryQueue,
 ) {
     clear_catalogs_after_account_change(before, accounts, providers, pending);
@@ -3671,6 +4223,29 @@ fn enqueue_catalog_discovery(
 ) {
     if catalog_source(provider, providers).is_some() {
         pending.enqueue(provider.to_owned());
+    }
+}
+
+/// A raced read must retry after the old completion has been retired, even
+/// when reconciliation proved the same account and kept its incarnation.
+fn retry_catalog_after_source_reconcile(
+    provider: &str,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    sources: &Arc<StdMutex<CredentialSourceRegistry>>,
+    pending: &mut AutomaticCatalogDiscoveryQueue,
+) {
+    let readable = accounts
+        .active_for_provider(provider)
+        .is_some_and(|descriptor| {
+            matches!(descriptor.status, CredentialStatus::Ok)
+                && linked_source_for_catalog(sources, Some(descriptor))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|source| linked_catalog_credential(&source, descriptor).is_ok())
+        });
+    if readable {
+        enqueue_catalog_discovery(provider, providers, pending);
     }
 }
 
@@ -3772,7 +4347,7 @@ async fn resolve_account(
     vault: &dyn Vault,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     provider: &str,
     failure: Option<(CredentialAlias, RotationTrigger)>,
@@ -3856,6 +4431,7 @@ async fn resolve_account(
 
     providers.clear_discovered_models(provider);
     accounts.select(&selected.alias)?;
+    reconcile_catalog_selection_scope(provider, accounts, providers);
     enqueue_catalog_discovery(provider, providers, pending_catalog_discoveries);
     refresh_resolver_snapshot(snapshot, accounts);
     let revision = store.advance_management_revision().await?;
@@ -3863,7 +4439,7 @@ async fn resolve_account(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     Ok(ResolvedAccount {
@@ -4321,14 +4897,26 @@ async fn handle_set_label(
 /// Rebuilds public identity from the credential already inside Haider's
 /// vault. OAuth providers all pass through the provider-owned abstraction;
 /// no token bytes enter the response, receipt, or diagnostic path.
+struct RefreshIdentityCatalogContext<'a> {
+    providers: &'a mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pending: &'a mut AutomaticCatalogDiscoveryQueue,
+    source_registry: &'a Arc<StdMutex<CredentialSourceRegistry>>,
+}
+
 async fn handle_refresh_identity(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    catalog: RefreshIdentityCatalogContext<'_>,
     job: RefreshIdentityJob,
 ) {
+    let RefreshIdentityCatalogContext {
+        providers,
+        pending,
+        source_registry,
+    } = catalog;
     let alias = CredentialAlias::new(job.alias.trim());
     let Some(current) = accounts
         .list()
@@ -4353,6 +4941,71 @@ async fn handle_refresh_identity(
             return;
         }
     };
+    let (mut credential_digest, stored_access_digest) = match current.auth_method {
+        AuthMethod::ApiKey => (
+            blake3::hash(stored.expose_secret()).to_hex().to_string(),
+            None,
+        ),
+        AuthMethod::OAuth => {
+            let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    respond_management_error(&job.route, &error);
+                    return;
+                }
+            };
+            (
+                oauth_credential_digest(&bundle),
+                Some(blake3::hash(bundle.access_token()).to_hex().to_string()),
+            )
+        }
+    };
+    if let Some(source) = source_registry.lock().ok().and_then(|registry| {
+        registry
+            .records()
+            .iter()
+            .find(|source| {
+                source.enabled && source.account_alias.as_deref() == Some(alias.as_str())
+            })
+            .cloned()
+    }) {
+        let material = match crate::device_discovery::read_linked_source(&source) {
+            Ok(material) => material,
+            Err(_) => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::CredentialMissing,
+                        "linked credential changed during identity refresh",
+                        true,
+                    ),
+                );
+                return;
+            }
+        };
+        let same_access = material
+            .encoded_bundle
+            .as_ref()
+            .and_then(|encoded| haider_accounts::OAuthTokenBundleV1::decode(encoded).ok())
+            .is_some_and(|bundle| {
+                stored_access_digest.as_deref()
+                    == Some(blake3::hash(bundle.access_token()).to_hex().as_str())
+            });
+        if !same_access {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    "linked credential changed during identity refresh",
+                    true,
+                ),
+            );
+            return;
+        }
+        if let Some(digest) = material.credential_digest {
+            credential_digest = digest;
+        }
+    }
     let identity = match current.auth_method {
         AuthMethod::ApiKey => {
             let mut identity = api_key_identity(&current.provider, stored.expose_secret());
@@ -4411,21 +5064,26 @@ async fn handle_refresh_identity(
             }
         }
     };
-    let descriptor = match accounts.set_identity(&alias, identity) {
+    let before = accounts.list().to_vec();
+    let descriptor = match accounts.reconcile_identity(&alias, identity, Some(credential_digest)) {
         Ok(descriptor) => descriptor,
         Err(error) => {
             respond_management_error(&job.route, &error);
             return;
         }
     };
-    let revision =
-        match publish_next_management_revision(store, snapshot, management, accounts).await {
-            Ok(revision) => revision,
-            Err(error) => {
-                respond_management_error(&job.route, &error);
-                return;
-            }
-        };
+    finish_catalog_account_mutation(store, &before, accounts, providers, pending).await;
+    let revision = match publish_next_management_revision_with_inventory(
+        store, snapshot, management, accounts, providers,
+    )
+    .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
     respond(
         &job.route,
         ResponseBody::AccountRefresh {
@@ -4450,6 +5108,26 @@ fn publish_management_snapshot(
     }
 }
 
+fn publish_management_snapshot_with_inventory(
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    revision: u64,
+) {
+    let descriptors = accounts.list().to_vec();
+    if let Ok(mut view) = snapshot.lock() {
+        *view = descriptors.clone();
+    }
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            descriptors,
+            catalog_summaries(accounts, providers),
+        );
+    }
+}
+
 async fn publish_next_management_revision(
     store: &SqliteStoreHandle,
     snapshot: &AccountsSnapshot,
@@ -4459,6 +5137,33 @@ async fn publish_next_management_revision(
     let revision = store.advance_management_revision().await?;
     publish_management_snapshot(snapshot, management, accounts, revision);
     Ok(revision)
+}
+
+/// Account change that may have cleared live catalog rows (source
+/// enrollment, scan, reconciliation, import heal): the accounts view and the
+/// provider summaries are published together, so no reader sees the new
+/// account beside the previous account's rows.
+async fn publish_next_management_revision_with_inventory(
+    store: &SqliteStoreHandle,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Result<u64, HaiderError> {
+    let revision = store.advance_management_revision().await;
+    // Descriptor/configuration commits cannot be rolled back by a failed
+    // publication write. Keep admission coherent even without a new revision.
+    if let Some(current) = revision
+        .as_ref()
+        .ok()
+        .copied()
+        .or_else(|| management.and_then(|view| view.inspect(|view| view.revision)))
+    {
+        publish_management_snapshot_with_inventory(
+            snapshot, management, accounts, providers, current,
+        );
+    }
+    revision
 }
 
 async fn publish_marked_management_revision(
@@ -4518,6 +5223,11 @@ struct SetDefaultModelIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetDefaultModelRecovery {
+    catalog_selection_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ProviderConfigureIdentity {
     input: ProviderConfigureInput,
     expected_revision: u64,
@@ -4531,6 +5241,8 @@ struct ProviderConfigureRecovery {
     /// journals the same transition even if the profile file was already saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_auth_requirement: Option<ProviderAuthRequirementWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_origin: Option<String>,
     /// Public catalog facts already authenticated before the receipt claim.
     /// Retaining them lets a crash-resume rebuild the durable cache without
     /// persisting or reusing the ephemeral probe credential.
@@ -4538,6 +5250,10 @@ struct ProviderConfigureRecovery {
     discovered_models: Option<Vec<DiscoveredModel>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovered_etag: Option<String>,
+    /// Catalog producer before the receipt claim. Older receipts without a
+    /// producer cannot safely replay fetched rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_producer: Option<ConfigureCatalogProducer>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     revision_unchanged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4699,7 +5415,7 @@ async fn handle_set_active(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     job: SetActiveJob,
 ) {
@@ -4846,6 +5562,7 @@ async fn handle_set_active(
         return;
     }
     if switching {
+        reconcile_catalog_selection_scope(&recovery.provider, accounts, providers);
         enqueue_catalog_discovery(&recovery.provider, providers, pending_catalog_discoveries);
     }
     if let Err(error) = try_refresh_resolver_snapshot(snapshot, accounts) {
@@ -4885,7 +5602,7 @@ async fn handle_set_active(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     respond(
@@ -4905,7 +5622,7 @@ async fn handle_remove_account(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &mut HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
@@ -5121,7 +5838,7 @@ async fn handle_remove_account(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     respond(
@@ -5184,17 +5901,48 @@ async fn handle_set_default_model(
             return;
         }
     }
+    if let Some(summary) = catalog_summary(&identity.provider, accounts, providers)
+        .filter(|summary| !summary.model_is_selectable(&identity.model))
+    {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::ProviderError,
+                summary
+                    .selection_reason(Some(&identity.model))
+                    .unwrap_or_else(|| "configured deployment requires a model-list fetch".into()),
+                true,
+            ),
+        );
+        return;
+    }
     if let Err(error) = providers.validate_default_model(&identity.provider, &identity.model) {
         respond_management_error(&job.route, &error);
         return;
     }
+    let recovery_json = match serde_json::to_string(&SetDefaultModelRecovery {
+        catalog_selection_key: catalog_selection_scope(&identity.provider, accounts, providers),
+    }) {
+        Ok(json) => json,
+        Err(error) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("default-model recovery could not be encoded: {error}"),
+                    false,
+                ),
+            );
+            return;
+        }
+    };
     match store
         .management_claim_receipt::<ProviderReceipt>(
             job.command_id.clone(),
             ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned(),
             request_digest,
             request_json,
-            None,
+            Some(recovery_json),
             Some(job.expected_revision),
         )
         .await
@@ -5215,6 +5963,7 @@ async fn handle_set_default_model(
             return;
         }
     }
+    reconcile_catalog_selection_scope(&identity.provider, accounts, providers);
     let profile = match providers.set_default_model(&identity.provider, &identity.model) {
         Ok(profile) => profile,
         Err(error) => {
@@ -5222,10 +5971,7 @@ async fn handle_set_default_model(
             return;
         }
     };
-    let Some(provider) = providers.summary(
-        &profile.provider_id,
-        &provider_credential_ready_for_summary(accounts),
-    ) else {
+    let Some(provider) = catalog_summary(&profile.provider_id, accounts, providers) else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -5258,7 +6004,7 @@ async fn handle_set_default_model(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     respond(
@@ -5271,8 +6017,10 @@ async fn handle_set_default_model(
 }
 
 struct ProviderConfigureContext<'a> {
+    profile_id: &'a str,
     store: &'a SqliteStoreHandle,
-    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+    accounts: &'a mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &'a AccountsSnapshot,
     vault: &'a dyn Vault,
     management: Option<&'a ManagementSnapshot>,
     providers: &'a mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
@@ -5299,7 +6047,7 @@ fn respond_provider_probe_error(route: &LoginRoute, provider: &str, error: Catal
             "custom provider returned an empty model list".to_owned(),
             false,
         ),
-        CatalogError::Unavailable { reason } => {
+        CatalogError::Unavailable { reason } | CatalogError::Unsupported { reason } => {
             (ProviderProbeFailureWire::Unavailable, reason, false)
         }
         CatalogError::NotModified => (
@@ -5327,8 +6075,10 @@ async fn handle_provider_configure(
     mut job: ProviderConfigureJob,
 ) {
     let ProviderConfigureContext {
+        profile_id,
         store,
         accounts,
+        snapshot,
         vault,
         management,
         providers,
@@ -5350,6 +6100,9 @@ async fn handle_provider_configure(
     let mut previous_auth_requirement = providers
         .get(&job.input.provider)
         .map(|profile| profile.auth_requirement);
+    let mut previous_origin = providers
+        .get(&job.input.provider)
+        .and_then(|profile| profile.base_url.clone());
     let preflight = store
         .management_receipt_preflight::<ProviderReceipt>(
             job.command_id.clone(),
@@ -5367,6 +6120,7 @@ async fn handle_provider_configure(
     }
     let mut accepted_revision_unchanged = None;
     let mut recovered_catalog = None;
+    let mut catalog_producer = None;
     match preflight {
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
             respond(
@@ -5382,9 +6136,20 @@ async fn handle_provider_configure(
             recovery_json: Some(recovery),
         })) => match serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
             Ok(recovery) => {
-                job.input = recovery.input;
+                // The request identity is the only trusted explicit model
+                // list in a legacy receipt without producer provenance.
+                job.input = if recovery.catalog_producer.is_some() {
+                    recovery.input
+                } else {
+                    identity.input.clone()
+                };
                 previous_auth_requirement = recovery.previous_auth_requirement;
-                if let Some(models) = recovery.discovered_models {
+                previous_origin = recovery.previous_origin;
+                catalog_producer = recovery.catalog_producer;
+                if let Some(models) = recovery
+                    .discovered_models
+                    .filter(|_| catalog_producer.is_some())
+                {
                     recovered_catalog = Some(DiscoveredCatalog {
                         models,
                         etag: recovery.discovered_etag,
@@ -5494,31 +6259,10 @@ async fn handle_provider_configure(
                 .as_ref()
                 .is_none_or(|profile| matches!(profile.provenance, ProviderProvenance::Custom))
         {
-            // A non-empty inventory means the card has already probed, or
-            // explicitly chosen a manual fallback. Preserve that inventory
-            // through the durable cache/recovery path. Empty means
-            // post-commit discovery is still pending, never a successful
-            // fetch of zero rows.
-            let models = job
-                .input
-                .models
-                .iter()
-                .map(|slug| haider_provider::DiscoveredModel {
-                    slug: slug.clone(),
-                    display_name: slug.clone(),
-                    context_window: None,
-                    max_output_tokens: None,
-                    description: None,
-                    default_effort: None,
-                    supported_efforts: Vec::new(),
-                    visible: true,
-                    priority: None,
-                    use_responses_lite: None,
-                    extensions: None,
-                })
-                .collect();
+            // An explicit list is durable provider configuration, not a
+            // fetched catalog owned by whichever credential is active now.
+            // Empty means post-commit discovery remains pending.
             discovered_slugs = Some(job.input.models.clone());
-            discovered_catalog = Some(DiscoveredCatalog { models, etag: None });
         }
         if should_discover {
             let Some(origin) = origin else {
@@ -5662,10 +6406,26 @@ async fn handle_provider_configure(
                         .cloned()
                 })
                 .or_else(|| slugs.first().cloned());
-            job.input.models = slugs.clone();
-            job.input.default_model = selected_default;
-            discovered_slugs = Some(slugs);
-            discovered_catalog = Some(catalog);
+            if job.probe_secret.is_some() {
+                // A staged secret is only a probe. It has no committed account
+                // incarnation, so its private rows cannot become the active
+                // account's fetched inventory or durable catalog.
+                discovered_slugs = Some(job.input.models.clone());
+            } else {
+                catalog_producer = auth_requirement.and_then(|auth| {
+                    configure_catalog_producer(
+                        profile_id,
+                        &job.input.provider,
+                        Some(origin),
+                        auth,
+                        accounts,
+                    )
+                });
+                job.input.models = slugs.clone();
+                job.input.default_model = selected_default;
+                discovered_slugs = Some(slugs);
+                discovered_catalog = Some(catalog);
+            }
         }
     }
     let custom_repoint = providers.get(&job.input.provider).is_some_and(|profile| {
@@ -5699,10 +6459,7 @@ async fn handle_provider_configure(
         discovered_catalog = None;
     }
     let revision_unchanged_response = if revision_unchanged {
-        match providers.summary(
-            &job.input.provider,
-            &provider_credential_ready_for_summary(accounts),
-        ) {
+        match catalog_summary(&job.input.provider, accounts, providers) {
             Some(provider) => Some(ProviderReceipt {
                 provider,
                 revision_unchanged: true,
@@ -5725,12 +6482,14 @@ async fn handle_provider_configure(
     let recovery_json = match serde_json::to_string(&ProviderConfigureRecovery {
         input: job.input.clone(),
         previous_auth_requirement,
+        previous_origin: previous_origin.clone(),
         discovered_models: discovered_catalog
             .as_ref()
             .map(|catalog| catalog.models.clone()),
         discovered_etag: discovered_catalog
             .as_ref()
             .and_then(|catalog| catalog.etag.clone()),
+        catalog_producer: catalog_producer.clone(),
         revision_unchanged,
         revision_unchanged_response,
     }) {
@@ -5772,8 +6531,14 @@ async fn handle_provider_configure(
             recovery_json: Some(recovery),
         }) => {
             if let Ok(recovery) = serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
-                job.input = recovery.input;
+                job.input = if recovery.catalog_producer.is_some() {
+                    recovery.input
+                } else {
+                    identity.input.clone()
+                };
                 previous_auth_requirement = recovery.previous_auth_requirement;
+                previous_origin = recovery.previous_origin;
+                catalog_producer = recovery.catalog_producer;
                 revision_unchanged = recovery.revision_unchanged;
             }
         }
@@ -5803,6 +6568,24 @@ async fn handle_provider_configure(
         }
     } else {
         let configured = match discovered_slugs.as_deref() {
+            Some(inventory) if catalog_producer.is_some() => {
+                // A resumed discovery receipt carries fetched slugs in its
+                // recovery input. Only the original caller's deployments
+                // are permanent configuration, on both live and startup replay.
+                job.input.models = identity.input.models.clone();
+                let retired = catalog_producer.as_ref().is_some_and(|producer| {
+                    configure_catalog_producer(
+                        profile_id,
+                        &producer.provider,
+                        producer.origin.as_deref(),
+                        producer.auth,
+                        accounts,
+                    )
+                    .as_ref()
+                        != Some(producer)
+                });
+                providers.reconcile_discovered_configure(job.input, inventory, retired)
+            }
             Some(inventory) => providers.configure_with_inventory(job.input, inventory),
             None => providers.configure(job.input),
         };
@@ -5814,6 +6597,42 @@ async fn handle_provider_configure(
             }
         }
     };
+    let configuration_boundary = !revision_unchanged
+        && (previous_origin != profile.base_url
+            || previous_auth_requirement.is_some_and(|auth| auth != profile.auth_requirement));
+    if configuration_boundary {
+        // The profile JSON may already be durable. Hide its prior fetched
+        // rows even if reserving a new incarnation or pruning then fails;
+        // receipt recovery completes the boundary before restart hydration.
+        providers.clear_discovered_models(&profile.provider_id);
+        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
+        // The JSON save has committed. Admission readers must lose the old
+        // inventory before any remaining fallible write, including journaling.
+        // Receipt finalization still owns the durable revision advance.
+        publish_management_snapshot_with_inventory(
+            snapshot,
+            management,
+            accounts,
+            providers,
+            management
+                .and_then(|view| view.inspect(|view| view.revision))
+                .unwrap_or(job.expected_revision),
+        );
+        if let Err(error) = mint_provider_incarnations(accounts, &profile.provider_id) {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        reconcile_catalog_selection_scope(&profile.provider_id, accounts, providers);
+        refresh_resolver_snapshot(snapshot, accounts);
+        if let Err(error) = store
+            .delete_provider_models(profile.provider_id.clone())
+            .await
+        {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        prune_catalog_cache(store, accounts, providers).await;
+    }
     let auth_event_revision = if let Some((previous, auth_requirement)) = auth_change {
         let Some(anticipated_revision) = job.expected_revision.checked_add(1) else {
             respond_management_error(
@@ -5843,7 +6662,18 @@ async fn handle_provider_configure(
     } else {
         None
     };
-    if let Some(catalog) = discovered_catalog {
+    if catalog_producer.as_ref().is_some_and(|producer| {
+        configure_catalog_producer(
+            profile_id,
+            &profile.provider_id,
+            profile.base_url.as_deref(),
+            profile.auth_requirement,
+            accounts,
+        )
+        .as_ref()
+            == Some(producer)
+    }) && let Some(catalog) = discovered_catalog
+    {
         let models_json = match serde_json::to_string(&catalog.models) {
             Ok(models_json) => models_json,
             Err(error) => {
@@ -5877,10 +6707,7 @@ async fn handle_provider_configure(
         );
     }
     prune_catalog_cache(store, accounts, providers).await;
-    let Some(provider) = providers.summary(
-        &profile.provider_id,
-        &provider_credential_ready_for_summary(accounts),
-    ) else {
+    let Some(provider) = catalog_summary(&profile.provider_id, accounts, providers) else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -5928,7 +6755,7 @@ async fn handle_provider_configure(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     if discover_after_commit
@@ -6105,7 +6932,7 @@ async fn handle_provider_remove(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     respond(
@@ -6227,7 +7054,7 @@ async fn handle_provider_set_trust(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     respond(
@@ -6457,13 +7284,14 @@ const fn provider_auth_label(auth: ProviderAuthRequirementWire) -> &'static str 
 /// commit-order and ownership laws this implements.
 #[allow(clippy::too_many_arguments)]
 async fn handle_login(
+    refresh_fences: &RefreshFenceRegistry,
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     validator: &dyn CredentialValidator,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     _profile_id: &str,
     default_model: &str,
     pending: &mut HashMap<String, PendingSecret>,
@@ -6699,7 +7527,10 @@ async fn handle_login(
     };
     match validation {
         Ok(validated) => {
-            let replacing = replace_existing || accounts.get(&alias).is_some();
+            // Replacement permission also covers re-enrollment after a
+            // no-auth update removed this alias. Only an existing descriptor
+            // uses the replace operation.
+            let replacing = accounts.get(&alias).is_some();
             let before = accounts.list().to_vec();
             let prior_secret = if replacing {
                 vault.resolve(&alias).ok()
@@ -6709,6 +7540,20 @@ async fn handle_login(
             let same_key = prior_secret
                 .as_ref()
                 .is_some_and(|prior| bool::from(prior.expose_secret().ct_eq(secret.as_ref())));
+            if let Err(error) =
+                refresh_fences.bind_legacy_api_key(accounts.get(&alias), prior_secret.as_ref())
+            {
+                respond_management_error(&route, &error);
+                return;
+            }
+            // Deny inference/discovery reads until descriptor publication or rollback.
+            let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    respond_management_error(&route, &error);
+                    return;
+                }
+            };
             // Keychain first (R10 step 9).
             if let Err(error) = vault.put(&alias, &secret) {
                 pending.insert(
@@ -6742,14 +7587,16 @@ async fn handle_login(
                         .and_then(|descriptor| descriptor.account_identity.as_ref()),
                 );
             }
+            let credential_digest = blake3::hash(&secret).to_hex().to_string();
             drop(secret);
             pending.remove(&command_id);
-            let descriptor = descriptor_for(
+            let mut descriptor = descriptor_for(
                 &identity,
                 &alias,
                 Some(validated.identity),
                 Some(account_identity),
             );
+            descriptor.credential_digest = Some(credential_digest);
             let descriptor_result = if replacing {
                 accounts.replace(descriptor)
             } else {
@@ -6914,12 +7761,13 @@ impl OAuthAddIdentity {
 /// Neither it nor the ready reference is ever serialized into SQLite.
 #[allow(clippy::too_many_arguments)]
 async fn handle_oauth_add(
+    refresh_fences: &RefreshFenceRegistry,
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     _profile_id: &str,
     reserved_aliases: &HashSet<String>,
@@ -7089,12 +7937,20 @@ async fn handle_oauth_add(
         return;
     }
     let before = accounts.list().to_vec();
+    let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+        Ok(guard) => guard,
+        Err(error) => {
+            respond_management_error(&route, &error);
+            return;
+        }
+    };
     if let Err(error) = persist_oauth_bundle(
         accounts,
         Arc::clone(&vault),
         &identity.provider,
         &alias,
         claim.bundle,
+        None,
         None,
     )
     .await
@@ -7195,7 +8051,7 @@ async fn handle_device_import(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
@@ -7380,7 +8236,7 @@ async fn handle_gcloud_import(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     job: DeviceImportJob,
 ) {
@@ -7459,6 +8315,8 @@ async fn handle_gcloud_import(
             })
     } else {
         accounts.add(CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: alias.clone(),
             provider: haider_provider::VERTEX_PROVIDER_NAME.to_owned(),
             base_url: None,
@@ -7496,7 +8354,7 @@ async fn handle_gcloud_import(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     let Some(descriptor) = accounts.get(&alias).cloned() else {
@@ -7526,7 +8384,7 @@ async fn handle_oauth_import_heal(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
@@ -7845,7 +8703,7 @@ async fn handle_oauth_import(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     pending_catalog_discoveries: &mut AutomaticCatalogDiscoveryQueue,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
@@ -8136,12 +8994,19 @@ async fn handle_oauth_import(
         );
         return;
     }
+    let imported_source_digest = blake3::Hash::from_bytes(imported.source_fingerprint)
+        .to_hex()
+        .to_string();
     if resume
         && let Some(prior) = prior_bundle.as_ref()
         && same_oauth_import(prior, &imported.bundle)
+        && replacing
+            .as_ref()
+            .and_then(|row| row.credential_digest.as_deref())
+            == Some(imported_source_digest.as_str())
     {
         let before = accounts.list().to_vec();
-        let descriptor = oauth_descriptor_for(
+        let mut descriptor = oauth_descriptor_for(
             spec.provider,
             &alias,
             prior,
@@ -8149,6 +9014,12 @@ async fn handle_oauth_import(
                 .as_ref()
                 .is_some_and(|descriptor| descriptor.active)
                 || accounts.active_for_provider(spec.provider).is_none(),
+        );
+        descriptor.credential_digest = Some(
+            replacing
+                .as_ref()
+                .and_then(|previous| previous.credential_digest.clone())
+                .unwrap_or(imported_source_digest),
         );
         let committed = if replacing.is_some() {
             accounts.replace(descriptor)
@@ -8186,6 +9057,19 @@ async fn handle_oauth_import(
     if replacing.is_some() {
         refresh_fences.invalidate(&alias);
     }
+    if let Err(error) =
+        refresh_fences.bind_legacy_api_key(accounts.get(&alias), prior_secret.as_ref())
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let _credential_write = match refresh_fences.begin_credential_write(&alias) {
+        Ok(guard) => guard,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
     if let Err(error) = persist_oauth_import_material(
         accounts,
         Arc::clone(&vault),
@@ -8387,6 +9271,7 @@ async fn persist_oauth_bundle(
     alias: &CredentialAlias,
     bundle: haider_accounts::OAuthTokenBundleV1,
     prior_secret: Option<SecretHandle>,
+    intake_digest: Option<String>,
 ) -> Result<(), HaiderError> {
     // The STORE is the authority on whether the descriptor row exists —
     // not `prior_secret`. A vanished prior secret (a Keychain→file-vault
@@ -8399,7 +9284,10 @@ async fn persist_oauth_bundle(
         || accounts.active_for_provider(provider).is_none(),
         |descriptor| descriptor.active,
     );
-    let descriptor = oauth_descriptor_for(provider, alias, &bundle, active);
+    let mut descriptor = oauth_descriptor_for(provider, alias, &bundle, active);
+    if let Some(digest) = intake_digest {
+        descriptor.credential_digest = Some(digest);
+    }
     let encoded = bundle.encode()?;
     let vault_for_put = Arc::clone(&vault);
     let alias_for_put = alias.clone();
@@ -8445,6 +9333,9 @@ async fn persist_oauth_import_material(
     material: OAuthImportMaterial,
     prior_secret: Option<SecretHandle>,
 ) -> Result<(), HaiderError> {
+    let intake_digest = blake3::Hash::from_bytes(material.source_fingerprint)
+        .to_hex()
+        .to_string();
     let Some(device_id) = material.kimi_device_id else {
         return persist_oauth_bundle(
             accounts,
@@ -8453,6 +9344,7 @@ async fn persist_oauth_import_material(
             alias,
             material.bundle,
             prior_secret,
+            Some(intake_digest),
         )
         .await;
     };
@@ -8483,6 +9375,7 @@ async fn persist_oauth_import_material(
         alias,
         material.bundle,
         prior_secret,
+        Some(intake_digest),
     )
     .await
     {
@@ -8521,6 +9414,8 @@ fn oauth_descriptor_for(
     active: bool,
 ) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: Some(oauth_credential_digest(bundle)),
         alias: alias.clone(),
         provider: provider.to_owned(),
         base_url: None,
@@ -8534,6 +9429,24 @@ fn oauth_descriptor_for(
         // preserves the prior value, including None for pre-964 rows.
         created_at_ms: None,
     }
+}
+
+/// Compare the credential bytes that an OAuth intake can actually reuse.
+/// Bundle generation and capture time are bookkeeping, while a changed
+/// refresh or ID token is a changed credential even if the access token is
+/// coincidentally identical.
+fn oauth_credential_digest(bundle: &haider_accounts::OAuthTokenBundleV1) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(&(bundle.access_token().len() as u64).to_le_bytes());
+    digest.update(bundle.access_token());
+    for optional in [bundle.refresh_token(), bundle.id_token()] {
+        digest.update(&[u8::from(optional.is_some())]);
+        if let Some(bytes) = optional {
+            digest.update(&(bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+    }
+    digest.finalize().to_hex().to_string()
 }
 
 #[derive(Clone, Copy)]
@@ -8612,7 +9525,7 @@ async fn finalize_oauth_commit(
             return;
         }
     };
-    publish_management_snapshot(snapshot, management, accounts, revision);
+    publish_management_snapshot_with_inventory(snapshot, management, accounts, providers, revision);
     enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
     match response {
         OAuthCommitResponse::Add => respond(route, ResponseBody::AccountAdd { descriptor }),
@@ -8629,6 +9542,8 @@ fn descriptor_for(
     account_identity: Option<AccountIdentity>,
 ) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: identity.provider.clone(),
         base_url: None,
@@ -8738,7 +9653,7 @@ async fn finalize_and_respond(
         management.publish(
             revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(accounts)),
+            catalog_summaries(accounts, providers),
         );
     }
     enqueue_catalog_discovery(&descriptor.provider, providers, pending_catalog_discoveries);
@@ -8999,6 +9914,7 @@ impl From<&DiscoveredModel> for AccountProviderCatalogModelCacheKey {
 /// resolver implementations remain constructor constants in one process.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct AccountProviderAdapterCacheKey {
+    incarnation: u64,
     provider: String,
     alias: CredentialAlias,
     account_identity: String,
@@ -9023,6 +9939,7 @@ impl AccountProviderAdapterCacheKey {
         gemini_cache_registry: &Arc<haider_provider::GeminiCacheRegistry>,
     ) -> Self {
         Self {
+            incarnation: descriptor.incarnation,
             provider: descriptor.provider.clone(),
             alias: descriptor.alias.clone(),
             account_identity: descriptor.identity.clone(),
@@ -9955,6 +10872,7 @@ pub(crate) struct AccountsProviderFactory {
     broker: Option<CredentialBroker>,
     gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
     resilience: AccountsResilienceConfig,
+    resilience_catalog_scopes: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -9966,6 +10884,14 @@ pub(crate) struct AccountsResilienceConfig {
 struct ReadOnlySnapshotStore(Vec<CredentialDescriptor>);
 
 impl StoreLike for ReadOnlySnapshotStore {
+    fn reserve_incarnation(&self, _floor: u64) -> Result<u64, HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::StoreLocked,
+            "read-only account snapshot cannot reserve an incarnation",
+            false,
+        ))
+    }
+
     fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
         Ok(self.0.clone())
     }
@@ -9997,6 +10923,7 @@ impl AccountsProviderFactory {
             broker: None,
             gemini_cache_registry: Arc::default(),
             resilience: AccountsResilienceConfig::default(),
+            resilience_catalog_scopes: HashMap::new(),
         }
     }
 
@@ -10016,6 +10943,7 @@ impl AccountsProviderFactory {
             broker: Some(broker),
             gemini_cache_registry: Arc::default(),
             resilience: AccountsResilienceConfig::default(),
+            resilience_catalog_scopes: HashMap::new(),
         }
     }
 
@@ -10034,6 +10962,7 @@ impl AccountsProviderFactory {
             broker: None,
             gemini_cache_registry: Arc::default(),
             resilience: AccountsResilienceConfig::default(),
+            resilience_catalog_scopes: HashMap::new(),
         }
     }
 
@@ -10053,12 +10982,100 @@ impl AccountsProviderFactory {
             broker: Some(broker),
             gemini_cache_registry: Arc::default(),
             resilience: AccountsResilienceConfig::default(),
+            resilience_catalog_scopes: HashMap::new(),
         }
     }
 
     pub(crate) fn with_resilience(mut self, resilience: AccountsResilienceConfig) -> Self {
+        self.resilience_catalog_scopes = resilience
+            .fallback_chain
+            .iter()
+            .chain(resilience.promotion_targets.values())
+            .map(|target| {
+                (
+                    target.provider.clone(),
+                    self.catalog_owner_key(&target.provider),
+                )
+            })
+            .collect();
         self.resilience = resilience;
         self
+    }
+
+    fn active_catalog_incarnation(&self, provider: &str) -> Option<(CredentialAlias, u64)> {
+        self.snapshot
+            .lock()
+            .ok()?
+            .iter()
+            .find(|row| row.provider == provider && row.active)
+            .map(|row| (row.alias.clone(), row.incarnation))
+    }
+
+    fn resilience_model_is_current(&self, profile: &ProviderSummaryWire, model: &str) -> bool {
+        let permanent = profile.configured_models.iter().any(|row| row == model)
+            || profile.static_models.iter().any(|row| row == model)
+            || profile.model_details.iter().any(|row| {
+                row.name == model
+                    && matches!(
+                        row.source,
+                        Some(
+                            haider_rpc::ModelDetailSourceWire::Static
+                                | haider_rpc::ModelDetailSourceWire::Configured
+                        )
+                    )
+            });
+        permanent || self.resilience_scope_is_current(&profile.provider)
+    }
+
+    fn catalog_owner_key(&self, provider: &str) -> Option<String> {
+        let profile = self.provider_profile(provider);
+        if let Some(scope) = profile
+            .as_ref()
+            .and_then(|profile| profile.catalog_scope.as_ref())
+        {
+            return Some(scope.key.clone());
+        }
+        self.unscoped_catalog_owner_key(provider, profile.as_ref())
+    }
+
+    fn unscoped_catalog_owner_key(
+        &self,
+        provider: &str,
+        profile: Option<&ProviderSummaryWire>,
+    ) -> Option<String> {
+        if profile.is_some_and(|profile| {
+            matches!(
+                profile.catalog,
+                haider_rpc::ProviderCatalogKindWire::Public
+                    | haider_rpc::ProviderCatalogKindWire::Offline
+            )
+        }) {
+            return Some(format!("public:{provider}"));
+        }
+        // Compatibility for injected/older management snapshots without the
+        // additive producer key. Production scopes include origin and auth.
+        self.active_catalog_incarnation(provider)
+            .map(|(alias, incarnation)| format!("{alias}:{incarnation}"))
+    }
+
+    fn resilience_scope_is_current(&self, provider: &str) -> bool {
+        let profile = self.provider_profile(provider);
+        let current = if let Some(profile) = profile
+            .as_ref()
+            .filter(|profile| profile.catalog_scope.is_some())
+        {
+            self.snapshot.lock().ok().and_then(|rows| {
+                let descriptor = rows
+                    .iter()
+                    .find(|row| row.provider == provider && row.active);
+                Self::descriptor_catalog_key(profile, descriptor)
+            })
+        } else {
+            self.unscoped_catalog_owner_key(provider, profile.as_ref())
+        };
+        self.resilience_catalog_scopes
+            .get(provider)
+            .is_some_and(|scope| scope.is_some() && *scope == current)
     }
 
     /// Shares the daemon's typed durable-catalog projection with per-turn
@@ -10080,6 +11097,111 @@ impl AccountsProviderFactory {
             .providers
             .into_iter()
             .find(|profile| profile.provider == provider)
+    }
+
+    /// Recompute the opaque producer coordinate for the actual credential,
+    /// including inactive session-pinned aliases. Never borrow the active
+    /// account's inventory just because both accounts use the same provider.
+    fn descriptor_catalog_key(
+        profile: &ProviderSummaryWire,
+        descriptor: Option<&CredentialDescriptor>,
+    ) -> Option<String> {
+        profile.catalog_scope.as_ref()?;
+        let auth = if profile.auth_methods.contains(&AuthMethod::OAuth) {
+            ProviderAuthRequirementWire::OAuth
+        } else if profile.auth_methods.contains(&AuthMethod::ApiKey) {
+            ProviderAuthRequirementWire::ApiKey
+        } else if profile.auth_methods.is_empty() {
+            ProviderAuthRequirementWire::None
+        } else {
+            return None;
+        };
+        let cache_auth = if profile.catalog == haider_rpc::ProviderCatalogKindWire::Public {
+            ProviderAuthRequirementWire::None
+        } else {
+            auth
+        };
+        let cache_key = catalog_cache_key(&profile.provider, cache_auth, descriptor)?;
+        let key = format!(
+            "{}|{:?}|{:?}",
+            String::from(cache_key),
+            auth,
+            profile.endpoint
+        );
+        Some(blake3::hash(key.as_bytes()).to_hex().to_string())
+    }
+
+    fn automatic_model_selection(
+        profile: &ProviderSummaryWire,
+        model: &str,
+        current: &haider_protocol::session::SessionMetadataV1,
+    ) -> Option<(
+        Option<String>,
+        haider_protocol::output_budget::SessionOutputBudgetV1,
+    )> {
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![profile.clone()]));
+        // Automatic routing has already checked target availability and credentials.
+        let selection = authority
+            .validate_selection_with_status(&profile.provider, None, model)
+            .ok()?;
+        let budget = crate::session_hub::rpc::reapply_session_output_budget(current, &selection);
+        let key = authority
+            .model_catalog_key(&profile.provider, model)
+            .or_else(|| authority.model_settings_catalog_key(&profile.provider, model, &budget));
+        Some((key, budget))
+    }
+
+    fn admit_catalog_key(
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        current: Option<String>,
+    ) -> Result<(), HaiderError> {
+        if metadata
+            .model_catalog_key
+            .as_ref()
+            .is_some_and(|expected| current.as_ref() != Some(expected))
+        {
+            let mut error = HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "saved catalog-derived model belongs to a retired account or endpoint; explicitly reselect a model",
+                false,
+            );
+            error.details = Some(serde_json::json!({"requires_model_reselection": true,
+                "provider": metadata.provider, "model": metadata.model}));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn inventory_requires_current_producer(profile: &ProviderSummaryWire) -> bool {
+        profile.catalog_scope.is_some()
+            && (!profile.configured_models.is_empty()
+                || (matches!(
+                    profile.catalog,
+                    haider_rpc::ProviderCatalogKindWire::Public
+                        | haider_rpc::ProviderCatalogKindWire::Authenticated
+                ) && profile.inventory_authority
+                    == haider_rpc::ModelInventoryAuthorityWire::Authoritative))
+    }
+
+    fn admit_inventory_producer(
+        profile: &ProviderSummaryWire,
+        current: Option<&str>,
+    ) -> Result<(), HaiderError> {
+        if Self::inventory_requires_current_producer(profile)
+            && profile
+                .catalog_scope
+                .as_ref()
+                .map(|scope| scope.key.as_str())
+                != current
+        {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "model inventory belongs to a different account or endpoint; refresh models before using this selection",
+                true,
+            ));
+        }
+        Ok(())
     }
 
     /// Persistence is not catalog admission. This is shared by ordinary /
@@ -10107,6 +11229,62 @@ impl AccountsProviderFactory {
             // Test/injected factories may have no management authority.
             None => Vec::new(),
         };
+        let profile = summaries
+            .iter()
+            .find(|summary| summary.provider == metadata.provider);
+        if self.management.is_some() && profile.is_none() {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "provider was removed",
+                false,
+            ));
+        }
+        // Even an explicitly configured model can borrow fetched eligibility:
+        // Configured providers share discovery availability, and authoritative
+        // inventories require membership. Account and inventory snapshots are
+        // published separately, so fence that eligibility against the actual
+        // credential and route before using either snapshot's result.
+        let borrows_inventory = profile.is_some_and(Self::inventory_requires_current_producer);
+        if metadata.model_catalog_key.is_some() || borrows_inventory {
+            let descriptors = self.snapshot.lock().map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "account snapshot is unavailable",
+                    true,
+                )
+            })?;
+            let descriptor = descriptors.iter().find(|row| {
+                row.provider == metadata.provider
+                    && metadata
+                        .account_alias
+                        .as_ref()
+                        .map_or(row.active, |alias| row.alias.as_str() == alias)
+            });
+            let current = profile.and_then(|profile| {
+                let mut routed = profile.clone();
+                if let Some(origin) = &metadata.provider_base_url {
+                    routed.endpoint = Some(origin.clone());
+                }
+                Self::descriptor_catalog_key(&routed, descriptor)
+            });
+            Self::admit_catalog_key(metadata, current.clone())?;
+            if let Some(profile) = profile {
+                Self::admit_inventory_producer(profile, current.as_deref())?;
+            }
+        }
+
+        if let Some(summary) = summaries.iter().find(|summary| {
+            summary.provider == metadata.provider
+                && !summary.model_is_selectable(metadata.model_coordinate())
+        }) {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                summary
+                    .selection_reason(Some(metadata.model_coordinate()))
+                    .unwrap_or_else(|| "configured deployment requires a model-list fetch".into()),
+                true,
+            ));
+        }
         let remote_authority = summaries.iter().any(|summary| {
             summary.provider == metadata.provider
                 && matches!(
@@ -10120,11 +11298,16 @@ impl AccountsProviderFactory {
         if !remote_authority {
             return Ok(());
         }
-        let authority = crate::model_select::ModelSelectionAuthority::new(None, summaries);
+        let authority = crate::model_select::ModelSelectionAuthority::new(
+            None,
+            self.management.as_ref().map(|_| summaries),
+        );
+        // Only a recorded creation resolution can authorize a different saved
+        // spelling. Legacy implicit aliases still require explicit reselection.
         let selection = authority
-            .validate_selection_with_status(&metadata.provider, None, &metadata.model)
+            .validate_selection_with_status(&metadata.provider, None, metadata.model_coordinate())
             .and_then(|selection| {
-                if selection.model == metadata.model {
+                if selection.model == metadata.model_coordinate() {
                     Ok(selection)
                 } else {
                     Err(crate::model_select::SelectionRefusal::ModelUnknown {
@@ -10193,11 +11376,21 @@ impl AccountsProviderFactory {
                 target_profile.availability,
                 ProviderAvailabilityWire::Available
             )
+            || (matches!(
+                target_profile.inventory,
+                haider_rpc::ModelInventoryWire::Configured
+            ) && matches!(
+                target_profile.inventory_authority,
+                haider_rpc::ModelInventoryAuthorityWire::Advisory
+            ))
         {
             return None;
         }
         let model = target.model.as_ref()?.clone();
-        if model == metadata.model {
+        if !target_profile.models.contains(&model)
+            || model == metadata.model
+            || !self.resilience_model_is_current(&target_profile, &model)
+        {
             return None;
         }
         let current_window = self.model_context_window(&metadata.provider, &metadata.model)?;
@@ -10215,6 +11408,12 @@ impl AccountsProviderFactory {
         let resolved = self.resolve_account(&target.provider, None).await.ok()?;
         let mut target_metadata = metadata.clone();
         target_metadata.model = model.clone();
+        target_metadata.resolved_model = None;
+        let (model_catalog_key, output_budget) =
+            Self::automatic_model_selection(&target_profile, &model, metadata)?;
+        target_metadata.model_catalog_key = model_catalog_key.clone();
+        target_metadata.max_tokens = output_budget.max_tokens;
+        target_metadata.max_tokens_source = Some(output_budget.source);
         let tuning = provider_tuning_with_web_degrade(&target_metadata, web_degrade);
         let (provider, oauth_access_fingerprint) = self
             .build_attempt_provider(&resolved.descriptor, &target_metadata, &tuning)
@@ -10244,9 +11443,12 @@ impl AccountsProviderFactory {
         )
         .with_web_degrade(web_degrade);
         Some(haider_core::ProviderPairSwitchTarget {
+            model_catalog_key,
+            output_budget: Some(output_budget),
             provider,
             account: resolved.descriptor.alias,
-            account_incarnation: resolved.descriptor.created_at_ms,
+            account_incarnation: (resolved.descriptor.incarnation != 0)
+                .then_some(resolved.descriptor.incarnation),
             provider_name: target.provider.clone(),
             model,
             context_window: Some(target_window),
@@ -10273,6 +11475,10 @@ impl AccountsProviderFactory {
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         self.admit_persisted_model(metadata)?;
         let mut profile = self.provider_profile(&descriptor.provider);
+        // A session route changes the effective origin, not the stored
+        // credential's producer coordinate. Keep that coordinate intact when
+        // projecting the route into the adapter descriptor below.
+        let catalog_descriptor = descriptor;
         let mut routed_descriptor;
         let descriptor = if let Some(base_url) = metadata.provider_base_url.as_ref() {
             routed_descriptor = descriptor.clone();
@@ -10284,9 +11490,44 @@ impl AccountsProviderFactory {
         } else {
             descriptor
         };
+        let current = profile
+            .as_ref()
+            .and_then(|profile| Self::descriptor_catalog_key(profile, Some(catalog_descriptor)));
+        Self::admit_catalog_key(metadata, current.clone())?;
+        if let Some(profile) = &profile {
+            Self::admit_inventory_producer(profile, current.as_deref())?;
+        }
+        let catalog_is_current = profile.as_ref().is_none_or(|profile| {
+            profile
+                .catalog_scope
+                .as_ref()
+                .is_none_or(|scope| current.as_ref() == Some(&scope.key))
+        });
+        if !catalog_is_current && let Some(profile) = profile.as_mut() {
+            profile.model_details.retain(|row| {
+                matches!(
+                    row.source,
+                    Some(
+                        haider_rpc::ModelDetailSourceWire::Static
+                            | haider_rpc::ModelDetailSourceWire::Configured
+                    )
+                )
+            });
+            profile
+                .models
+                .retain(|model| profile.model_details.iter().any(|row| &row.name == model));
+            if profile
+                .default_model
+                .as_ref()
+                .is_some_and(|model| !profile.models.contains(model))
+            {
+                profile.default_model = None;
+            }
+        }
         let catalog_model = self
             .model_source
             .as_ref()
+            .filter(|_| catalog_is_current)
             .and_then(|source| source.models(&descriptor.provider))
             .and_then(|models| {
                 models
@@ -10357,6 +11598,8 @@ impl AccountsProviderFactory {
         }
         let base_url = profile.endpoint.clone()?;
         let descriptor = CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new(provider),
             provider: provider.to_owned(),
             base_url: Some(base_url),
@@ -10411,7 +11654,7 @@ impl AccountsProviderFactory {
                 false,
             ));
         };
-        let accounts = AccountStore::new(ReadOnlySnapshotStore(descriptors))?;
+        let accounts = AccountStore::new_read_only(ReadOnlySnapshotStore(descriptors))?;
         let active = accounts
             .active_for_provider(provider)
             .cloned()
@@ -10537,6 +11780,12 @@ impl AccountsProviderFactory {
             self.builder.retain_agent_owned_aliases(&live);
         }
         let profile = self.provider_profile(&descriptor.provider);
+        Self::admit_catalog_key(
+            metadata,
+            profile
+                .as_ref()
+                .and_then(|profile| Self::descriptor_catalog_key(profile, Some(descriptor))),
+        )?;
         self.builder
             .build_agent_owned(profile.as_ref(), descriptor, &metadata.model, &metadata.cwd)
     }
@@ -10561,7 +11810,16 @@ impl AccountsProviderFactory {
                     false,
                 ));
             };
-            vault.resolve(&descriptor.alias)
+            if !crate::oauth::api_key_descriptor_is_current(&self.snapshot, descriptor) {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "credential changed while resolving the account; retry",
+                    true,
+                ));
+            }
+            let secret = vault.resolve(&descriptor.alias)?;
+            crate::oauth::validate_api_key_secret(descriptor, &secret)?;
+            Ok(secret)
         }
     }
 
@@ -10983,7 +12241,8 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             haider_core::ResolvedProviderAttempt {
                 provider,
                 account: resolved.descriptor.alias,
-                account_incarnation: resolved.descriptor.created_at_ms,
+                account_incarnation: (resolved.descriptor.incarnation != 0)
+                    .then_some(resolved.descriptor.incarnation),
                 rotation,
             },
         ))
@@ -11034,6 +12293,13 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 !profile.enabled
                     || profile.trust != haider_rpc::ProviderTrustWire::Full
                     || !matches!(profile.availability, ProviderAvailabilityWire::Available)
+                    || (matches!(
+                        profile.inventory,
+                        haider_rpc::ModelInventoryWire::Configured
+                    ) && matches!(
+                        profile.inventory_authority,
+                        haider_rpc::ModelInventoryAuthorityWire::Advisory
+                    ))
             }) {
                 continue;
             }
@@ -11047,11 +12313,29 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             let model = match entry
                 .model
                 .clone()
-                .or_else(|| target_profile.and_then(|profile| profile.default_model))
-            {
+                .filter(|model| {
+                    target_profile.as_ref().map_or_else(
+                        || {
+                            self.factory.management.is_none()
+                                && self.factory.resilience_scope_is_current(&entry.provider)
+                        },
+                        |profile| self.factory.resilience_model_is_current(profile, model),
+                    )
+                })
+                .or_else(|| {
+                    target_profile
+                        .as_ref()
+                        .and_then(|profile| profile.default_model.clone())
+                }) {
                 Some(model) if !model.trim().is_empty() => model,
                 _ => continue,
             };
+            if target_profile
+                .as_ref()
+                .is_some_and(|profile| !profile.models.contains(&model))
+            {
+                continue;
+            }
             let resolved = match self.factory.resolve_account(&entry.provider, None).await {
                 Ok(resolved) => resolved,
                 Err(_) => continue,
@@ -11059,6 +12343,25 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             let mut metadata = self.metadata.clone();
             metadata.provider = entry.provider.clone();
             metadata.model = model.clone();
+            metadata.resolved_model = None;
+            let selection = match target_profile.as_ref() {
+                Some(profile) => match AccountsProviderFactory::automatic_model_selection(
+                    profile,
+                    &model,
+                    &self.metadata,
+                ) {
+                    Some(selection) => Some(selection),
+                    None => continue,
+                },
+                None => None,
+            };
+            let model_catalog_key = selection.as_ref().and_then(|(key, _)| key.clone());
+            let output_budget = selection.map(|(_, budget)| budget);
+            metadata.model_catalog_key = model_catalog_key.clone();
+            if let Some(budget) = output_budget {
+                metadata.max_tokens = budget.max_tokens;
+                metadata.max_tokens_source = Some(budget.source);
+            }
             let tuning = provider_tuning_with_web_degrade(&metadata, self.web_degrade);
             let (provider, oauth_access_fingerprint) = match self
                 .factory
@@ -11095,9 +12398,12 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             .at_fallback_cursor(index);
             return Ok(haider_core::ProviderAttemptDecision::Switch(
                 haider_core::ProviderPairSwitchTarget {
+                    model_catalog_key,
+                    output_budget,
                     provider,
                     account: resolved.descriptor.alias,
-                    account_incarnation: resolved.descriptor.created_at_ms,
+                    account_incarnation: (resolved.descriptor.incarnation != 0)
+                        .then_some(resolved.descriptor.incarnation),
                     provider_name: entry.provider.clone(),
                     model,
                     context_window,
@@ -11126,6 +12432,15 @@ impl AccountsProviderFactory {
         tuning: ProviderTuning,
         web_degrade: crate::worker::WebCapabilityDegrade,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
+        self.admit_persisted_model(metadata)?;
+        // Keep the saved/public literal intact while every adapter, capability
+        // lookup and retry on this turn uses the admitted catalog coordinate.
+        let mut resolved_metadata = metadata.clone();
+        if let Some(model) = &metadata.resolved_model {
+            resolved_metadata.model = model.clone();
+            resolved_metadata.resolved_model = None;
+        }
+        let metadata = &resolved_metadata;
         let (resolved, provider, oauth_access_fingerprint, active_no_auth) =
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
@@ -11143,7 +12458,8 @@ impl AccountsProviderFactory {
             model: metadata.model.clone(),
             context_window,
             account_alias: Some(resolved.descriptor.alias.as_str().to_owned()),
-            account_incarnation: resolved.descriptor.created_at_ms,
+            account_incarnation: (resolved.descriptor.incarnation != 0)
+                .then_some(resolved.descriptor.incarnation),
             active_no_auth,
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,
@@ -11842,6 +13158,7 @@ async fn reconcile_set_active_receipts(
 
 async fn reconcile_provider_receipts(
     store: &SqliteStoreHandle,
+    profile_id: &str,
     accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Result<(), HaiderError> {
@@ -11928,79 +13245,93 @@ async fn reconcile_provider_receipts(
             }
             continue;
         }
-        let (profile, revision_unchanged, recovered_catalog, auth_change) = match row
-            .method
-            .as_str()
-        {
-            ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
-                let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
-                    .map_err(|error| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("pending default-model identity is invalid: {error}"),
-                            false,
-                        )
-                    })?;
-                (
-                    providers.reconcile_set_default_model(&identity.provider, &identity.model)?,
-                    false,
-                    None,
-                    None,
-                )
-            }
-            PROVIDER_SET_TRUST_METHOD => {
-                let identity: ProviderSetTrustIdentity = serde_json::from_str(&row.request_json)
-                    .map_err(|error| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("pending provider-trust identity is invalid: {error}"),
-                            false,
-                        )
-                    })?;
-                let recovery: ProviderSetTrustRecovery = row
-                    .recovery_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            "pending provider-trust receipt has no recovery coordinates",
-                            false,
-                        )
-                    })?;
-                commit_provider_trust(
-                    store,
-                    accounts,
-                    providers,
-                    &row.command_id,
-                    &identity,
-                    recovery.previous,
-                )
-                .await?;
-                continue;
-            }
-            PROVIDER_CONFIGURE_METHOD => {
-                let identity: ProviderConfigureIdentity = serde_json::from_str(&row.request_json)
-                    .map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        format!("pending provider-configure identity is invalid: {error}"),
-                        false,
+        let (profile, revision_unchanged, recovered_catalog, catalog_producer, auth_change) =
+            match row.method.as_str() {
+                ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
+                    let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
+                        .map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("pending default-model identity is invalid: {error}"),
+                                false,
+                            )
+                        })?;
+                    let profile = if let Some(json) = row.recovery_json.as_deref() {
+                        let recovery: SetDefaultModelRecovery = serde_json::from_str(json)
+                            .map_err(|error| {
+                                HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    format!("pending default-model recovery is invalid: {error}"),
+                                    false,
+                                )
+                            })?;
+                        let current =
+                            catalog_selection_scope(&identity.provider, accounts, providers);
+                        providers.restore_claimed_default_model(
+                            &identity.provider,
+                            &identity.model,
+                            recovery.catalog_selection_key,
+                            current,
+                        )?
+                    } else {
+                        providers
+                            .reconcile_set_default_model(&identity.provider, &identity.model)?
+                    };
+                    (profile, false, None, None, None)
+                }
+                PROVIDER_SET_TRUST_METHOD => {
+                    let identity: ProviderSetTrustIdentity =
+                        serde_json::from_str(&row.request_json).map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("pending provider-trust identity is invalid: {error}"),
+                                false,
+                            )
+                        })?;
+                    let recovery: ProviderSetTrustRecovery = row
+                        .recovery_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                "pending provider-trust receipt has no recovery coordinates",
+                                false,
+                            )
+                        })?;
+                    commit_provider_trust(
+                        store,
+                        accounts,
+                        providers,
+                        &row.command_id,
+                        &identity,
+                        recovery.previous,
                     )
-                })?;
-                let recovery: ProviderConfigureRecovery = row
-                    .recovery_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            "pending provider-configure receipt has no recovery coordinates",
-                            false,
-                        )
-                    })?;
-                let revision_unchanged = recovery.revision_unchanged;
-                let auth_change = recovery
+                    .await?;
+                    continue;
+                }
+                PROVIDER_CONFIGURE_METHOD => {
+                    let identity: ProviderConfigureIdentity =
+                        serde_json::from_str(&row.request_json).map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("pending provider-configure identity is invalid: {error}"),
+                                false,
+                            )
+                        })?;
+                    let recovery: ProviderConfigureRecovery = row
+                        .recovery_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                "pending provider-configure receipt has no recovery coordinates",
+                                false,
+                            )
+                        })?;
+                    let revision_unchanged = recovery.revision_unchanged;
+                    let auth_change = recovery
                     .previous_auth_requirement
                     .zip(recovery.input.auth_requirement)
                     .filter(|(previous, current)| previous != current)
@@ -12020,14 +13351,44 @@ async fn reconcile_provider_receipts(
                             })
                     })
                     .transpose()?;
-                let recovered_catalog =
-                    recovery.discovered_models.map(|models| DiscoveredCatalog {
-                        models,
-                        etag: recovery.discovered_etag,
+                    let catalog_producer = recovery.catalog_producer;
+                    let recovered_catalog = recovery
+                        .discovered_models
+                        .filter(|_| catalog_producer.is_some())
+                        .map(|models| DiscoveredCatalog {
+                            models,
+                            etag: recovery.discovered_etag,
+                        });
+                    let producer_current = catalog_producer.as_ref().is_some_and(|producer| {
+                        configure_catalog_producer(
+                            profile_id,
+                            &producer.provider,
+                            producer.origin.as_deref(),
+                            producer.auth,
+                            accounts,
+                        )
+                        .as_ref()
+                            == Some(producer)
                     });
-                let profile = if revision_unchanged {
-                    providers
-                        .get(&recovery.input.provider)
+                    let recovered_input = if producer_current {
+                        let mut input = recovery.input;
+                        // Only caller-stated rows are permanent configuration.
+                        input.models = identity.input.models;
+                        input
+                    } else {
+                        let mut input = identity.input;
+                        if catalog_producer.is_some() {
+                            // Fetched slugs in a retired recovery are not
+                            // explicit provider configuration.
+                            input.default_model = input
+                                .default_model
+                                .filter(|model| input.models.contains(model));
+                        }
+                        input
+                    };
+                    let profile = if revision_unchanged {
+                        providers
+                        .get(&recovered_input.provider)
                         .cloned()
                         .ok_or_else(|| {
                             HaiderError::new(
@@ -12036,53 +13397,78 @@ async fn reconcile_provider_receipts(
                                 false,
                             )
                         })?
-                } else {
-                    providers.reconcile_configure(recovery.input)?
-                };
-                (profile, revision_unchanged, recovered_catalog, auth_change)
-            }
-            PROVIDER_REMOVE_METHOD => {
-                let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
-                    .map_err(|error| {
-                        HaiderError::new(
+                    } else if producer_current {
+                        let slugs = recovered_catalog
+                            .as_ref()
+                            .map(|catalog| {
+                                catalog
+                                    .models
+                                    .iter()
+                                    .map(|row| row.slug.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        providers.reconcile_discovered_configure(recovered_input, &slugs, false)?
+                    } else if catalog_producer.is_some() {
+                        let explicit = recovered_input.models.clone();
+                        providers.reconcile_discovered_configure(
+                            recovered_input,
+                            &explicit,
+                            true,
+                        )?
+                    } else {
+                        providers.reconcile_configure(recovered_input)?
+                    };
+                    (
+                        profile,
+                        revision_unchanged,
+                        recovered_catalog,
+                        catalog_producer,
+                        auth_change,
+                    )
+                }
+                PROVIDER_REMOVE_METHOD => {
+                    let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
+                        .map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("provider-remove identity is invalid: {error}"),
+                                false,
+                            )
+                        })?;
+                    if latest_existence_mutation.get(&identity.provider) != Some(&index) {
+                        return Err(HaiderError::new(
                             ErrorCode::StoreCorrupt,
-                            format!("provider-remove identity is invalid: {error}"),
+                            format!(
+                                "pending provider-remove `{}` was superseded by a later mutation",
+                                row.command_id
+                            ),
                             false,
+                        ));
+                    }
+                    providers.reconcile_remove(&identity.provider)?;
+                    store
+                        .finalize_provider_remove_receipt(
+                            row.command_id,
+                            identity.provider.clone(),
+                            ProviderRemoveReceipt {
+                                provider: identity.provider,
+                            },
                         )
-                    })?;
-                if latest_existence_mutation.get(&identity.provider) != Some(&index) {
+                        .await?;
+                    continue;
+                }
+                _ => {
                     return Err(HaiderError::new(
                         ErrorCode::StoreCorrupt,
                         format!(
-                            "pending provider-remove `{}` was superseded by a later mutation",
-                            row.command_id
+                            "unexpected pending provider management method `{}`",
+                            row.method
                         ),
                         false,
                     ));
                 }
-                providers.reconcile_remove(&identity.provider)?;
-                store
-                    .finalize_provider_remove_receipt(
-                        row.command_id,
-                        identity.provider.clone(),
-                        ProviderRemoveReceipt {
-                            provider: identity.provider,
-                        },
-                    )
-                    .await?;
-                continue;
-            }
-            _ => {
-                return Err(HaiderError::new(
-                    ErrorCode::StoreCorrupt,
-                    format!(
-                        "unexpected pending provider management method `{}`",
-                        row.method
-                    ),
-                    false,
-                ));
-            }
-        };
+            };
         if let Some((provider, previous, auth_requirement, revision)) = auth_change {
             journal_provider_auth_changed(
                 store,
@@ -12094,7 +13480,18 @@ async fn reconcile_provider_receipts(
             )
             .await?;
         }
-        if let Some(catalog) = recovered_catalog {
+        if catalog_producer.as_ref().is_some_and(|producer| {
+            configure_catalog_producer(
+                profile_id,
+                &profile.provider_id,
+                profile.base_url.as_deref(),
+                profile.auth_requirement,
+                accounts,
+            )
+            .as_ref()
+                == Some(producer)
+        }) && let Some(catalog) = recovered_catalog
+        {
             let models_json = serde_json::to_string(&catalog.models).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::StoreCorrupt,
@@ -12116,12 +13513,8 @@ async fn reconcile_provider_receipts(
                 fetched_at_ms,
             );
         }
-        let summary = providers
-            .summary(
-                &profile.provider_id,
-                &provider_credential_ready_for_summary(accounts),
-            )
-            .ok_or_else(|| {
+        let summary =
+            catalog_summary(&profile.provider_id, accounts, providers).ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::StoreCorrupt,
                     "reconciled provider disappeared before receipt finalization",
@@ -12307,6 +13700,8 @@ fn reconcile_credential_sources(
                 };
                 let provider = source_provider(record.kind);
                 let descriptor = CredentialDescriptor {
+                    incarnation: 0,
+                    credential_digest: material.credential_digest,
                     alias: alias.clone(),
                     provider: provider.to_owned(),
                     base_url: None,
@@ -12328,6 +13723,19 @@ fn reconcile_credential_sources(
                 }
             }
             Err(failure) => {
+                if let Some(alias) = record.account_alias.as_deref().map(CredentialAlias::new)
+                    && accounts.get(&alias).is_some_and(|current| {
+                        (matches!(failure, crate::device_discovery::LinkedSourceReadFailure::SourceGone)
+                            && record.health != CredentialSourceHealth::SourceGone)
+                            || (matches!(failure, crate::device_discovery::LinkedSourceReadFailure::RequiresOriginClient)
+                                && record.kind == CredentialSourceKind::KimiCodeHome
+                                && current.credential_digest.is_some())
+                    })
+                {
+                    // Removal retires the source. A partial/unreadable write
+                    // retains its proof until it can be compared on recovery.
+                    accounts.invalidate_incarnation(&alias)?;
+                }
                 record.health = source_failure_health(failure);
                 if let Some(alias) = record.account_alias.as_deref().map(CredentialAlias::new)
                     && accounts.get(&alias).is_some()
@@ -12627,6 +14035,8 @@ fn import_bedrock_env_bearer(
         .ok()
         .map(|secret| api_key_identity(BEDROCK_PROVIDER_NAME, secret.expose_secret()));
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: alias.clone(),
         provider: BEDROCK_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -12658,6 +14068,7 @@ impl AccountsRuntime {
         default_model: &str,
         provider_names: &std::collections::BTreeSet<String>,
         discovery_disabled: bool,
+        injected_provider_names: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Self, HaiderError> {
         let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
@@ -12743,6 +14154,7 @@ impl AccountsRuntime {
         }
         // Explicit enrollments are independent of ambient discovery. The
         // discovery switch suppresses only auto-enrollment of default roots.
+        let startup_before = accounts.list().to_vec();
         reconcile_credential_sources(&mut source_registry, &mut accounts)?;
         let source_registry = Arc::new(StdMutex::new(source_registry));
         let source_snapshot: AccountSourcesSnapshot = Arc::new(StdMutex::new(
@@ -12759,37 +14171,10 @@ impl AccountsRuntime {
             initial_provider_profiles(provider_names, default_model),
             model_source.clone(),
         )?;
-        if !schema_bootstrapped_from_zero {
-            let provider_ids = providers
-                .summaries(&|_| false)
-                .into_iter()
-                .map(|summary| summary.provider)
-                .collect::<Vec<_>>();
-            for provider in provider_ids {
-                let Some(cache_key) = active_catalog_cache_key(&provider, &accounts, &providers)
-                else {
-                    continue;
-                };
-                if let Some(cached) = store.provider_models(cache_key.into()).await? {
-                    let models = serde_json::from_str(&cached.models_json).map_err(|error| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!(
-                                "cached model catalog for provider `{provider}` is invalid: {error}"
-                            ),
-                            false,
-                        )
-                    })?;
-                    model_source.replace(
-                        provider.clone(),
-                        ProviderInventory::Fetched {
-                            models,
-                            fetched_at_ms: cached.fetched_at_ms,
-                        },
-                    );
-                }
-            }
+        if let Some(names) = injected_provider_names {
+            providers = providers.with_injected_factory(names);
         }
+        let mut startup_catalog_discoveries = HashSet::new();
         // R10: every daemon vault consumer funnels through this ONE wrap.
         // Global aliases are the descriptor coordinate, but the Keychain is
         // machine-global — the physical key must stay profile-scoped so two
@@ -12859,23 +14244,134 @@ impl AccountsRuntime {
             )
             .await?;
             reconcile_set_active_receipts(store, &mut accounts).await?;
-            reconcile_provider_receipts(store, &accounts, &mut providers).await?;
+            let pending_configurations = store
+                .management_receipts(PROVIDER_CONFIGURE_METHOD.to_owned())
+                .await?
+                .into_iter()
+                .filter(|row| row.state == "pending")
+                .filter_map(|row| row.recovery_json)
+                .filter_map(|json| serde_json::from_str::<ProviderConfigureRecovery>(&json).ok())
+                .collect::<Vec<_>>();
+            // Fence an accepted configure while its receipt is still pending.
+            // Finalizing first leaves a crash window in which the next
+            // restart could hydrate the prior account key for a new origin.
+            for recovery in pending_configurations {
+                let Some(profile) = providers.get(&recovery.input.provider) else {
+                    continue;
+                };
+                let target_origin = recovery.input.origin.as_ref().or(profile.base_url.as_ref());
+                let target_auth = recovery
+                    .input
+                    .auth_requirement
+                    .unwrap_or(profile.auth_requirement);
+                let boundary = recovery.previous_origin.as_ref() != target_origin
+                    || recovery
+                        .previous_auth_requirement
+                        .is_some_and(|auth| auth != target_auth);
+                if boundary {
+                    let provider = profile.provider_id.clone();
+                    mint_provider_incarnations(&mut accounts, &provider)?;
+                    providers.clear_discovered_models(&provider);
+                    store.delete_provider_models(provider.clone()).await?;
+                    startup_catalog_discoveries.insert(provider);
+                }
+            }
+            reconcile_provider_receipts(store, profile_id, &accounts, &mut providers).await?;
             reserved_aliases
         };
         if !crate::android_policy::enabled() {
             import_bedrock_env_bearer(&mut accounts, &vault);
         }
+        let startup_backfilled_identity = if let VaultProvision::Available(vault) = &vault {
+            backfill_oauth_identities(&mut accounts, vault.as_ref()).await
+        } else {
+            false
+        };
+        let startup_providers = startup_before
+            .iter()
+            .chain(accounts.list())
+            .map(|row| row.provider.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for provider in startup_providers {
+            let Some((_, auth)) = catalog_source(provider, &providers) else {
+                continue;
+            };
+            let previous_active = startup_before
+                .iter()
+                .find(|row| row.provider == provider && row.active);
+            let previous = catalog_cache_key(provider, auth, previous_active);
+            let current = catalog_cache_key(provider, auth, accounts.active_for_provider(provider));
+            if previous != current && current.is_some() {
+                startup_catalog_discoveries.insert(provider.to_owned());
+            }
+        }
+        let startup_catalog_discoveries = if discovery_disabled {
+            Vec::new()
+        } else {
+            let mut providers = startup_catalog_discoveries.into_iter().collect::<Vec<_>>();
+            providers.sort();
+            providers
+        };
+        if !schema_bootstrapped_from_zero {
+            let provider_ids = providers
+                .summaries(&|_| false)
+                .into_iter()
+                .map(|summary| summary.provider)
+                .collect::<Vec<_>>();
+            for provider in provider_ids {
+                let Some(cache_key) = active_catalog_cache_key(&provider, &accounts, &providers)
+                else {
+                    continue;
+                };
+                if let Some(cached) = store.provider_models(cache_key.into()).await? {
+                    let models = serde_json::from_str(&cached.models_json).map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "cached model catalog for provider `{provider}` is invalid: {error}"
+                            ),
+                            false,
+                        )
+                    })?;
+                    model_source.replace(
+                        provider.clone(),
+                        ProviderInventory::Fetched {
+                            models,
+                            fetched_at_ms: cached.fetched_at_ms,
+                        },
+                    );
+                }
+            }
+        }
+        for provider in providers
+            .summaries(&|_| false)
+            .into_iter()
+            .map(|row| row.provider)
+        {
+            if catalog_source(&provider, &providers).is_some() {
+                let key = catalog_selection_scope(&provider, &accounts, &providers);
+                providers.reconcile_startup_catalog_scope(&provider, key)?;
+                if let Some(producer) =
+                    catalog_producer(profile_id, &provider, &accounts, &providers)
+                {
+                    providers
+                        .restore_catalog_evidence(&provider, &catalog_evidence_scope(&producer))?;
+                }
+            }
+        }
         prune_catalog_cache(store, &accounts, &providers).await;
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         let management_revision = if schema_bootstrapped_from_zero {
             0
+        } else if startup_backfilled_identity {
+            store.advance_management_revision().await?
         } else {
             store.management_revision().await?
         };
         let management = ManagementSnapshot::new(
             management_revision,
             accounts.list().to_vec(),
-            providers.summaries(&provider_credential_ready_for_summary(&accounts)),
+            catalog_summaries(&accounts, &providers),
         );
         let device_discovery = DeviceDiscoverySnapshot::new(discovery_disabled);
         let promotion_targets = management
@@ -12951,6 +14447,14 @@ impl AccountsRuntime {
                     Arc::new(StrictNoNativeCredentialStore),
                 )?;
                 let commands = actor.commands();
+                for provider in startup_catalog_discoveries {
+                    let _ = commands
+                        .send(AccountCommand::RefreshProviderModels {
+                            provider,
+                            completed: ProviderModelsRefreshCompletion::Automatic,
+                        })
+                        .await;
+                }
                 Ok(Self {
                     facade: AccountsFacade {
                         login: Some(commands),
@@ -12976,6 +14480,14 @@ impl AccountsRuntime {
             VaultProvision::Unsupported => {
                 let actor = start_account_actor(actor_config);
                 let commands = actor.commands();
+                for provider in startup_catalog_discoveries {
+                    let _ = commands
+                        .send(AccountCommand::RefreshProviderModels {
+                            provider,
+                            completed: ProviderModelsRefreshCompletion::Automatic,
+                        })
+                        .await;
+                }
                 Ok(Self {
                     facade: AccountsFacade {
                         login: Some(commands),
@@ -13006,6 +14518,10 @@ mod persisted_model_tests;
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod accounts_tests;
+
+#[cfg(test)]
+#[path = "accounts_partial_write_tests.rs"]
+mod partial_write_tests;
 
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_accounts_tests.rs"]

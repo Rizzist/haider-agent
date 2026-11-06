@@ -72,6 +72,9 @@ const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"powershell-wait"}"#;
 
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
         endpoint: None,
@@ -645,6 +648,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     let session_id = SessionId::new("graph-node-scoped-wait");
     let generation = store.worker_generation();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-graph-node-scoped-wait".into(),
         request_digest: "create-graph-node-scoped-wait-digest".into(),
         request_json: r#"{"session":"graph-node-scoped-wait"}"#.into(),
@@ -654,6 +658,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -814,10 +819,12 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         RunState::Queued,
     );
     *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "workflow-idle-ttl-workspace".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "workflow-idle-ttl-model".into(),
         max_output_tokens: 64,
         effort: None,
@@ -947,6 +954,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session_id = SessionId::new("delete-barrier-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-delete-barrier-session".into(),
         request_digest: "create-delete-barrier-session-digest".into(),
         request_json: r#"{"session":"delete-barrier-session"}"#.into(),
@@ -956,6 +964,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1073,6 +1082,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
         let original_generation = store.worker_generation();
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-branch-rpc-session".into(),
             request_digest: "create-branch-rpc-session-digest".into(),
             request_json: r#"{"session":"branch-rpc-receipt"}"#.into(),
@@ -1082,6 +1092,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2506,6 +2517,8 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let selected_alias = haider_protocol::ids::CredentialAlias::new("selected-fake");
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: selected_alias.clone(),
         provider: "fake".into(),
         base_url: None,
@@ -2519,8 +2532,11 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     };
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into(), "fake-v2".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("active-other"),
         provider: "other".into(),
         active: true,
@@ -2533,6 +2549,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     };
     let mut other_provider = provider_summary("other");
     other_provider.models = vec!["other-v1".into()];
+    other_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     other_provider.default_model = Some("other-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
@@ -2581,6 +2598,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                     .to_string_lossy()
                     .into_owned(),
                 provider: String::new(),
+                expected_catalog_key: None,
                 model: String::new(),
                 max_tokens: 4_096,
                 permission_overrides: None,
@@ -2656,6 +2674,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                 resolve_model: false,
                 effort: None,
                 fast: None,
+                expected_catalog_key: None,
             },
         )
         .await
@@ -2709,6 +2728,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
             model: model.to_owned(),
             confirm_new_epoch: true,
             max_tokens,
+            expected_catalog_key: None,
         }
     };
     let initial_epoch = store
@@ -2806,6 +2826,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                     model: model.to_owned(),
                     confirm_new_epoch: true,
                     max_tokens: None,
+                    expected_catalog_key: None,
                 },
             )
             .await
@@ -2856,6 +2877,8 @@ async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
         label: None,
         account_identity: None,
         created_at_ms: None,
+        incarnation: 0,
+        credential_digest: None,
     };
     let new = haider_protocol::credential::CredentialDescriptor {
         alias: haider_protocol::ids::CredentialAlias::new("new-fake"),
@@ -2929,6 +2952,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
@@ -2964,6 +2988,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
         command_id: haider_rpc::CommandId::new(command_id),
         cwd: cwd.clone(),
         provider: "fake".into(),
+        expected_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         permission_overrides: None,
@@ -3166,6 +3191,8 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     });
     let mut failure_provider = provider_summary("fake");
     failure_provider.models = vec!["fake-v1".into()];
+    // This working provider lets admission reach the injected scope-write failure.
+    failure_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     failure_provider.default_model = Some("fake-v1".into());
     failure_hub
         .install_accounts(crate::accounts::AccountsFacade {
@@ -4608,6 +4635,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     .expect("install scope vault");
     let source = SessionId::new("metafork-review-parent");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-metafork-review-parent".into(),
         request_digest: "create-metafork-review-parent-digest".into(),
         request_json: r#"{"session":"metafork-review-parent"}"#.into(),
@@ -4617,6 +4645,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -5976,12 +6005,14 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
     let cwd = std::env::temp_dir().to_string_lossy().into_owned();
 
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{suffix}"),
         request_digest: format!("create-digest-{suffix}"),
         request_json: format!(r#"{{"fixture":"{suffix}"}}"#),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         max_tokens_source: None,
@@ -6266,6 +6297,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     *fact.payload = haider_protocol::session::ModelSelected {
         selection_epoch: None,
         provider: "fake-b".into(),
+        model_catalog_key: None,
         model: "model-b".into(),
         route_only: false,
         cleared_account_pin: None,
@@ -8327,6 +8359,160 @@ async fn customprov_models_probe_requires_control_and_keeps_keyed_probes_local()
     store.close().await.expect("probe store closes");
 }
 
+/// A current model's budget preflight must use the admitted coordinate while
+/// keeping its public creation spelling. Restoring the raw model argument in
+/// account_set_active makes the recorded alias require an unknown-cost approval.
+#[tokio::test]
+async fn c5_account_switch_cache_preflight_uses_the_recorded_coordinate() {
+    use haider_protocol::cache::{CachePolicyMode, CachePolicySettingsV1};
+    use haider_protocol::provider::{Usage, UsageRequestKind, UsageScope, UsageSource};
+
+    let canonical = "claude-sonnet-4-6";
+    for (index, (literal, coordinate, should_queue)) in [
+        (canonical, None, true),
+        ("CLAUDE_SONNET_4_6", Some(canonical), true),
+        ("literal-unpriced-model", None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().expect("cache preflight profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session = SessionId::new(format!("c5-account-cache-{index}"));
+        let mut create = create_command(&session, &format!("c5-account-cache-{index}"));
+        create.provider = "anthropic".into();
+        create.model = literal.into();
+        create.resolved_model = coordinate.map(str::to_owned);
+        create.cache_policy = CachePolicySettingsV1 {
+            mode: CachePolicyMode::Balanced,
+            cold_cost_threshold_microusd: 1_000_000_000,
+        };
+        store.create_session(create).await.expect("typed session");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let mut usage = run_payload_envelope(
+            &session,
+            &RunId::new("c5-cache-history"),
+            store.worker_generation(),
+            "c5-cache-history",
+            EventPayload::Usage(Usage {
+                input: 4_096,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: Some(UsageScope {
+                    provider: "anthropic".into(),
+                    model: coordinate.unwrap_or(literal).into(),
+                    account_scope: Some(haider_protocol::ids::CredentialAlias::new(
+                        "old-anthropic",
+                    )),
+                    auth_scope: "api_key".into(),
+                    api_family: None,
+                    effort: None,
+                    speed: None,
+                    cache_epoch: "c5-cache-history".into(),
+                    stable_prefix_tokens: 4_096,
+                    cache_boundaries: None,
+                    request_kind: UsageRequestKind::MainTurn,
+                    run: None,
+                    agent: None,
+                    prefix_digests: None,
+                }),
+                cache_cost: None,
+                request: None,
+            }),
+        );
+        usage.run_id = None;
+        haider_core::StoreHandle::append(&store, &mut [usage])
+            .await
+            .expect("cache scope commits");
+        assert!(
+            crate::cache_policy::latest_main_cache_scope(&store, &session)
+                .await
+                .expect("cache scope")
+                .is_some(),
+            "the preflight must actually inspect a cached prefix"
+        );
+        let old = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("old-anthropic"),
+            provider: "anthropic".into(),
+            base_url: None,
+            auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+            identity: "synthetic cache account".into(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+            incarnation: 0,
+            credential_digest: None,
+        };
+        let new = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("new-anthropic"),
+            active: false,
+            ..old.clone()
+        };
+        let mut summary = provider_summary("anthropic");
+        summary.models = vec![canonical.into()];
+        summary.static_models = summary.models.clone();
+        let (login, mut queued) = tokio::sync::mpsc::channel(1);
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: Some(login),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(0, vec![old, new], vec![summary]),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+                Arc::new(CapturingFrameSink::default()),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection");
+        connection
+            .request(
+                RequestId::new("c5-account-switch"),
+                RequestBody::AccountSetActive {
+                    command_id: haider_rpc::CommandId::new("c5-account-switch"),
+                    alias: "new-anthropic".into(),
+                    confirm_new_epoch: false,
+                },
+            )
+            .await
+            .expect("preflight routes");
+        assert_eq!(
+            matches!(
+                queued.try_recv(),
+                Ok(crate::accounts::AccountCommand::SetActive(_))
+            ),
+            should_queue,
+            "C5 account-switch cache preflight uses the admitted coordinate: {literal}"
+        );
+        assert_eq!(
+            store
+                .session_metadata(&session)
+                .await
+                .expect("metadata")
+                .expect("typed metadata")
+                .model,
+            literal,
+            "preflight preserves the public literal"
+        );
+        drop(connection);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}
+
 /// Successful deletion must reclaim this session's retained stopped runs,
 /// while leaving another session's stop defenses intact (Opus gate M7).
 #[tokio::test]
@@ -8349,6 +8535,8 @@ async fn session_delete_reclaims_only_its_retained_stopped_runs() {
             cwd: root.path().to_string_lossy().into_owned(),
             provider: "fake".into(),
             model: "fake-model".into(),
+            resolved_model: None,
+            model_catalog_key: None,
             max_tokens: 4096,
             max_tokens_source: None,
             permission_overrides: None,
@@ -8582,6 +8770,8 @@ async fn r7_check_stop_lookup_epoch(finish_while_waiting: bool, wait_on_admissio
         cwd: root.path().display().to_string(),
         provider: "fake".into(),
         model: "fake-v1".into(),
+        resolved_model: None,
+        model_catalog_key: None,
         max_output_tokens: 64,
         effort: None,
         fast: false,

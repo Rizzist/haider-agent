@@ -19,6 +19,9 @@ fn summary(
     availability: ProviderAvailabilityWire,
 ) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -52,7 +55,7 @@ fn authority(
     creatable_providers: &[&str],
     summaries: Vec<ProviderSummaryWire>,
 ) -> ModelSelectionAuthority {
-    ModelSelectionAuthority::new(creatable(creatable_providers), summaries)
+    ModelSelectionAuthority::new(creatable(creatable_providers), Some(summaries))
 }
 
 #[test]
@@ -69,7 +72,7 @@ fn selection_derives_limits_when_inventory_details_are_incomplete() {
     assert_eq!(selection.context_window, Some(1_000_000));
     assert_eq!(selection.max_output_tokens, 128_000);
 
-    let selection = authority(&["custom"], Vec::new())
+    let selection = ModelSelectionAuthority::new(creatable(&["custom"]), None)
         .validate_selection_with_status("custom", None, "future-model")
         .expect("unknown inventory permits passthrough");
     assert!(selection.max_output_tokens > 4_096);
@@ -107,14 +110,15 @@ fn absent_provider_selects_within_the_current_provider() {
 /// is not creatable is a typed refusal, and the copy speaks model selection.
 #[test]
 fn uncreatable_provider_is_refused_typed() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     let refusal = authority
         .validate_selection("openai", Some("frontier-imaginary"), "some-model")
         .expect_err("uncreatable provider must refuse");
     assert_eq!(
         refusal,
         SelectionRefusal::ProviderUnavailable {
-            provider: "frontier-imaginary".to_owned()
+            provider: "frontier-imaginary".to_owned(),
+            reason: None,
         }
     );
     assert_eq!(refusal.kind(), "provider_unavailable");
@@ -221,7 +225,7 @@ fn model_unknown_carries_inventory_age_when_fetch_time_is_known() {
 /// errors surface at turn time, never a guessed refusal.
 #[test]
 fn unknown_inventory_accepts_honestly() {
-    let authority = authority(&["openai", "anthropic-oauth"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai", "anthropic-oauth"]), None);
     assert_eq!(
         authority.validate_selection("openai", Some("anthropic-oauth"), "fable-5"),
         Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
@@ -232,7 +236,7 @@ fn unknown_inventory_accepts_honestly() {
 /// creatability — the session already runs it (explicit == absent).
 #[test]
 fn current_provider_rows_skip_creatability() {
-    let authority = ModelSelectionAuthority::new(None, Vec::new());
+    let authority = ModelSelectionAuthority::new(None, None);
     assert_eq!(
         authority.validate_selection("fake", Some("fake"), "fake-model-2"),
         Ok(("fake".to_owned(), "fake-model-2".to_owned()))
@@ -240,6 +244,103 @@ fn current_provider_rows_skip_creatability() {
     assert_eq!(
         authority.validate_selection("fake", None, "fake-model-2"),
         Ok(("fake".to_owned(), "fake-model-2".to_owned()))
+    );
+}
+
+#[test]
+fn missing_provider_in_a_registered_snapshot_is_unavailable() {
+    let healthy = summary("healthy", &["m-one"], ProviderAvailabilityWire::Available);
+    for rows in [Vec::new(), vec![healthy.clone()]] {
+        // Even a factory declaration cannot supply a row removed from an
+        // installed management registry. Test empty and nonempty registries.
+        let authority = ModelSelectionAuthority::new(creatable(&["ghost", "healthy"]), Some(rows));
+        for requested in [None, Some("ghost")] {
+            assert!(matches!(
+                authority.validate_selection("ghost", requested, "m-one"),
+                Err(SelectionRefusal::ProviderUnavailable { provider, .. }) if provider == "ghost"
+            ));
+        }
+        for (model, provider) in [(None, None), (Some("m-one"), Some("ghost"))] {
+            assert!(matches!(
+                authority.resolve_child_selector("ghost", "m-one", model, provider),
+                Err(SelectionRefusal::ProviderUnavailable { provider, .. }) if provider == "ghost"
+            ));
+        }
+    }
+    // A factory-only caller has no management registry to prove removal.
+    let factory = ModelSelectionAuthority::new(creatable(&["ghost"]), None);
+    assert!(factory.validate_selection("ghost", None, "m-one").is_ok());
+    assert!(
+        factory
+            .validate_selection("other", Some("ghost"), "m-one")
+            .is_ok()
+    );
+    assert_eq!(
+        factory.resolve_child_selector("ghost", "m-one", None, None),
+        Ok(("ghost".into(), "m-one".into()))
+    );
+    // An existing provider with unknown inventory remains distinct from a
+    // missing provider, and a removed parent can select a healthy target.
+    let mut unknown = summary("ghost", &[], ProviderAvailabilityWire::Available);
+    unknown.inventory = haider_rpc::ModelInventoryWire::NeverFetched;
+    unknown.catalog = haider_rpc::ProviderCatalogKindWire::Adapter;
+    let present = ModelSelectionAuthority::new(None, Some(vec![unknown]));
+    assert!(present.validate_selection("ghost", None, "m-one").is_ok());
+    assert!(
+        present
+            .resolve_child_selector("ghost", "m-one", None, None)
+            .is_ok()
+    );
+    let rescue = ModelSelectionAuthority::new(creatable(&["healthy"]), Some(vec![healthy]));
+    assert_eq!(
+        rescue.validate_selection("ghost", Some("healthy"), "m-one"),
+        Ok(("healthy".into(), "m-one".into()))
+    );
+}
+
+#[test]
+fn child_selection_filters_unavailable_parent_inventory() {
+    for disabled in [false, true] {
+        let mut parent = summary(
+            "parent",
+            &["target"],
+            if disabled {
+                ProviderAvailabilityWire::Available
+            } else {
+                ProviderAvailabilityWire::Unavailable
+            },
+        );
+        parent.enabled = !disabled;
+        let healthy = summary("healthy", &["target"], ProviderAvailabilityWire::Available);
+        let authority = ModelSelectionAuthority::new(
+            creatable(&["parent", "healthy"]),
+            Some(vec![parent.clone(), healthy]),
+        );
+        for model in ["target", "tar-get"] {
+            assert_eq!(
+                authority.resolve_child_selector("parent", "target", Some(model), None),
+                Ok(("healthy".into(), "target".into()))
+            );
+        }
+        assert_eq!(
+            authority.resolve_child_selector("parent", "target", None, None),
+            Ok(("parent".into(), "target".into()))
+        );
+        let alone = ModelSelectionAuthority::new(creatable(&["parent"]), Some(vec![parent]));
+        assert!(matches!(
+            alone.resolve_child_selector("parent", "target", Some("target"), None),
+            Err(SelectionRefusal::ModelNotResolvable { .. })
+        ));
+    }
+    let mut parent = summary("parent", &["target"], ProviderAvailabilityWire::Available);
+    parent.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    let healthy = ModelSelectionAuthority::new(None, Some(vec![parent]));
+    assert_eq!(
+        healthy.resolve_child_selector("parent", "target", None, None),
+        Ok(("parent".into(), "target".into()))
     );
 }
 
@@ -257,7 +358,7 @@ fn enabled_custom_openai_and_anthropic_profiles_are_creatable() {
             ProviderAvailabilityWire::Available,
         );
         custom.api_family = family;
-        let authority = ModelSelectionAuthority::new(creatable(&["openai"]), vec![custom]);
+        let authority = ModelSelectionAuthority::new(creatable(&["openai"]), Some(vec![custom]));
         assert_eq!(
             authority.validate_selection("openai", Some("my-endpoint"), "local-model"),
             Ok(("my-endpoint".to_owned(), "local-model".to_owned()))
@@ -268,7 +369,7 @@ fn enabled_custom_openai_and_anthropic_profiles_are_creatable() {
 /// An empty model is a malformed selector, not a lookup.
 #[test]
 fn empty_model_is_an_invalid_selector() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert!(matches!(
         authority.validate_selection("openai", None, "  "),
         Err(SelectionRefusal::InvalidSelector { .. })
@@ -367,7 +468,7 @@ fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
 /// a mid-session pair switch — is pinned in `pair_switch_runtime_tests.rs`.
 #[test]
 fn absent_selector_inherits_the_parents_current_pair() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert_eq!(
         authority.resolve_child_selector("anthropic-oauth", "fable-5", None, None),
         Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
@@ -580,7 +681,7 @@ fn near_match_ranking_is_nearest_first_capped_and_empty_inventory_safe() {
     assert_eq!(suggestions.len(), 5);
     assert_eq!(suggestions[0], "glm-4.7-flashx · haider-code");
 
-    let empty = authority(&["openai"], Vec::new())
+    let empty = ModelSelectionAuthority::new(creatable(&["openai"]), None)
         .resolve_child_selector("openai", "gpt-a", Some("anything"), None)
         .expect_err("empty inventory refuses honestly");
     assert!(matches!(
@@ -695,7 +796,7 @@ fn explicit_pair_validates_like_a_live_selection() {
 /// MODEL; the provider only disambiguates it.
 #[test]
 fn provider_without_model_is_an_invalid_selector() {
-    let authority = authority(&["openai"], Vec::new());
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), None);
     assert!(matches!(
         authority.resolve_child_selector("openai", "gpt-a", None, Some("openai")),
         Err(SelectionRefusal::InvalidSelector { .. })
@@ -716,7 +817,8 @@ fn provider_without_model_is_an_invalid_selector() {
 /// them (the fast half). Expected RUNTIME failure: the named assertions.
 #[test]
 fn le_bedrock_and_vertex_pairs_validate_effort_but_refuse_fast() {
-    let authority = authority(&["bedrock", "vertex", "anthropic"], Vec::new());
+    let authority =
+        ModelSelectionAuthority::new(creatable(&["bedrock", "vertex", "anthropic"]), None);
     authority
         .validate_effort("bedrock", "anthropic.claude-opus-5", Some("xhigh"))
         .expect("normalized bedrock spelling resolves the opus-5 ladder");
@@ -829,4 +931,565 @@ fn static_subscription_row_is_selectable_after_catalog_403() {
         authority.validate_selection("anthropic-oauth", None, "invented-model"),
         Err(SelectionRefusal::ModelUnknown { .. })
     ));
+}
+
+#[test]
+fn configured_azure_selection_reports_discovery_reason_and_accepts_unsupported_listing() {
+    let mut azure = summary(
+        "azure",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Unavailable,
+    );
+    azure.endpoint = Some("https://synthetic.openai.azure.com/openai/v1".into());
+    azure.inventory = haider_rpc::ModelInventoryWire::Configured;
+    azure.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    for reason in [
+        "model list not fetched — fetch models before selecting",
+        "server returned 503 for /models — retry model-list fetch",
+        "model catalog timed out — retry model-list fetch",
+    ] {
+        azure.availability_reason = Some(reason.into());
+        for current in ["azure", "other"] {
+            let refusal = authority(&[], vec![azure.clone()])
+                .validate_selection(current, Some("azure"), "my-deployment")
+                .expect_err("unavailable deployment");
+            assert!(refusal.message().contains(reason));
+            assert_eq!(refusal.details()["reason"], reason);
+            assert_eq!(refusal.kind(), "provider_unavailable");
+        }
+    }
+    azure.availability = ProviderAvailabilityWire::Available;
+    azure.availability_reason =
+        Some("configured (unverified): server returned 404 for /models".into());
+    for current in ["azure", "other"] {
+        assert!(
+            authority(&["azure"], vec![azure.clone()])
+                .validate_selection(current, Some("azure"), "my-deployment")
+                .is_ok()
+        );
+    }
+    azure.endpoint = Some("http://127.0.0.1:18123/v1".into());
+    azure.availability = ProviderAvailabilityWire::Unavailable;
+    assert!(
+        authority(&[], vec![azure])
+            .validate_selection("azure", None, "my-deployment")
+            .is_err(),
+        "all configured providers require the same discovery evidence"
+    );
+}
+
+#[test]
+fn permanent_ids_do_not_inherit_their_remote_default_settings_as_unowned_configuration() {
+    let mut profile = summary(
+        "custom",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Available,
+    );
+    profile.configured_models = vec!["my-deployment".into()];
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-account-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    profile.model_details = vec![ModelDetailWire {
+        max_output_tokens_source: None,
+        source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+        name: "my-deployment".into(),
+        display_name: None,
+        context_window: Some(100_000),
+        max_output_tokens: Some(500),
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let derived = SessionOutputBudgetSourceV1::Derived.apply(500, 500);
+    let clamped = SessionOutputBudgetSourceV1::UserSet { requested: 1000 }.apply(500, 500);
+    let explicit = SessionOutputBudgetSourceV1::UserSet { requested: 100 }.apply(500, 500);
+    let selection = authority(&["custom"], vec![profile.clone()]);
+    assert_eq!(
+        selection.model_catalog_key("custom", "my-deployment"),
+        None,
+        "the declared ID is permanent"
+    );
+    assert_eq!(
+        selection
+            .model_settings_catalog_key("custom", "my-deployment", &derived)
+            .as_deref(),
+        Some("synthetic-account-A"),
+        "the fetched output default is A's data"
+    );
+    assert_eq!(
+        selection
+            .model_settings_catalog_key("custom", "my-deployment", &clamped)
+            .as_deref(),
+        Some("synthetic-account-A"),
+        "the effective ceiling is fetched even though the requested budget is user-set"
+    );
+    assert_eq!(
+        selection.model_settings_catalog_key("custom", "my-deployment", &explicit),
+        None,
+        "an unchanged explicit budget remains user configuration"
+    );
+    profile.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+    profile.model_details[0].max_output_tokens = None;
+    let selection = authority(&["custom"], vec![profile]);
+    assert_eq!(
+        selection.model_settings_catalog_key("custom", "my-deployment", &derived),
+        None,
+        "ordinary configured fallback uses no fetched defaults"
+    );
+}
+
+#[test]
+fn selection_scope_follows_the_session_route_instead_of_borrowing_the_active_account() {
+    for (route, retired) in [
+        ("same", false),
+        ("endpoint", true),
+        ("account", true),
+        ("legacy", false),
+    ] {
+        let mut profile = summary(
+            "custom",
+            &["my-deployment", "a-private-only"],
+            ProviderAvailabilityWire::Available,
+        );
+        profile.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+        profile.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+        profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+        profile.endpoint = Some("http://127.0.0.1:23456/v1".into());
+        profile.configured_models = vec!["my-deployment".into()];
+        profile.catalog_scope = (route != "legacy").then(|| haider_rpc::ProviderCatalogScopeWire {
+            key: "synthetic-account-A".into(),
+            account_alias: Some("work".into()),
+            account_incarnation: Some(1),
+        });
+        profile.model_details = profile
+            .models
+            .iter()
+            .map(|name| ModelDetailWire {
+                max_output_tokens_source: None,
+                source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+                name: name.clone(),
+                display_name: Some("A's private label".into()),
+                context_window: Some(100_000),
+                max_output_tokens: Some(500),
+                supported_efforts: vec!["high".into()],
+                default_effort: Some("high".into()),
+                supported_speeds: vec!["fast".into()],
+                supports_thinking_type: Some(true),
+                supports_vision: Some(false),
+            })
+            .collect();
+        let current: haider_protocol::session::SessionMetadataV1 = serde_json::from_value(serde_json::json!({
+            "cwd":"/synthetic", "provider":"custom", "model":"my-deployment", "max_tokens":500, "created_at_ms":1,
+            "provider_base_url": if route == "endpoint" { "http://127.0.0.1:23457/v1" } else { "http://127.0.0.1:23456/v1" },
+            "account_alias": if route == "account" { "other" } else { "work" },
+        })).expect("typed session metadata");
+        let mut selected =
+            authority(&["custom"], vec![profile]).scoped_to_session_route(&current, "custom");
+        if retired {
+            assert!(
+                matches!(
+                    selected.validate_selection_with_status("custom", None, "my-deployment"),
+                    Err(SelectionRefusal::ProviderUnavailable { .. })
+                ),
+                "a new route cannot borrow the previous route listing"
+            );
+            // Unsupported discovery on this route is independent positive
+            // evidence for configured passthrough, without A's fetched data.
+            selected.summaries[0].availability = ProviderAvailabilityWire::Available;
+            selected.summaries[0].availability_reason =
+                Some("configured (unverified): server returned 405 for /models".into());
+        }
+        let resolved = selected
+            .validate_selection_with_status("custom", None, "my-deployment")
+            .expect("matching list or route-owned unsupported evidence");
+        if retired {
+            assert!(!selected.catalog_key_is_current("custom", "synthetic-account-A"));
+            assert_eq!(resolved.context_window, None);
+            assert_ne!(resolved.max_output_tokens, 500);
+            assert!(
+                !selected.summaries[0]
+                    .models
+                    .iter()
+                    .any(|name| name == "a-private-only")
+            );
+            let detail = &selected.summaries[0].model_details[0];
+            assert_eq!(
+                detail.source,
+                Some(haider_rpc::ModelDetailSourceWire::Configured)
+            );
+            assert_eq!(detail.supports_vision, None);
+            assert!(detail.supported_efforts.is_empty());
+            let explicit = selected
+                .validate_selection_with_status("custom", None, "manual-unlisted")
+                .expect("advisory configuration is preserved");
+            assert_eq!(explicit.context_window, None);
+        } else {
+            assert_eq!(resolved.context_window, Some(100_000));
+            assert_eq!(resolved.max_output_tokens, 500);
+        }
+    }
+}
+
+#[test]
+fn unsupported_azure_evidence_cannot_be_borrowed_by_a_rebound_account() {
+    let mut azure = summary(
+        "azure",
+        &["my-deployment"],
+        ProviderAvailabilityWire::Available,
+    );
+    azure.endpoint = Some("https://synthetic.openai.azure.com/openai/v1".into());
+    azure.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    azure.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    azure.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "server returned 404 for /models".into(),
+    };
+    azure.configured_models = vec!["my-deployment".into()];
+    azure.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-account-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    for (account, allowed) in [("work", true), ("other", false)] {
+        let current = serde_json::from_value(serde_json::json!({
+            "cwd":"/synthetic", "provider":"azure", "model":"my-deployment", "max_tokens":500, "created_at_ms":1,
+            "account_alias":account,
+        })).expect("session metadata");
+        let selection = authority(&["azure"], vec![azure.clone()])
+            .scoped_to_session_route(&current, "azure")
+            .validate_selection_with_status("azure", None, "my-deployment");
+        assert_eq!(selection.is_ok(), allowed);
+        if !allowed {
+            let refusal = selection.expect_err("B needs its own discovery evidence");
+            assert!(!refusal.message().contains("404"));
+            assert_eq!(refusal.kind(), "provider_unavailable");
+        }
+    }
+}
+
+#[test]
+fn configured_selector_aliases_cannot_bypass_fresh_absence() {
+    let mut profile = summary("custom", &["healthy"], ProviderAvailabilityWire::Available);
+    profile.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: u64::MAX,
+    };
+    profile.configured_models = vec!["deployment".into(), "MÖDEL.東京 Δ".into(), "İ-model".into()];
+    profile.configured_models.push("deployment".into());
+    let absent = authority(&["custom"], vec![profile.clone()]);
+    for model in [
+        "deployment",
+        "DEPLOYMENT",
+        "de.ploy_ment",
+        "de\u{a0}ploy\u{2003}ment",
+        "mödel_東京-δ",
+        "i\u{307}.mo_DEL",
+    ] {
+        assert!(
+            matches!(
+                absent.validate_selection("custom", None, model),
+                Err(SelectionRefusal::ProviderUnavailable { .. })
+            ),
+            "{model}"
+        );
+        assert!(
+            matches!(
+                absent.resolve_child_selector("custom", "healthy", Some(model), Some("custom")),
+                Err(SelectionRefusal::ProviderUnavailable { .. })
+            ),
+            "explicit child: {model}"
+        );
+    }
+    assert_eq!(
+        absent.validate_selection("custom", None, "HEALTHY"),
+        Ok(("custom".into(), "healthy".into()))
+    );
+    assert_eq!(
+        absent.validate_selection("custom", None, "future/model"),
+        Ok(("custom".into(), "future/model".into()))
+    );
+    profile.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    let stale = authority(&["custom"], vec![profile]);
+    assert_eq!(
+        stale.validate_selection("custom", None, "DEPLOY.MENT"),
+        Ok(("custom".into(), "deployment".into()))
+    );
+    assert_eq!(
+        stale.validate_selection("custom", None, "mödel_東京-δ"),
+        Ok(("custom".into(), "MÖDEL.東京 Δ".into()))
+    );
+}
+
+fn c5_profile(model: &str) -> ProviderSummaryWire {
+    let mut profile = summary("custom", &[model], ProviderAvailabilityWire::Available);
+    profile.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    profile.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-owner-A".into(),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(1),
+    });
+    profile.model_details = vec![ModelDetailWire {
+        max_output_tokens_source: None,
+        name: model.into(),
+        source: Some(haider_rpc::ModelDetailSourceWire::Remote),
+        context_window: Some(32_000),
+        max_output_tokens: Some(2_048),
+        supported_efforts: vec!["low".into(), "high".into()],
+        display_name: None,
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }];
+    profile
+}
+
+fn c5_assert_coordinate(model: &str, spelling: &str) {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1::{Derived, UserSet};
+    let profile = c5_profile(model);
+    let authority = authority(&["custom"], vec![profile]);
+    let selected = authority
+        .validate_selection_with_status("custom", None, spelling)
+        .expect("unique selector");
+    assert_eq!(selected.model, model);
+    assert_eq!(selected.max_output_tokens, 2_048);
+    assert_eq!(
+        authority.model_catalog_key("custom", spelling).as_deref(),
+        Some("synthetic-owner-A"),
+        "C5 resolved model owns the selection: {spelling:?}"
+    );
+    for source in [Derived, UserSet { requested: 4_096 }] {
+        assert_eq!(
+            authority
+                .model_settings_catalog_key("custom", spelling, &source.apply(2_048, 2_048))
+                .as_deref(),
+            Some("synthetic-owner-A"),
+            "C5 resolved declaration owns derived/clamped settings: {spelling:?}"
+        );
+    }
+    assert_eq!(
+        authority.model_settings_catalog_key(
+            "custom",
+            spelling,
+            &UserSet { requested: 1_024 }.apply(2_048, 2_048)
+        ),
+        None
+    );
+    assert!(
+        authority
+            .validate_effort("custom", spelling, Some("high"))
+            .is_ok()
+    );
+    assert!(
+        authority
+            .validate_effort("custom", spelling, Some("max"))
+            .is_err()
+    );
+}
+
+macro_rules! c5_spelling {
+    ($test:ident, $spelling:expr) => {
+        #[test]
+        fn $test() {
+            c5_assert_coordinate("shared-model", $spelling);
+        }
+    };
+}
+c5_spelling!(c5_coordinate_case, "SHARED-MODEL");
+c5_spelling!(c5_coordinate_underscore, "shared_model");
+c5_spelling!(c5_coordinate_dot, "shared.model");
+c5_spelling!(c5_coordinate_space, "shared model");
+c5_spelling!(c5_coordinate_nbsp, "shared\u{a0}model");
+c5_spelling!(c5_coordinate_emspace, "shared\u{2003}model");
+c5_spelling!(
+    c5_coordinate_mixed_separators,
+    " Shared._-\u{a0}\u{2003}MODEL "
+);
+
+#[test]
+fn c5_coordinate_scalar_lowercase_expansion() {
+    c5_assert_coordinate("i\u{307}-k-ß", "İ.K_ẞ");
+}
+
+#[test]
+fn c5_permanent_rows_keep_fetched_settings_owner_only() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1::{Derived, UserSet};
+    for configured in [false, true] {
+        let mut profile = c5_profile("shared-model");
+        if configured {
+            profile.configured_models.push("shared-model".into());
+        } else {
+            profile.static_models.push("shared-model".into());
+        }
+        let authority = authority(&["custom"], vec![profile]);
+        assert_eq!(authority.model_catalog_key("custom", "SHARED_MODEL"), None);
+        for source in [Derived, UserSet { requested: 4_096 }] {
+            assert_eq!(
+                authority
+                    .model_settings_catalog_key(
+                        "custom",
+                        "SHARED_MODEL",
+                        &source.apply(2_048, 2_048)
+                    )
+                    .as_deref(),
+                Some("synthetic-owner-A")
+            );
+        }
+        assert_eq!(
+            authority.model_settings_catalog_key(
+                "custom",
+                "SHARED_MODEL",
+                &UserSet { requested: 1_024 }.apply(2_048, 2_048)
+            ),
+            None
+        );
+    }
+}
+
+#[test]
+fn c5_ambiguous_unlisted_and_noncontract_unicode_remain_literal() {
+    let mut profile = c5_profile("shared-model");
+    profile.models.push("shared_model".into());
+    let authority = authority(&["custom"], vec![profile]);
+    for literal in [
+        "SHARED.MODEL",
+        "unlisted",
+        "shared/model",
+        "sharéd-model",
+        "shared\u{2014}model",
+    ] {
+        assert_eq!(
+            authority
+                .validate_selection("custom", None, literal)
+                .expect("advisory literal")
+                .1,
+            literal
+        );
+        assert_eq!(authority.model_catalog_key("custom", literal), None);
+        assert!(
+            authority
+                .validate_effort("custom", literal, Some("high"))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        authority
+            .model_catalog_key("custom", "shared-model")
+            .as_deref(),
+        Some("synthetic-owner-A"),
+        "exact wins even in a normalized collision"
+    );
+}
+
+macro_rules! c5_static_effort {
+    ($test:ident, $provider:expr, $model:expr, $spelling:expr, $effort:expr, $fast:expr) => {
+        #[test]
+        fn $test() {
+            let authority = authority(
+                &[$provider],
+                vec![summary(
+                    $provider,
+                    &[$model],
+                    ProviderAvailabilityWire::Available,
+                )],
+            );
+            for spelling in [$spelling, &format!("  {}  ", $model)] {
+                assert!(
+                    authority
+                        .validate_effort($provider, spelling, Some($effort))
+                        .is_ok(),
+                    "C5 static effort for {spelling:?}"
+                );
+                assert_eq!(
+                    authority.validate_fast($provider, spelling, true).is_ok(),
+                    $fast,
+                    "C5 fast gate for {spelling:?}"
+                );
+                assert!(authority.validate_fast($provider, spelling, false).is_ok());
+            }
+        }
+    };
+}
+c5_static_effort!(
+    c5_static_claude_effort_fast,
+    "anthropic",
+    "claude-opus-5",
+    "CLAUDE_OPUS_5",
+    "xhigh",
+    true
+);
+c5_static_effort!(
+    c5_static_oauth_claude_effort_fast,
+    "anthropic-oauth",
+    "claude-opus-4-8",
+    "CLAUDE.OPUS.4.8",
+    "max",
+    true
+);
+c5_static_effort!(
+    c5_static_gemini_effort,
+    "gemini",
+    "gemini-3.1-pro",
+    "GEMINI 3_1 PRO",
+    "high",
+    false
+);
+c5_static_effort!(
+    c5_static_bedrock_effort,
+    "bedrock",
+    "anthropic.claude-opus-5",
+    "ANTHROPIC_CLAUDE_OPUS_5",
+    "xhigh",
+    false
+);
+c5_static_effort!(
+    c5_static_vertex_effort,
+    "vertex",
+    "claude-sonnet-4-6@20251101",
+    "CLAUDE_SONNET_4_6@20251101",
+    "max",
+    false
+);
+
+#[test]
+fn c5_declared_effort_accepts_alternate_and_trimmed_creation_or_later_tuning() {
+    let authority = authority(&["custom"], vec![c5_profile("shared-model")]);
+    for spelling in [
+        "SHARED_MODEL",
+        " shared-model ",
+        "shared\u{a0}model",
+        "shared\u{2003}model",
+    ] {
+        assert!(
+            authority
+                .validate_effort("custom", spelling, Some("high"))
+                .is_ok(),
+            "C5 declared effort uses canonical row: {spelling:?}"
+        );
+    }
+}
+
+#[test]
+fn c5_trimmed_static_capabilities_without_a_management_snapshot() {
+    let authority = ModelSelectionAuthority::new(creatable(&["anthropic"]), None);
+    assert!(
+        authority
+            .validate_effort("anthropic", "  claude-opus-5  ", Some("xhigh"))
+            .is_ok(),
+        "trimmed exact static effort must remain usable before management publication"
+    );
+    assert!(
+        authority
+            .validate_fast("anthropic", "  claude-opus-5  ", true)
+            .is_ok(),
+        "trimmed exact static fast must remain usable before management publication"
+    );
 }

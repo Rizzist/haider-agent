@@ -106,12 +106,14 @@ fn context_economy_metadata_survives_reopen_without_rewriting_the_journal() {
     let expected = {
         let store = must(Store::open(root.path()));
         must(store.create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "context-economy-create".into(),
             request_digest: "context-economy-digest".into(),
             request_json: r#"{"session":"context-economy-reopen"}"#.into(),
             session_id: session.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4_096,
             max_tokens_source: None,

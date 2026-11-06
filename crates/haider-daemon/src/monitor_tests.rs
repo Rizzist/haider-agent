@@ -542,12 +542,14 @@ impl MonitorWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("monitor-create-{label}"),
             request_digest: format!("monitor-create-{label}-digest"),
             request_json: format!(r#"{{"session":"{label}"}}"#),
             session_id: session.clone(),
             cwd,
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2819,6 +2821,8 @@ async fn assert_already_cancelling_stop_retention(scope: &str) {
             cwd: world._root.path().to_string_lossy().into_owned(),
             provider: "fake".into(),
             model: "fake-model".into(),
+            resolved_model: None,
+            model_catalog_key: None,
             max_tokens: 4096,
             max_tokens_source: None,
             permission_overrides: None,

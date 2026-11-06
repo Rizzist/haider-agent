@@ -52,6 +52,7 @@ fn overrides() -> Option<SessionPermissionOverridesV1> {
 
 fn task_metadata(cwd: &str) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -64,6 +65,7 @@ fn task_metadata(cwd: &str) -> SessionMetadataV1 {
         cwd: cwd.to_owned(),
         provider: "fake".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -83,12 +85,14 @@ fn task_metadata(cwd: &str) -> SessionMetadataV1 {
 async fn create_task_session(hub: &SessionHub, name: &str, cwd: &str) -> SessionId {
     let session_id = SessionId::new(name.to_owned());
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{name}"),
         request_digest: format!("create-{name}-digest"),
         request_json: format!("{{\"session\":\"{name}\"}}"),
         session_id: session_id.clone(),
         cwd: cwd.to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

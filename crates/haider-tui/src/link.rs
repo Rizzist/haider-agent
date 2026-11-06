@@ -751,6 +751,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
+        LiveCommand::AccountListWatch => &[haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1],
         _ => &[],
     }
 }
@@ -1101,12 +1102,15 @@ pub fn request_body_for_features(
             provider,
             model,
             max_tokens,
+            expected_catalog_key,
             ..
         } => RequestBody::SessionCreateWithPermissionOverrides {
             command_id,
             cwd,
             provider,
+            resolve_model: model.is_empty(),
             model,
+            expected_catalog_key,
             max_tokens,
             // OWNER DIRECTIVE: the interactive surface runs in full AUTO-ALLOW
             // mode (the Codex --full-auto analogue) — writes, exec, web fetch,
@@ -1131,7 +1135,6 @@ pub fn request_body_for_features(
             ssh_scope: None,
             account_alias,
             resolve_provider: false,
-            resolve_model: false,
             effort: None,
             fast: None,
         },
@@ -1769,12 +1772,14 @@ pub fn request_body_for_features(
             model,
             provider,
             confirm_new_epoch,
+            expected_catalog_key,
             ..
         } => RequestBody::SessionSelectModel {
             command_id,
             session_id: session,
             worker_generation,
             model,
+            expected_catalog_key,
             provider: Some(provider),
             confirm_new_epoch,
             max_tokens: None,
@@ -2023,6 +2028,8 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 worker_generation,
                 cwd: metadata.cwd.clone(),
                 model: metadata.model.clone(),
+                provider: metadata.provider.clone(),
+                model_catalog_key: metadata.model_catalog_key.clone(),
                 metadata: Some(metadata),
             }]
         }),
@@ -2455,6 +2462,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        ResponseBody::AccountListWatch { accepted } => {
+            vec![LiveReply::ManagementWatch { accepted }]
+        }
         ResponseBody::AccountList {
             descriptors,
             revision,
@@ -2569,6 +2579,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             selected_seq,
             worker_generation,
             output_budget,
+            model_catalog_key,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ModelSelected {
@@ -2580,6 +2591,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 model,
                 worker_generation,
                 output_budget,
+                model_catalog_key,
             }]
         }),
         // G2: the NORMALIZED committed title — the reply reports daemon
@@ -2997,7 +3009,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             high_water_seq,
         }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
-        WireFrame::AccountsChanged { revision } => vec![LiveReply::AccountsChanged { revision }],
         WireFrame::SessionSurfaceDelta {
             session_id,
             input: Some(input),
@@ -3046,6 +3057,11 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.
         WireFrame::ResidentSessionBinding { .. } => Vec::new(),
+        // `account.list_watch` signal: re-read the management snapshot so an
+        // idle terminal follows another client's account or catalog change.
+        WireFrame::AccountsChanged { revision } => {
+            vec![LiveReply::ManagementChanged { revision }]
+        }
         WireFrame::ProtocolError(error)
             if matches!(
                 error.code.as_str(),

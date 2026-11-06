@@ -54,15 +54,148 @@ inactive alias leaves the active account's rows alone. Removing or re-keying
 an account prunes its durable row, and provider removal prunes its remaining
 account rows. The prune is best-effort garbage collection of rows no reader
 uses; a failed sweep is logged and retried on the next mutation or startup.
-A configure that re-submits a provider's unchanged default model is accepted
-while the new account's inventory is still unknown.
+Fetched defaults and picker selections are inventory too. The daemon persists
+their serving catalog coordinate and clears them when the incarnation,
+endpoint or auth mode changes; explicit configured deployments and static
+release-owned IDs remain provider configuration. The CLI does not turn a
+summary's derived default into an explicit configure request, and renders
+intake from the post-commit view. The TUI likewise resolves automatic session
+defaults inside the daemon's create request; a catalog picker choice carries
+its observed producer key. Create and select refuse a delayed choice from a
+retired producer. Durable session metadata, selection events/receipts,
+headless run pins, delegation and automatic pair switches retain that key. A
+turn checks it against both the current profile and the actual credential being used, so
+an advisory custom endpoint cannot reuse a former account's derived default.
+Attached sessions await explicit reselection; the launcher can adopt the new
+account's default. Explicit unlisted input and legacy metadata without a
+catalog owner retain their configuration semantics. A permanent model ID can
+still have account-owned fetched settings: deriving a session's output default
+from remote metadata, or clamping a user budget to a fetched ceiling, captures
+that metadata's producer, even for a configured
+deployment or static ID. Provider summaries retain declared deployments
+separately from fetched details. Retiring a producer preserves those declared
+names while clearing fetched capability, context, effort and speed fields.
+Automatic switches reapply the stored budget source to the target model before
+persisting its selection and issuing requests; recovery retains that budget
+with the switch's producer.
+Configuration-only custom updates preserve omitted explicit deployments and
+same-incarnation selections. The TUI retires current markers and launcher
+defaults on an incarnation change. The last-model preference persists its
+producer, preserves it across theme writes and sends it even before the first
+inventory reply after restart. Retiring a pick removes the preference too.
+Legacy preferences with unknown ownership defer to daemon resolution until
+fresh inventory proves a permanent choice; explicit unowned configuration is
+recorded distinctly and keeps its spelling. Provider summaries carry an opaque catalog
+producer key and its account incarnation, so independently arriving account
+and provider replies cannot adopt an old default. A newer catalog waits for
+its matching account reply; a retired catalog loses fetched rows and
+capability metadata even if an unrelated provider has advanced the global
+management revision. Adapter capability caches include the
+incarnation, and automatic failover/promotion require the current model list
+and the selection's original producer, including anonymous endpoint/auth
+context. Pending default-model receipts carry the same owner; retired receipts
+cannot restore a fetched selection. Recovered
+discovery rows remain fetched inventory rather than permanent deployments.
 
 Vertex (gcloud) keys its catalog by the active gcloud account
 (`gcloud config get-value account`), not the rotating access token, so a
 same-account re-import keeps its cache.
 
-Authenticated fetched rows are keyed to the descriptor's stable account ID,
-then email, then display identity. If an OAuth refresh later adds an account
-ID or changes the email without a user account switch, the key changes: a
-restart loads a cold catalog and an in-flight refresh can return Busy once.
-This identity drift does not expose the previous account's fetched rows.
+Authenticated fetched rows use a v3 cache key containing the provider, alias,
+and durable account incarnation. Each profile reserves monotonically
+increasing incarnations in a separate fsynced counter before saving a
+descriptor; remove/re-add cannot recycle one, including after a crash. The
+v2 identity/epoch cache is pruned on migration, causing one cold fetch.
+Neither login time, source mtime, a display label, nor a source path establishes
+account identity.
+
+Intake keeps an incarnation only for identical ingested bytes in the same
+provider/auth/origin context, or an unchanged complete provider-issued user
+coordinate. A workspace ID alone does not prove an OpenAI user; source IDs,
+truncated fields and unverified display metadata do not prove continuity.
+Otherwise import/re-login/repoint/auth changes mint before publication, clear
+live rows and derived selections, fence late completions by the complete
+producer, and prune unreachable durable rows. A failed prune cannot authorize
+a read under the new key. Inactive replacements do not clear active inventory.
+
+Owned grant-only Kimi, Grok and Anthropic identities survive OAuth token
+rotation and manual refresh when their grant coordinate is unchanged. New
+intakes still use the stricter rule. Linked-source partial/unreadable writes
+retain the last digest, keep attention status, and compare recovered bytes;
+source removal retires the incarnation. A discovery aborted by source rotation
+reconciles and requeues once the source is readable. Source enrollment, scans
+and reconciliation publish account and provider views together.
+
+Configured deployments share one availability policy across every provider kind.
+Before the first successful model list, a provider that requires supported discovery
+is Unavailable; this includes Azure. Definite negative evidence also makes a
+selection Unavailable: credential/authentication failure, a deployment absent
+from a successful fresh list, or a disabled/removed provider.
+
+Uncertainty keeps configured rows selectable with a visible reason. A previous
+successful list remains usable after its 15-minute freshness window, and later
+503 or timeout results keep it selectable. A first failed fetch does not clear
+the unavailable-until-fetched state. HTTP 404/405
+or a typed unsupported listing shows **configured (unverified)**. Adapter kinds
+without a discovery API have that same label immediately. They accept explicit
+models without manufacturing picker rows or defaults. Configured-unverified
+inventory is advisory for every provider kind. That unverified
+inventory remains excluded from automatic failover and promotion. Maintained
+offline and OAuth catalogs retain their permanent rows with healthy credentials.
+
+A valid HTTP success with an empty model array persists an empty listing and its discovery timestamp. Nonempty arrays with no usable IDs remain discovery errors. Successful empty listings retain their discovery timestamp when a later refresh fails.
+For advisory custom providers, that uncertainty also permits explicit input when
+no model IDs are declared; it does not invent picker rows, metadata or a default.
+Configured IDs use the published shared availability decision without awaiting
+admission-time discovery. Staleness schedules background refresh with bounded backoff; it never blocks
+new sessions or turns of existing sessions. Plain `haider models` reads return the cached snapshot without awaiting discovery; only explicit `--refresh` waits for a listing. The daemon's admission, CLI, TUI
+picker and summaries use `ProviderSummaryWire::selection_availability` and its
+shared reason projection. A fresh empty list does not authorize configured rows.
+The TUI ages the complete projection through the same RPC policy, including
+configured IDs omitted by a fresh list. An authenticated unavailable snapshot
+retains its original listing evidence until the matching typed account view
+can supply credential readiness; either reply order is supported.
+Producer-scoped authentication rejection and unsupported-discovery evidence
+survive restart in an additive optional `catalog_evidence` map. A different
+producer cannot inherit it, and a fresh successful list clears it.
+A stale list preserves fetched metadata and may show missing explicit configured
+rows without borrowing metadata from another inventory.
+
+The running TUI follows management changes through a connection-scoped watch,
+with polling only when the daemon does not accept the watch. Acceptance at boot
+and reconnect triggers a snapshot read to cover changes before subscription.
+Refusing a required management signal closes the connection, allowing reconnect
+to restore the snapshot and watch instead of leaving the client silently stale.
+Custom or authenticated catalogs using public provider names still fence
+legacy and restored picks by their producer. Unscoped public catalogs, offline
+configuration, and declared/static IDs retain their permanent-name semantics.
+Retiring a catalog
+producer clears every current identity projection, including the launcher and
+session headers, composer, account label and context meter. A restored private
+model preference stays hidden until live snapshots prove its owner. Startup may
+adopt a legacy chosen default only after loading the active producer's matching
+inventory; summary filtering independently rejects foreign defaults.
+
+Route edits preserve a session selection's original catalog key. Changing the
+provider, account override, or endpoint does not turn fetched model settings
+into explicit configuration. Admission requires a fresh selection for the new
+producer, and the TUI retires its current marker immediately. The daemon projects
+release-owned IDs separately from remote metadata, so a fetched override cannot
+make the permanent name belong to the former account.
+
+Session endpoint/account overrides retire the active route's fetched enrichment
+even when the model name is explicit. The shared wire projection removes remote
+context, output limits, effort/speed and vision/thinking declarations. Both the
+picker and daemon selection authority use it; the authority also removes the old
+producer key, so a queued choice cannot become explicit configuration. Unsupported
+Azure-listing evidence belongs to its route and cannot authorize another account.
+
+TUI snapshots use management revisions to hold a provider projection that arrives before its active-account proof. The whole projection is retained, including an empty successful list. Account incarnations are compared for exact ownership, never ordered to infer which account will become active. This also preserves stale-success selection when an existing account with an older incarnation is activated.
+
+An accepted provider publication replaces its pending projection as well as its visible summary. Full snapshots retire all prior buffers; a model refresh or default change retires only that provider's buffer. Rejected older replies preserve pending evidence. A delayed account reply therefore cannot restore evidence superseded by a newer publication, even across rapid switches back to the original account.
+
+Each provider retains its own publication revision. A partial update to another provider cannot make an older catalog outrank a newer account reply. Current negative credential evidence makes the TUI projection unavailable while retaining the listing timestamp and the publication's original availability. Same-owner credential recovery restores that evidence before applying the shared inventory policy. New publications and ownership retirement discard the temporary credential projection, so recovery cannot override a later catalog authentication failure or borrow availability from another account.
+
+Accepted default, trust, and configuration replies immediately reconcile their catalog and current-model projection against the active account. Account and provider removal receipts clear the header and context immediately, before the follow-up management lists arrive. A late success receipt cannot display a retired account's private default in its acknowledgement.
+
+Availability and admission resolve selectors through the same unique alias rule: literal IDs win, then a unique listed alias, then a unique configured alias. Case, Unicode whitespace and `-`, `_`, `.` separators cannot bypass fresh negative evidence for a declared deployment. Repeated identical rows still describe one ID. Ambiguous aliases between distinct IDs stay literal; advisory passthrough and exact healthy IDs retain their existing behavior.

@@ -92,6 +92,10 @@ lockdown-save-worker-retirement	all	haider-daemon	lib	replaced_and_retired_worke
 lockdown-durable-crash-boundary	all	haider-daemon	lib	crash_between_durable_publish_and_execute_recovers_the_frozen_binding	crates/haider-daemon/src/lockdown_binding_tests.rs
 lockdown-startup-publication	all	haider-daemon	test:lockdown_startup_tests	lockdown_join_precedes_every_startup_publication_surface	crates/haider-daemon/tests/lockdown_startup_tests.rs
 lockdown-startup-exits	all	haider-daemon	test:lockdown_startup_tests	early_startup_failures_join_lockdown_initialization	crates/haider-daemon/tests/lockdown_startup_tests.rs
+catalog-linked-rotation	linux	haider-daemon	lib	same_account_linked_rotation_race_completes_then_reconciles_and_retries	crates/haider-daemon/src/accounts_tests.rs
+daemon-sidecar-committed-coverage	all	haider-daemon	test:session_hub_tests	sidecar_wait_requires_committed_coverage_before_returning	crates/haider-daemon/tests/session_hub_tests.rs
+daemon-stalled-outbox-pressure	all	haider-daemon	test:session_hub_tests	commit_pressure_behind_a_stalled_outbox_laggs_and_detaches	crates/haider-daemon/tests/session_hub_tests.rs
+daemon-undelivered-response-pressure	all	haider-daemon	test:session_hub_tests	undelivered_attach_response_is_answered_with_a_correlated_error_not_lagged	crates/haider-daemon/tests/session_hub_tests.rs
 # Lock ownership and fixture readiness under parallel load (lane 973-file-lock-flake).
 lock-file-refresh-lease-release-does-not-wait-for-a-duplicated-descriptor	linux	haider-accounts	lib	file_refresh_lease_release_does_not_wait_for_a_duplicated_descriptor	crates/haider-accounts/src/file_vault_tests.rs
 lock-capture-waits-for-eof-from-both-descendant-streams	linux	haider-cli	test:autospawn_tests	capture_waits_for_eof_from_both_descendant_streams	crates/haider-cli/tests/autospawn_tests.rs

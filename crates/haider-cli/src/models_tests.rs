@@ -63,18 +63,25 @@ fn refresh_parser_distinguishes_global_and_provider_scopes() {
     assert!(parse_options(&["--refresh".to_owned(), "--refresh".to_owned()]).is_err());
 }
 
-/// MUTATION CHECK: changing the documented fifteen-minute TTL comparison
-/// from `>=` to `>` makes the exact-boundary provider disappear.
+/// MUTATION: implicitly refresh a stale row on an ordinary read. A held
+/// listing would then hide otherwise selectable cached inventory until timeout.
 #[test]
-fn automatic_refresh_starts_at_the_exact_ttl_boundary() {
+fn default_read_never_waits_for_stale_inventory_refresh() {
     let just_fresh = haider_rpc::MODEL_INVENTORY_TTL_MS - 1;
     let at_boundary = haider_rpc::MODEL_INVENTORY_TTL_MS;
     let document = document(vec![
         provider("fresh", Some(1), Some(just_fresh)),
         provider("stale", Some(2), Some(at_boundary)),
+        provider("older", Some(3), Some(at_boundary + 1)),
         provider("seeded", None, None),
     ]);
-    assert_eq!(refresh_targets(&document, None), vec!["stale"]);
+    assert!(refresh_targets(&document, None).is_empty());
+    assert_eq!(document.providers[1].availability, "available");
+    assert_eq!(document.providers[1].models[0].model, "local-model");
+    assert_eq!(
+        refresh_targets(&document, Some(&ModelsRefresh::Provider("stale".into()))),
+        vec!["stale"]
+    );
 }
 
 /// Explicit global refresh includes a configured compatible source even when
@@ -167,4 +174,72 @@ fn cli_preserves_static_rows_when_subscription_catalog_returns_403() {
     let value = serde_json::to_value(&view).expect("CLI JSON");
     assert_eq!(value["models"][0]["source"], "static");
     assert_eq!(value["models"][0]["context_window"], 1_000_000);
+}
+
+#[test]
+fn cli_projects_configured_rows_when_a_fresh_empty_list_ages_before_render() {
+    let summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"work", "api_family":"openai_chat_completions",
+        "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+        "models":[], "configured_models":["deployment"],
+        "inventory":{"state":"fetched", "fetched_at_ms":100},
+        "inventory_authority":"authoritative", "availability":"unavailable"
+    }))
+    .expect("fresh empty list");
+    let fresh = provider_view(
+        summary.clone(),
+        &[],
+        100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1,
+    );
+    assert_eq!(fresh.availability, "unavailable");
+    assert!(fresh.models.is_empty());
+    let aged = provider_view(summary, &[], 100 + haider_rpc::MODEL_INVENTORY_TTL_MS);
+    assert_eq!(aged.availability, "available");
+    assert_eq!(aged.models.len(), 1);
+    assert_eq!(aged.models[0].model, "deployment");
+    assert!(aged.models[0].context_window.is_none());
+    assert!(
+        aged.availability_reason
+            .expect("stale reason")
+            .contains("refresh")
+    );
+}
+
+#[test]
+fn provider_availability_refusals_keep_provider_exit_status() {
+    for code in [
+        "provider_error",
+        "provider_timeout",
+        "credential_missing",
+        "credential_limited",
+        "unauthorized",
+        "provider_unavailable",
+    ] {
+        for retryable in [false, true] {
+            let error = ModelsError::Rpc {
+                code: code.into(),
+                message: "fixture refusal".into(),
+                retryable,
+            };
+            assert_eq!(failure(&error), ExitCode::from(EX_PROVIDER), "{code}");
+        }
+    }
+    for code in [
+        "internal",
+        "busy",
+        "PROVIDER_UNAVAILABLE",
+        " provider_unavailable",
+        "provider_unavailable_extra",
+        "provider_unavailable ",
+        "",
+    ] {
+        for retryable in [false, true] {
+            let error = ModelsError::Rpc {
+                code: code.into(),
+                message: "unknown refusal".into(),
+                retryable,
+            };
+            assert_eq!(failure(&error), ExitCode::from(EX_SOFTWARE), "{code}");
+        }
+    }
 }
