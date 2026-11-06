@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 fn create_command(id: &str, body: &Value) -> SessionCreateCommand {
     let request_json = body.to_string();
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("delegation-session-{id}"),
         request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
         request_json,
@@ -24,6 +25,7 @@ fn create_command(id: &str, body: &Value) -> SessionCreateCommand {
         system_prompt_version: "test".into(),
         event_id: EventId::new(format!("created-{id}")),
         device_id: DeviceId::new("test"),
+        model_catalog_key: None,
     }
 }
 
@@ -913,6 +915,7 @@ fn candidate_pick(store: &Store, session: &SessionId, index: usize, provider: &s
             output_budget: None,
             event_id: EventId::new(format!("candidate-picked-{session}-{index}")),
             device_id: DeviceId::new("test"),
+            model_catalog_key: None,
         })
         .expect("candidate pick");
 }
@@ -1478,6 +1481,7 @@ fn frozen_child_route_precedes_next_turn_parent_route_on_legacy_replay() {
             .expect("typed");
         store
             .select_session_model(&haider_store::SessionSelectModelCommand {
+                model_catalog_key: None,
                 command_id: "next-parent".into(),
                 request_digest: "next-parent".into(),
                 request_json: "{}".into(),
@@ -1684,6 +1688,8 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                 accept(&store, &parent.session_id, &run);
                 if !matches!(case, "legacy-rebound" | "linked-queued") {
                     let pair = haider_protocol::session::RunOutputPairPinnedV1 {
+                        resolved_model: None,
+                        model_catalog_key: None,
                         route_snapshot: Some(
                             haider_protocol::session::RunOutputRouteSnapshotV1::capture(&admitted),
                         ),
@@ -1736,6 +1742,7 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                         // names the run even though its event was unscoped.
                         store
                             .select_session_model(&haider_store::SessionSelectModelCommand {
+                                model_catalog_key: None,
                                 command_id: "automatic-prepared".into(),
                                 request_digest: "automatic-prepared".into(),
                                 request_json: json!({"automatic":true,"run_id":run}).to_string(),
@@ -1766,6 +1773,7 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                             .expect("newer explicit route");
                         store
                             .select_session_model(&haider_store::SessionSelectModelCommand {
+                                model_catalog_key: None,
                                 command_id: "next-parent".into(),
                                 request_digest: "next-parent".into(),
                                 request_json: "{}".into(),
@@ -1807,6 +1815,7 @@ fn legacy_unrecorded_child_route_uses_running_parent_instead_of_next_turn() {
                 }
                 store
                     .select_session_model(&haider_store::SessionSelectModelCommand {
+                        model_catalog_key: None,
                         command_id: "next-parent".into(),
                         request_digest: "next-parent".into(),
                         request_json: "{}".into(),

@@ -130,6 +130,18 @@ impl Profile {
         } else {
             assert_success(&boot);
         }
+        // Configuring a deployment is not proof of a successful model fetch.
+        let refreshed = self.output(&["models", "--refresh", PROVIDER, "--json"]);
+        assert_success(&refreshed);
+        let catalog: Value = serde_json::from_slice(&refreshed.stdout).expect("catalog JSON");
+        let provider = catalog["providers"]
+            .as_array()
+            .expect("provider rows")
+            .iter()
+            .find(|row| row["provider"] == PROVIDER)
+            .expect("proxy catalog");
+        assert_eq!(provider["inventory"]["state"], "fetched");
+        assert_eq!(provider["availability"], "available");
         let mut command = self.command();
         command.args([
             "run",

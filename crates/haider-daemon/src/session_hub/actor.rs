@@ -2549,12 +2549,14 @@ mod error_wave3_tests {
         let session_id = SessionId::new("e6a-abandon-session");
         store
             .create_session(haider_store::SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-e6a-abandon".into(),
                 request_digest: "digest-e6a-abandon".into(),
                 request_json: r#"{"session":"e6a-abandon"}"#.into(),
                 session_id: session_id.clone(),
                 cwd: root.path().to_string_lossy().into_owned(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-v1".into(),
                 max_tokens: 1_024,
                 max_tokens_source: None,

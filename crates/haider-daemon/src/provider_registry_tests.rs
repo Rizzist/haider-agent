@@ -29,6 +29,140 @@ fn discovered(slug: &str, visible: bool, priority: Option<i64>) -> DiscoveredMod
     discovered_with_context(slug, visible, priority, None)
 }
 
+#[test]
+fn injected_factory_availability_is_registered_scoped_and_not_persisted() {
+    let names = std::collections::BTreeSet::from([
+        "fake".to_owned(),
+        "openai".to_owned(),
+        "anthropic".to_owned(),
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+    ]);
+    let store: Arc<dyn ProviderRegistryStoreLike> = Arc::new(MemoryProviderStore::default());
+    let mut registry = ProviderRegistry::new(
+        store.clone(),
+        initial_provider_profiles(&names, "unused"),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("registry");
+    for provider in &names {
+        assert!(
+            !registry
+                .summary(provider, &|_| false)
+                .expect("accounts-backed summary")
+                .model_is_selectable("fixture-model")
+        );
+    }
+    let registered = std::collections::BTreeSet::from([
+        "fake".to_owned(),
+        "openai".to_owned(),
+        HAIDER_CODE_PROVIDER_NAME.to_owned(),
+    ]);
+    registry = registry.with_injected_factory(&registered);
+    for provider in &registered {
+        let summary = registry
+            .summary(provider, &|_| false)
+            .expect("injected summary");
+        assert!(summary.model_is_selectable("fixture-model"));
+        assert!(summary.selection_reason(Some("fixture-model")).is_none());
+        assert_eq!(
+            summary.catalog,
+            haider_rpc::ProviderCatalogKindWire::Adapter
+        );
+        // Injection supplies transport availability. Membership still obeys
+        // the inventory's authoritative or advisory contract.
+        let model = summary
+            .models
+            .first()
+            .map_or("fixture-model", String::as_str)
+            .to_owned();
+        let has_known_models = summary.has_known_models();
+        let advisory =
+            summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory;
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]));
+        let selection = authority.validate_selection_with_status(provider, None, &model);
+        assert!(selection.is_ok(), "{provider}: {selection:?}");
+        if has_known_models {
+            let unlisted = authority.validate_selection_with_status(
+                provider,
+                None,
+                "synthetic-unlisted-injected-regression-id",
+            );
+            if advisory {
+                assert_eq!(
+                    unlisted
+                        .expect("advisory inventory permits explicit unlisted ids")
+                        .inventory_status,
+                    haider_rpc::ModelInventoryStatusWire::Unlisted
+                );
+            } else {
+                assert!(
+                    matches!(
+                        unlisted,
+                        Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
+                    ),
+                    "{provider}: {unlisted:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        !registry
+            .summary("anthropic", &|_| false)
+            .expect("unregistered accounts-backed provider")
+            .model_is_selectable("fixture-model")
+    );
+    assert!(registry.summary("removed", &|_| true).is_none());
+
+    // A known provider's explicit disablement and fresh negative membership
+    // remain authoritative even when transport construction is injected.
+    registry
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.provider_id == "openai")
+        .expect("known profile")
+        .enabled = false;
+    let disabled = registry.summary("openai", &|_| false).expect("disabled");
+    assert!(!disabled.model_is_selectable("fixture-model"));
+    assert_eq!(
+        disabled.selection_reason(None).as_deref(),
+        Some("provider is disabled")
+    );
+    let mut fresh = registry.summary("fake", &|_| false).expect("fake");
+    fresh.configured_models = vec!["missing".into()];
+    fresh.models = vec!["listed".into()];
+    fresh.inventory = haider_rpc::ModelInventoryWire::Fetched {
+        fetched_at_ms: u64::MAX,
+    };
+    fresh.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+    assert!(!fresh.model_is_selectable("missing"));
+    let authority = crate::model_select::ModelSelectionAuthority::new(None, Some(vec![fresh]));
+    assert!(authority.validate_selection("fake", None, "listed").is_ok());
+    assert!(matches!(
+        authority.validate_selection("fake", None, "missing"),
+        Err(crate::model_select::SelectionRefusal::ProviderUnavailable { .. })
+    ));
+    assert!(matches!(
+        authority.validate_selection("fake", None, "synthetic-unlisted-injected-regression-id"),
+        Err(crate::model_select::SelectionRefusal::ModelUnknown { .. })
+    ));
+
+    let reloaded = ProviderRegistry::new(
+        store,
+        initial_provider_profiles(&names, "unused"),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("reload without injected registration");
+    for provider in &registered {
+        assert!(
+            !reloaded
+                .summary(provider, &|_| false)
+                .expect("production summary")
+                .model_is_selectable("fixture-model")
+        );
+    }
+}
+
 fn discovered_with_context(
     slug: &str,
     visible: bool,
@@ -57,7 +191,10 @@ fn model_source(
     for (provider, models) in entries {
         source.replace(
             provider.to_owned(),
-            ProviderInventory::Configured { models },
+            ProviderInventory::Fetched {
+                models,
+                fetched_at_ms: u64::MAX,
+            },
         );
     }
     source
@@ -141,6 +278,10 @@ fn fresh_subscription_and_failed_catalog_keep_static_rows_selectable() {
         .iter()
         .find(|row| row.name == "claude-fable-5-1")
         .expect("overridden");
+    assert!(
+        merged.static_models.contains(&"claude-fable-5-1".into()),
+        "release ownership is independent of fetched metadata precedence"
+    );
     assert_eq!(overridden.context_window, Some(123_456));
     assert_eq!(
         overridden.source,
@@ -395,6 +536,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::from([(
@@ -417,6 +559,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::new(),
@@ -439,6 +582,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
             promotion_models: std::collections::HashMap::new(),
@@ -486,6 +630,7 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
             configured_models: vec!["future-model".to_owned()],
             default_model: Some("future-model".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -557,7 +702,7 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     )
     .expect("Gemini registry");
     let summary = registry
-        .summary(GEMINI_PROVIDER_NAME, &|_| false)
+        .summary(GEMINI_PROVIDER_NAME, &|_| true)
         .expect("Gemini summary");
     assert_eq!(
         summary.api_family,
@@ -567,6 +712,12 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
     assert_eq!(summary.models, vec!["gemini-2.5-flash"]);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert!(
+        !registry
+            .summary(GEMINI_PROVIDER_NAME, &|_| false)
+            .expect("missing credential")
+            .model_is_selectable("gemini-2.5-flash")
+    );
     assert_eq!(
         summary.inventory_authority,
         haider_rpc::ModelInventoryAuthorityWire::Authoritative
@@ -625,6 +776,14 @@ fn google_antigravity_registers_as_an_acp_agent_with_no_endpoint_and_no_seeded_m
         "nothing is offered until the authenticated agent publishes a catalog"
     );
 
+    assert_eq!(
+        registry
+            .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
+            .expect("healthy but unfetched")
+            .availability,
+        ProviderAvailabilityWire::Unavailable
+    );
+
     // Once discovery publishes the agent's catalog, every reasoning variant
     // survives as its own row and the provider lights up.
     let discovered = model_source([(
@@ -645,7 +804,7 @@ fn google_antigravity_registers_as_an_acp_agent_with_no_endpoint_and_no_seeded_m
     )
     .expect("Antigravity registry with a catalog");
     let summary = registry
-        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
         .expect("Antigravity summary with a catalog");
     assert_eq!(
         summary.models,
@@ -722,7 +881,7 @@ fn admitting_the_supervised_agent_leaves_the_api_key_gemini_provider_unchanged()
     )
     .expect("both Google lanes register side by side");
     let gemini_summary = registry
-        .summary(GEMINI_PROVIDER_NAME, &|_| false)
+        .summary(GEMINI_PROVIDER_NAME, &|_| true)
         .expect("Gemini summary");
     assert_eq!(
         gemini_summary.api_family,
@@ -739,7 +898,7 @@ fn admitting_the_supervised_agent_leaves_the_api_key_gemini_provider_unchanged()
         ProviderAvailabilityWire::Available
     );
     let antigravity_summary = registry
-        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| true)
         .expect("Antigravity summary");
     assert_eq!(antigravity_summary.models, vec!["gemini-3.8-flash-high"]);
     assert_ne!(gemini_summary.models, antigravity_summary.models);
@@ -1046,6 +1205,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
             configured_models: vec!["literal-guess".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -1061,7 +1221,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
 
     let summary = registry
-        .summaries(&|_| false)
+        .summaries(&|_| true)
         .into_iter()
         .next()
         .expect("summary");
@@ -1073,6 +1233,11 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     );
     assert_eq!(summary.default_model.as_deref(), Some("frontier-a"));
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    let unavailable = registry
+        .summary("custom", &|_| false)
+        .expect("credential negative");
+    assert_eq!(unavailable.models, summary.models);
+    assert!(!unavailable.model_is_selectable("frontier-a"));
 }
 
 /// A custom OpenAI-compatible model id is endpoint vocabulary, while the
@@ -1097,6 +1262,7 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         configured_models: vec!["deepseek-v4-flash".to_owned()],
         default_model: Some("deepseek-v4-flash".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     };
@@ -1127,7 +1293,7 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
     let empty = registry
         .summary("bench-proxy", &|_| true)
         .expect("empty summary");
-    assert!(empty.models.is_empty());
+    assert_eq!(empty.models, ["deepseek-v4-flash"]);
     assert_eq!(
         empty.inventory_authority,
         haider_rpc::ModelInventoryAuthorityWire::Advisory
@@ -1156,6 +1322,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             configured_models: Vec::new(),
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
+            catalog_selection_key: None,
             provenance: ProviderProvenance::Custom,
             trust: haider_rpc::ProviderTrustWire::Full,
         }])
@@ -1925,16 +2092,14 @@ fn bedrock_and_vertex_model_details_get_effort_ladders_but_no_speeds() {
 }
 
 /// LAW (LZ2 — the azure discovery-404 fallback): an Azure-origin CUSTOM
-/// profile keeps its manually entered deployments as inventory when
-/// discovery has nothing, and lights Available once its key exists; a
-/// non-azure custom keeps the G4a rule (discovery is the only inventory
-/// truth) — both directions.
+/// profile keeps its manually entered deployments visible when discovery has
+/// nothing. Configured rows do not claim that remote discovery succeeded;
+/// both Azure and other custom origins remain Unavailable until a fetch.
 ///
-/// MUTATION CHECK: drop the azure-origin arm from `seeded_inventory`.
-/// Expected RUNTIME failure: the azure row below reports Unavailable with
-/// an empty model list.
+/// MUTATION CHECK: drop the configured-row fallback from `seeded_inventory`.
+/// Expected runtime failure: the Azure and generic rows below are empty.
 #[test]
-fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
+fn lz2_azure_custom_keeps_manual_deployments_visible_without_discovery() {
     let custom = |provider: &str, origin: &str| ProviderProfileV1 {
         provider_id: provider.to_owned(),
         display_name: provider.to_owned(),
@@ -1948,6 +2113,7 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
         configured_models: vec!["my-gpt-deployment".to_owned()],
         default_model: Some("my-gpt-deployment".to_owned()),
         promotion_model: None,
+        catalog_selection_key: None,
         provenance: ProviderProvenance::Custom,
         trust: haider_rpc::ProviderTrustWire::Full,
     };
@@ -1963,7 +2129,7 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
     let azure = registry
         .summary("azure", &|provider| provider == "azure")
         .expect("azure summary");
-    assert_eq!(azure.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(azure.availability, ProviderAvailabilityWire::Unavailable);
     assert_eq!(azure.models, ["my-gpt-deployment"]);
     assert_eq!(azure.default_model.as_deref(), Some("my-gpt-deployment"));
 
@@ -1982,12 +2148,12 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
     assert_eq!(
         generic.availability,
         ProviderAvailabilityWire::Unavailable,
-        "non-azure customs keep the G4a discovery-only inventory rule"
+        "configured rows do not establish remote availability"
     );
-    assert!(generic.models.is_empty());
+    assert_eq!(generic.models, ["my-gpt-deployment"]);
     assert_eq!(
         generic.availability_reason.as_deref(),
-        Some("provider model inventory is unavailable")
+        Some("model list not fetched — fetch models before selecting")
     );
 }
 
@@ -2095,6 +2261,8 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
             .expect("summary")
     };
     assert_eq!(current().inventory, haider_rpc::ModelInventoryWire::Static);
+    let permanent_models = current().models;
+    assert!(!permanent_models.is_empty(), "permanent seed control");
     source.unavailable(HAIDER_CODE_PROVIDER_NAME, "catalog transport failed".into());
     let unavailable = current();
     assert!(matches!(
@@ -2105,7 +2273,13 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         unavailable.availability,
         haider_rpc::ProviderAvailabilityWire::Available
     );
-    assert_eq!(unavailable.availability_reason, None);
+    assert!(
+        unavailable
+            .availability_reason
+            .as_deref()
+            .expect("visible transport uncertainty")
+            .contains("catalog transport failed")
+    );
     assert_eq!(
         unavailable.default_model.as_deref(),
         Some("deepseek-v4-flash")
@@ -2119,12 +2293,28 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     );
     source.unavailable(
         HAIDER_CODE_PROVIDER_NAME,
-        "empty cache is not prior inventory".into(),
+        "temporary outage after successful empty inventory".into(),
     );
+    let empty_stale = current();
     assert!(matches!(
-        current().inventory,
-        haider_rpc::ModelInventoryWire::Unavailable { .. }
+        empty_stale.inventory,
+        haider_rpc::ModelInventoryWire::Stale {
+            fetched_at_ms: 1,
+            ..
+        }
     ));
+    assert_eq!(empty_stale.models, permanent_models);
+    assert_eq!(
+        empty_stale.availability,
+        haider_rpc::ProviderAvailabilityWire::Available
+    );
+    assert!(
+        empty_stale
+            .availability_reason
+            .as_deref()
+            .expect("visible uncertainty")
+            .contains("temporary outage after successful empty inventory")
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -2155,7 +2345,13 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
         stale.availability,
         haider_rpc::ProviderAvailabilityWire::Available
     );
-    assert_eq!(stale.availability_reason, None);
+    assert!(
+        stale
+            .availability_reason
+            .as_deref()
+            .expect("visible uncertainty")
+            .contains("temporary outage")
+    );
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
@@ -2200,6 +2396,981 @@ fn upgrade_removes_persisted_public_seed_without_creating_aliases() {
     );
 }
 
+#[test]
+fn configured_deployments_are_selectable_only_after_success_or_unsupported_discovery() {
+    let mut registry = seeded_registry("openai");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "azure-test".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://fixture.openai.azure.com/openai/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["my-deployment".into()],
+            default_model: Some("my-deployment".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("configured deployment");
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_err()
+    );
+    for (reason, unsupported) in [
+        ("server returned 404 for /models", true),
+        ("server returned 405 for /models", true),
+        ("model listing is explicitly not supported", true),
+        ("server returned 503 for /models", false),
+        ("model catalog discovery timed out", false),
+        ("model catalog authentication failed", false),
+    ] {
+        if unsupported {
+            registry.models_unsupported("azure-test", reason.into());
+        } else if reason.contains("authentication") {
+            registry.models_rejected("azure-test", reason.into());
+        } else {
+            registry.models_unavailable("azure-test", reason.into());
+        }
+        let selectable = !reason.contains("authentication");
+        let summary = registry.summary("azure-test", &|_| true).expect("summary");
+        assert_eq!(summary.models, ["my-deployment"]);
+        let authority =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary.clone()]));
+        assert_eq!(
+            authority
+                .validate_selection_with_status("azure-test", None, "my-deployment")
+                .is_ok(),
+            selectable,
+            "session and picker selection must agree: {reason}"
+        );
+        assert_eq!(
+            summary.availability == ProviderAvailabilityWire::Available,
+            selectable,
+            "{reason}"
+        );
+        assert_eq!(
+            registry
+                .validate_default_model("azure-test", "my-deployment")
+                .is_ok(),
+            selectable,
+            "selection agrees with summary"
+        );
+        assert!(
+            summary
+                .availability_reason
+                .as_deref()
+                .expect("specific reason")
+                .contains(reason)
+        );
+        if unsupported {
+            assert!(
+                summary
+                    .availability_reason
+                    .as_deref()
+                    .expect("label")
+                    .contains("configured (unverified)")
+            );
+            assert_eq!(
+                registry
+                    .summary("azure-test", &|_| false)
+                    .expect("keyless")
+                    .availability,
+                ProviderAvailabilityWire::Unavailable
+            );
+        }
+    }
+    registry.replace_discovered_models(
+        "azure-test".into(),
+        vec![offline_model("azure-test", "my-deployment")],
+        u64::MAX,
+    );
+    let fetched = registry.summary("azure-test", &|_| true).expect("fetched");
+    assert_eq!(fetched.availability, ProviderAvailabilityWire::Available);
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_ok()
+    );
+    registry.models_unavailable("azure-test", "server returned 503 for /models".into());
+    let failed = registry
+        .summary("azure-test", &|_| true)
+        .expect("failed after success");
+    assert_eq!(failed.availability, ProviderAvailabilityWire::Available);
+    assert!(
+        failed
+            .availability_reason
+            .as_deref()
+            .expect("reason")
+            .contains("503")
+    );
+    assert!(
+        registry
+            .validate_default_model("azure-test", "my-deployment")
+            .is_ok()
+    );
+    assert!(
+        crate::model_select::ModelSelectionAuthority::new(None, Some(vec![failed]))
+            .validate_selection_with_status("azure-test", None, "my-deployment")
+            .is_ok()
+    );
+}
+
+#[test]
+fn fetched_default_is_scoped_durably_and_configured_deployment_is_a_negative_control() {
+    let dir = tempfile::tempdir().expect("profile");
+    let store = JsonProviderRegistryStore::new(dir.path());
+    let mut registry =
+        ProviderRegistry::new(store, Vec::new(), model_source([])).expect("registry");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "work".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://fixture.example.test/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["configured-deployment".into()],
+            default_model: Some("configured-deployment".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("provider");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-A".into()))
+        .expect("A scope");
+    registry.replace_discovered_models(
+        "work".into(),
+        vec![offline_model("work", "a-private")],
+        u64::MAX,
+    );
+    registry
+        .set_default_model("work", "a-private")
+        .expect("fetched selection");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "work".into(),
+            api_family: None,
+            origin: None,
+            auth_requirement: None,
+            enabled: true,
+            models: Vec::new(),
+            default_model: None,
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        })
+        .expect("configuration-only update");
+    let profile = registry.get("work").expect("same-incarnation profile");
+    assert_eq!(profile.default_model.as_deref(), Some("a-private"));
+    assert_eq!(profile.configured_models, ["configured-deployment"]);
+    drop(registry);
+    let mut registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("restart");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-A".into()))
+        .expect("same scope");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private"),
+        "same incarnation retains its selected default"
+    );
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-B".into()))
+        .expect("replacement");
+    assert!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .is_none()
+    );
+    registry.replace_discovered_models(
+        "work".into(),
+        vec![offline_model("work", "b-current")],
+        u64::MAX,
+    );
+    assert_eq!(
+        registry
+            .summary("work", &|_| true)
+            .expect("B summary")
+            .default_model
+            .as_deref(),
+        Some("b-current")
+    );
+    registry.models_unsupported("work", "not supported".into());
+    registry
+        .set_default_model("work", "configured-deployment")
+        .expect("explicit config");
+    registry
+        .reconcile_catalog_scope("work", Some("incarnation-C".into()))
+        .expect("new account");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("configured-deployment")
+    );
+    drop(registry);
+    let registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        model_source([]),
+    )
+    .expect("restart after replacement");
+    assert_ne!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private")
+    );
+}
+
+#[test]
+fn retired_catalog_failover_models_are_removed_from_the_durable_document() {
+    let dir = tempfile::tempdir().expect("profile");
+    let path = dir.path().join("providers.json");
+    let mut profile = builtin_or_unknown("work", "unused");
+    profile.provenance = ProviderProvenance::Custom;
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.auth_requirement = ProviderAuthRequirementWire::ApiKey;
+    profile.enabled = true;
+    profile.base_url = Some("https://fixture.example.test".into());
+    profile.catalog_selection_key = Some("A".into());
+    profile.configured_models = vec!["explicit-deployment".into()];
+    profile.default_model = Some("a-private".into());
+    profile.promotion_model = Some("a-private-large".into());
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&ProviderRegistryDocumentV1 {
+            providers: vec![profile],
+            fallback_chain: vec!["work/a-private".into()],
+            ..ProviderRegistryDocumentV1::default()
+        })
+        .expect("document"),
+    )
+    .expect("seed");
+    let mut registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        vec![],
+        model_source([]),
+    )
+    .expect("registry");
+    registry
+        .reconcile_catalog_scope("work", Some("B".into()))
+        .expect("retire A");
+    let document: ProviderRegistryDocumentV1 =
+        serde_json::from_slice(&std::fs::read(path).expect("read")).expect("document");
+    assert_eq!(document.fallback_chain, ["work"]);
+    assert!(document.providers[0].default_model.is_none());
+    assert!(document.providers[0].promotion_model.is_none());
+    assert_eq!(registry.fallback_chain()[0].model, None);
+    assert_eq!(
+        document.providers[0].configured_models,
+        ["explicit-deployment"]
+    );
+}
+
+#[test]
+fn discovery_recovery_does_not_promote_fetched_slugs_into_configured_deployments() {
+    for retired in [false, true] {
+        let mut registry = seeded_registry("openai");
+        let input = ProviderConfigureInput {
+            provider: "recovery-work".into(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://synthetic.example.test/v1".into()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["a-private".into()],
+            default_model: Some("a-private".into()),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+        };
+        registry
+            .configure(input.clone())
+            .expect("partially saved legacy discovery");
+        if retired {
+            registry
+                .reconcile_catalog_scope("recovery-work", Some("B".into()))
+                .expect("account changed before recovery");
+        }
+        let mut original = input;
+        original.models.clear();
+        if retired {
+            original.default_model = None;
+        }
+        let fetched = if retired {
+            Vec::new()
+        } else {
+            vec!["a-private".into()]
+        };
+        registry
+            .reconcile_discovered_configure(original, &fetched, retired)
+            .expect("recovery");
+        assert!(
+            registry
+                .get("recovery-work")
+                .expect("profile")
+                .configured_models
+                .is_empty()
+        );
+        if retired {
+            assert!(
+                registry
+                    .get("recovery-work")
+                    .expect("profile")
+                    .default_model
+                    .is_none()
+            );
+        }
+        registry
+            .reconcile_catalog_scope("recovery-work", Some("B".into()))
+            .expect("replacement");
+        assert!(
+            registry
+                .get("recovery-work")
+                .expect("profile")
+                .default_model
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn summary_rejects_foreign_default_without_startup_reconciliation() {
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.default_model = Some("a-private-beta".into());
+    let source = model_source([]);
+    source.replace(
+        "work".into(),
+        ProviderInventory::Fetched {
+            models: vec![discovered("b-current", true, None)],
+            fetched_at_ms: u64::MAX,
+        },
+    );
+    let registry = ProviderRegistry::new(MemoryProviderStore::default(), vec![profile], source)
+        .expect("registry");
+    assert_eq!(
+        registry
+            .get("work")
+            .expect("profile")
+            .default_model
+            .as_deref(),
+        Some("a-private-beta")
+    );
+    assert_eq!(
+        registry
+            .summary("work", &|_| true)
+            .expect("summary")
+            .default_model
+            .as_deref(),
+        Some("b-current")
+    );
+}
+
+fn removable_provider_profile_for_catalog_test() -> ProviderProfileV1 {
+    let mut profile = builtin_or_unknown("work", "unused");
+    profile.provenance = ProviderProvenance::Custom;
+    profile.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    profile.base_url = Some("http://127.0.0.1:19373/v1".into());
+    profile.auth_requirement = ProviderAuthRequirementWire::None;
+    profile.configured_models.clear();
+    profile.enabled = true;
+    profile
+}
+
+#[test]
+fn configured_availability_retains_stale_success_and_rejects_negative_evidence() {
+    for origin in [
+        "https://synthetic.openai.azure.com/openai/v1",
+        "http://127.0.0.1:19373/v1",
+    ] {
+        let mut profile = removable_provider_profile_for_catalog_test();
+        profile.base_url = Some(origin.into());
+        profile.configured_models = vec!["deployment".into()];
+        profile.default_model = Some("deployment".into());
+        let source = model_source([]);
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            source.clone(),
+        )
+        .expect("registry");
+        let assert_policy = |expected| {
+            let summary = registry.summary("work", &|_| true).expect("summary");
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                expected,
+                "{origin}: {summary:?}"
+            );
+            assert_eq!(
+                registry
+                    .validate_default_model("work", "deployment")
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(
+                crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
+                    .validate_selection_with_status("work", None, "deployment")
+                    .is_ok(),
+                expected
+            );
+        };
+        assert_policy(false);
+        source.unavailable("work", "server returned 503 for /models".into());
+        assert_policy(false);
+        source.unavailable("work", "model catalog discovery timed out".into());
+        assert_policy(false);
+        registry.clear_discovered_models("work");
+        assert_policy(false);
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("deployment", true, None)],
+                fetched_at_ms: 1,
+            },
+        );
+        assert_policy(true);
+        assert!(
+            registry
+                .summary("work", &|_| true)
+                .expect("stale")
+                .availability_reason
+                .expect("visible reason")
+                .contains("refresh")
+        );
+        source.unavailable("work", "server returned 503 for /models".into());
+        assert_policy(true);
+        source.unavailable("work", "model catalog discovery timed out".into());
+        assert_policy(true);
+        registry.models_rejected("work", "model catalog authentication failed".into());
+        assert_policy(false);
+        source.unavailable(
+            "work",
+            "later timeout is not proof the credential recovered".into(),
+        );
+        assert_policy(false);
+        registry.models_unsupported(
+            "work",
+            "later unsupported listing is not an auth success".into(),
+        );
+        assert_policy(false);
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("other", true, None)],
+                fetched_at_ms: u64::MAX,
+            },
+        );
+        assert_policy(false);
+        source.replace(
+            "work".into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("other", true, None)],
+                fetched_at_ms: 1,
+            },
+        );
+        assert_policy(true);
+        assert!(
+            registry
+                .summary("work", &|_| true)
+                .expect("stale row")
+                .models
+                .contains(&"deployment".into())
+        );
+        registry.models_unsupported("work", "server returned 405 for /models".into());
+        assert_policy(true);
+    }
+}
+
+#[test]
+fn aged_snapshot_admits_configured_model_before_the_next_registry_publication() {
+    for models in [vec![discovered("other", true, None)], vec![]] {
+        let mut profile = removable_provider_profile_for_catalog_test();
+        profile.configured_models = vec!["deployment".into()];
+        // Exercise the authoritative membership veto as well as availability.
+        profile.provenance = ProviderProvenance::BuiltIn;
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            model_source([("work", models)]),
+        )
+        .expect("registry");
+        let mut summary = registry.summary("work", &|_| true).expect("fresh summary");
+        summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 100 };
+        let fresh =
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary.clone()]));
+        assert!(
+            fresh
+                .validate_selection_with_status("work", None, "deployment")
+                .is_err()
+        );
+        summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+        let aged = crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]));
+        assert!(
+            aged.validate_selection_with_status("work", None, "deployment")
+                .is_ok()
+        );
+        assert!(
+            aged.validate_selection_with_status("work", None, "unconfigured")
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
+    for provider in [
+        "work",
+        HAIDER_CODE_PROVIDER_NAME,
+        DEEPSEEK_PROVIDER_NAME,
+        GEMINI_PROVIDER_NAME,
+        ANTHROPIC_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME,
+        BEDROCK_PROVIDER_NAME,
+    ] {
+        let profile = if provider == "work" {
+            removable_provider_profile_for_catalog_test()
+        } else {
+            builtin_or_unknown(provider, "unused")
+        };
+        let offline = offline_inventory(&profile);
+        let unsupported = catalog_source_for_profile(&profile).is_none();
+        let requires_credential = profile.auth_requirement != ProviderAuthRequirementWire::None;
+        let source = model_source([]);
+        let mut registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            source.clone(),
+        )
+        .expect("registry");
+        // Configure through the production path after startup's deliberate
+        // cleanup of legacy release-owned fetched catalog rows.
+        registry
+            .configure_with_inventory(
+                ProviderConfigureInput {
+                    provider: provider.into(),
+                    api_family: None,
+                    origin: None,
+                    auth_requirement: None,
+                    enabled: true,
+                    models: vec!["deployment".into()],
+                    default_model: Some("deployment".into()),
+                    response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
+                    trust: None,
+                },
+                &["deployment".into()],
+            )
+            .expect("explicit configuration");
+        let assert_policy = |expected| {
+            let summary = registry.summary(provider, &|_| true).expect("summary");
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                expected,
+                "{provider}: {summary:?}"
+            );
+            assert_eq!(
+                crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
+                    .validate_selection_with_status(provider, None, "deployment")
+                    .is_ok(),
+                expected,
+                "new-session policy for {provider}"
+            );
+        };
+        assert_policy(offline || unsupported);
+        source.unavailable(provider, "server returned 503 for /models".into());
+        assert_policy(offline || unsupported);
+        let uncertainty = registry.summary(provider, &|_| true).expect("503");
+        if offline {
+            assert_eq!(
+                uncertainty.inventory,
+                haider_rpc::ModelInventoryWire::Static
+            );
+        } else {
+            assert!(uncertainty.selection_reason(None).is_some());
+            if unsupported {
+                assert!(
+                    uncertainty
+                        .availability_reason
+                        .expect("reason")
+                        .contains("configured (unverified)")
+                );
+            }
+        }
+        registry.models_rejected(provider, "synthetic credential rejection".into());
+        assert_policy(false);
+        registry.clear_discovered_models(provider);
+        registry.models_unsupported(provider, "server returned 404 for /models".into());
+        assert_policy(true);
+        if !offline {
+            let summary = registry.summary(provider, &|_| true).expect("unverified");
+            assert_eq!(
+                summary.inventory_authority,
+                haider_rpc::ModelInventoryAuthorityWire::Advisory
+            );
+            assert!(
+                summary
+                    .availability_reason
+                    .expect("reason")
+                    .contains("configured (unverified)")
+            );
+        }
+        for (model, age, selectable) in [
+            ("deployment", u64::MAX, true),
+            ("deployment", 1, true),
+            ("other", u64::MAX, false),
+            ("other", 1, true),
+        ] {
+            source.replace(
+                provider.into(),
+                ProviderInventory::Fetched {
+                    models: vec![discovered(model, true, None)],
+                    fetched_at_ms: age,
+                },
+            );
+            assert_policy(selectable);
+        }
+        source.replace(
+            provider.into(),
+            ProviderInventory::Fetched {
+                models: vec![discovered("deployment", true, None)],
+                fetched_at_ms: u64::MAX,
+            },
+        );
+        assert_eq!(
+            registry
+                .summary(provider, &|_| false)
+                .expect("no credential")
+                .model_is_selectable("deployment"),
+            !requires_credential,
+            "credential failure policy for {provider}"
+        );
+    }
+}
+
+#[test]
+fn catalog_rejection_survives_restart_and_uncertainty_only_for_its_owner() {
+    let dir = tempfile::tempdir().expect("profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile.clone()]).expect("profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_rejection("work", "owner-A", "synthetic authentication failed".into())
+        .expect("negative evidence");
+    store
+        .save(&[profile])
+        .expect("management save preserves evidence");
+    let reloaded = ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart");
+    assert!(
+        !reloaded
+            .restore_catalog_evidence("work", "owner-B")
+            .expect("other owner")
+    );
+    reloaded.models_unsupported("work", "server returned 404 for /models".into());
+    assert!(
+        reloaded
+            .summary("work", &|_| true)
+            .expect("B")
+            .model_is_selectable("deployment")
+    );
+    assert!(
+        reloaded
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("owner")
+    );
+    for unsupported in [false, true] {
+        if unsupported {
+            reloaded.models_unsupported("work", "server returned 405 for /models".into());
+        } else {
+            reloaded.models_unavailable("work", "synthetic timeout / 503".into());
+        }
+        assert!(
+            !reloaded
+                .summary("work", &|_| true)
+                .expect("A")
+                .model_is_selectable("deployment")
+        );
+    }
+    reloaded
+        .clear_catalog_evidence("owner-A")
+        .expect("positive evidence retires rejection");
+    reloaded.replace_discovered_models(
+        "work".into(),
+        vec![discovered("deployment", true, None)],
+        u64::MAX,
+    );
+    assert!(
+        reloaded
+            .summary("work", &|_| true)
+            .expect("recovered")
+            .model_is_selectable("deployment")
+    );
+    let restarted =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("restart recovered");
+    assert!(
+        !restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("cleared")
+    );
+    let document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join(PROVIDERS_FILE_NAME)).expect("document"),
+    )
+    .expect("json");
+    assert!(
+        document.get("catalog_evidence").is_none(),
+        "empty additive field is omitted"
+    );
+}
+
+#[test]
+fn unsupported_discovery_survives_restart_and_uncertainty_only_for_its_owner() {
+    let dir = tempfile::tempdir().expect("profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile]).expect("profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_unsupported("work", "owner-A", "server returned 404 for /models".into())
+        .expect("unsupported");
+    let restarted = ProviderRegistry::new(store, vec![], model_source([])).expect("restart");
+    assert!(
+        !restarted
+            .restore_catalog_evidence("work", "owner-B")
+            .expect("B")
+    );
+    restarted.models_unavailable("work", "server returned 503 for /models".into());
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("B")
+            .model_is_selectable("deployment")
+    );
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("A")
+    );
+    for reason in ["server returned 503 for /models", "synthetic timeout"] {
+        restarted.models_unavailable("work", reason.into());
+        let summary = restarted.summary("work", &|_| true).expect("A");
+        assert!(summary.model_is_selectable("deployment"));
+        assert!(
+            summary
+                .availability_reason
+                .expect("reason")
+                .contains("configured (unverified)")
+        );
+    }
+    restarted
+        .record_catalog_rejection("work", "owner-A", "synthetic auth failure".into())
+        .expect("rejection");
+    restarted
+        .record_catalog_unsupported("work", "owner-A", "server returned 405 for /models".into())
+        .expect("later uncertainty");
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("restore negative")
+    );
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("negative")
+            .model_is_selectable("deployment")
+    );
+}
+
+#[test]
+fn unsupported_adapters_accept_explicit_models_without_fabricating_inventory() {
+    for provider in [OPENAI_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME] {
+        let profile = builtin_or_unknown(provider, "unused");
+        assert!(catalog_source_for_profile(&profile).is_none());
+        let registry = ProviderRegistry::new(
+            MemoryProviderStore::default(),
+            vec![profile],
+            model_source([]),
+        )
+        .expect("registry");
+        let summary = registry.summary(provider, &|_| true).expect("healthy");
+        assert!(summary.models.is_empty());
+        assert!(summary.model_details.is_empty());
+        assert!(summary.default_model.is_none());
+        assert_eq!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Configured
+        );
+        assert_eq!(
+            summary.inventory_authority,
+            haider_rpc::ModelInventoryAuthorityWire::Advisory
+        );
+        assert!(summary.model_is_selectable("synthetic-explicit-model"));
+        assert!(
+            summary
+                .availability_reason
+                .as_deref()
+                .expect("reason")
+                .contains("configured (unverified)")
+        );
+        assert!(
+            crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary]))
+                .validate_selection_with_status(provider, None, "synthetic-explicit-model")
+                .is_ok()
+        );
+        assert!(
+            !registry
+                .summary(provider, &|_| false)
+                .expect("credential negative")
+                .model_is_selectable("synthetic-explicit-model")
+        );
+        assert!(
+            registry
+                .validate_default_model(provider, "synthetic-explicit-model")
+                .is_err(),
+            "an explicit passthrough must not fabricate a picker/default row"
+        );
+    }
+}
+
+#[test]
+fn transient_refresh_failure_preserves_successful_empty_inventory() {
+    for (origin, provider) in [
+        ("https://synthetic.openai.azure.com/openai/v1", "work"),
+        ("http://127.0.0.1:19373/v1", "work"),
+        ("https://synthetic.openai.azure.com/openai/v1", "openai"),
+        ("http://127.0.0.1:19373/v1", "openai"),
+    ] {
+        for fetched_at_ms in [1, u64::MAX] {
+            for listed in [None, Some("other"), Some("deployment")] {
+                for declared in [false, true] {
+                    let mut profile = removable_provider_profile_for_catalog_test();
+                    profile.base_url = Some(origin.into());
+                    profile.provider_id = provider.into();
+                    profile.configured_models = if declared {
+                        vec!["deployment".into()]
+                    } else {
+                        Vec::new()
+                    };
+                    profile.default_model = declared.then(|| "deployment".into());
+                    let source = model_source([]);
+                    source.replace(
+                        provider.into(),
+                        ProviderInventory::Fetched {
+                            models: listed
+                                .map(|name| vec![discovered(name, true, None)])
+                                .unwrap_or_default(),
+                            fetched_at_ms,
+                        },
+                    );
+                    let registry = ProviderRegistry::new(
+                        MemoryProviderStore::default(),
+                        vec![profile],
+                        source.clone(),
+                    )
+                    .expect("registry");
+                    let initial = registry.summary(provider, &|_| true).expect("listing");
+                    assert_eq!(
+                        initial.model_is_selectable("deployment"),
+                        fetched_at_ms == 1
+                            || listed == Some("deployment")
+                            || (!declared && listed.is_some()),
+                        "fresh absence remains definite negative evidence"
+                    );
+                    for reason in [
+                        "server returned 503 for /models",
+                        "model catalog discovery timed out",
+                    ] {
+                        source.unavailable(provider, reason.into());
+                        assert!(matches!(source.inventory(provider),
+                        ProviderInventory::Stale { fetched_at_ms: retained, .. }
+                            if retained == fetched_at_ms));
+                        let summary = registry.summary(provider, &|_| true).expect("uncertainty");
+                        assert!(
+                            summary.model_is_selectable("deployment"),
+                            "{origin}: {summary:?}"
+                        );
+                        assert!(
+                            crate::model_select::ModelSelectionAuthority::new(
+                                None,
+                                Some(vec![summary.clone()]),
+                            )
+                            .validate_selection_with_status(provider, None, "deployment")
+                            .is_ok(),
+                            "advisory uncertainty permits explicit input"
+                        );
+                        if !declared && listed.is_none() {
+                            assert!(summary.models.is_empty());
+                            assert!(summary.model_details.is_empty());
+                            assert!(summary.default_model.is_none());
+                        }
+                        assert!(
+                            summary
+                                .selection_reason(Some("deployment"))
+                                .expect("visible reason")
+                                .contains(reason)
+                        );
+                        if declared && listed != Some("deployment") {
+                            let detail = summary
+                                .model_details
+                                .iter()
+                                .find(|detail| detail.name == "deployment")
+                                .expect("configured row");
+                            assert_eq!(
+                                detail.source,
+                                Some(haider_rpc::ModelDetailSourceWire::Configured)
+                            );
+                            assert_eq!(detail.context_window, None);
+                        }
+                    }
+                    registry
+                        .models_rejected(provider, "model catalog authentication failed".into());
+                    source.unavailable(provider, "later timeout".into());
+                    assert!(
+                        !registry
+                            .summary(provider, &|_| true)
+                            .expect("rejected")
+                            .model_is_selectable("deployment")
+                    );
+                    source.remove(provider);
+                    source.unavailable(provider, "first fetch timed out".into());
+                    assert!(
+                        !registry
+                            .summary(provider, &|_| true)
+                            .expect("never succeeded")
+                            .model_is_selectable("deployment")
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn selection_over_projected_rows(
     provider: &str,
     rows: Vec<DiscoveredModel>,
@@ -2212,6 +3383,9 @@ fn selection_over_projected_rows(
         .map(|row| model_detail_wire(provider, row, haider_rpc::ModelDetailSourceWire::Remote))
         .collect::<Vec<_>>();
     let summary = haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
@@ -2236,7 +3410,7 @@ fn selection_over_projected_rows(
     (
         crate::model_select::ModelSelectionAuthority::new(
             Some(std::iter::once(provider.to_owned()).collect()),
-            vec![summary],
+            Some(vec![summary]),
         ),
         model_details,
     )

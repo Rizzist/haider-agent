@@ -1743,6 +1743,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
         "fallback remains approximately 15 minutes"
     );
     let imported_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("openai-oauth"),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -1784,6 +1786,8 @@ async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
 
     let pkce_alias = CredentialAlias::new("openai-oauth-2");
     let pkce_descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: pkce_alias.clone(),
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         base_url: None,
@@ -3783,6 +3787,8 @@ impl Vault for ResolveCountingVault {
 
 fn oauth_descriptor_for_test() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("work-oauth"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6074,6 +6080,8 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let vault = Arc::new(MemoryVault::new());
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-api"),
         provider: "fake-oauth".into(),
         base_url: None,
@@ -6250,6 +6258,8 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
 
     broker.invalidate(&descriptor.alias);
     let replacement = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: descriptor.alias.clone(),
         provider: "replacement-provider".into(),
         base_url: Some("https://replacement.invalid".into()),
@@ -6375,4 +6385,115 @@ fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
 #[test]
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
+}
+
+#[tokio::test]
+async fn api_key_broker_rejects_mismatched_bytes_and_preserves_gcloud_rotation() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.auth_method = AuthMethod::ApiKey;
+    descriptor.credential_digest = Some(blake3::hash(b"SYNTHETIC_KEY_A").to_hex().to_string());
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_B")
+        .expect("different key");
+    let (broker, snapshot, descriptor) = broker_for(&server, vault.clone(), descriptor);
+    assert!(
+        broker.resolve(&descriptor).await.is_err(),
+        "an externally changed vault cannot supply a different account's key"
+    );
+    let mut gcloud = descriptor.clone();
+    gcloud.provider = haider_provider::VERTEX_PROVIDER_NAME.into();
+    gcloud.alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    vault
+        .put(&gcloud.alias, b"SYNTHETIC_ROTATED_GCLOUD_TOKEN")
+        .expect("native token rotation");
+    *snapshot.lock().expect("snapshot") = vec![gcloud.clone()];
+    assert_eq!(
+        broker
+            .resolve(&gcloud)
+            .await
+            .expect("same-account native token")
+            .expose_secret(),
+        b"SYNTHETIC_ROTATED_GCLOUD_TOKEN"
+    );
+}
+
+#[tokio::test]
+async fn api_key_broker_rejects_a_read_that_crosses_a_rollback() {
+    struct HeldReadVault {
+        inner: MemoryVault,
+        entered: Notify,
+        released: (Mutex<bool>, Condvar),
+    }
+    impl Vault for HeldReadVault {
+        fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+            self.inner.put(alias, secret)
+        }
+        fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+            let secret = self.inner.resolve(alias)?;
+            self.entered.notify_one();
+            let (lock, wake) = &self.released;
+            let (released, _) = wake
+                .wait_timeout_while(
+                    lock.lock().expect("release lock"),
+                    Duration::from_secs(30),
+                    |released| !*released,
+                )
+                .expect("held vault read");
+            assert!(*released, "test released vault reader");
+            Ok(secret)
+        }
+        fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+        fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(HeldReadVault {
+        inner: MemoryVault::new(),
+        entered: Notify::new(),
+        released: (Mutex::new(false), Condvar::new()),
+    });
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.auth_method = AuthMethod::ApiKey;
+    descriptor.credential_digest = None;
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_A")
+        .expect("seed A");
+    let (broker, _, descriptor) = broker_for(&server, vault.clone() as Arc<dyn Vault>, descriptor);
+    let read_broker = broker.clone();
+    let read_descriptor = descriptor.clone();
+    let task = tokio::spawn(async move { read_broker.resolve(&read_descriptor).await });
+    let entered = tokio::time::timeout(Duration::from_secs(10), vault.entered.notified()).await;
+    let guard = broker
+        .inner
+        .fences
+        .begin_credential_write(&descriptor.alias)
+        .expect("replacement writer");
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_B")
+        .expect("vault-first write");
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_A")
+        .expect("rollback");
+    drop(guard);
+    *vault.released.0.lock().expect("release reader") = true;
+    vault.released.1.notify_all();
+    let read = task.await.expect("reader task");
+    entered.expect("reader entered vault");
+    assert!(
+        read.is_err(),
+        "a rollback cannot hide a replacement that crossed this read"
+    );
+    assert_eq!(
+        broker
+            .resolve(&descriptor)
+            .await
+            .expect("fresh A read after rollback")
+            .expose_secret(),
+        b"SYNTHETIC_KEY_A"
+    );
 }

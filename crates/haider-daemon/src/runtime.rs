@@ -932,6 +932,11 @@ async fn run_inner(
         &config.default_model,
         &creatable_providers,
         config.discovery_disabled,
+        match &dependencies.provider_factory {
+            crate::worker::ProviderFactoryConfig::Injected { providers, .. } => Some(providers),
+            crate::worker::ProviderFactoryConfig::Accounts
+            | crate::worker::ProviderFactoryConfig::AccountsWith(_) => None,
+        },
     )
     .await
     {

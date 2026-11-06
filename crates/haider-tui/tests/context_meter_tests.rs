@@ -29,6 +29,8 @@ use common::{launcher_model, run_slash};
 
 fn oauth_descriptor(provider: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(provider),
         provider: provider.to_owned(),
         base_url: None,
@@ -48,6 +50,9 @@ fn summary(
     default: &str,
 ) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -736,6 +741,7 @@ fn deliver_model_fact(
         selection_epoch: Some(seq),
         provider: provider.to_owned(),
         model: slug.to_owned(),
+        model_catalog_key: None,
         route_only: false,
         cleared_account_pin: None,
         cleared_provider_endpoint: None,
@@ -772,6 +778,7 @@ fn model_selected_reply_at(
         command_id: haider_rpc::CommandId::new(format!("select-{slug}")),
         session: session.clone(),
         provider: provider.to_owned(),
+        model_catalog_key: None,
         model: slug.to_owned(),
         worker_generation: 7,
         output_budget,
@@ -1354,6 +1361,7 @@ fn listed_summary(
     max_tokens: u64,
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -1379,6 +1387,7 @@ fn listed_summary(
         agent_type: None,
         context_economy: Default::default(),
         created_at_ms: 1,
+        model_catalog_key: None,
     };
     haider_rpc::SessionSummary {
         owner_agent_id: None,

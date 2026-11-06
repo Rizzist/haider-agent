@@ -164,12 +164,14 @@ async fn zero_hooks_retain_without_decode_then_post_install_replay_fires_old_eve
     let session_id = SessionId::new("hook-peak-rss-session");
     let run_id = RunId::new("hook-peak-rss-run");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hook-peak-rss".into(),
         request_digest: "create-hook-peak-rss-digest".into(),
         request_json: r#"{"session":"hook-peak-rss"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_str().expect("UTF-8 workspace").to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -251,6 +253,7 @@ async fn zero_hooks_retain_without_decode_then_post_install_replay_fires_old_eve
     let clean_session_id = SessionId::new("hook-peak-rss-clean-session");
     let clean_run_id = RunId::new("hook-peak-rss-clean-run");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hook-peak-rss-clean".into(),
         request_digest: "create-hook-peak-rss-clean-digest".into(),
         request_json: r#"{"session":"hook-peak-rss-clean"}"#.into(),
@@ -260,6 +263,7 @@ async fn zero_hooks_retain_without_decode_then_post_install_replay_fires_old_eve
             .expect("UTF-8 clean workspace")
             .to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

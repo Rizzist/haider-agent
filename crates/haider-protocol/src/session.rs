@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 /// native worker pickup write this same fact before any provider resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOutputPairPinnedV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
@@ -419,6 +423,15 @@ pub struct SessionMetadataV1 {
     pub account_alias: Option<String>,
     /// Full provider model identifier — the current model selection.
     pub model: String,
+    /// Canonical coordinate admitted for an explicit creation spelling that
+    /// differs from `model`. Absence keeps legacy saved-name admission strict.
+    /// The public literal remains in `model`; model reselection clears this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// Producer of a catalog-derived selection. An absent key preserves explicit
+    /// configuration and legacy metadata; a retired key requires reselection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     /// Maximum output tokens for each provider request.
     pub max_tokens: u64,
     /// Whether `max_tokens` was derived from the selected model or set by the
@@ -493,6 +506,14 @@ pub struct SessionMetadataV1 {
     pub created_at_ms: u64,
 }
 
+impl SessionMetadataV1 {
+    /// The admitted provider request coordinate, separately from public spelling.
+    #[must_use]
+    pub fn model_coordinate(&self) -> &str {
+        self.resolved_model.as_deref().unwrap_or(&self.model)
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
@@ -513,6 +534,8 @@ pub struct ModelSelected {
     pub provider: String,
     /// The selected full model identifier.
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     /// This fact publishes route provenance without changing the model pair.
     /// The first resolved route keeps the captured epoch; a rotation advances it.
     /// Older readers may still treat it as a model selection; new readers
@@ -768,6 +791,9 @@ impl SessionProviderRebound {
 
     /// Rebuild the routing projection from a replayed committed fact.
     pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
+        // A route edit is not a new model selection. Preserve the original
+        // producer so admission cannot treat its derived model/settings as
+        // explicit configuration for another account or endpoint.
         if let Some(epoch) = self.selection_epoch {
             metadata.selection_epoch = Some(epoch);
         }

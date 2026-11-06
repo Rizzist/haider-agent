@@ -99,12 +99,14 @@ fn create_session(store: &Store, name: &str) -> SessionId {
     let session_id = SessionId::new(name);
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{name}"),
             request_digest: format!("create-digest-{name}"),
             request_json: format!(r#"{{"session":"{name}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -125,12 +127,14 @@ fn create_autonomous_session(store: &Store, name: &str) -> SessionId {
     store
         .create_session_with_interaction_mode(
             &SessionCreateCommand {
+                resolved_model: None,
                 command_id: format!("create-{name}"),
                 request_digest: format!("create-digest-{name}"),
                 request_json: format!(r#"{{"session":"{name}","interaction_mode":"autonomous"}}"#),
                 session_id: session_id.clone(),
                 cwd: "/tmp".into(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-v1".into(),
                 max_tokens: 4096,
                 max_tokens_source: None,

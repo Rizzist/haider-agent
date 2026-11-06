@@ -113,6 +113,8 @@ async fn successor_during_stop(scope: &str, recovery: bool, direct: bool) {
         cwd: root.path().display().to_string(),
         provider: "fake".into(),
         model: "fake-v1".into(),
+        resolved_model: None,
+        model_catalog_key: None,
         max_output_tokens: 64,
         effort: None,
         fast: false,

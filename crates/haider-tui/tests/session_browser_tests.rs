@@ -76,6 +76,7 @@ fn seed(model: &mut AppModel, summary: SessionSummary) {
 
 fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -88,6 +89,7 @@ fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionM
         cwd: cwd.to_owned(),
         provider: "openai".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.to_owned(),
         max_tokens: 4_096,
         max_tokens_source: None,

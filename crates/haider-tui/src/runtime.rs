@@ -874,11 +874,7 @@ pub fn sync_model_persistence(
     }
     *seen_commits = model.model_commits;
     if let Some(store) = settings.as_mut() {
-        store.save_last_model_if_changed(
-            model.theme_choice,
-            &model.launcher_identity.provider,
-            &model.launcher_identity.model_short,
-        );
+        store.save_last_model_if_changed(model.theme_choice, model.last_model_pick());
     }
 }
 
@@ -1154,15 +1150,11 @@ pub async fn run_demo(
     if let Some(store) = settings.as_mut() {
         store.set_tool_rows(tool_rows);
     }
-    if let Some((provider, model_short)) = settings
+    if let Some(pick) = settings
         .as_ref()
         .and_then(crate::settings::SettingsStore::load_last_model)
     {
-        model.identity.provider = provider;
-        model.identity.model_short = model_short;
-        model.launcher_identity_pinned = true;
-        model.refresh_context_window();
-        model.launcher_identity = model.identity.clone();
+        model.restore_last_model_pick(&pick);
     }
     // 970: the terms acknowledgements this profile already carries — read
     // ONCE at boot so the first-login disclosure never reappears for a user
@@ -2774,6 +2766,8 @@ impl DemoDriver {
                     return;
                 };
                 let descriptor = haider_protocol::credential::CredentialDescriptor {
+                    incarnation: 0,
+                    credential_digest: None,
                     alias: haider_protocol::ids::CredentialAlias::new(row.alias),
                     provider: row.provider,
                     base_url: row.base_url,
@@ -4465,17 +4459,13 @@ pub async fn run_live(
     // user last selected — seed the identity pair from the persisted pick.
     // The next CreateSession mints from this pair (M9), and live daemon
     // replies stay the running authority afterwards.
-    if let Some((provider, model_short)) = settings
+    if let Some(pick) = settings
         .as_ref()
         .and_then(crate::settings::SettingsStore::load_last_model)
     {
-        model.identity.provider = provider.clone();
-        model.identity.model_short = model_short.clone();
-        model.launcher_identity_pinned = true;
-        model.refresh_context_window();
-        model.launcher_identity = model.identity.clone();
+        model.restore_last_model_pick(&pick);
         if let Some(store) = settings.as_mut() {
-            store.set_last_model(Some((provider, model_short)));
+            store.set_last_model(Some(pick));
         }
     }
     // 970: see the demo loop — one boot read of the acknowledgement journal.
@@ -4531,6 +4521,13 @@ pub async fn run_live(
     // `TalkPhase::Listening`), so an idle terminal takes ZERO extra
     // wakeups — the same efficiency-rider law the guarded `frame_tick`
     // already follows.
+    // Catalog and account mutations from other clients must retire identity
+    // chrome even when the terminal is idle. A daemon serving
+    // `account.list_watch` pushes a signal per published revision, so the
+    // idle terminal keeps zero extra wakeups; only an older daemon without
+    // the watch is polled, one bounded pair per interval.
+    let mut management_tick = tokio::time::interval(Duration::from_secs(5));
+    management_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut talk_tick = tokio::time::interval(Duration::from_millis(TALK_ANIM_MS));
     talk_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
@@ -4716,6 +4713,11 @@ pub async fn run_live(
                     }
                     None => update_events_open = false,
                 }
+            }
+            _ = management_tick.tick(), if link_replies_open
+                && !update_in_progress
+                && !driver.management_watch_active() => {
+                pending.extend(driver.refresh_management());
             }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);

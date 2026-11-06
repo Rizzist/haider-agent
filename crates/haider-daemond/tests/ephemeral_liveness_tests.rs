@@ -224,6 +224,11 @@ fn spawn_helper(
         .env("HAIDER_PROFILE_DIR", &profile.store_dir)
         .env("HAIDER_RUNTIME_DIR", runtime_root)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // Liveness fixtures need no host credential or live provider.
+        .env(
+            "HAIDER_TEST_FAKE_PROVIDER",
+            r#"[{"step":"finish","reason":"end_turn"}]"#,
+        )
         // Lockdown is intentionally machine-user global. Keep that global
         // root inside this black-box fixture rather than touching the
         // developer/runner account's real home.
@@ -332,14 +337,17 @@ fn wait_for_cleanup_preserving_peer_registration(
         || {
             !pid_path(profile).exists()
                 && !profile.endpoint_path.exists()
-                && std::fs::read_dir(&profile.runtime_dir).is_ok_and(|entries| {
-                    entries.flatten().all(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| name.starts_with("ph-") && name.ends_with(".j"))
-                    })
-                })
+                && match std::fs::read_dir(&profile.runtime_dir) {
+                    Ok(entries) => entries.into_iter().all(|entry| {
+                        entry.is_ok_and(|entry| {
+                            entry.file_type().is_ok_and(|kind| kind.is_file())
+                                && entry.file_name().to_str().is_some_and(|name| {
+                                    name.starts_with("ph-") && name.ends_with(".j")
+                                })
+                        })
+                    }),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                }
         },
         || {
             process_snapshot(profile, child.as_deref_mut(), daemon_pid)
@@ -867,8 +875,8 @@ fn active_monitor_holds_ephemeral_daemon_until_expiry() {
         .block_on(connected.client.request(RequestBody::SessionCreate {
             command_id: CommandId::new("ephemeral-monitor-session"),
             cwd: root.path().to_string_lossy().into_owned(),
-            provider: "anthropic".into(),
-            model: "claude-opus-5".into(),
+            provider: "fake".into(),
+            model: "monitor-fixture".into(),
             max_tokens: 64,
         }))
         .expect("create ephemeral monitor session");

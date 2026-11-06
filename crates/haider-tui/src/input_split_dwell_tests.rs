@@ -660,25 +660,9 @@ fn split_repeat_and_closers_match_paced_input_on_every_owner() {
                 }
                 "effort" => m.effort_picker = Some(EffortPicker::default()),
                 "model" => {
-                    m.providers.providers.push(haider_rpc::ProviderSummaryWire {
-                        provider: "synthetic".into(),
-                        api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
-                        endpoint: None,
-                        response_open_timeout_ms: None,
-                        chunk_idle_timeout_ms: None,
-                        semantic_progress_timeout_ms: None,
-                        models: (0..4).map(|i| format!("model-{i}")).collect(),
-                        model_details: vec![],
-                        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
-                        inventory: haider_rpc::ModelInventoryWire::Static,
-                        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
-                        auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],
-                        availability: haider_rpc::ProviderAvailabilityWire::Available,
-                        availability_reason: None,
-                        default_model: None,
-                        enabled: true,
-                        trust: haider_rpc::ProviderTrustWire::Full,
-                    });
+                    m.providers.providers.push(metadata_provider(
+                        (0..4).map(|i| format!("model-{i}")).collect(),
+                    ));
                     m.open_model_picker(String::new());
                     assert!(m.model_picker_rows().len() >= 4);
                 }
@@ -1582,6 +1566,9 @@ fn metadata_provider(models: Vec<String>) -> haider_rpc::ProviderSummaryWire {
         response_open_timeout_ms: None,
         chunk_idle_timeout_ms: None,
         semantic_progress_timeout_ms: None,
+        static_models: models.clone(),
+        configured_models: Vec::new(),
+        catalog_scope: None,
         models,
         model_details: vec![],
         catalog: haider_rpc::ProviderCatalogKindWire::Unknown,

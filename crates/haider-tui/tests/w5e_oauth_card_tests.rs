@@ -190,6 +190,8 @@ fn cancel_closes_and_late_replies_are_ghosts() {
     assert!(model.oauth_add.is_none());
     // A late COMPLETION for the retired attempt must not repaint either.
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("openai-oauth"),
         provider: "openai-oauth".into(),
         base_url: None,

@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +18,156 @@ SPEC = importlib.util.spec_from_file_location(
     'image_identity', ROOT / 'packaging/installers/macos-image-identity.py')
 IMAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(IMAGE)
+INVALID_DATE_INVENTORY = (
+    b'<plist><dict><key>images</key><array/><key>date</key>'
+    b'<date>invalid</date></dict></plist>')
+
+
+class InventoryTests(unittest.TestCase):
+    def response(self, status=0, output=None, error=b''):
+        return subprocess.CompletedProcess([], status,
+            plistlib.dumps({'images': []}) if output is None else output, error)
+
+    def test_busy_and_incomplete_inventory_retry_by_count(self):
+        for status, diagnostic in ((16, b''), (0, b'Resource busy'), (1, b'Resource busy'), (9, b'DEVICE BUSY'),
+                (1, b'Resource temporarily unavailable'), (1, b'error: EBUSY.'),
+                (0, b'cannot get IO media array')):
+            for failures in (1, 3, 4):
+                with self.subTest(status=status, diagnostic=diagnostic, failures=failures), \
+                        patch.object(IMAGE.subprocess, 'run', side_effect=
+                            [self.response(status, error=diagnostic)] * failures + [self.response()]) as query, \
+                        patch.object(IMAGE.time, 'sleep') as sleep:
+                    if failures == 4:
+                        with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                            IMAGE.staging_inventory()
+                    else:
+                        self.assertEqual(IMAGE.staging_inventory(), [])
+                    self.assertEqual(query.call_count, min(failures + 1, 4))
+                    self.assertEqual(sleep.call_count, min(failures, 3))
+                    self.assertTrue(all(call.kwargs['timeout'] == 60 for call in query.call_args_list))
+
+    def test_other_failed_or_invalid_inventory_stops_immediately(self):
+        responses = [self.response(9, error=b'Invalid argument'),
+                     self.response(1, error=b'not_ebusy_suffix'),
+                     self.response(error=b'unexpected inventory warning'),
+                     self.response(output=INVALID_DATE_INVENTORY),
+                     self.response(output=b'truncated plist'),
+                     self.response(output=b'<?xml version="1.0"?><plist><dict>')]
+        responses += [self.response(output=plistlib.dumps(value)) for value in
+                      ({}, [], {'images': {}}, {'images': [False]}, {'images': [{}]},
+                       {'images': [{'system-entities': {}}]},
+                       {'images': [{'system-entities': [False]}]},
+                       {'images': [{'image-path': 1}]},
+                       {'images': [{'image-path': '/a', 'system-entities': [], 'hdid-pid': []}]},
+                       {'images': [{'system-entities': [{'dev-entry': 1}]}]})]
+        for response in responses:
+            with self.subTest(response=response), \
+                    patch.object(IMAGE.subprocess, 'run', return_value=response) as query, \
+                    patch.object(IMAGE.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                sleep.assert_not_called()
+        for error in (AttributeError('invalid date'), OverflowError('invalid value'),
+                      RecursionError('nested plist')):
+            with self.subTest(parser_error=error), \
+                    patch.object(IMAGE.subprocess, 'run', return_value=self.response()) as query, \
+                    patch.object(IMAGE.plistlib, 'loads', side_effect=error), \
+                    patch.object(IMAGE.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_unavailable_inventory_and_reader_queries_fail_closed(self):
+        for error in (OSError('unavailable'), subprocess.TimeoutExpired('inventory', 60)):
+            with self.subTest(error=error), \
+                    patch.object(IMAGE.subprocess, 'run', side_effect=error) as query:
+                with self.assertRaisesRegex(IMAGE.InventoryError, 'retaining'):
+                    IMAGE.staging_inventory()
+                self.assertEqual(query.call_count, 1)
+                self.assertIsNone(IMAGE.backing_identity({'hdid-pid': 973}, [1, 2]))
+                with patch.object(IMAGE.time, 'sleep'):
+                    with self.assertRaisesRegex(RuntimeError, 'retaining'):
+                        IMAGE.open_image_users(Path('/unused'), 0)
+        for response in (subprocess.CompletedProcess([], 9, b'', b''),
+                subprocess.CompletedProcess([], 0, b'f3\0tREG\0Dinvalid\0i2\0', b''),
+                subprocess.CompletedProcess([], 0, b'f3\0tREG\0D0x1\0i2\0', b'warning')):
+            with self.subTest(response=response), patch.object(IMAGE.subprocess, 'run', return_value=response):
+                self.assertIsNone(IMAGE.backing_identity({'hdid-pid': 973}, [1, 2]))
+
+    def test_complete_inventory_preserves_legitimate_entries(self):
+        images = [{'image-path': '/tmp/É image.dmg', 'hdid-pid': 973,
+                   'system-entities': [{'dev-entry': '/dev/disk973'}]}]
+        for expected in ([], images):
+            with self.subTest(images=expected), patch.object(IMAGE.subprocess, 'run',
+                    return_value=self.response(output=plistlib.dumps({'images': expected}))) as query:
+                self.assertEqual(IMAGE.staging_inventory(), expected)
+                self.assertEqual(query.call_count, 1)
+        valid_date = INVALID_DATE_INVENTORY.replace(b'invalid', b'2026-10-20T00:00:00Z')
+        with patch.object(IMAGE.subprocess, 'run', return_value=self.response(output=valid_date)) as query:
+            self.assertEqual(IMAGE.staging_inventory(), [])
+            self.assertEqual(query.call_count, 1)
+
+    def prepare_cli_image(self, root, *, invalid_record=False):
+        path = root / 'image.dmg'
+        path.write_bytes(b'retained image bytes')
+        record = root / 'identity.json'
+        expected = IMAGE.identity(path.stat())
+        record.write_text(json.dumps({} if invalid_record else {'identity': expected, 'copying': True}))
+        saved = {'path': str(path), 'directory': IMAGE.identity(root.stat())}
+        if not invalid_record:
+            saved['identity'] = expected
+        (root / 'staged-image.json').write_text(json.dumps(saved))
+        (root / 'retain-create').write_text(str(path))
+        return path, record
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX image descriptors and a shell fixture')
+    def test_cli_inventory_refusals_retain_files_without_tracebacks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shim = root / 'hdiutil'
+            count = root / 'calls'
+            for status, output in ((16, 'Resource busy'), (9, 'Invalid argument'),
+                                   (0, 'invalid plist'), (0, INVALID_DATE_INVENTORY.decode())):
+                shim.write_text('#!/bin/sh\necho info >> "' + str(count) + '"\n'
+                                'echo "' + output + '" >&' + ('1' if status == 0 else '2') + '\n'
+                                'exit ' + str(status) + '\n')
+                shim.chmod(0o755)
+                for action in ('finish', 'clean', 'remove', 'withdraw-image'):
+                    with self.subTest(action=action, status=status, output=output):
+                        count.unlink(missing_ok=True)
+                        path, record = self.prepare_cli_image(root)
+                        result = subprocess.run([sys.executable, str(SPEC.origin), action,
+                            str(path), str(record), str(root)], capture_output=True, text=True,
+                            env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']}, timeout=30)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('retaining', result.stderr)
+                        self.assertNotIn('Traceback', result.stderr)
+                        self.assertEqual(path.read_bytes(), b'retained image bytes')
+                        self.assertTrue((root / 'retain-create').exists())
+                        self.assertEqual(len(count.read_text().splitlines()), 4 if status == 16 else 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX image descriptors and a shell fixture')
+    def test_cli_invalid_identity_records_retain_files_before_inventory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            count = root / 'calls'
+            shim = root / 'hdiutil'
+            shim.write_text('#!/bin/sh\necho info >> "' + str(count) + '"\nexit 9\n')
+            shim.chmod(0o755)
+            for action in ('finish', 'clean', 'remove', 'withdraw-image'):
+                with self.subTest(action=action):
+                    path, record = self.prepare_cli_image(root, invalid_record=True)
+                    result = subprocess.run([sys.executable, str(SPEC.origin), action,
+                        str(path), str(record), str(root)], capture_output=True, text=True,
+                        env={**os.environ, 'PATH':str(root) + os.pathsep + os.environ['PATH']}, timeout=30)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn('retaining', result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(path.read_bytes(), b'retained image bytes')
+                    self.assertTrue((root / 'retain-create').exists())
+                    self.assertFalse(count.exists(), 'queried inventory before proving the image identity')
 
 
 @unittest.skipUnless(platform.system() == 'Darwin', 'requires macOS backing-inode lifecycle semantics')
@@ -488,14 +640,55 @@ class ImageIdentityTests(unittest.TestCase):
         self.assertFalse((self.root / 'digest').exists())
 
     def test_backing_identity_requires_an_open_numeric_descriptor(self):
-        for output, expected in ((b'f3\ntREG\nD0x10\ni42\nn/x/image.dmg\n', True),
-                                 (b'f3\ntREG\nD0x10\ni43\nn/x/image.dmg\n', False),
-                                 (b'f3\ntREG\nD0x11\ni42\nn/x/image.dmg\n', False),
-                                 (b'ftxt\nD0x10\ni42\n', None)):
+        for output, expected in ((b'p123\0\nf3\0tREG\0D0x10\0i42\0n/x/image.dmg\0\n', True),
+                                 (b'p123\0\nf3\0tREG\0D0x10\0i43\0n/x/image.dmg\0\n', False),
+                                 (b'p123\0\nf3\0tREG\0D0x11\0i42\0n/x/image.dmg\0\n', False),
+                                 (b'p123\0\nftxt\0D0x10\0i42\0\n', None)):
             with self.subTest(output=output), patch.object(IMAGE.subprocess, 'run',
                     return_value=subprocess.CompletedProcess([], 0, output)):
                 self.assertEqual(IMAGE.backing_identity({'hdid-pid': 123, 'image-path': '/x/image.dmg'}, [16, 42]), expected)
         self.assertFalse(IMAGE.backing_identity({}, [16, 42]))
+
+    def test_backing_identity_judges_each_file_set_on_its_own(self):
+        # Shape of a real diskimages-helper listing (-F0fDtin): cwd, txt and
+        # character-device sets carry no backing authority and are skipped.
+        head = (b'p973\0\nfcwd\0tDIR\0D0x10\0i2\0n/\0\n'
+                b'ftxt\0tREG\0D0x10\0i9\0n/System/diskimages-helper\0\nftxt\0tREG\0n/lib\0\n'
+                b'f0\0tCHR\0D0xdd\0i336\0n/dev/null\0\nf4\0tPIPE\0n->0x1\0\nf5\0tunix\0\n')
+        image = {'hdid-pid': 973, 'image-path': '/x/image.dmg'}
+        def query(output):
+            with patch.object(IMAGE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, b'')):
+                return IMAGE.backing_identity(image, [16, 42])
+        own = b'f3\0tREG\0D0x10\0i42\0n/x/image.dmg\0\n'
+        other = b'f6\0tREG\0D0x10\0i7\0n/x/other\0\n'
+        self.assertTrue(query(head + own))
+        self.assertTrue(query(head + other + own))
+        self.assertTrue(query(head + own[:-1]))
+        self.assertTrue(query(head + b'f3\0tREG\0D0x10\0i42\0\n'))
+        self.assertIsNone(query(head + other))
+        self.assertFalse(query(head + b'f3\0tREG\0D0x10\0i43\0n/x/image.dmg\0\n'))
+        # D and i of different records can never pair, whichever fields were lost.
+        uncertain = {
+            'second set lost f and D': other + b'tREG\0i42\0n/y/lib\0\n',
+            'first lost i, second lost f and D': b'f6\0tREG\0D0x10\0n/x/other\0\ntREG\0i42\0n/y/lib\0\n',
+            'second set lost f, t and D': b'f6\0tREG\0D0x10\0n/x/other\0\ni42\0n/y/lib\0\n',
+            'regular file lost D': b'f6\0tREG\0i42\0n/x/image.dmg\0\n',
+            'regular file lost i': b'f6\0tREG\0D0x10\0n/x/image.dmg\0\n',
+            'regular file lost D and i': b'f6\0tREG\0n/x/image.dmg\0\n',
+            'numeric descriptor lost t': b'f6\0D0x10\0i42\0n/x/image.dmg\0\n',
+            'invalid D': b'f6\0tREG\0D0xg\0i42\0\n',
+            'invalid i': b'f6\0tREG\0D0x10\0i4x\0\n',
+            'lost set delimiter': other[:-1] + own,
+            'duplicate field': b'f3\0tREG\0D0x10\0i42\0i42\0\n',
+            'empty field': b'f3\0tREG\0\0D0x10\0i42\0\n',
+            'unterminated field': own + b'f7\0tREG\0D0x10\0i4',
+            'unterminated trailing junk': own + b'nignored',
+            'process set with file fields': b'p974\0f3\0tREG\0D0x10\0i42\0\n',
+        }
+        for name, tail in uncertain.items():
+            with self.subTest(name=name):
+                self.assertIsNone(query(head + tail))
+                self.assertIsNone(query(head + own + tail))
 
     def test_backing_inode_matches_without_reopening_a_replaced_path(self):
         output = b'f3\0tREG\0D0x10\0i42\0n/a name with\nnewline.dmg\0'

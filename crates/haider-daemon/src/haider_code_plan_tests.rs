@@ -22,6 +22,8 @@ use super::haider_code_plan::{
 
 fn descriptor(alias: &str) -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new(alias),
         provider: "haider-code".into(),
         base_url: None,
@@ -679,12 +681,14 @@ async fn real_session_hub_interest_requires_an_attached_haider_code_session() {
 
     fn create_command(session_id: &SessionId, provider: &str) -> SessionCreateCommand {
         SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-interest-{provider}"),
             request_digest: format!("digest-interest-{provider}"),
             request_json: format!(r#"{{"provider":"{provider}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: provider.into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4_096,
             max_tokens_source: None,

@@ -240,10 +240,12 @@ fn projection_envelope(
 
 fn test_headless_spec() -> HeadlessRunSpecV1 {
     HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "warm-projection-workspace".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_output_tokens: 64,
         effort: None,

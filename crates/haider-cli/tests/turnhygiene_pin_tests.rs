@@ -180,6 +180,24 @@ impl TestProfile {
             .expect("providers JSON"),
         )
         .expect("write providers registry");
+        // The real listing is a fixture precondition, outside every measured turn.
+        let refreshed = output_with_boot_retry(self.proxy_command().args([
+            "models",
+            "--refresh",
+            PROXY_PROVIDER,
+            "--json",
+        ]));
+        assert_success(&refreshed, "proxy catalog refresh");
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&refreshed.stdout).expect("catalog JSON");
+        let provider = catalog["providers"]
+            .as_array()
+            .expect("provider rows")
+            .iter()
+            .find(|row| row["provider"] == PROXY_PROVIDER)
+            .expect("proxy catalog");
+        assert_eq!(provider["inventory"]["state"], "fetched");
+        assert_eq!(provider["availability"], "available");
     }
 
     fn stop_daemon(&self) {

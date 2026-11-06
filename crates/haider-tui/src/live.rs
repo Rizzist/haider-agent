@@ -194,6 +194,7 @@ pub enum LiveCommand {
         message: String,
     },
     Create {
+        expected_catalog_key: Option<String>,
         command_id: CommandId,
         cwd: String,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
@@ -732,7 +733,10 @@ pub enum LiveCommand {
     AccountListAt {
         epoch: u64,
     },
-    /// Watch daemon account revisions, including changes from another CLI.
+    /// `account.list_watch`: subscribe this connection to management
+    /// revision signals (account or provider catalog changes, including
+    /// another CLI's). A read; a socket loss ends it and the reconnect
+    /// resume re-opens it.
     AccountListWatch,
     /// `account.device_candidates` (D2) — the daemon's metadata-only
     /// discovery of first-party CLI credential stores. A read, issued on
@@ -809,6 +813,7 @@ pub enum LiveCommand {
     /// selection. DURABLE — a reconnect resends under the same command id
     /// and the daemon replays the committed receipt.
     SelectModel {
+        expected_catalog_key: Option<String>,
         connection_epoch: u64,
         command_id: CommandId,
         session: SessionId,
@@ -1427,9 +1432,6 @@ pub enum LiveReply {
         sources: Vec<crate::app::AccountSourceRow>,
         epoch: u64,
     },
-    AccountsChanged {
-        revision: u64,
-    },
     ProvidersAt {
         providers: Vec<haider_rpc::ProviderSummaryWire>,
         revision: u64,
@@ -1463,6 +1465,8 @@ pub enum LiveReply {
     },
     /// `session.create` answered: the daemon's own session id.
     Created {
+        provider: String,
+        model_catalog_key: Option<String>,
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
@@ -1922,6 +1926,16 @@ pub enum LiveReply {
         retryable: bool,
         presentation: Option<haider_protocol::error::ErrorPresentation>,
     },
+    /// `account.list_watch` answered: whether this connection now receives
+    /// management revision signals.
+    ManagementWatch {
+        accepted: bool,
+    },
+    /// The daemon published a new management revision (account or provider
+    /// catalog state). A signal only: the snapshot is re-read.
+    ManagementChanged {
+        revision: u64,
+    },
     /// `account.list` answered (W5d `/accounts`).
     Accounts {
         descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
@@ -1977,6 +1991,7 @@ pub enum LiveReply {
         command_id: CommandId,
         session: SessionId,
         provider: String,
+        model_catalog_key: Option<String>,
         model: String,
         worker_generation: u64,
         /// Budget the selection committed; a clamp becomes a visible notice.
@@ -2296,6 +2311,12 @@ pub struct LiveDriver {
     /// Reads that must not cross a reconnect (loom.list) carry it out and
     /// their replies echo it back; a mismatch installs nothing.
     connection_epoch: u64,
+    management_refresh_started: Option<std::time::Instant>,
+    management_refresh_accounts: bool,
+    management_refresh_providers: bool,
+    /// The daemon pushes management revision signals on this connection,
+    /// so an idle terminal needs no polling.
+    management_watch: bool,
     /// Bidirectional volatile composer state. Session fences reset on a new
     /// socket; the process-local publish counter stays monotonic.
     input_mirror: InputMirrorState,
@@ -2604,6 +2625,10 @@ impl LiveDriver {
             meter_list_retry_at: None,
             meter_list_retry_delay: METER_LIST_RETRY_INITIAL,
             connection_epoch: 0,
+            management_refresh_started: None,
+            management_refresh_accounts: false,
+            management_refresh_providers: false,
+            management_watch: false,
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
             routes: HashMap::new(),
@@ -2795,7 +2820,46 @@ impl LiveDriver {
             LiveCommand::ProviderListAt {
                 epoch: self.connection_epoch,
             },
+            // Dropped by the link when the daemon lacks the feature; the
+            // runtime then falls back to a slow management poll.
+            LiveCommand::AccountListWatch,
         ]
+    }
+
+    /// Whether management changes arrive as pushed signals on this
+    /// connection. When false the runtime polls `refresh_management`.
+    #[must_use]
+    pub fn management_watch_active(&self) -> bool {
+        self.connected && self.management_watch
+    }
+
+    /// Poll external management changes with at most one outstanding pair.
+    /// The read deadline permits recovery when an old peer drops a reply.
+    pub fn refresh_management(&mut self) -> Vec<LiveCommand> {
+        if !self.connected
+            || self
+                .management_refresh_started
+                .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return Vec::new();
+        }
+        self.management_refresh_started = Some(std::time::Instant::now());
+        self.management_refresh_accounts = true;
+        self.management_refresh_providers = true;
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: self.connection_epoch,
+            },
+            LiveCommand::ProviderListAt {
+                epoch: self.connection_epoch,
+            },
+        ]
+    }
+
+    fn management_refresh_complete(&mut self) {
+        if !self.management_refresh_accounts && !self.management_refresh_providers {
+            self.management_refresh_started = None;
+        }
     }
 
     // ---------------------------------------------------------- commands --
@@ -3816,6 +3880,8 @@ impl LiveDriver {
                 worker_generation,
                 cwd,
                 model: model_name,
+                provider,
+                model_catalog_key,
                 metadata,
             } => {
                 let cwd_display = workspace_display_path(&cwd);
@@ -3830,26 +3896,51 @@ impl LiveDriver {
                 // daemon's own id in hand — does a row exist. Nothing was
                 // fabricated locally, so nothing has to be reconciled.
                 model.upsert_live_session(&session);
-                if let Some(metadata) = metadata.as_ref() {
-                    model.note_session_metadata_at(
-                        &session,
-                        &metadata.provider,
-                        &metadata.model,
-                        metadata.max_tokens,
-                        metadata.selection_epoch,
-                        metadata.max_tokens_source,
-                    );
+                let selection_admitted = if let Some(metadata) = metadata.as_ref() {
+                    let admitted = model.note_session_catalog_metadata(&session, metadata);
                     model.note_session_budget_clamp(&session, metadata);
-                }
+                    admitted
+                } else {
+                    let current_epoch = if model.active_session.as_ref() == Some(&session) {
+                        model.meter_epoch.selection_epoch
+                    } else {
+                        model
+                            .sessions
+                            .iter()
+                            .find(|row| row.id == session)
+                            .and_then(|row| row.meter_epoch.selection_epoch)
+                    };
+                    current_epoch.is_none()
+                        && model.note_session_metadata_at(
+                            &session,
+                            &provider,
+                            &model_name,
+                            0,
+                            None,
+                            None,
+                        )
+                };
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
                     // The ROW shows the display form; `cwd` is the absolute
                     // path the daemon was given.
                     row.dir = cwd_display.clone();
                     row.workspace_cwd = Some(cwd.clone());
-                    row.model_short = model_name;
+                    if selection_admitted {
+                        row.model_short = model_name.clone();
+                    }
                 }
                 let mut commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
+                if metadata.is_none() && selection_admitted {
+                    // Initial legacy receipts remain usable; a receipt without
+                    // an epoch cannot replace a newer versioned selection.
+                    model.note_selected_catalog_key(
+                        &session,
+                        &provider,
+                        &model_name,
+                        model_catalog_key,
+                    );
+                }
                 model.session_dir = cwd_display;
                 model.session_workspace_cwd = Some(cwd);
                 // THE ORDER (R11 cut 4): create response → attach response
@@ -4377,6 +4468,8 @@ impl LiveDriver {
                     }
                     None => format!("removed `{removed_alias}`"),
                 });
+                model.bootstrap_identity_from_daemon();
+                model.refresh_context_window();
                 model.dirty = true;
                 vec![
                     LiveCommand::AccountListAt {
@@ -4401,6 +4494,8 @@ impl LiveDriver {
                     .min(model.providers.providers.len().saturating_sub(1));
                 model.providers.revision = Some(revision);
                 model.providers.message = Some(format!("removed `{provider}`"));
+                model.bootstrap_identity_from_daemon();
+                model.refresh_context_window();
                 model.dirty = true;
                 vec![LiveCommand::ProviderListAt {
                     epoch: self.connection_epoch,
@@ -4414,7 +4509,10 @@ impl LiveDriver {
                 self.retire(&command_id);
                 let name = provider.provider.clone();
                 let trust = provider.trust;
-                model.providers.apply_models_refresh(provider, revision);
+                if model.providers.apply_models_refresh(provider, revision) {
+                    model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
+                }
                 model.providers.message = Some(format!(
                     "{name} trust → {}",
                     match trust {
@@ -4787,16 +4885,83 @@ impl LiveDriver {
                     Vec::new()
                 }
             }
+            LiveReply::ManagementWatch { accepted } => {
+                self.management_watch = accepted;
+                if accepted {
+                    // The boot/reconnect snapshots can precede subscription.
+                    // Re-read after acceptance so a change in that gap cannot
+                    // leave an idle terminal on the previous account forever.
+                    self.management_refresh_started = None;
+                    self.refresh_management()
+                } else {
+                    Vec::new()
+                }
+            }
+            LiveReply::ManagementChanged { revision: _ } => {
+                // Another client (or a background catalog refresh) published
+                // a management revision. Re-read both halves now: account
+                // and catalog replacements must retire identity chrome
+                // without user input (N1). The daemon collapses bursts into
+                // one signal carrying the newest revision.
+                self.management_refresh_started = None;
+                self.refresh_management()
+            }
             LiveReply::Accounts {
                 descriptors,
                 revision,
                 sources,
             } => {
+                self.management_refresh_accounts = false;
+                self.management_refresh_complete();
+                let previous_scopes = model
+                    .accounts
+                    .rows
+                    .iter()
+                    .filter(|row| row.selected)
+                    .map(|row| {
+                        (
+                            row.provider.clone(),
+                            row.alias.clone(),
+                            model.accounts.catalog_incarnations.get(&row.alias).copied(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let rows = descriptors
                     .iter()
                     .map(crate::app::AccountRow::from_descriptor)
                     .collect();
                 if model.accounts.apply_snapshot(rows, revision) {
+                    for (provider, alias, incarnation) in previous_scopes {
+                        let same = descriptors
+                            .iter()
+                            .find(|row| row.active && row.provider == provider)
+                            .is_some_and(|row| {
+                                row.alias.as_str() == alias && Some(row.incarnation) == incarnation
+                            });
+                        if !same
+                            && incarnation.is_some_and(|value| value != 0)
+                            && model.providers.revision < revision
+                            && let Some(summary) = model
+                                .providers
+                                .providers
+                                .iter_mut()
+                                .find(|row| row.provider == provider)
+                            && summary.catalog_scope.is_none()
+                            && !matches!(
+                                summary.catalog,
+                                haider_rpc::ProviderCatalogKindWire::Public
+                                    | haider_rpc::ProviderCatalogKindWire::Offline
+                            )
+                        {
+                            // Account and provider replies can arrive in either order.
+                            // Retire old remote metadata immediately at the account boundary.
+                            crate::app::retire_fetched_catalog(summary);
+                        }
+                    }
+                    model.accounts.catalog_incarnations = descriptors
+                        .iter()
+                        .map(|row| (row.alias.as_str().to_owned(), row.incarnation))
+                        .collect();
                     model.accounts.apply_sources(sources);
                     // Daemon truth landed: an unpinned identity follows the
                     // active account (W5f-2) so the first session can serve.
@@ -4806,19 +4971,6 @@ impl LiveDriver {
                 // An active OAuth account with no catalog yet needs one
                 // discovered before the picker or the bootstrap can work.
                 self.provider_model_refreshes(model)
-            }
-            LiveReply::AccountsChanged { revision } => {
-                if model
-                    .accounts
-                    .revision
-                    .is_some_and(|known| revision <= known)
-                {
-                    Vec::new()
-                } else {
-                    vec![LiveCommand::AccountListAt {
-                        epoch: self.connection_epoch,
-                    }]
-                }
             }
             LiveReply::DeviceCandidates {
                 candidates,
@@ -4899,12 +5051,21 @@ impl LiveDriver {
                     self.pending_account_select = None;
                 }
                 model.apply_account_selected(&descriptor, revision);
-                Vec::new()
+                vec![
+                    LiveCommand::AccountListAt {
+                        epoch: self.connection_epoch,
+                    },
+                    LiveCommand::ProviderListAt {
+                        epoch: self.connection_epoch,
+                    },
+                ]
             }
             LiveReply::Providers {
                 providers,
                 revision,
             } => {
+                self.management_refresh_providers = false;
+                self.management_refresh_complete();
                 if model.providers.apply_snapshot(providers, revision) {
                     // The provider snapshot may complete the bootstrap the
                     // account snapshot started (either order works).
@@ -4946,6 +5107,7 @@ impl LiveDriver {
                 model: model_name,
                 worker_generation,
                 output_budget,
+                model_catalog_key,
             } => {
                 if connection_epoch
                     .is_some_and(|epoch| epoch != self.connection_epoch || !self.connected)
@@ -4967,13 +5129,20 @@ impl LiveDriver {
                 {
                     self.pending_model_select = None;
                 }
-                model.apply_session_model_selected_at(
+                if model.apply_session_model_selected_at(
                     &session,
                     &provider,
                     &model_name,
                     output_budget.as_ref(),
                     Some(selected_seq),
-                );
+                ) {
+                    model.note_selected_catalog_key(
+                        &session,
+                        &provider,
+                        &model_name,
+                        model_catalog_key,
+                    );
+                }
                 self.generations.insert(session, worker_generation);
                 Vec::new()
             }
@@ -5090,7 +5259,10 @@ impl LiveDriver {
                 };
                 // Upsert semantics — the created profile joins the list
                 // under the commit's revision.
-                model.providers.apply_models_refresh(provider, revision);
+                if model.providers.apply_models_refresh(provider, revision) {
+                    model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
+                }
                 let credential_staged = pending.vault_reference.is_some();
                 let login_attempt = model.custom_add_committed(pending.attempt, credential_staged);
                 model.dirty = true;
@@ -5992,6 +6164,7 @@ impl LiveDriver {
                 Vec::new()
             }
             LiveReply::Disconnected { reason } => {
+                self.management_refresh_started = None;
                 // The session may be served elsewhere while disconnected.
                 // Keep recorded accounts, but expire its unserved forecast.
                 for row in &mut model.sessions {
@@ -6027,6 +6200,9 @@ impl LiveDriver {
                     authoring.validated = false;
                 }
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
+                // The management watch is connection-scoped; the reconnect
+                // resume re-opens it, and the runtime polls until then.
+                self.management_watch = false;
                 // Round 3: capability facts die with the socket as well; the
                 // reconnect handshake re-grounds them before work resumes.
                 model.daemon_features.clear();
@@ -6512,14 +6688,7 @@ impl LiveDriver {
                 // epoch can exceed the child's local journal head.
                 // Epoch and pair admission order the configuration;
                 // the summary watermark orders the history counts.
-                model.note_session_metadata_at(
-                    &summary.session_id,
-                    &metadata.provider,
-                    &metadata.model,
-                    metadata.max_tokens,
-                    metadata.selection_epoch,
-                    metadata.max_tokens_source,
-                );
+                model.note_session_catalog_metadata(&summary.session_id, metadata);
                 model.note_session_account(&summary.session_id, metadata);
                 model.note_session_budget_clamp(&summary.session_id, metadata);
                 self.workspace_paths
@@ -7092,19 +7261,32 @@ impl LiveDriver {
             // bind its own meter epoch (never the identity on screen).
             match payload {
                 haider_protocol::session::SessionConfigEventPayload::ModelSelected(selected) => {
-                    if selected.route_only {
+                    let admitted = if selected.route_only {
                         model.note_parked_route_selected_at(
                             session,
                             &selected.provider,
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
-                        );
+                        )
                     } else {
                         model.note_parked_model_selected_at(
                             session,
                             &selected.provider,
                             &selected.model,
                             selected.selection_epoch.or(Some(envelope.seq)),
+                        )
+                    };
+                    if admitted {
+                        if selected.cleared_account_pin.is_some()
+                            || selected.cleared_provider_endpoint.is_some()
+                        {
+                            model.clear_session_catalog_route(session);
+                        }
+                        model.note_selected_catalog_key(
+                            session,
+                            &selected.provider,
+                            &selected.model,
+                            selected.model_catalog_key.clone(),
                         );
                     }
                 }
@@ -7181,6 +7363,18 @@ impl LiveDriver {
                     model.identity.model_short = selected.model.clone();
                     model.refresh_context_window();
                 }
+                // The selected pair keeps the catalog owner the daemon
+                // admitted it under (catalog-fixes); a route-only fact keeps
+                // the current key.
+                if selected.cleared_account_pin.is_some() || selected.cleared_provider_endpoint.is_some() {
+                    model.clear_session_catalog_route(session);
+                }
+                model.note_selected_catalog_key(
+                    session,
+                    &selected.provider,
+                    &selected.model,
+                    selected.model_catalog_key.clone(),
+                );
                 if !route_only {
                     model.projection.push_note(format!(
                         "⇄ model → {} · {}",
@@ -7200,11 +7394,9 @@ impl LiveDriver {
                 }
                 model.note_session_rebound_account_at(session, &rebound,
                     rebound.selection_epoch.or(Some(envelope.seq)));
-                if model.identity.provider != rebound.provider {
-                    model.identity.provider = rebound.provider;
-                    model.refresh_context_window();
-                    model.dirty = true;
-                }
+                // The routing fact keeps the model's producer; a route
+                // mismatch retires its catalog marker (catalog-fixes).
+                model.apply_session_provider_rebound(&rebound);
                 let next_clamp = rebound.output_budget.and_then(|budget| budget.clamped);
                 if let Some(clamp) = next_clamp {
                     model.apply_output_budget_clamp(&clamp);
@@ -7375,10 +7567,10 @@ impl LiveDriver {
             LiveCommand::ProviderListAt {
                 epoch: self.connection_epoch,
             },
+            // The one management-change path: dropped by the link when the
+            // daemon lacks the feature, and the runtime then polls.
+            LiveCommand::AccountListWatch,
         ];
-        if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1) {
-            commands.push(LiveCommand::AccountListWatch);
-        }
         if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1) {
             commands.push(LiveCommand::DeviceCandidates);
         }
@@ -7493,7 +7685,16 @@ impl LiveDriver {
                         workspace_allocation,
                         account_alias: None,
                         provider: model.identity.provider.clone(),
-                        model: model.identity.model_short.clone(),
+                        model: if model.launcher_model_pick_is_ready() {
+                            model.identity.model_short.clone()
+                        } else {
+                            String::new()
+                        },
+                        expected_catalog_key: if model.launcher_model_pick_is_ready() {
+                            model.identity_choice_catalog_key()
+                        } else {
+                            None
+                        },
                         max_tokens: 0,
                         first_text: text,
                     },
@@ -7672,6 +7873,7 @@ impl LiveDriver {
                 })]
             }
             AppRequest::SelectModel {
+                expected_catalog_key,
                 session,
                 model: model_name,
                 provider,
@@ -7697,6 +7899,7 @@ impl LiveDriver {
                     command_id,
                     session: session.clone(),
                     worker_generation,
+                    expected_catalog_key,
                     model: model_name,
                     provider,
                     confirm_new_epoch,

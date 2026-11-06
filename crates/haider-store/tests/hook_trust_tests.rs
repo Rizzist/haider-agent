@@ -92,12 +92,14 @@ fn run_scoped_trust_is_atomic_with_turn_acceptance_and_omitted_by_default() {
     let session_id = SessionId::new("hook-run-trust-session");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-hook-run-trust".into(),
             request_digest: "create-hook-run-trust-digest".into(),
             request_json: r#"{"session":"hook-run-trust"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -135,12 +137,14 @@ fn run_scoped_trust_is_atomic_with_turn_acceptance_and_omitted_by_default() {
     let other_session = SessionId::new("ordinary-hook-run-session");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-ordinary-hook-run".into(),
             request_digest: "create-ordinary-hook-run-digest".into(),
             request_json: r#"{"session":"ordinary"}"#.into(),
             session_id: other_session.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

@@ -645,8 +645,10 @@ async fn spawn(
                 attachments: Vec::new(),
                 trust_hooks: false,
                 spec: HeadlessRunSpecV1 {
+                    resolved_model: metadata.resolved_model,
                     cwd: metadata.cwd,
                     provider: metadata.provider,
+                    model_catalog_key: metadata.model_catalog_key,
                     model: metadata.model,
                     max_output_tokens: metadata.max_tokens,
                     effort: metadata.effort,
@@ -751,6 +753,7 @@ fn agent_session_create_request(
         command_id: CommandId::new(format!("{command}-session")),
         cwd,
         provider: spec.provider.clone().unwrap_or_default(),
+        expected_catalog_key: None,
         model: spec.model.clone().unwrap_or_default(),
         max_tokens: 0,
         permission_overrides: None,

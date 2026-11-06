@@ -12,12 +12,14 @@ use haider_store::{
 fn create(store: &Store, session: &str) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session}"),
             request_digest: format!("create-digest-{session}"),
             request_json: format!(r#"{{"session":"{session}"}}"#),
             session_id: SessionId::new(session),
             cwd: "/tmp".into(),
             provider: "source".into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -58,6 +60,7 @@ fn legacy_omitted_budget_source_does_not_mint_a_noop_selection_epoch() {
         }),
         event_id: EventId::new("legacy-noop-event"),
         device_id: DeviceId::new("test-device"),
+        model_catalog_key: None,
     };
     let SessionSelectModelOutcome::Committed { selected, .. } = store
         .select_session_model(&command)
@@ -117,6 +120,7 @@ fn cross_provider_pick_clears_pin_and_old_route_with_typed_notice() {
         output_budget: None,
         event_id: EventId::new("pin-source-event"),
         device_id: DeviceId::new("test-device"),
+        model_catalog_key: None,
     };
     store.select_session_model(&first).expect("pin source");
     let current = store
@@ -204,6 +208,7 @@ fn derived_child_inherits_explicit_route_and_rejects_mismatched_provider() {
         .expect("parent metadata")
         .expect("typed");
     let child = SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-derived".into(),
         request_digest: "create-derived-digest".into(),
         request_json: r#"{"child":"derived"}"#.into(),
@@ -220,6 +225,7 @@ fn derived_child_inherits_explicit_route_and_rejects_mismatched_provider() {
         system_prompt_version: "test-system".into(),
         event_id: EventId::new("derived-created"),
         device_id: DeviceId::new("test-device"),
+        model_catalog_key: None,
     };
     store
         .create_session_with_workspace_configuration(
@@ -511,6 +517,7 @@ fn model_provider_switch_clears_rebind_override_but_same_provider_preserves_it()
         session_id: rebound.session_id.clone(),
         worker_generation: store.worker_generation(),
         provider: "proxy".into(),
+        model_catalog_key: None,
         model: "model-2".into(),
         expected_pair: None,
         automatic_run: None,
@@ -586,6 +593,7 @@ fn selection_epoch_survives_restart_and_advances_for_budget_model_and_route() {
         }),
         event_id: EventId::new("budget-event-1"),
         device_id: DeviceId::new("test-device"),
+        model_catalog_key: None,
     };
     let SessionSelectModelOutcome::Committed {
         selected: budget,
@@ -842,6 +850,7 @@ fn endpoint_only_and_both_choices_get_complete_clear_receipts_and_facts() {
             output_budget: None,
             event_id: EventId::new("clear-endpoint-fact"),
             device_id: DeviceId::new("test"),
+            model_catalog_key: None,
         };
         let SessionSelectModelOutcome::Committed { selected, envelope } =
             store.select_session_model(&select).expect("clear")
@@ -909,6 +918,7 @@ fn clamps_survive_selection_replay_and_unreported_legacy_route_gets_one_fact() {
         }),
         event_id: EventId::new("clamp"),
         device_id: DeviceId::new("test"),
+        model_catalog_key: None,
     };
     let SessionSelectModelOutcome::Committed { selected, envelope } =
         store.select_session_model(&command).expect("clamp")
@@ -1038,6 +1048,7 @@ fn late_route_callback_cannot_publish_or_replace_a_selection_after_restart() {
                 }),
                 event_id: EventId::new("new-selection-event"),
                 device_id: DeviceId::new("test-device"),
+                model_catalog_key: None,
             };
             if variant == "rebind" {
                 let mut rebind = command(&store);

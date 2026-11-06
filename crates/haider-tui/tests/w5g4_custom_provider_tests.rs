@@ -35,6 +35,9 @@ fn accounts_model() -> AppModel {
 
 fn live_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9999/v1".to_owned()),
@@ -421,6 +424,8 @@ fn a_selected_api_key_account_triggers_model_discovery() {
     // The trigger runs on the ACCOUNTS reply path — feed the api-key
     // account through it (a pre-seeded row would be replaced).
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("probe-api"),
         provider: "custom-llama".to_owned(),
         base_url: Some("http://127.0.0.1:18123/v1".to_owned()),

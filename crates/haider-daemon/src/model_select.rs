@@ -27,7 +27,7 @@
 
 use haider_rpc::{
     ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
-    ProviderAvailabilityWire, ProviderSummaryWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, normalize_model_selector,
 };
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -44,9 +44,12 @@ pub(crate) struct ModelSelectionAuthority {
     /// not installed (startup edge) and no cross-provider row is creatable.
     creatable: Option<BTreeSet<String>>,
     /// Management-snapshot provider summaries (inventory + availability).
-    /// Empty when no account facade is installed: every inventory is then
-    /// unknown and selection stays honest rather than guessing.
+    /// Absent registry authority leaves inventory unknown. An installed
+    /// registry with no row is proof that the provider is unavailable.
     summaries: Vec<ProviderSummaryWire>,
+    /// An installed management registry distinguishes a removed provider
+    /// from a factory-only caller with no registry authority.
+    provider_registry_installed: bool,
 }
 
 /// One admitted explicit selection plus its honest relationship to the
@@ -180,7 +183,10 @@ impl TuningRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectionRefusal {
     /// The selected row's provider attribute is not creatable on this daemon.
-    ProviderUnavailable { provider: String },
+    ProviderUnavailable {
+        provider: String,
+        reason: Option<String>,
+    },
     /// The provider has a KNOWN discovered inventory and the model is not in
     /// it.
     ModelUnknown {
@@ -217,9 +223,14 @@ impl SelectionRefusal {
     /// Human copy — model-selection language, never provider-switch language.
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::ProviderUnavailable { provider } => {
-                format!("this model row's provider `{provider}` is not available on this daemon")
-            }
+            Self::ProviderUnavailable { provider, reason } => reason.as_ref().map_or_else(
+                || {
+                    format!(
+                        "this model row's provider `{provider}` is not available on this daemon"
+                    )
+                },
+                |reason| format!("provider `{provider}` is unavailable: {reason}"),
+            ),
             Self::ModelUnknown {
                 provider,
                 model,
@@ -253,16 +264,19 @@ impl SelectionRefusal {
         }
     }
 
-    /// Structured coordinates for wire `details` / tool previews. Static
-    /// vocabulary plus the caller's own selector strings — never provider
-    /// response bytes.
+    /// Structured coordinates for wire `details` / tool previews. Discovery
+    /// reasons have already passed the catalog's credential-redaction boundary.
     pub(crate) fn details(&self) -> serde_json::Value {
         match self {
-            Self::ProviderUnavailable { provider } => serde_json::json!({
-                "kind": self.kind(),
-                "provider": provider,
-                "suggestions": [],
-            }),
+            Self::ProviderUnavailable { provider, reason } => {
+                let mut details = serde_json::json!({
+                    "kind": self.kind(), "provider": provider, "suggestions": [],
+                });
+                if let Some(reason) = reason {
+                    details["reason"] = serde_json::Value::String(reason.clone());
+                }
+                details
+            }
             Self::ModelUnknown {
                 provider,
                 model,
@@ -295,14 +309,142 @@ impl SelectionRefusal {
 }
 
 impl ModelSelectionAuthority {
+    /// `None` means no management authority; `Some`, including an empty
+    /// vector, is the installed registry's complete provider projection.
     pub(crate) fn new(
         creatable: Option<BTreeSet<String>>,
-        summaries: Vec<ProviderSummaryWire>,
+        summaries: Option<Vec<ProviderSummaryWire>>,
     ) -> Self {
         Self {
             creatable,
-            summaries,
+            provider_registry_installed: summaries.is_some(),
+            summaries: summaries.unwrap_or_default(),
         }
+    }
+
+    fn registered_provider(
+        &self,
+        provider: &str,
+    ) -> Result<Option<&ProviderSummaryWire>, SelectionRefusal> {
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider);
+        if self.provider_registry_installed && summary.is_none() {
+            return Err(SelectionRefusal::ProviderUnavailable {
+                provider: provider.to_owned(),
+                reason: None,
+            });
+        }
+        Ok(summary)
+    }
+
+    /// Session overrides cannot inherit the active route's discovery evidence.
+    pub(crate) fn scoped_to_session_route(
+        mut self,
+        current: &haider_protocol::session::SessionMetadataV1,
+        provider: &str,
+    ) -> Self {
+        if current.provider == provider {
+            for summary in &mut self.summaries {
+                if summary.provider == provider
+                    && !summary.catalog_matches_session_route(
+                        current.provider_base_url.as_deref(),
+                        current.account_alias.as_deref(),
+                    )
+                {
+                    summary.retire_fetched_catalog();
+                    summary.catalog_scope = None;
+                }
+            }
+        }
+        self
+    }
+
+    pub(crate) fn catalog_key_is_current(&self, provider: &str, key: &str) -> bool {
+        self.summaries.iter().any(|summary| {
+            summary.provider == provider
+                && summary
+                    .catalog_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.key == key)
+        })
+    }
+
+    /// Creation preserves the public literal spelling. Resolve it against this
+    /// snapshot before consulting row metadata, including later tuning reads.
+    /// The shared selector keeps exact IDs and ambiguous/unlisted literals intact.
+    fn canonical_model<'a>(&'a self, provider: &str, model: &'a str) -> &'a str {
+        let model = model.trim();
+        self.summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .map_or(model, |summary| summary.canonical_model_selector(model))
+    }
+
+    /// Permanent rows and explicit unlisted configuration have no private owner.
+    pub(crate) fn model_catalog_key(&self, provider: &str, model: &str) -> Option<String> {
+        let model = self.canonical_model(provider, model);
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        if summary.configured_models.iter().any(|row| row == model)
+            || summary.static_models.iter().any(|row| row == model)
+            || haider_provider::subscription_static_models(provider)
+                .iter()
+                .any(|row| row.slug == model)
+            || summary.model_details.iter().any(|row| {
+                row.name == model
+                    && matches!(
+                        row.source,
+                        Some(
+                            haider_rpc::ModelDetailSourceWire::Static
+                                | haider_rpc::ModelDetailSourceWire::Configured
+                        )
+                    )
+            })
+            || !summary.models.iter().any(|row| row == model)
+        {
+            return None;
+        }
+        summary
+            .catalog_scope
+            .as_ref()
+            .map(|scope| scope.key.clone())
+    }
+
+    /// Remote declarations may derive or clamp an effective session budget
+    /// even when the ID is permanent. The user's unclamped request is unowned.
+    pub(crate) fn model_settings_catalog_key(
+        &self,
+        provider: &str,
+        model: &str,
+        budget: &haider_protocol::output_budget::SessionOutputBudgetV1,
+    ) -> Option<String> {
+        if budget.source != haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived
+            && budget.clamped.is_none()
+        {
+            return None;
+        }
+        let model = self.canonical_model(provider, model);
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        summary
+            .model_details
+            .iter()
+            .any(|row| {
+                row.name == model && row.source == Some(haider_rpc::ModelDetailSourceWire::Remote)
+            })
+            .then(|| {
+                summary
+                    .catalog_scope
+                    .as_ref()
+                    .map(|scope| scope.key.clone())
+            })
+            .flatten()
     }
 
     /// The `session.create` creatability rule: the installed static registry,
@@ -330,6 +472,9 @@ impl ModelSelectionAuthority {
         self.summaries
             .iter()
             .find(|summary| summary.provider == provider)
+            .filter(|summary| {
+                summary.selection_availability(None) == ProviderAvailabilityWire::Available
+            })
             .map(|summary| summary.models.as_slice())
             .filter(|models| !models.is_empty())
     }
@@ -489,17 +634,21 @@ impl ModelSelectionAuthority {
             .map(str::trim)
             .filter(|provider| !provider.is_empty())
             .unwrap_or(current_provider);
+        let summary = self.registered_provider(provider)?;
+        if summary.is_some_and(|summary| !summary.model_is_selectable(requested_model)) {
+            return Err(SelectionRefusal::ProviderUnavailable {
+                provider: provider.to_owned(),
+                reason: summary.and_then(|row| row.selection_reason(Some(requested_model))),
+            });
+        }
         // Staying on the current provider is not a create; only a row on a
         // DIFFERENT provider consults the creatability authority.
         if provider != current_provider && !self.provider_is_creatable(provider) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
+                reason: None,
             });
         }
-        let summary = self
-            .summaries
-            .iter()
-            .find(|summary| summary.provider == provider);
         if summary.is_some_and(|summary| {
             matches!(
                 summary.catalog,
@@ -509,25 +658,14 @@ impl ModelSelectionAuthority {
         }) {
             return Err(SelectionRefusal::ProviderUnavailable {
                 provider: provider.to_owned(),
+                reason: None,
             });
         }
         let resolved_model = summary
-            .and_then(|summary| {
-                summary
-                    .models
-                    .iter()
-                    .find(|known| known.as_str() == requested_model)
-                    .or_else(|| {
-                        let normalized = normalize_model_selector(requested_model);
-                        let mut matches = summary
-                            .models
-                            .iter()
-                            .filter(|known| normalize_model_selector(known) == normalized);
-                        let only = matches.next()?;
-                        matches.next().is_none().then_some(only)
-                    })
+            .map_or(requested_model, |summary| {
+                summary.canonical_model_selector(requested_model)
             })
-            .map_or_else(|| requested_model.to_owned(), Clone::clone);
+            .to_owned();
         let inventory_status = summary.map_or(ModelInventoryStatusWire::Unknown, |summary| {
             summary.model_inventory_status(&resolved_model)
         });
@@ -584,6 +722,7 @@ impl ModelSelectionAuthority {
     /// before a management snapshot exists. Everything else honestly gets
     /// the EMPTY ladder.
     pub(crate) fn effort_ladder(&self, provider: &str, model: &str) -> Vec<String> {
+        let model = self.canonical_model(provider, model);
         let declared = self
             .summaries
             .iter()
@@ -660,6 +799,7 @@ impl ModelSelectionAuthority {
         if !enabled {
             return Ok(());
         }
+        let model = self.canonical_model(provider, model);
         let supported = matches!(
             provider,
             haider_provider::ANTHROPIC_PROVIDER_NAME
@@ -698,7 +838,12 @@ impl ModelSelectionAuthority {
             .map(str::trim)
             .filter(|provider| !provider.is_empty());
         match (model, provider) {
-            (None, None) => Ok((parent_provider.to_owned(), parent_model.to_owned())),
+            (None, None) => {
+                // The factory validates the inherited account route at
+                // pickup. Only provider removal is independent of that route.
+                self.registered_provider(parent_provider)?;
+                Ok((parent_provider.to_owned(), parent_model.to_owned()))
+            }
             (None, Some(_)) => Err(SelectionRefusal::InvalidSelector {
                 message: "spawn_subagent `provider` only disambiguates a `model` — name the model"
                     .to_owned(),
@@ -753,17 +898,15 @@ impl ModelSelectionAuthority {
     }
 
     fn child_matching_rows(&self, matches_model: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+        let matches_model = &matches_model;
         self.summaries
             .iter()
-            .filter(|summary| {
-                matches!(summary.availability, ProviderAvailabilityWire::Available)
-                    && self.provider_is_creatable(&summary.provider)
-            })
+            .filter(|summary| self.provider_is_creatable(&summary.provider))
             .flat_map(|summary| {
                 summary
                     .models
                     .iter()
-                    .filter(|known| matches_model(known))
+                    .filter(move |known| summary.model_is_selectable(known) && matches_model(known))
                     .map(move |known| (summary.provider.clone(), known.clone()))
             })
             .collect()
@@ -799,16 +942,6 @@ fn append_suggestion_guidance(message: &mut String, suggestions: &[String]) {
             suggestions.join(", ")
         ));
     }
-}
-
-/// Unicode-safe model selector key: lower-case scalar expansion, dropping
-/// only the punctuation/spacing family the public selector contract names.
-pub(crate) fn normalize_model_selector(selector: &str) -> String {
-    selector
-        .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn nearest_model_rows<'a>(

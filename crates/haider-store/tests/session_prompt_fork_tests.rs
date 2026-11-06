@@ -44,12 +44,14 @@ struct AcceptedFixture {
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"session_id":"{session_id}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp/prompt-fork".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

@@ -458,13 +458,15 @@ impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
             .run_output_pair(self.store.session_id(), &self.run_id)
             .await?
             && pair.provider == provider
-            && pair.model == model
+            && pair.model_coordinate() == model
         {
             pair.restore_route(&mut selection)?;
             selection.provider = pair.provider;
             selection.model = pair.model;
+            selection.resolved_model = pair.resolved_model;
+            selection.model_catalog_key = pair.model_catalog_key;
         }
-        if selection.provider != provider || selection.model != model {
+        if selection.provider != provider || selection.model_coordinate() != model {
             return Ok(selection.selection_epoch.unwrap_or(0));
         }
         let epoch = self
@@ -559,7 +561,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             }));
             return Err(error);
         }
-        let request_json = serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
@@ -573,8 +575,14 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             "provider": switch.to_provider,
             "model": switch.to_model,
             "cause": switch.cause.as_str(),
-        })
-        .to_string();
+        });
+        if let Some(key) = &switch.model_catalog_key {
+            request_coordinates["model_catalog_key"] = serde_json::json!(key);
+        }
+        if let Some(budget) = switch.output_budget {
+            request_coordinates["output_budget"] = serde_json::json!(budget);
+        }
+        let request_json = request_coordinates.to_string();
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         let command_id = format!(
             "automatic-pair-switch-{}",
@@ -600,6 +608,24 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
         let mut active_selection = self.turn_selection.lock().await.clone();
         pair.restore_route(&mut active_selection)?;
         let selection_epoch = active_selection.selection_epoch;
+        if let Some(key) = &switch.model_catalog_key {
+            let summaries = self
+                .store
+                .hub()
+                .accounts()
+                .map_err(hub_error)?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(Vec::new, |view| view.providers);
+            if !crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
+                .catalog_key_is_current(&switch.to_provider, key)
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::RevisionConflict,
+                    "automatic model selection belongs to a retired catalog",
+                    false,
+                ));
+            }
+        }
         let command = SessionSelectModelCommand {
             command_id,
             request_digest,
@@ -607,6 +633,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             session_id: self.store.session_id().clone(),
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
+            model_catalog_key: switch.model_catalog_key.clone(),
             model: switch.to_model.clone(),
             // Preserve a later next-turn choice while fencing this active
             // run against concurrent explicit rebinds.
@@ -619,10 +646,9 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 selection_epoch,
             }),
             account_alias: None,
-            // No validated model row exists on this path: keep the stored
-            // budget. An oversized budget on the fallback model is recovered
-            // by the provider's one-shot `max_tokens too large` retry.
-            output_budget: None,
+            // Production resolution reapplies the stored source to the target
+            // row. Injected legacy lanes without inventory preserve the budget.
+            output_budget: switch.output_budget,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
@@ -645,6 +671,8 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 }
                 current.provider = selected.provider;
                 current.model = selected.model;
+                current.resolved_model = None;
+                current.model_catalog_key = switch.model_catalog_key.clone();
                 Ok(selected.selected_seq)
             }
             Err(crate::session_hub::SessionHubError::Store(error)) => Err(error),
@@ -2843,7 +2871,9 @@ pub enum ProviderFactoryConfig {
     /// Accounts-backed resolution with an injected provider constructor —
     /// the login→next-turn test seam.
     AccountsWith(Arc<dyn crate::accounts::AccountProviderBuilder>),
-    /// Fully injected factory plus its creatable-provider set.
+    /// Fully injected factory plus its creatable-provider set. The factory
+    /// owns credential and transport readiness for these registrations;
+    /// accounts-backed availability applies to `Accounts` / `AccountsWith`.
     Injected {
         factory: Arc<dyn ProviderFactory>,
         providers: BTreeSet<String>,
@@ -8933,11 +8963,7 @@ async fn start_turn(
             .as_ref()
             .filter(|pair| pair.durably_pinned || headless.is_none())
         {
-            pair.restore_route(&mut fresh)?;
-            fresh.provider.clone_from(&pair.provider);
-            fresh.model.clone_from(&pair.model);
-            fresh.max_tokens = pair.max_tokens;
-            fresh.max_tokens_source = pair.source;
+            pair.restore_metadata(&mut fresh)?;
         } else if let Some(context) = headless.as_ref() {
             if let Some(legacy) = recorded_pair.as_ref() {
                 fresh.max_tokens_source = legacy.source;
@@ -8952,6 +8978,8 @@ async fn start_turn(
         }
         if needs_pin {
             let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                resolved_model: fresh.resolved_model.clone(),
+                model_catalog_key: fresh.model_catalog_key.clone(),
                 route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
                     &fresh,
                 )),
@@ -14246,6 +14274,7 @@ mod manager_law_tests {
         let session_id = SessionId::new("queued-turnid-session");
         let device_id = DeviceId::new("queued-turnid-device");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "queued-turnid-create".into(),
             request_digest: "queued-turnid-create-digest".into(),
             request_json: "{}".into(),
@@ -14255,6 +14284,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -14362,6 +14392,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-retirement-recreation");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-retirement-create".into(),
             request_digest: "worker-retirement-create-digest".into(),
             request_json: "{}".into(),
@@ -14371,6 +14402,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -14474,6 +14506,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-idle-ttl");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-idle-create".into(),
             request_digest: "worker-idle-create-digest".into(),
             request_json: "{}".into(),
@@ -14483,6 +14516,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -23059,7 +23093,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .and_then(|facade| facade.management.read())
                 .map(|view| view.providers)
                 .unwrap_or_default();
-            let mut page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
+            let mut page = crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
                 .model_catalog(filter.as_deref(), usize::MAX);
             let cap = haider_tools::LIST_MODELS_ROW_CAP;
             let truncated = page.models.len() > cap;
@@ -24111,7 +24145,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         let attempt = self.record_side_request_attempt(run_id).await?;
                         match executor
                             .search(
-                                &self.metadata.model,
+                                self.metadata.model_coordinate(),
                                 self.session_id.as_str(),
                                 &query,
                                 &attempt,

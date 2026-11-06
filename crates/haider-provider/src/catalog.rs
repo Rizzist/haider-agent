@@ -116,6 +116,8 @@ pub enum CatalogError {
     /// The provider will not serve a list to this credential (or at all).
     /// The caller falls back; it must NOT fabricate a list.
     Unavailable { reason: String },
+    /// Listing is explicitly unsupported (including HTTP 404/405).
+    Unsupported { reason: String },
     /// Transport/guard failure — retryable.
     Transport { reason: String },
     /// The endpoint explicitly rejected the supplied credential.
@@ -137,7 +139,9 @@ impl std::fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotModified => write!(formatter, "model catalog is unchanged"),
-            Self::Unavailable { reason } | Self::Transport { reason } => {
+            Self::Unavailable { reason }
+            | Self::Unsupported { reason }
+            | Self::Transport { reason } => {
                 write!(formatter, "{reason}")
             }
             Self::Unauthorized => write!(formatter, "model catalog authentication failed"),
@@ -487,6 +491,16 @@ pub async fn discover_models_with_resolver(
                 format!("model catalog request failed: {error}")
             },
         })?;
+    read_catalog_response(source, response, access_token).await
+}
+
+/// Classifies and parses the bounded response for every discovery transport.
+/// Fixed-origin and compatible adapters share the same availability evidence.
+pub(super) async fn read_catalog_response(
+    source: CatalogSource,
+    response: reqwest::Response,
+    access_token: Option<&str>,
+) -> Result<DiscoveredCatalog, CatalogError> {
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Err(CatalogError::NotModified);
     }
@@ -495,8 +509,13 @@ pub async fn discover_models_with_resolver(
             reason: "model catalog endpoint redirects; refusing to follow".to_owned(),
         });
     }
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
+    let response_status = response.status();
+    let compatible_listing = matches!(
+        source,
+        CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
+    );
+    if !response_status.is_success() {
+        let status = response_status.as_u16();
         if status == 401 {
             return Err(CatalogError::Unauthorized);
         }
@@ -510,20 +529,24 @@ pub async fn discover_models_with_resolver(
                 ),
             });
         }
-        if matches!(
-            source,
-            CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
-        ) {
+        let reason = format!("server returned {status} for /models");
+        if matches!(status, 404 | 405) {
+            return Err(CatalogError::Unsupported { reason });
+        }
+        if status >= 500 {
+            return Err(CatalogError::Transport { reason });
+        }
+        if !compatible_listing && status == 403 {
+            // Subscription model-list permission failures retain the
+            // informational classification used by maintained static rows.
             return Err(CatalogError::Unavailable {
-                reason: format!("server returned {status} for /models"),
+                reason: format!(
+                    "provider does not serve a model list to this credential ({status})"
+                ),
             });
         }
-        // 401/403/404 under a subscription token is the "not served to this
-        // credential" case the brief anticipated: honest unavailability, and
-        // the caller keeps its last-known list.
-        return Err(CatalogError::Unavailable {
-            reason: format!("provider does not serve a model list to this credential ({status})"),
-        });
+        // A typed not-supported answer is valid for every catalog source.
+        // Read it through the same body bound below.
     }
     let response_etag = response
         .headers()
@@ -548,11 +571,60 @@ pub async fn discover_models_with_resolver(
         }
         body.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|error| CatalogError::InvalidBody {
-            reason: format!("model catalog response is not JSON: {error}"),
-        })?;
-    let models = parse_catalog(source, &value)?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+        if response_status.is_success() {
+            CatalogError::InvalidBody {
+                reason: format!("model catalog response is not JSON: {error}"),
+            }
+        } else {
+            CatalogError::Unavailable {
+                reason: format!("server returned {} for /models", response_status.as_u16()),
+            }
+        }
+    })?;
+    let code = [value.pointer("/error/code"), value.pointer("/error/type")]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|code| {
+            [
+                "OperationNotSupported",
+                "NotSupported",
+                "not_supported",
+                "unsupported_operation",
+                "not_implemented",
+            ]
+            .iter()
+            .any(|known| code.eq_ignore_ascii_case(known))
+        });
+    if let Some(code) = code {
+        return Err(CatalogError::Unsupported {
+            reason: format!(
+                "server returned {} for /models: {code}",
+                response_status.as_u16()
+            ),
+        });
+    }
+    if !response_status.is_success() {
+        return Err(CatalogError::Unavailable {
+            reason: format!("server returned {} for /models", response_status.as_u16()),
+        });
+    }
+    let models = parse_discovered_models(source, &value, access_token)?;
+    Ok(DiscoveredCatalog {
+        models,
+        etag: response_etag,
+    })
+}
+
+fn parse_discovered_models(
+    source: CatalogSource,
+    value: &serde_json::Value,
+    access_token: Option<&str>,
+) -> Result<Vec<DiscoveredModel>, CatalogError> {
+    let declared_empty = catalog_entries(&source, value)?.is_empty();
+    let models = parse_catalog(source, value)?;
     // A credential-reflecting server must not smuggle the key into a
     // public picker, receipt, cache, or event as a model id.
     if access_token
@@ -567,13 +639,12 @@ pub async fn discover_models_with_resolver(
             reason: "model catalog response contains credential material".to_owned(),
         });
     }
-    if models.is_empty() {
+    // A real empty array is successful negative listing evidence, with a
+    // fetch time and validator. A nonempty array without usable IDs is not.
+    if models.is_empty() && !declared_empty {
         return Err(CatalogError::Empty);
     }
-    Ok(DiscoveredCatalog {
-        models,
-        etag: response_etag,
-    })
+    Ok(models)
 }
 
 /// Custom model ids must retain every character when a terminal draws
@@ -596,13 +667,11 @@ fn declared_token_count(entry: &serde_json::Value, keys: &[&str]) -> Option<u64>
         .filter(|tokens| *tokens > 0)
 }
 
-/// Parses either provider's shape. Public so the fake-server tests drive the
-/// same parser production uses.
-pub fn parse_catalog(
-    source: CatalogSource,
-    value: &serde_json::Value,
-) -> Result<Vec<DiscoveredModel>, CatalogError> {
-    let entries = match source {
+fn catalog_entries<'a>(
+    source: &CatalogSource,
+    value: &'a serde_json::Value,
+) -> Result<&'a [serde_json::Value], CatalogError> {
+    match source {
         // codex: `{ "models": [ … ] }`
         CatalogSource::OpenAiSubscription | CatalogSource::GeminiApiKey => value.get("models"),
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
@@ -616,9 +685,19 @@ pub fn parse_catalog(
         | CatalogSource::XaiApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
+    .map(Vec::as_slice)
     .ok_or_else(|| CatalogError::InvalidBody {
         reason: "model catalog response has no model array".to_owned(),
-    })?;
+    })
+}
+
+/// Parses either provider's shape. Public so the fake-server tests drive the
+/// same parser production uses.
+pub fn parse_catalog(
+    source: CatalogSource,
+    value: &serde_json::Value,
+) -> Result<Vec<DiscoveredModel>, CatalogError> {
+    let entries = catalog_entries(&source, value)?;
 
     let mut models = Vec::new();
     for entry in entries {
@@ -953,4 +1032,81 @@ pub fn pickable(provider: &str, models: &[DiscoveredModel]) -> Vec<DiscoveredMod
             .then_with(|| left.display_name.cmp(&right.display_name))
     });
     visible
+}
+
+#[cfg(test)]
+mod catalog_response_tests {
+    use super::*;
+
+    /// MUTATION: reject every empty decoded list. Every supported wire shape
+    /// must retain a genuine empty success without accepting unusable entries.
+    #[test]
+    fn empty_success_is_distinct_from_unusable_catalog_entries() {
+        let sources = [
+            CatalogSource::OpenAiSubscription,
+            CatalogSource::AnthropicSubscription,
+            CatalogSource::KimiOAuth,
+            CatalogSource::GrokOAuth,
+            CatalogSource::GeminiApiKey,
+            CatalogSource::OpenAiCompatible {
+                origin: "http://127.0.0.1/v1".into(),
+            },
+            CatalogSource::AnthropicCompatible {
+                origin: "http://127.0.0.1/v1".into(),
+            },
+            CatalogSource::DeepSeekApi,
+            CatalogSource::HaiderCodeApi,
+            CatalogSource::XaiApi,
+        ];
+        for source in sources {
+            let key = if matches!(
+                source,
+                CatalogSource::OpenAiSubscription | CatalogSource::GeminiApiKey
+            ) {
+                "models"
+            } else {
+                "data"
+            };
+            let mut payload = serde_json::json!({});
+            payload[key] = serde_json::json!([]);
+            let empty = parse_discovered_models(source.clone(), &payload, None)
+                .unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert!(empty.is_empty(), "{source:?}");
+            payload[key] = serde_json::json!([{}]);
+            assert!(
+                matches!(
+                    parse_discovered_models(source.clone(), &payload, None),
+                    Err(CatalogError::Empty)
+                ),
+                "{source:?}"
+            );
+            assert!(
+                matches!(
+                    parse_discovered_models(
+                        source.clone(),
+                        &serde_json::json!({"unexpected": []}),
+                        None
+                    ),
+                    Err(CatalogError::InvalidBody { .. })
+                ),
+                "{source:?}"
+            );
+            payload[key] = match source {
+                CatalogSource::OpenAiSubscription => serde_json::json!([{"slug": "model-one"}]),
+                CatalogSource::GeminiApiKey => serde_json::json!([{"name": "models/model-one"}]),
+                _ => serde_json::json!([{"id": "model-one"}]),
+            };
+            let named = parse_discovered_models(source.clone(), &payload, None)
+                .unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert_eq!(named.len(), 1, "{source:?}");
+            assert_eq!(named[0].slug, "model-one", "{source:?}");
+            assert!(
+                matches!(
+                    parse_discovered_models(source.clone(), &payload, Some("model-one")),
+                    Err(CatalogError::InvalidBody { .. })
+                ),
+                "credential reflection {source:?}"
+            );
+        }
+    }
 }
