@@ -30,6 +30,9 @@ fn accounts_model() -> AppModel {
 #[test]
 fn oauth_receipt_flags_ambiguous_email_without_wrong_removal_hint() {
     let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
         alias: CredentialAlias::new(alias),
         provider: "anthropic-oauth".into(),
         base_url: None,
@@ -240,6 +243,8 @@ fn cancel_closes_and_late_replies_are_ghosts() {
     assert!(model.oauth_add.is_none());
     // A late COMPLETION for the retired attempt must not repaint either.
     let descriptor = CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("openai-oauth"),
         provider: "openai-oauth".into(),
         base_url: None,
@@ -340,6 +345,9 @@ fn check_duplicate_notice(
         "account=a;organization=team"
     };
     let descriptor = |alias: &str, status| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
         alias: CredentialAlias::new(alias),
         provider: provider.into(),
         base_url: None,
@@ -462,6 +470,9 @@ fn check_duplicate_notice(
 #[test]
 fn a25_legacy_email_notice_does_not_offer_placeholder_as_a_duplicate() {
     let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
         alias: CredentialAlias::new(alias),
         provider: "anthropic-oauth".into(),
         base_url: None,

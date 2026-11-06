@@ -20,10 +20,8 @@
 //! Only the catalog credential falls back. The provider default and any
 //! session's pinned account are never changed by this module.
 //!
-//! Cache seam (catalog-accuracy lane): the refreshed catalog is stored per
-//! provider, and the alias that actually served it is reported back in
-//! `ProviderModelsRefreshCompleted::account_alias`. An account-scoped cache
-//! key (`account-v2:`) belongs where that alias is consumed.
+//! Each attempt captures its producing account incarnation and route. The
+//! completion and durable cache keep that owner even when a fallback serves it.
 
 use super::*;
 
@@ -162,7 +160,15 @@ pub(super) async fn discover_models_with_account(
     model_discoverer: &dyn ProviderModelDiscoverer,
     source: CatalogSource,
     etag: Option<&str>,
-) -> ProviderModelsRefreshResult {
+    linked_source: Option<&CredentialSourceRecord>,
+) -> (ProviderModelsRefreshResult, bool) {
+    let expected_access = match linked_source
+        .map(|source| linked_catalog_credential(source, descriptor))
+        .transpose()
+    {
+        Ok(expected) => expected,
+        Err(error) => return (ProviderModelsRefreshResult::Credential(error), true),
+    };
     // The discoverer names where the credential goes: a real endpoint only
     // ever receives a live-issued token; the debug fake data plane is
     // numeric loopback.
@@ -175,6 +181,18 @@ pub(super) async fn discover_models_with_account(
     };
     match resolved {
         Ok(access_token) => {
+            if expected_access.is_some_and(|digest| {
+                *blake3::hash(access_token.expose_secret()).as_bytes() != digest
+            }) {
+                return (
+                    ProviderModelsRefreshResult::Credential(HaiderError::new(
+                        ErrorCode::CredentialMissing,
+                        "linked credential changed before catalog discovery",
+                        true,
+                    )),
+                    true,
+                );
+            }
             let access_token = std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
                 let message = if descriptor.auth_method == AuthMethod::OAuth {
                     "OAuth access token is not valid UTF-8"
@@ -183,21 +201,27 @@ pub(super) async fn discover_models_with_account(
                 };
                 HaiderError::new(ErrorCode::CredentialMissing, message, false)
             });
-            match access_token {
-                Ok(access_token) => ProviderModelsRefreshResult::Discovery(
-                    discover_provider_models_bounded(
-                        model_discoverer,
-                        source,
-                        destination,
-                        Some(access_token),
-                        etag,
-                    )
-                    .await,
-                ),
-                Err(error) => ProviderModelsRefreshResult::Credential(error),
-            }
+            (
+                match access_token {
+                    Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                        discover_provider_models_bounded(
+                            model_discoverer,
+                            source,
+                            destination,
+                            Some(access_token),
+                            etag,
+                        )
+                        .await,
+                    ),
+                    Err(error) => ProviderModelsRefreshResult::Credential(error),
+                },
+                false,
+            )
         }
-        Err(error) => ProviderModelsRefreshResult::Credential(error),
+        Err(error) => (
+            ProviderModelsRefreshResult::Credential(error),
+            linked_source.is_some(),
+        ),
     }
 }
 

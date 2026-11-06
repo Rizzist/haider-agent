@@ -86,6 +86,7 @@ fn seed_legacy_session(store: &Store, session: &SessionId) {
 fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
     let cwd = cwd.to_string_lossy().into_owned();
     let command = SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session_id}"),
         request_digest: "digest-create".into(),
         request_json: json!({
@@ -98,6 +99,7 @@ fn typed_session(store: &Store, session_id: &str, cwd: &Path) -> SessionId {
         session_id: SessionId::new(session_id),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -197,6 +199,8 @@ fn derived_create_origin(mode: haider_protocol::session::SessionInteractionModeV
         cwd: parent_metadata.cwd.clone(),
         provider: parent_metadata.provider.clone(),
         model: parent_metadata.model.clone(),
+        resolved_model: parent_metadata.resolved_model.clone(),
+        model_catalog_key: parent_metadata.model_catalog_key.clone(),
         max_tokens: parent_metadata.max_tokens,
         max_tokens_source: parent_metadata.max_tokens_source,
         permission_overrides: parent_metadata.permission_overrides,

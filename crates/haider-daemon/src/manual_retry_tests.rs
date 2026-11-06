@@ -113,12 +113,14 @@ impl RetryWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("{prefix}-create"),
             request_digest: format!("{prefix}-create-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
             session_id: session_id.clone(),
             cwd,
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -227,12 +229,14 @@ impl RetryWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("{prefix}-idle-create"),
             request_digest: format!("{prefix}-idle-create-digest"),
             request_json: format!(r#"{{"session":"{prefix}-idle"}}"#),
             session_id: session_id.clone(),
             cwd,
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

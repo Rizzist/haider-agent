@@ -277,12 +277,14 @@ async fn toolshape_task_output_original_hash_survives_completion_eviction_and_ad
     let registry = hub.task_registry();
     let session = SessionId::new("toolshape-task-session");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: "toolshape-create-session".into(),
         request_digest: "toolshape-create-session-digest".into(),
         request_json: "{}".into(),
         session_id: session.clone(),
         cwd: profile.path().to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

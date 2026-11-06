@@ -1054,12 +1054,31 @@ async fn execute_custom(
         .iter()
         .find(|provider| provider.provider == options.alias)
         .cloned();
-    if create && existing.is_some() {
-        return Err(AccountError::Protocol(
-            "account add alias already names a provider; use account update",
-        ));
-    }
-    if !create && existing.is_none() {
+    if let Some(provider) = &existing {
+        // Removing a credential deliberately retains its custom profile. A
+        // vacant credential slot can be filled again, but an existing account
+        // (including an inactive or expired one) still requires update.
+        let custom_requires_account = provider.catalog
+            == haider_rpc::ProviderCatalogKindWire::Custom
+            && !provider.auth_methods.is_empty();
+        let account_present = if custom_requires_account {
+            account_snapshot(client)
+                .await?
+                .0
+                .iter()
+                .any(|descriptor| descriptor.alias.as_str() == options.alias)
+        } else {
+            false
+        };
+        if create && (!custom_requires_account || account_present) {
+            return Err(AccountError::Protocol(
+                "account add alias already names a provider; use account update",
+            ));
+        }
+        if !create && custom_requires_account && !account_present {
+            return Err(AccountError::MissingAlias(options.alias));
+        }
+    } else if !create {
         return Err(AccountError::MissingAlias(options.alias));
     }
     let existing = existing.as_ref();
@@ -1090,11 +1109,11 @@ async fn execute_custom(
             origin: options.base_url.clone(),
             auth_requirement,
             enabled: existing.is_none_or(|provider| provider.enabled),
-            // Empty commits a remote provider with no invented inventory.
+            // Empty requests no invented inventory; existing explicit models remain.
             // The durable credential commit below schedules discovery in the
             // daemon; this mutation never waits for `/models`.
             models: Vec::new(),
-            default_model: existing.and_then(|provider| provider.default_model.clone()),
+            default_model: None,
             response_open_timeout_ms: options.response_open_timeout_ms,
             chunk_idle_timeout_ms: options.chunk_idle_timeout_ms,
             semantic_progress_timeout_ms: options.semantic_progress_timeout_ms,
@@ -1104,7 +1123,7 @@ async fn execute_custom(
         })
         .await
         .map_err(AccountError::Client)?;
-    let (configured, configured_revision) = match response {
+    let (_configured, configured_revision) = match response {
         ResponseBody::ProviderConfigure { provider, revision } => (provider, revision),
         ResponseBody::Error {
             code,
@@ -1175,7 +1194,7 @@ async fn execute_custom(
                 provider: options.alias.clone(),
                 alias: Some(options.alias.clone()),
                 vault_reference,
-                validation_model: configured.default_model.clone(),
+                validation_model: None,
                 replace_existing: !create,
             })
             .await
@@ -1202,6 +1221,13 @@ async fn execute_custom(
             }
         }
     }
+    let (committed, _) = provider_snapshot(client).await?;
+    let configured = committed
+        .into_iter()
+        .find(|provider| provider.provider == options.alias)
+        .ok_or(AccountError::Protocol(
+            "committed provider disappeared from intake",
+        ))?;
     let document = custom_document(
         if create { "add" } else { "update" },
         &options.alias,

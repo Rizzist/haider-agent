@@ -17,6 +17,9 @@ fn descriptors() -> Vec<CredentialDescriptor> {
     ["a", "b"]
         .into_iter()
         .map(|alias| CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
+
             alias: CredentialAlias::new(alias),
             provider: PROVIDER.into(),
             base_url: None,

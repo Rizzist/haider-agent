@@ -2484,9 +2484,15 @@ fn codex_import_bundle(
         generation,
     )
     .map_err(|_| invalid_import(path, "codex"))?;
-    if let Some(identity) = account_identity {
-        bundle = bundle.with_account_identity(identity);
-    }
+    let account_identity = account_identity.unwrap_or_else(|| {
+        grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            captured_at,
+        )
+    });
+    bundle = bundle.with_account_identity(account_identity);
     if let Some(id_token) = id_token {
         bundle = bundle.with_id_token(id_token);
     }
@@ -2583,16 +2589,15 @@ fn claude_import_bundle(
         generation,
     )
     .map(|bundle| {
+        let mut account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            captured_at,
+        );
+        account.plan = plan.map(str::to_owned);
         bundle
-            .with_account_identity(AccountIdentity {
-                email: None,
-                display_name: Some(display_identity.to_owned()),
-                account_id: None,
-                plan: plan.map(str::to_owned),
-                issuer: Some(registration.issuer.clone()),
-                captured_at,
-                verified: false,
-            })
+            .with_account_identity(account)
             .with_import_source_access_fingerprint(source_access_fingerprint)
     })
     .map_err(|_| invalid_import(path, "claude-code"))
@@ -2717,7 +2722,14 @@ fn kimi_import_bundle(
         generation,
     )
     .map(|bundle| {
+        let account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            now_ms().unwrap_or(0),
+        );
         bundle
+            .with_account_identity(account)
             .with_import_source_access_fingerprint(source_access_fingerprint)
             .with_refresh_after(
                 expires_at_unix_ms.saturating_sub(refresh_threshold.saturating_mul(1000)),
@@ -2795,7 +2807,17 @@ fn grok_import_bundle(
         },
         generation,
     )
-    .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
+    .map(|bundle| {
+        let account = grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &bundle.identity,
+            now,
+        );
+        bundle
+            .with_account_identity(account)
+            .with_import_source_access_fingerprint(source_access_fingerprint)
+    })
     .map_err(|_| invalid_import(path, "grok-cli"))
 }
 
@@ -5236,6 +5258,25 @@ async fn token_bundle_from_response(
             }
         }
     }
+    if account_identity.is_none()
+        && matches!(
+            &registration.identity_mode,
+            RuntimeIdentityMode::TokenEndpointGrant { .. }
+        )
+    {
+        // The token response has no ID token/account coordinate (Anthropic,
+        // Kimi, Grok without an ID token). Pin one synthetic identity to the
+        // login's initial grant identity; the refresh path preserves this
+        // AccountIdentity byte-for-byte, so token rotation cannot rename the
+        // account or break its meter association, while a new login is a new
+        // account boundary (catalog cache keys included).
+        account_identity = Some(grant_account_identity(
+            &registration.provider_id,
+            &registration.issuer,
+            &identity,
+            now,
+        ));
+    }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))
         .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?;
@@ -5548,9 +5589,106 @@ impl RefreshFlight {
 #[derive(Clone, Default)]
 pub(crate) struct RefreshFenceRegistry {
     fences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    credential_writes: Arc<Mutex<HashMap<String, Arc<CredentialWriteState>>>>,
+}
+
+#[derive(Default)]
+struct CredentialWriteState {
+    generation: AtomicU64,
+    legacy_digest: Mutex<Option<LegacyApiKeyBinding>>,
+}
+
+struct LegacyApiKeyBinding {
+    incarnation: u64,
+    digest: Option<String>,
+}
+
+/// Covers the vault-first commit, snapshot publication and any rollback.
+/// An odd generation denies readers, including legacy descriptors with no digest.
+pub(crate) struct CredentialWriteGuard(Arc<CredentialWriteState>);
+
+impl Drop for CredentialWriteGuard {
+    fn drop(&mut self) {
+        self.0.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl RefreshFenceRegistry {
+    fn credential_write_counter(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<Arc<CredentialWriteState>, HaiderError> {
+        let mut writes = self
+            .credential_writes
+            .lock()
+            .map_err(|_| credential_changed())?;
+        Ok(Arc::clone(
+            writes
+                .entry(alias.as_str().to_owned())
+                .or_insert_with(|| Arc::new(CredentialWriteState::default())),
+        ))
+    }
+
+    /// Bind a migrated API key before replacing its bytes. The binding survives
+    /// receipt failure while the published snapshot still refers to that incarnation.
+    pub(crate) fn bind_legacy_api_key(
+        &self,
+        descriptor: Option<&CredentialDescriptor>,
+        secret: Option<&SecretHandle>,
+    ) -> Result<(), HaiderError> {
+        if let Some(descriptor) = descriptor
+            && descriptor.auth_method == AuthMethod::ApiKey
+            && descriptor.credential_digest.is_none()
+            && !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        {
+            let state = self.credential_write_counter(&descriptor.alias)?;
+            *state
+                .legacy_digest
+                .lock()
+                .map_err(|_| credential_changed())? = Some(LegacyApiKeyBinding {
+                incarnation: descriptor.incarnation,
+                // An unreadable old secret cannot authorize any replacement bytes.
+                digest: secret
+                    .map(|secret| blake3::hash(secret.expose_secret()).to_hex().to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_credential_write(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<CredentialWriteGuard, HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2)
+            || counter
+                .generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(credential_changed());
+        }
+        Ok(CredentialWriteGuard(counter))
+    }
+
+    fn credential_read_generation(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<(Arc<CredentialWriteState>, u64), HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return Err(credential_changed());
+        }
+        Ok((counter, generation))
+    }
+
     fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
         self.fences
             .lock()
@@ -5589,6 +5727,40 @@ struct BrokerInner {
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     #[cfg(test)]
     panic_refresh_worker: AtomicBool,
+}
+
+pub(crate) fn api_key_descriptor_is_current(
+    snapshot: &crate::accounts::AccountsSnapshot,
+    expected: &CredentialDescriptor,
+) -> bool {
+    snapshot.lock().is_ok_and(|descriptors| {
+        descriptors.iter().any(|current| {
+            current.alias == expected.alias
+                && current.provider == expected.provider
+                && current.auth_method == expected.auth_method
+                && current.base_url == expected.base_url
+                && current.incarnation == expected.incarnation
+        })
+    })
+}
+
+pub(crate) fn validate_api_key_secret(
+    descriptor: &CredentialDescriptor,
+    secret: &SecretHandle,
+) -> Result<(), HaiderError> {
+    // The native gcloud account deliberately rotates its access token without
+    // replacing the account. Ordinary API keys are immutable within an incarnation.
+    if !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        && descriptor
+            .credential_digest
+            .as_ref()
+            .is_some_and(|expected| {
+                expected != &blake3::hash(secret.expose_secret()).to_hex().to_string()
+            })
+    {
+        return Err(credential_changed());
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -5967,7 +6139,41 @@ impl CredentialBroker {
             return Err(broker_stopped());
         }
         match descriptor.auth_method {
-            AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
+            AuthMethod::ApiKey => {
+                let (counter, generation) = self
+                    .inner
+                    .fences
+                    .credential_read_generation(&descriptor.alias)?;
+                if !api_key_descriptor_is_current(&self.inner.snapshot, descriptor) {
+                    return Err(credential_changed());
+                }
+                let secret = self.resolve_vault(&descriptor.alias).await?;
+                if counter.generation.load(Ordering::Acquire) != generation
+                    || !api_key_descriptor_is_current(&self.inner.snapshot, descriptor)
+                {
+                    return Err(credential_changed());
+                }
+                validate_api_key_secret(descriptor, &secret)?;
+                if descriptor.credential_digest.is_none()
+                    && counter
+                        .legacy_digest
+                        .lock()
+                        .map_err(|_| credential_changed())?
+                        .as_ref()
+                        .is_some_and(|binding| {
+                            binding.incarnation == descriptor.incarnation
+                                && binding.digest.as_ref().is_none_or(|expected| {
+                                    expected
+                                        != &blake3::hash(secret.expose_secret())
+                                            .to_hex()
+                                            .to_string()
+                                })
+                        })
+                {
+                    return Err(credential_changed());
+                }
+                Ok(secret)
+            }
             AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
                 SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
                     self.resolve_oauth(descriptor, false, None, &destination)
@@ -7119,6 +7325,33 @@ fn kimi_refresh_retry_delay(error: &OAuthPublicError, attempts: usize) -> Option
     })
 }
 
+/// The synthetic account identity of a login whose provider returns no
+/// account coordinate: derived from that login's initial grant, so it is
+/// stable across token refresh and distinct for every new login. Anthropic
+/// keeps its released `anthropic:<grant>` spelling (meter association).
+pub(crate) fn grant_account_identity(
+    provider: &str,
+    issuer: &str,
+    identity: &OAuthIdentityV1,
+    captured_at: u64,
+) -> AccountIdentity {
+    let stable_suffix = identity.subject_hash.chars().take(16).collect::<String>();
+    let account_id = if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+        format!("anthropic:{stable_suffix}")
+    } else {
+        format!("{provider}:grant-{stable_suffix}")
+    };
+    AccountIdentity {
+        email: None,
+        display_name: Some(identity.display_identity.clone()),
+        account_id: Some(account_id),
+        plan: None,
+        issuer: Some(issuer.to_owned()),
+        captured_at,
+        verified: false,
+    }
+}
+
 fn validate_bundle_against(
     registration: &OAuthProviderRegistration,
     descriptor: &CredentialDescriptor,
@@ -7526,6 +7759,14 @@ fn expired_or_replaced(descriptor: &CredentialDescriptor) -> HaiderError {
         haider_accounts::RotationTrigger::AuthExpired,
         false,
         "OAuth credential is expired or was replaced",
+    )
+}
+
+fn credential_changed() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "the account credential changed while resolving it; retry with the current account",
+        true,
     )
 }
 

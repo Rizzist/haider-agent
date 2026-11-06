@@ -41,12 +41,14 @@ impl ProviderFactory for RecordingRebindFactory {
 
 pub(super) async fn create_rebind_test_session(hub: &SessionHub, session_id: &SessionId) {
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session_id}"),
         request_digest: format!("create-digest-{session_id}"),
         request_json: "{}".into(),
         session_id: session_id.clone(),
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "initial-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -212,6 +214,7 @@ async fn provider_rebind_after_automatic_model_change_builds_current_live_reques
             session_id: session_id.clone(),
             worker_generation: store.worker_generation(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: model.into(),
             expected_pair,
             automatic_run: None,
@@ -480,6 +483,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         create_rebind_test_session(&hub, &session_id).await;
         let select_native =
             |id: &str, model: &str, budget| haider_store::SessionSelectModelCommand {
+                model_catalog_key: None,
                 command_id: id.into(),
                 request_digest: format!("{id}-digest"),
                 request_json: "{}".into(),
@@ -569,6 +573,8 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                 &event_ids,
                 vec![
                     haider_protocol::session::RunOutputPairPinnedV1 {
+                        resolved_model: None,
+                        model_catalog_key: None,
                         route_snapshot: None,
                         provider: "fake".into(),
                         model: model.into(),
@@ -644,6 +650,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
         }
         if headless {
             hub.select_session_model(haider_store::SessionSelectModelCommand {
+                model_catalog_key: None,
                 command_id: "pending-selection".into(),
                 request_digest: "pending-selection-digest".into(),
                 request_json: "{}".into(),
@@ -1012,7 +1019,9 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
                         data: serde_json::json!({
                             "from_provider": "fake", "from_model": "initial-model",
                             "to_provider": "fake", "to_model": "promoted-live-model",
-                            "why": "fallback_chain"
+                            "why": "fallback_chain",
+                            "model_catalog_key": "synthetic-live-producer",
+                            "output_budget": haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived.apply(333, 333)
                         }),
                     },
                 })],
@@ -1045,6 +1054,7 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
                 session_id: session_id.clone(),
                 worker_generation: store.worker_generation(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "pending-next-turn-model".into(),
                 output_budget: None,
                 expected_pair: None,
@@ -1199,6 +1209,10 @@ async fn astra_divergent_headless_recovery_reapplies_active_limit() {
             assert_eq!(calls[0].effort.as_deref(), Some("high"));
             assert!(calls[0].fast);
             assert_eq!(calls[0].max_tokens, 8192);
+            assert_eq!(
+                calls[0].model_catalog_key.as_deref(),
+                automatic_switch.then_some("synthetic-live-producer")
+            );
         }
         let requests = provider.requests();
         assert_eq!(requests.len(), 1);
@@ -1264,6 +1278,8 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
         .expect("metadata")
         .expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        resolved_model: None,
+        model_catalog_key: None,
         route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
             &metadata,
         )),
@@ -1330,6 +1346,7 @@ async fn pinned_route_provenance_is_run_scoped_across_restart_and_next_turn() {
     );
     let selected = hub
         .select_session_model(haider_store::SessionSelectModelCommand {
+            model_catalog_key: None,
             command_id: "next-route".into(),
             request_digest: "next-route".into(),
             request_json: "{}".into(),
@@ -1510,6 +1527,8 @@ async fn matching_rebind_route_publishes_account_and_rotation_epoch() {
             .expect("lease");
         let md = lease.session_metadata().await.expect("md").expect("typed");
         let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+            resolved_model: None,
+            model_catalog_key: None,
             route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
                 &md,
             )),
@@ -1704,6 +1723,8 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         .expect("metadata")
         .expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        resolved_model: None,
+        model_catalog_key: None,
         route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
             &metadata,
         )),
@@ -1742,6 +1763,7 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
         "a matching branched route still publishes session truth"
     );
     hub.select_session_model(haider_store::SessionSelectModelCommand {
+        model_catalog_key: None,
         command_id: "branch-route-next".into(),
         request_digest: "branch-route-next".into(),
         request_json: "{}".into(),
@@ -1835,6 +1857,106 @@ async fn pinned_route_resolution_keeps_the_active_run_branch() {
     store.close().await.expect("close");
 }
 
+async fn admit_catalog_headless_fixture(
+    hub: &SessionHub,
+    session: &SessionId,
+    run: &RunId,
+    spec: &HeadlessRunSpecV1,
+) {
+    hub.accept_internal_turn(haider_core::TurnAcceptCommand {
+        command_id: format!("catalog-accept-{run}"),
+        request_digest: format!("catalog-accept-{run}"),
+        request_json: serde_json::json!({"headless":spec}).to_string(),
+        session_id: session.clone(),
+        worker_generation: hub.worker_generation(),
+        run_id: run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "synthetic catalog recovery".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("catalog-queued-{run}")),
+        user_event_id: EventId::new(format!("catalog-user-{run}")),
+        active_event_id: EventId::new(format!("catalog-active-{run}")),
+        device_id: DeviceId::new("catalog-test"),
+    })
+    .await
+    .expect("admitted headless run");
+}
+
+#[tokio::test]
+async fn recovered_headless_model_retains_its_catalog_owner_instead_of_pending_selection_owner() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("scoped-headless-pin");
+    create_rebind_test_session(&hub, &session).await;
+    let mut metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    metadata.model = "pending-b-model".into();
+    metadata.model_catalog_key = Some("synthetic-B-producer".into());
+    let mut spec = rebound_recovery_headless_spec();
+    spec.model_catalog_key = Some("synthetic-A-producer".into());
+    admit_catalog_headless_fixture(&hub, &session, &RunId::new("scoped-headless-run"), &spec).await;
+    let handle = hub.acquire_worker_lease(session).await.expect("lease");
+    pin_headless_turn_metadata(
+        &mut metadata,
+        &spec,
+        &handle,
+        &RunId::new("scoped-headless-run"),
+    )
+    .await
+    .expect("pin");
+    assert_eq!(metadata.model, spec.model);
+    assert_eq!(
+        metadata.model_catalog_key, spec.model_catalog_key,
+        "A's model cannot borrow B's current metadata owner"
+    );
+    hub.shutdown().await.expect("shutdown");
+    drop(handle);
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn c5_headless_recovery_pins_the_creation_coordinate_separately_from_pending_selection() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("c5-headless-coordinate");
+    create_rebind_test_session(&hub, &session).await;
+    let mut metadata = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    metadata.model = "pending-model".into();
+    let mut json = serde_json::to_value(rebound_recovery_headless_spec()).expect("spec");
+    json["model"] = serde_json::json!("INITIAL_MODEL");
+    json["resolved_model"] = serde_json::json!("initial-model");
+    let spec = serde_json::from_value(json).expect("additive spec");
+    admit_catalog_headless_fixture(&hub, &session, &RunId::new("c5-run"), &spec).await;
+    let handle = hub.acquire_worker_lease(session).await.expect("lease");
+    pin_headless_turn_metadata(&mut metadata, &spec, &handle, &RunId::new("c5-run"))
+        .await
+        .expect("pin");
+    let metadata_json = serde_json::to_value(metadata).expect("pinned metadata");
+    assert_eq!(metadata_json["model"], "INITIAL_MODEL");
+    assert_eq!(
+        metadata_json["resolved_model"], "initial-model",
+        "headless run must retain its admitted coordinate independently of a pending selection"
+    );
+    hub.shutdown().await.expect("shutdown");
+    drop(handle);
+    store.close().await.expect("close");
+}
+
 fn rotation_route_facts(
     events: &[haider_protocol::envelope::RawEnvelope],
     run: &RunId,
@@ -1873,6 +1995,7 @@ pub(super) async fn select_rotation_test_model(
     budget: Option<u64>,
 ) {
     hub.select_session_model(haider_store::SessionSelectModelCommand {
+        model_catalog_key: None,
         command_id: format!("rotation-{id}"),
         request_digest: format!("rotation-{id}"),
         request_json: "{}".into(),
@@ -2013,6 +2136,8 @@ async fn pin_rotation_test_run(
         .expect("lease");
     let md = lease.session_metadata().await.expect("md").expect("typed");
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        resolved_model: None,
+        model_catalog_key: None,
         route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
             &md,
         )),
@@ -2481,4 +2606,76 @@ async fn run_scoped_route_epoch_is_allocated_with_its_append() {
         failures.is_empty(),
         "run-scoped epoch allocation failures: {failures:#?}"
     );
+}
+
+/// The prepared target is already owned by this run before Core publishes its
+/// completion fact. Recovery must retain its catalog key and target budget while
+/// leaving an ordinary next-turn selection alone.
+#[tokio::test]
+async fn c5_prepared_automatic_target_retains_owner_and_budget_before_completion() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), crate::SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new("prepared-catalog-target");
+    let run = RunId::new("prepared-catalog-run");
+    create_rebind_test_session(&hub, &session).await;
+    admit_catalog_headless_fixture(&hub, &session, &run, &rebound_recovery_headless_spec()).await;
+    let selection = |id: &str, model: &str, owner: &str| haider_store::SessionSelectModelCommand {
+        command_id: id.into(),
+        request_digest: id.into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        model: model.into(),
+        model_catalog_key: Some(owner.into()),
+        expected_pair: None,
+        automatic_run: None,
+        account_alias: None,
+        output_budget: None,
+        event_id: EventId::new(id),
+        device_id: DeviceId::new("prepared-test"),
+    };
+    hub.select_session_model(selection(
+        "pending-choice",
+        "pending-model",
+        "pending-owner",
+    ))
+    .await
+    .expect("next-turn choice");
+    let mut prepared = selection("prepared-choice", "target-model", "target-owner");
+    prepared.expected_pair = Some(("fake".into(), "initial-model".into()));
+    prepared.automatic_run = Some(haider_store::AutomaticRunSelection {
+        run_id: run.clone(),
+        branch_id: None,
+        rebind_seq: 0,
+        resolved_alias: "target-account".into(),
+        selection_epoch: Some(0),
+    });
+    prepared.output_budget = Some(
+        haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet { requested: 333 }
+            .apply(1000, 1000),
+    );
+    hub.select_session_model(prepared)
+        .await
+        .expect("prepared target");
+    let pair = hub
+        .run_output_pair(&session, &run)
+        .await
+        .expect("pair")
+        .expect("admitted run");
+    assert_eq!(pair.model, "target-model");
+    assert_eq!(pair.model_catalog_key.as_deref(), Some("target-owner"));
+    assert_eq!(pair.max_tokens, 333);
+    let next = hub
+        .session_metadata(&session)
+        .await
+        .expect("metadata")
+        .expect("session");
+    assert_eq!(next.model, "pending-model");
+    assert_eq!(next.model_catalog_key.as_deref(), Some("pending-owner"));
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }

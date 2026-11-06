@@ -950,6 +950,8 @@ pub(crate) struct ResolvedRouteCommitProbe {
 }
 
 pub(crate) struct ActiveRunOutputPairSnapshot {
+    pub resolved_model: Option<String>,
+    pub model_catalog_key: Option<String>,
     branch_id: Option<BranchId>,
     pub durably_pinned: bool,
     pub complete_pin: bool,
@@ -963,6 +965,26 @@ pub(crate) struct ActiveRunOutputPairSnapshot {
 }
 
 impl ActiveRunOutputPairSnapshot {
+    pub(crate) fn model_coordinate(&self) -> &str {
+        self.resolved_model.as_deref().unwrap_or(&self.model)
+    }
+
+    pub(crate) fn restore_metadata(
+        &self,
+        metadata: &mut haider_protocol::session::SessionMetadataV1,
+    ) -> Result<(), HaiderError> {
+        self.restore_route(metadata)?;
+        metadata.provider.clone_from(&self.provider);
+        metadata.model.clone_from(&self.model);
+        metadata.resolved_model.clone_from(&self.resolved_model);
+        metadata
+            .model_catalog_key
+            .clone_from(&self.model_catalog_key);
+        metadata.max_tokens = self.max_tokens;
+        metadata.max_tokens_source = self.source;
+        Ok(())
+    }
+
     pub(crate) fn restore_route(
         &self,
         metadata: &mut haider_protocol::session::SessionMetadataV1,
@@ -978,6 +1000,8 @@ enum RunOutputPairChange {
         model: String,
         rebind_seq: Option<u64>,
         resolved_alias: Option<String>,
+        model_catalog_key: Option<String>,
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     LegacyCheckpoint {
         run_id: RunId,
@@ -990,6 +1014,8 @@ enum RunOutputPairChange {
         resolved_alias: Option<String>,
         selection_seq: Option<u64>,
         source_rebind_seq: Option<u64>,
+        model_catalog_key: Option<String>,
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     },
     Rebind {
         rebound: Box<haider_protocol::session::SessionProviderRebound>,
@@ -6963,6 +6989,8 @@ impl SessionHub {
                         event.seq,
                         RunOutputPairChange::SwitchPrepared {
                             run_id: run_id.clone(),
+                            model_catalog_key: selected.model_catalog_key,
+                            output_budget: None,
                             provider: selected.provider,
                             model: selected.model,
                             rebind_seq: None,
@@ -6982,6 +7010,20 @@ impl SessionHub {
                         event.seq,
                         RunOutputPairChange::SwitchPrepared {
                             run_id: run_id.clone(),
+                            model_catalog_key: selected.model_catalog_key,
+                            output_budget: event
+                                .payload
+                                .get("automatic_output_budget")
+                                .cloned()
+                                .map(serde_json::from_value)
+                                .transpose()
+                                .map_err(|error| {
+                                    HaiderError::new(
+                                        ErrorCode::StoreCorrupt,
+                                        format!("invalid prepared output budget: {error}"),
+                                        false,
+                                    )
+                                })?,
                             provider: selected.provider,
                             model: selected.model,
                             rebind_seq: Some(rebind_seq),
@@ -7065,6 +7107,8 @@ impl SessionHub {
                                     latest_rebind_seq: 0,
                                     run_id: run_id.clone(),
                                     provider: pin.provider,
+                                    resolved_model: pin.resolved_model,
+                                    model_catalog_key: pin.model_catalog_key,
                                     model: pin.model,
                                     max_tokens: pin.max_tokens,
                                     source: Some(pin.source),
@@ -7137,6 +7181,22 @@ impl SessionHub {
                                 run_id: run_id.clone(),
                                 provider: provider.to_owned(),
                                 model: model.to_owned(),
+                                model_catalog_key: data
+                                    .get("model_catalog_key")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned),
+                                output_budget: data
+                                    .get("output_budget")
+                                    .cloned()
+                                    .map(serde_json::from_value)
+                                    .transpose()
+                                    .map_err(|error| {
+                                        HaiderError::new(
+                                            ErrorCode::StoreCorrupt,
+                                            format!("invalid automatic output budget: {error}"),
+                                            false,
+                                        )
+                                    })?,
                                 source_rebind_seq: data
                                     .get("source_rebind_seq")
                                     .and_then(serde_json::Value::as_u64),
@@ -7246,6 +7306,11 @@ impl SessionHub {
                         latest_rebind_seq: 0,
                         run_id: run_id.clone(),
                         provider: spec.map_or(snapshot.provider, |spec| spec.provider.clone()),
+                        resolved_model: spec
+                            .map_or(snapshot.resolved_model, |spec| spec.resolved_model.clone()),
+                        model_catalog_key: spec.map_or(snapshot.model_catalog_key, |spec| {
+                            spec.model_catalog_key.clone()
+                        }),
                         model: spec.map_or(snapshot.model, |spec| spec.model.clone()),
                         max_tokens: spec.map_or(snapshot.max_tokens, |spec| spec.max_output_tokens),
                         source: snapshot.source,
@@ -7270,6 +7335,8 @@ impl SessionHub {
                     model,
                     rebind_seq,
                     resolved_alias,
+                    model_catalog_key,
+                    output_budget,
                 } => {
                     let rebind_seq = rebind_seq.unwrap_or(latest_rebind_seq);
                     // Installing the target and its served-account witness is
@@ -7286,6 +7353,12 @@ impl SessionHub {
                         }
                         pair.provider.clone_from(&provider);
                         pair.model.clone_from(&model);
+                        pair.resolved_model = None;
+                        pair.model_catalog_key = model_catalog_key;
+                        if let Some(budget) = output_budget {
+                            pair.max_tokens = budget.max_tokens;
+                            pair.source = Some(budget.source);
+                        }
                         pair.route_snapshot
                             .record_switch_observation(resolved_alias);
                     }
@@ -7312,6 +7385,8 @@ impl SessionHub {
                     resolved_alias,
                     selection_seq,
                     source_rebind_seq,
+                    model_catalog_key,
+                    output_budget,
                 } => {
                     if pinned_at.get(&run_id).is_none_or(|pin| *pin >= seq)
                         || terminal_at.get(&run_id).is_some_and(|end| *end < seq)
@@ -7339,6 +7414,12 @@ impl SessionHub {
                         }
                         pair.provider = provider;
                         pair.model = model;
+                        pair.resolved_model = None;
+                        pair.model_catalog_key = model_catalog_key;
+                        if let Some(budget) = output_budget {
+                            pair.max_tokens = budget.max_tokens;
+                            pair.source = Some(budget.source);
+                        }
                         pair.route_snapshot
                             .record_switch_observation(resolved_alias);
                     }
@@ -7358,7 +7439,9 @@ impl SessionHub {
                         && provider
                             .as_ref()
                             .is_none_or(|provider| provider == &pair.provider)
-                        && model.as_ref().is_none_or(|model| model == &pair.model)
+                        && model.as_ref().is_none_or(|model| {
+                            model == &pair.model || model == pair.model_coordinate()
+                        })
                         && (pair
                             .route_snapshot
                             .matches_rebind(route.rebind_id.as_deref())
@@ -7470,7 +7553,7 @@ impl SessionHub {
                                             false,
                                         )
                                     })?,
-                                    view.providers,
+                                    Some(view.providers),
                                 );
                                 let selection = authority
                                     .validate_selection_with_status(
@@ -9449,7 +9532,8 @@ impl HubStoreHandle {
             HaiderError::new(ErrorCode::StoreCorrupt, "run session is missing", false)
         })?;
         let session_epoch = if session.provider == metadata.provider
-            && session.model == metadata.model
+            && session.model_coordinate() == metadata.model_coordinate()
+            && session.model_catalog_key == metadata.model_catalog_key
             && session.provider_rebind_id == metadata.provider_rebind_id
             && session.account_alias == metadata.account_alias
             && session.provider_base_url == metadata.provider_base_url
@@ -9623,7 +9707,7 @@ impl HubStoreHandle {
             .commands
             .send(ActorCommand::ResolvedRoute {
                 provider: metadata.provider.clone(),
-                model: metadata.model.clone(),
+                model: metadata.model_coordinate().to_owned(),
                 epoch: metadata.selection_epoch.unwrap_or(0),
                 alias: alias.map(str::to_owned),
                 device_id: self.hub.inner.device_id.clone(),

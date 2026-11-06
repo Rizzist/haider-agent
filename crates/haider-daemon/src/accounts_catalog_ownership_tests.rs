@@ -34,6 +34,7 @@ struct Fixture {
     frames: mpsc::UnboundedReceiver<WireFrame>,
     discoverer: Arc<BlockingModelDiscoverer>,
     session: SessionId,
+    retired_a: Option<CredentialDescriptor>,
 }
 
 fn catalog(maximum: u64) -> DiscoveredCatalog {
@@ -91,6 +92,8 @@ impl Fixture {
     ) -> Self {
         const CUSTOM: &str = "custom-catalog-ownership";
         let profile = ProviderProfileV1 {
+            catalog_selection_key: None,
+
             provider_id: CUSTOM.into(),
             display_name: "Fixture custom catalog".into(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
@@ -135,8 +138,32 @@ impl Fixture {
         foreign: bool,
         provider: &'static str,
         auth_method: AuthMethod,
+        providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+        pending_catalog: Option<DiscoveredCatalog>,
+    ) -> Self {
+        Self::start_with_replacement(
+            results,
+            pin,
+            foreign,
+            provider,
+            auth_method,
+            providers,
+            pending_catalog,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_replacement(
+        results: Vec<Result<DiscoveredCatalog, CatalogError>>,
+        pin: Option<&str>,
+        foreign: bool,
+        provider: &'static str,
+        auth_method: AuthMethod,
         mut providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
         pending_catalog: Option<DiscoveredCatalog>,
+        replace_a: bool,
     ) -> Self {
         let dir = test_store_dir();
         let store = open_store(dir.path()).await;
@@ -145,6 +172,9 @@ impl Fixture {
         for alias in ["a", "b"] {
             accounts
                 .add(CredentialDescriptor {
+                    incarnation: 0,
+                    credential_digest: None,
+
                     alias: CredentialAlias::new(alias),
                     provider: provider.into(),
                     base_url: None,
@@ -168,6 +198,28 @@ impl Fixture {
                 .put(&CredentialAlias::new(alias), &secret)
                 .expect("fixture vault");
         }
+        let retired_a = if replace_a {
+            let old = accounts
+                .get(&CredentialAlias::new("a"))
+                .expect("original A")
+                .clone();
+            let mut replacement = old.clone();
+            replacement.account_identity = Some(AccountIdentity {
+                email: None,
+                display_name: None,
+                account_id: Some("fixture-replacement-account".into()),
+                plan: None,
+                issuer: Some("fixture-issuer".into()),
+                captured_at: 1,
+                verified: true,
+            });
+            accounts
+                .replace(replacement)
+                .expect("replace original account");
+            Some(old)
+        } else {
+            None
+        };
         if let Some(catalog) = pending_catalog {
             let input = ProviderConfigureInput {
                 provider: provider.into(),
@@ -190,6 +242,21 @@ impl Fixture {
             let recovery = ProviderConfigureRecovery {
                 input,
                 previous_auth_requirement: None,
+                previous_origin: providers
+                    .get(provider)
+                    .and_then(|profile| profile.base_url.clone()),
+                catalog_producer: providers
+                    .get(provider)
+                    .filter(|profile| profile.auth_requirement == ProviderAuthRequirementWire::None)
+                    .and_then(|profile| {
+                        configure_catalog_producer(
+                            "catalog-owner-test",
+                            provider,
+                            profile.base_url.as_deref(),
+                            profile.auth_requirement,
+                            &accounts,
+                        )
+                    }),
                 discovered_models: Some(catalog.models),
                 discovered_etag: catalog.etag,
                 revision_unchanged: false,
@@ -211,7 +278,7 @@ impl Fixture {
             ));
             // The raw actor does not perform bootstrap reconciliation. Run
             // the production startup helper before publishing its registry.
-            reconcile_provider_receipts(&store, &accounts, &mut providers)
+            reconcile_provider_receipts(&store, "catalog-owner-test", &accounts, &mut providers)
                 .await
                 .expect("reconcile pending configure");
         }
@@ -288,6 +355,9 @@ impl Fixture {
         .expect("creatable");
         let session = SessionId::new("catalog-owner-session");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
+            model_catalog_key: None,
+
             command_id: "initial-create".into(),
             request_digest: "initial-digest".into(),
             request_json: "{}".into(),
@@ -346,6 +416,7 @@ impl Fixture {
             frames,
             discoverer,
             session,
+            retired_a,
         };
         if let Some(pin) = pin {
             fixture.pin(pin, "initial-pin").await;
@@ -417,6 +488,7 @@ impl Fixture {
 
     fn selection(&self, foreign: bool, budget: Option<u64>) -> RequestBody {
         RequestBody::SessionSelectModel {
+            expected_catalog_key: None,
             command_id: CommandId::new("select-owned"),
             session_id: self.session.clone(),
             worker_generation: self.store.worker_generation(),
@@ -429,6 +501,7 @@ impl Fixture {
 
     fn creation(&self, pinned: bool, budget: u64) -> RequestBody {
         RequestBody::SessionCreateWithPermissionOverrides {
+            expected_catalog_key: None,
             command_id: CommandId::new("create-owned"),
             cwd: self.dir.path().to_string_lossy().into_owned(),
             provider: self.provider.into(),
@@ -732,7 +805,17 @@ async fn catalog_owner_inactive_removed_304() {
 // This uses the actual actor's completion arm (and real SQLite publication),
 // while injecting the stale response at its asynchronous delivery boundary.
 async fn replaced_refresh_is_discarded(cached: bool) {
-    let f = Fixture::new(Vec::new(), None, false).await;
+    let f = Fixture::start_with_replacement(
+        Vec::new(),
+        None,
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        test_provider_registry(),
+        None,
+        true,
+    )
+    .await;
     let view = f
         .hub
         .accounts()
@@ -741,14 +824,18 @@ async fn replaced_refresh_is_discarded(cached: bool) {
         .management
         .read()
         .expect("view");
-    let mut old = view
+    let current = view
         .descriptors
         .iter()
         .find(|row| row.alias.as_str() == "a")
         .expect("A")
         .clone();
-    old.identity = "previous-A-identity".into();
-    old.account_identity = None;
+    let old = f.retired_a.clone().expect("captured original A");
+    assert_ne!(
+        ProviderModelCacheKey::for_account(PROVIDER, &old),
+        ProviderModelCacheKey::for_account(PROVIDER, &current),
+        "the real account replacement must retire the captured producer"
+    );
     let active = view.descriptors.iter().find(|row| row.active).expect("B");
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let models = catalog(2048);
@@ -756,6 +843,20 @@ async fn replaced_refresh_is_discarded(cached: bool) {
         .commands()
         .send(AccountCommand::ProviderModelsRefreshCompleted {
             provider: PROVIDER.into(),
+            producer: CatalogProducer {
+                profile: "catalog-owner-test".into(),
+                provider: PROVIDER.into(),
+                source: CatalogSource::OpenAiSubscription,
+                origin: view
+                    .providers
+                    .iter()
+                    .find(|row| row.provider == PROVIDER)
+                    .and_then(|row| row.endpoint.clone()),
+                auth: ProviderAuthRequirementWire::OAuth,
+                alias: Some(old.alias.clone()),
+                incarnation: Some(old.incarnation),
+                cache_key: ProviderModelCacheKey::for_account(PROVIDER, &old),
+            },
             account_alias: Some(old.alias.clone()),
             explicit_account: true,
             cache_key: ProviderModelCacheKey::for_account(PROVIDER, &old),
@@ -1451,6 +1552,14 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
         .iter()
         .find(|row| row.alias.as_str() == "a")
         .expect("A");
+    let mut account_store = memory_accounts();
+    account_store
+        .add(descriptor.clone())
+        .expect("persist original account");
+    let descriptor = account_store
+        .get(&descriptor.alias)
+        .expect("stored original")
+        .clone();
     let mut other_identity = descriptor.clone();
     other_identity.account_identity = Some(AccountIdentity {
         email: None,
@@ -1461,6 +1570,12 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
         captured_at: 1,
         verified: true,
     });
+    account_store
+        .replace(other_identity)
+        .expect("persist replacement identity");
+    let other_identity = account_store
+        .get(&descriptor.alias)
+        .expect("stored replacement");
     // Model-dependent constructor facts can be identical across accounts.
     // A cache hit must still distinguish canonical catalog ownership when
     // the legacy display, credential and capabilities have not changed.
@@ -1474,7 +1589,7 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
     let tuning = ProviderTuning::default();
     let first = AccountProviderAdapterCacheKey::new(
         profile,
-        descriptor,
+        &descriptor,
         &credential,
         MODEL,
         &tuning,
@@ -1483,7 +1598,7 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
     );
     let replaced = AccountProviderAdapterCacheKey::new(
         profile,
-        &other_identity,
+        other_identity,
         &credential,
         MODEL,
         &tuning,
@@ -2082,4 +2197,87 @@ async fn catalog_control_public_304_ignores_explicit_alias() {
 #[tokio::test]
 async fn catalog_control_public_flight_survives_active_account_change() {
     public_catalog_ignores_account_owner(false, true).await;
+}
+
+#[tokio::test]
+async fn catalog_owner_inactive_rejection_persists_without_poisoning_active_catalog() {
+    let registry_dir = test_store_dir();
+    let providers = ProviderRegistry::new(
+        Box::new(crate::provider_registry::JsonProviderRegistryStore::new(
+            registry_dir.path(),
+        )) as Box<dyn ProviderRegistryStoreLike>,
+        crate::provider_registry::initial_provider_profiles(
+            &std::collections::BTreeSet::from([PROVIDER.to_owned()]),
+            INITIAL_MODEL,
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("persistent fixture registry");
+    let fixture = Fixture::start(
+        vec![Ok(catalog(8192)), Err(CatalogError::Unauthorized)],
+        None,
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        providers,
+        None,
+    )
+    .await;
+    let ready = fixture.begin_refresh_for("b").await;
+    fixture.discoverer.release.notify_one();
+    ready.await.expect("B completion").expect("B catalog");
+    let facade = fixture
+        .hub
+        .accounts()
+        .expect("account facade")
+        .expect("installed facade");
+    let before = facade.management.read().expect("before snapshot");
+    let expected_scope = |alias: &str| {
+        let descriptor = before
+            .descriptors
+            .iter()
+            .find(|row| row.alias.as_str() == alias)
+            .expect("fixture account");
+        let wire = serde_json::to_value(descriptor).expect("public descriptor");
+        let identity = serde_json::json!({
+            "v": 1, "profile": "catalog-owner-test", "provider": PROVIDER,
+            "source": format!("{:?}", CatalogSource::OpenAiSubscription),
+            "origin": before.providers.iter().find(|row| row.provider == PROVIDER)
+                .and_then(|row| row.endpoint.clone()),
+            "auth": ProviderAuthRequirementWire::OAuth, "alias": descriptor.alias,
+            "incarnation": wire.get("incarnation"),
+            "cache_key": String::from(ProviderModelCacheKey::for_account(PROVIDER, descriptor)),
+        });
+        blake3::hash(identity.to_string().as_bytes())
+            .to_hex()
+            .to_string()
+    };
+    let a_scope = expected_scope("a");
+    let b_scope = expected_scope("b");
+    assert_ne!(a_scope, b_scope);
+    let rejected = fixture.begin_refresh_for("a").await;
+    fixture.discoverer.release.notify_one();
+    assert!(rejected.await.expect("A completion").is_err());
+    let after = facade.management.read().expect("after snapshot");
+    assert_eq!(
+        before.providers, after.providers,
+        "an inactive A rejection cannot poison active B's published catalog"
+    );
+    let document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(registry_dir.path().join("providers.json")).expect("registry file"),
+    )
+    .expect("registry document");
+    let evidence = document
+        .get("catalog_evidence")
+        .and_then(serde_json::Value::as_object)
+        .expect("inactive account rejection must remain durable under its producing account");
+    assert!(
+        evidence.contains_key(&a_scope),
+        "A rejection must retain A's original producer"
+    );
+    assert!(
+        !evidence.contains_key(&b_scope),
+        "A rejection cannot be cached as active B's evidence"
+    );
+    fixture.close().await;
 }

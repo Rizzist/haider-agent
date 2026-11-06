@@ -90,6 +90,8 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
         .expect("typed");
     let run_epoch = selection.selection_epoch;
     let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+        resolved_model: None,
+        model_catalog_key: None,
         provider: selection.provider.clone(),
         model: selection.model.clone(),
         max_tokens: selection.max_tokens,
@@ -136,6 +138,8 @@ async fn rotation_after_compaction_promotion_records_the_promoted_route() {
             to_provider: "fake-b".into(),
             to_model: "model-b".into(),
             cause: ProviderPairSwitchCause::CompactionGuard,
+            model_catalog_key: None,
+            output_budget: None,
         })
         .await
         .expect("promotion commit");
@@ -313,6 +317,8 @@ impl ProviderAttemptResolver for RuntimeFallbackResolver {
             account: CredentialAlias::new("fake-b-account"),
             account_incarnation: Some(2),
             provider_name: "fake-b".into(),
+            model_catalog_key: None,
+            output_budget: None,
             model: "model-b".into(),
             context_window: None,
             cached_input_is_subset: true,
@@ -494,12 +500,14 @@ impl PairSwitchWorld {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{prefix}"),
             request_digest: format!("create-{prefix}-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
             session_id: session_id.clone(),
             cwd,
             provider: "fake-a".into(),
+            model_catalog_key: None,
             model: "model-a".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -719,6 +727,7 @@ impl PairSwitchWorld {
             session_id: self.session_id.clone(),
             worker_generation,
             provider: "fake-b".into(),
+            model_catalog_key: None,
             model: "model-b".into(),
             expected_pair: None,
             automatic_run: None,
@@ -791,6 +800,9 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
 
 fn model_summary(provider: &str, models: &[&str]) -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -1145,6 +1157,8 @@ async fn assert_native_pickup_pair(
         .into_iter()
         .map(
             |provider| haider_protocol::credential::CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
                 alias: CredentialAlias::new(format!("{provider}-account")),
                 provider: provider.into(),
                 base_url: None,
@@ -1906,6 +1920,7 @@ async fn rpc_created_unpinned_session_can_rotate_and_commit_its_route_epoch() {
                 resolve_model: false,
                 effort: None,
                 fast: None,
+                expected_catalog_key: None,
             },
         )
         .await
@@ -2028,6 +2043,7 @@ async fn global_account_switch_does_not_advance_served_sessions() {
     world
         .hub
         .create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "switch-served-second-create".into(),
             request_digest: "switch-served-second-digest".into(),
             request_json: "{}".into(),
@@ -2047,6 +2063,7 @@ async fn global_account_switch_does_not_advance_served_sessions() {
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new("switch-served-second-created"),
             device_id: world.device_id.clone(),
+            model_catalog_key: None,
         })
         .await
         .expect("second session created");
@@ -2077,6 +2094,8 @@ async fn global_account_switch_does_not_advance_served_sessions() {
         label: None,
         account_identity: None,
         created_at_ms: None,
+        incarnation: 0,
+        credential_digest: None,
     };
     let new = haider_protocol::credential::CredentialDescriptor {
         alias: CredentialAlias::new("new-fake"),
@@ -3413,12 +3432,14 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-queue-consume-crash".into(),
         request_digest: "create-queue-consume-crash-digest".into(),
         request_json: r#"{"session":"queue-consume-crash"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake-a".into(),
+        model_catalog_key: None,
         model: "model-a".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -4427,6 +4448,8 @@ async fn automatic_pair_switch_waits_for_session_selection_fence() {
         let _ = started_tx.send(());
         committer
             .commit(&haider_core::ProviderPairSwitch {
+                model_catalog_key: None,
+                output_budget: None,
                 run_id: RunId::new("automatic-lock-run"),
                 switch_ordinal: 1,
                 source_rebind_seq: 0,

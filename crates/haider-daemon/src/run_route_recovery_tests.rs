@@ -198,6 +198,8 @@ async fn recovery_matrix(bindings: &[&str], variants: &[&str]) {
                     haider_core::ProviderPairSwitchCommitter::commit(
                         &committer,
                         &haider_core::ProviderPairSwitch {
+                            model_catalog_key: None,
+                            output_budget: None,
                             run_id: run.clone(),
                             switch_ordinal: 0,
                             source_rebind_seq: hub
@@ -782,6 +784,7 @@ async fn unrecoverable_legacy_route_history_returns_a_typed_error() {
             .await
             .expect("lease");
         let legacy = haider_protocol::session::ModelSelected {
+            model_catalog_key: None,
             selection_epoch: Some(2),
             provider: "fake".into(),
             model: "initial-model".into(),

@@ -11,6 +11,9 @@ use tuivirt_common::{check_golden, draw, launcher_model};
 
 fn row(alias: &str, provider: &str, status: CredentialStatus) -> AccountRow {
     AccountRow::from_descriptor(&CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
         base_url: None,
@@ -136,6 +139,9 @@ fn relogin_saved_elsewhere_names_the_saved_alias_and_the_untouched_row() {
         Some(1),
     );
     let saved = |alias: &str| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
         alias: CredentialAlias::new(alias),
         provider: "anthropic-oauth".to_owned(),
         base_url: None,

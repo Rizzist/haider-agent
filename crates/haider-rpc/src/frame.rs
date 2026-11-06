@@ -1553,9 +1553,28 @@ impl ModelInventoryWire {
     }
 }
 
+/// Opaque catalog producer coordinate. It contains no credential material.
+/// The key also scopes anonymous catalogs to their endpoint/auth context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCatalogScopeWire {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_incarnation: Option<u64>,
+}
+
 /// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_scope: Option<ProviderCatalogScopeWire>,
+    /// Explicit deployment IDs, independent of fetched metadata for those IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_models: Vec<String>,
+    /// Release-owned IDs remain permanent when remote details replace them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_models: Vec<String>,
     pub provider: String,
     pub api_family: ProviderApiFamilyWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1600,12 +1619,273 @@ pub struct ProviderSummaryWire {
     pub trust: ProviderTrustWire,
 }
 
+/// Unicode-safe model selector key: lower-case scalar expansion, dropping
+/// only the punctuation/spacing family the public selector contract names.
+#[must_use]
+pub fn normalize_model_selector(selector: &str) -> String {
+    selector
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl ProviderSummaryWire {
     /// Whether fetched rows and their limits belong to one credential account.
     #[must_use]
     pub fn catalog_is_account_scoped(&self) -> bool {
         self.catalog == ProviderCatalogKindWire::Authenticated
             || (self.catalog == ProviderCatalogKindWire::Custom && !self.auth_methods.is_empty())
+    }
+
+    /// Permanent names come from an unscoped public catalog or offline
+    /// configuration. A custom profile or account-owned inventory may use
+    /// a public provider namespace without inheriting that meaning.
+    #[must_use]
+    pub fn catalog_has_permanent_names(&self) -> bool {
+        self.catalog == ProviderCatalogKindWire::Offline
+            || (self.catalog == ProviderCatalogKindWire::Public
+                && self.inventory_authority != ModelInventoryAuthorityWire::Advisory
+                && self.auth_methods.is_empty()
+                && self.catalog_scope.as_ref().is_none_or(|scope| {
+                    scope.account_alias.is_none() && scope.account_incarnation.is_none()
+                }))
+    }
+
+    /// Age the entire projection, including configuration-owned IDs. A list
+    /// can expire between publication and read; admission must not wait for
+    /// the producer's next refresh tick to stop treating absence as proof.
+    pub fn project_inventory_at_time(
+        &mut self,
+        now_ms: u64,
+        descriptors: &[haider_protocol::credential::CredentialDescriptor],
+    ) {
+        let credential_ready = self.auth_methods.is_empty()
+            || descriptors.iter().any(|descriptor| {
+                descriptor.provider == self.provider
+                    && descriptor.active
+                    && matches!(
+                        &descriptor.status,
+                        haider_protocol::credential::CredentialStatus::Ok
+                            | haider_protocol::credential::CredentialStatus::Limited { .. }
+                    )
+            });
+        self.project_inventory_at_time_with_credential_ready(now_ms, credential_ready);
+    }
+
+    /// Clients with a typed account projection supply the same readiness
+    /// proof without reconstructing transport descriptors. Aging and model
+    /// availability remain one policy here.
+    pub fn project_inventory_at_time_with_credential_ready(
+        &mut self,
+        now_ms: u64,
+        credential_ready: bool,
+    ) {
+        let fetched = matches!(self.inventory, ModelInventoryWire::Fetched { .. });
+        self.inventory = self.inventory.clone().at_time(now_ms);
+        if !matches!(self.inventory, ModelInventoryWire::Stale { .. }) {
+            return;
+        }
+        for model in &self.configured_models {
+            if !self.models.contains(model) {
+                // Configuration supplies the ID, never fetched metadata.
+                self.models.push(model.clone());
+            }
+        }
+        if fetched
+            && (!self.configured_models.is_empty()
+                || self.inventory_authority == ModelInventoryAuthorityWire::Advisory)
+            && self.enabled
+            && self.api_family != ProviderApiFamilyWire::Unknown
+            && self.endpoint.is_some()
+            && credential_ready
+        {
+            // Even an empty successful list becomes uncertainty. Credential
+            // rejection uses Unavailable inventory and cannot enter here.
+            self.availability = ProviderAvailabilityWire::Available;
+            self.availability_reason = None;
+        }
+    }
+
+    /// Resolve the same unique selector before membership and admission.
+    /// Exact IDs take priority; listed aliases precede declared aliases.
+    /// Ambiguity preserves the literal request instead of guessing a row.
+    #[must_use]
+    pub fn canonical_model_selector<'a>(&'a self, model: &'a str) -> &'a str {
+        if self
+            .models
+            .iter()
+            .chain(&self.configured_models)
+            .any(|name| name == model)
+        {
+            return model;
+        }
+        let normalized = normalize_model_selector(model);
+        for rows in [&self.models, &self.configured_models] {
+            let mut matches = rows
+                .iter()
+                .filter(|name| normalize_model_selector(name) == normalized);
+            if let Some(only) = matches.next() {
+                return if matches.all(|other| other == only) {
+                    only.as_str()
+                } else {
+                    model
+                };
+            }
+        }
+        model
+    }
+
+    /// Shared admission policy for every consumer of a catalog projection.
+    /// Stale successful inventory remains selectable; a fresh list that omits
+    /// an explicitly configured deployment is definite negative evidence.
+    #[must_use]
+    pub fn model_is_selectable(&self, model: &str) -> bool {
+        self.selection_availability(Some(model)) == ProviderAvailabilityWire::Available
+    }
+
+    /// One availability decision for admission, pickers and summary clients.
+    /// The producer supplies credential/discovery evidence in `availability`;
+    /// consumers must also respect enablement and fresh negative membership.
+    #[must_use]
+    pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
+        let model = model.map(|model| self.canonical_model_selector(model));
+        if !self.enabled
+            || model.is_some_and(|model| {
+                (matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                    || (matches!(
+                        self.inventory,
+                        ModelInventoryWire::Static | ModelInventoryWire::Unavailable { .. }
+                    ) && self.inventory_authority
+                        == ModelInventoryAuthorityWire::Authoritative
+                        && self.has_static_models()))
+                    && self.configured_models.iter().any(|name| name == model)
+                    && !self.models.iter().any(|name| name == model)
+            })
+        {
+            ProviderAvailabilityWire::Unavailable
+        } else {
+            self.availability
+        }
+    }
+
+    #[must_use]
+    pub fn selection_reason(&self, model: Option<&str>) -> Option<String> {
+        if !self.enabled {
+            return Some("provider is disabled".into());
+        }
+        if self.availability == ProviderAvailabilityWire::Available
+            && self.selection_availability(model) == ProviderAvailabilityWire::Unavailable
+        {
+            return Some(
+                if matches!(self.inventory, ModelInventoryWire::Fetched { .. }) {
+                    "deployment is absent from the latest model list".into()
+                } else {
+                    self.availability_reason.clone().unwrap_or_else(|| {
+                        "model list not fetched for this deployment — fetch models".into()
+                    })
+                },
+            );
+        }
+        self.availability_reason
+            .clone()
+            .or_else(|| match &self.inventory {
+                ModelInventoryWire::Stale { reason, .. } => Some(format!("{reason} — refresh due")),
+                _ => None,
+            })
+    }
+
+    /// Private discovery belongs to the published route, including anonymous
+    /// endpoints. An explicit model name does not transfer its metadata.
+    #[must_use]
+    pub fn catalog_matches_session_route(
+        &self,
+        base_url: Option<&str>,
+        account: Option<&str>,
+    ) -> bool {
+        self.catalog_scope.as_ref().is_none_or(|scope| {
+            base_url.is_none_or(|url| self.endpoint.as_deref() == Some(url))
+                && account
+                    .zip(scope.account_alias.as_deref())
+                    .is_none_or(|(selected, published)| selected == published)
+        })
+    }
+
+    /// Retire discovery while preserving configuration and release-owned IDs.
+    pub fn retire_fetched_catalog(&mut self) {
+        for detail in &mut self.model_details {
+            if detail.source == Some(ModelDetailSourceWire::Remote)
+                && (self.configured_models.contains(&detail.name)
+                    || self.static_models.contains(&detail.name))
+            {
+                // Keep the explicit declaration, discard every fetched field.
+                detail.source = Some(if self.static_models.contains(&detail.name) {
+                    ModelDetailSourceWire::Static
+                } else {
+                    ModelDetailSourceWire::Configured
+                });
+                detail.display_name = None;
+                detail.context_window = None;
+                detail.max_output_tokens = None;
+                detail.max_output_tokens_source = None;
+                detail.supported_efforts.clear();
+                detail.default_effort = None;
+                detail.supported_speeds.clear();
+                detail.supports_thinking_type = None;
+                detail.supports_vision = None;
+            }
+        }
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.model_details.iter().any(|detail| &detail.name == name) {
+                self.model_details.push(ModelDetailWire {
+                    max_output_tokens_source: None,
+                    source: Some(if self.static_models.contains(name) {
+                        ModelDetailSourceWire::Static
+                    } else {
+                        ModelDetailSourceWire::Configured
+                    }),
+                    name: name.clone(),
+                    display_name: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                    supported_speeds: Vec::new(),
+                    supports_thinking_type: None,
+                    supports_vision: None,
+                });
+            }
+        }
+        self.model_details.retain(|detail| {
+            matches!(
+                detail.source,
+                Some(ModelDetailSourceWire::Static | ModelDetailSourceWire::Configured)
+            )
+        });
+        self.models
+            .retain(|name| self.model_details.iter().any(|detail| &detail.name == name));
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.models.contains(name) {
+                self.models.push(name.clone());
+            }
+        }
+        self.default_model = self
+            .default_model
+            .take()
+            .filter(|name| self.models.contains(name));
+        if self.has_static_models() {
+            self.inventory = ModelInventoryWire::Static;
+            self.availability_reason = (self.availability != ProviderAvailabilityWire::Available)
+                .then(|| "active account changed — refresh provider state".into());
+        } else {
+            self.inventory = if self.models.is_empty() {
+                ModelInventoryWire::NeverFetched
+            } else {
+                ModelInventoryWire::Configured
+            };
+            self.availability = ProviderAvailabilityWire::Unavailable;
+            self.availability_reason = Some("active account changed — fetch models".into());
+        }
     }
 
     /// Whether a pickable row comes from the maintained static catalog.
@@ -3698,6 +3978,9 @@ pub enum RequestBody {
         cwd: String,
         provider: String,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         max_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_overrides: Option<SessionPermissionOverridesV1>,
@@ -4215,6 +4498,9 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -5442,6 +5728,8 @@ pub enum ResponseBody {
         session_id: SessionId,
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_catalog_key: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
         /// `model_output_limits_v1`: the per-response budget this selection

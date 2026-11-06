@@ -304,6 +304,9 @@ fn live_session_model() -> AppModel {
 
 fn provider_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,

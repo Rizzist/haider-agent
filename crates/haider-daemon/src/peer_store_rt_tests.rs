@@ -80,12 +80,14 @@ async fn peer_store_round_trip_baseline_probe() {
     for index in 0..AGENTS {
         let session = SessionId::new(format!("store-count-{index}"));
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{index}"),
             request_digest: format!("create-digest-{index}"),
             request_json: "{}".into(),
             session_id: session,
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 1_024,
             max_tokens_source: None,

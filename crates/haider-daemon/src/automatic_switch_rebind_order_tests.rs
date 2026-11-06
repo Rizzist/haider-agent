@@ -27,6 +27,8 @@ async fn astra31_automatic_rebind_order_consistency() {
             start_legacy_rebind_test_run(&hub, &sid, store.worker_generation()).await;
             let lease = hub.acquire_worker_lease(sid.clone()).await.expect("lease");
             let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                resolved_model: None,
+                model_catalog_key: None,
                 provider: original.provider.clone(),
                 model: original.model.clone(),
                 max_tokens: original.max_tokens,
@@ -59,6 +61,8 @@ async fn astra31_automatic_rebind_order_consistency() {
             let automatic_seq = haider_core::ProviderPairSwitchCommitter::commit(
                 &committer,
                 &haider_core::ProviderPairSwitch {
+                    model_catalog_key: None,
+                    output_budget: None,
                     run_id: run.clone(),
                     switch_ordinal: 0,
                     source_rebind_seq: 0,
@@ -192,6 +196,8 @@ async fn astra31_automatic_rebind_live_consistency() {
             start_legacy_rebind_test_run(&hub, &sid, store.worker_generation()).await;
             let lease = hub.acquire_worker_lease(sid.clone()).await.expect("lease");
             let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                resolved_model: None,
+                model_catalog_key: None,
                 provider: original.provider.clone(),
                 model: original.model.clone(),
                 max_tokens: original.max_tokens,
@@ -224,6 +230,8 @@ async fn astra31_automatic_rebind_live_consistency() {
             let automatic_seq = haider_core::ProviderPairSwitchCommitter::commit(
                 &committer,
                 &haider_core::ProviderPairSwitch {
+                    model_catalog_key: None,
+                    output_budget: None,
                     run_id: run.clone(),
                     switch_ordinal: 0,
                     source_rebind_seq: 0,
@@ -361,6 +369,8 @@ async fn astra31_automatic_rebind_target_consistency() {
         start_legacy_rebind_test_run(&hub, &sid, store.worker_generation()).await;
         let lease = hub.acquire_worker_lease(sid.clone()).await.expect("lease");
         let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+            resolved_model: None,
+            model_catalog_key: None,
             provider: original.provider.clone(),
             model: original.model.clone(),
             max_tokens: original.max_tokens,
@@ -397,6 +407,8 @@ async fn astra31_automatic_rebind_target_consistency() {
         let automatic_result = haider_core::ProviderPairSwitchCommitter::commit(
             &committer,
             &haider_core::ProviderPairSwitch {
+                model_catalog_key: None,
+                output_budget: None,
                 run_id: run.clone(),
                 switch_ordinal: 0,
                 source_rebind_seq: 0,
