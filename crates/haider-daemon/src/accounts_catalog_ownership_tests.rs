@@ -3118,6 +3118,6 @@ async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
         .expect("saved selection");
     assert_eq!(metadata.account_alias.as_deref(), Some("a"));
     assert_eq!(metadata.model, model);
-    assert_eq!(f.discoverer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discoverer.seen.lock().expect("calls").len(), 1);
     f.close().await;
 }
