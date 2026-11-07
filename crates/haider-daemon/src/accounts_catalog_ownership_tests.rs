@@ -2950,7 +2950,7 @@ async fn runtime_negative_write_failure(check_owner: bool) {
     let provider_store =
         crate::provider_registry::JsonProviderRegistryStore::new(provider_dir.path());
     provider_store
-        .save(&[profile.clone()])
+        .save(std::slice::from_ref(&profile))
         .expect("synthetic provider document");
     let providers = ProviderRegistry::new(
         Box::new(provider_store.clone()) as Box<dyn ProviderRegistryStoreLike>,
