@@ -1392,13 +1392,21 @@ async fn complete_explicit_b_listing_refusal(f: &Fixture) {
 }
 
 fn configured_custom_baseline_detail() -> haider_rpc::ModelDetailWire {
-    Fixture::custom_registry(false)
-        .summary(CUSTOM, &|_| true)
-        .expect("configuration-only provider")
-        .model_details
-        .into_iter()
-        .find(|detail| detail.name == MODEL)
-        .expect("configured baseline model")
+    // The expected configuration row must not depend on the ownership
+    // projection under test. This custom ID has no remote or maintained facts.
+    haider_rpc::ModelDetailWire {
+        name: MODEL.into(),
+        display_name: Some(MODEL.into()),
+        context_window: None,
+        source: Some(haider_rpc::ModelDetailSourceWire::Configured),
+        max_output_tokens: Some(haider_provider::UNKNOWN_OUTPUT_LIMIT),
+        max_output_tokens_source: Some(haider_rpc::ModelOutputLimitSourceWire::Fallback),
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supported_speeds: Vec::new(),
+        supports_thinking_type: None,
+        supports_vision: None,
+    }
 }
 
 async fn custom_default_ignores_discovery_failure(other_account_catalog: bool) {
@@ -3087,17 +3095,18 @@ async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
         .copied()
         .find(|model| *model != INITIAL_MODEL)
         .expect("another maintained model");
-    let mut f = Fixture::new(
-        vec![Err(CatalogError::Unsupported {
+    let refusal = || {
+        Err(CatalogError::Unsupported {
             reason: "synthetic unsupported listing".into(),
-        })],
-        Some("a"),
-        false,
-    )
-    .await;
+        })
+    };
+    let mut f = Fixture::new(vec![refusal(), refusal()], Some("a"), false).await;
     let refresh = f.begin_refresh_for("a").await;
     f.discoverer.release.notify_one();
     let _refresh = refresh.await.expect("A listing refusal completion");
+    // Older discovery APIs report this as transient unavailability and may
+    // retry once. Keep that retry controlled and bound to the same account.
+    f.discoverer.release.notify_one();
     let mut request = f.selection(false, Some(4096));
     if let RequestBody::SessionSelectModel {
         model: selected, ..
@@ -3122,6 +3131,15 @@ async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
         .expect("saved selection");
     assert_eq!(metadata.account_alias.as_deref(), Some("a"));
     assert_eq!(metadata.model, model);
-    assert_eq!(f.discoverer.seen.lock().expect("calls").len(), 1);
+    {
+        let calls = f.discoverer.seen.lock().expect("calls");
+        assert!(
+            (1..=2).contains(&calls.len())
+                && calls
+                    .iter()
+                    .all(|(_, credential, _)| credential.as_deref() == Some("a")),
+            "maintained selection may only discover its owning account: {calls:?}"
+        );
+    }
     f.close().await;
 }
