@@ -10879,7 +10879,7 @@ impl HubConnection {
         let expected_owner = view.catalog_key_for_account(provider, requested_account_alias);
         let discovery_alias = view.scope_catalog_for_account(provider, account_alias);
         let account_alias = discovery_alias.as_ref().map(CredentialAlias::as_str);
-        let summaries = &mut view.providers;
+        let summaries = &view.providers;
         let cached_serves_model = summaries
             .iter()
             .find(|summary| summary.provider == provider)
@@ -10968,13 +10968,17 @@ impl HubConnection {
                 account_alias.map(|alias| CredentialAlias::new(alias.to_owned())),
             )
             .await;
-        let current_owner = facade
+        let mut current = facade
             .management
             .read()
-            .and_then(|view| view.catalog_key_for_account(provider, requested_account_alias));
-        if current_owner != expected_owner {
+            .ok_or_else(InventoryRefreshError::catalog_owner_changed)?;
+        if current.catalog_key_for_account(provider, requested_account_alias) != expected_owner {
             return Err(InventoryRefreshError::catalog_owner_changed());
         }
+        current.scope_catalog_for_account(provider, requested_account_alias);
+        // The refresh may have published a rejection. Every return path,
+        // including advisory/transient errors, must validate the new evidence.
+        *view = current;
         let refreshed = match result {
             Ok(refreshed) => refreshed,
             // A custom compatible catalog is advisory. Refresh-on-miss still
@@ -11007,6 +11011,13 @@ impl HubConnection {
         if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
             retain_backoff_until_catalog_recovers(&mut probes, provider, &refreshed.inventory);
         }
+        // A completion cannot acquire an owner merely because this request
+        // expected one. Keep a published owner only for the identical summary;
+        // otherwise the wire scope must prove the producer during projection.
+        if view.providers.iter().find(|row| row.provider == provider) != Some(&refreshed) {
+            view.catalog_owners.remove(provider);
+        }
+        let summaries = &mut view.providers;
         if let Some(summary) = summaries
             .iter_mut()
             .find(|summary| summary.provider == provider)
@@ -11015,9 +11026,7 @@ impl HubConnection {
         } else {
             summaries.push(refreshed);
         }
-        if let Some(owner) = expected_owner {
-            view.catalog_owners.insert(provider.to_owned(), owner);
-        }
+        view.scope_catalog_for_account(provider, requested_account_alias);
         Ok(())
     }
 

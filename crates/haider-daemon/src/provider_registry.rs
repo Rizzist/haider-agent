@@ -848,11 +848,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     ) -> Result<(), HaiderError> {
         // A discovery-capability response is uncertainty about listing, not
         // proof that this same credential recovered from authentication failure.
+        let mut evidence = self
+            .catalog_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if unsupported
-            && self
-                .catalog_evidence
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && evidence
                 .get(scope)
                 .is_some_and(|row| row.provider == provider && !row.unsupported)
         {
@@ -863,12 +864,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             reason,
             unsupported,
         };
-        self.store.set_catalog_evidence(scope, Some(next.clone()))?;
-        self.catalog_evidence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope.to_owned(), next);
-        Ok(())
+        // Network evidence is authoritative in this process even when the
+        // durable write fails. Publishing an older, weaker fact would allow a
+        // credential just rejected by the endpoint to serve new admissions.
+        evidence.insert(scope.to_owned(), next.clone());
+        self.store.set_catalog_evidence(scope, Some(next))
     }
 
     pub(crate) fn restore_catalog_evidence(
@@ -892,11 +892,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn clear_catalog_evidence(&self, scope: &str) -> Result<(), HaiderError> {
-        self.store.set_catalog_evidence(scope, None)?;
-        self.catalog_evidence
+        let mut evidence = self
+            .catalog_evidence
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(scope);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.store.set_catalog_evidence(scope, None)?;
+        evidence.remove(scope);
         Ok(())
     }
 

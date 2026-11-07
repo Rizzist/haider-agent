@@ -1003,6 +1003,33 @@ struct CatalogEvidenceContext {
     cache: crate::provider_registry::CatalogEvidenceCache,
 }
 
+impl CatalogEvidenceContext {
+    fn project(
+        &self,
+        descriptors: &[CredentialDescriptor],
+        profiles: &HashMap<String, ProviderProfileV1>,
+    ) -> HashMap<ProviderModelCacheKey, crate::provider_registry::CatalogEvidenceV1> {
+        let evidence = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let profile = profiles.get(&descriptor.provider)?;
+                let producer =
+                    catalog_producer_for_profile(&self.profile, profile, Some(descriptor))?;
+                producer.alias.as_ref()?;
+                let row = evidence
+                    .get(&catalog_evidence_scope(&producer))
+                    .filter(|row| row.is_for_provider(&descriptor.provider))?
+                    .clone();
+                Some((producer.cache_key, row))
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ManagementView {
     pub revision: u64,
@@ -1012,7 +1039,7 @@ pub(crate) struct ManagementView {
     /// Registry configuration rebuilds the entire summary after foreign
     /// catalog removal, including defaults, availability and configured rows.
     pub catalog_profiles: HashMap<String, ProviderProfileV1>,
-    /// Exact producer's durable negative evidence, frozen at this revision.
+    /// Exact producer's negative evidence, frozen at this revision.
     catalog_evidence: HashMap<ProviderModelCacheKey, crate::provider_registry::CatalogEvidenceV1>,
 }
 
@@ -1130,11 +1157,7 @@ impl ManagementView {
                 summary.inventory,
                 haider_rpc::ModelInventoryWire::Fetched { .. }
                     | haider_rpc::ModelInventoryWire::Stale { .. }
-            ) || (summary.catalog_scope.is_some()
-                && matches!(
-                    summary.inventory,
-                    haider_rpc::ModelInventoryWire::Unavailable { .. }
-                )))
+            ) || summary.catalog_scope.is_some())
         {
             if let Some(profile) = self.catalog_profiles.get(provider) {
                 *summary =
@@ -1222,24 +1245,7 @@ impl ManagementSnapshot {
         let Some(context) = context else {
             return HashMap::new();
         };
-        let evidence = context
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        descriptors
-            .iter()
-            .filter_map(|descriptor| {
-                let profile = profiles.get(&descriptor.provider)?;
-                let producer =
-                    catalog_producer_for_profile(&context.profile, profile, Some(descriptor))?;
-                producer.alias.as_ref()?;
-                let row = evidence
-                    .get(&catalog_evidence_scope(&producer))
-                    .filter(|row| row.is_for_provider(&descriptor.provider))?
-                    .clone();
-                Some((producer.cache_key, row))
-            })
-            .collect()
+        context.project(descriptors, profiles)
     }
 
     /// Observe published revisions. The current value is the revision at
@@ -4157,6 +4163,11 @@ async fn finish_provider_models_refresh(
         providers,
         completed,
     } = context;
+    let reply_account = if explicit_account {
+        account_alias
+    } else {
+        None
+    };
     let descriptor = account_alias.map_or_else(
         || accounts.active_for_provider(&provider),
         |alias| accounts.get(alias),
@@ -4331,11 +4342,13 @@ async fn finish_provider_models_refresh(
                 Some(cache_key.clone()),
             );
             let summaries = catalog_summaries(accounts, providers);
-            let Some(summary) = summaries
-                .iter()
-                .find(|summary| summary.provider == provider)
-                .cloned()
-            else {
+            let Some(summary) = catalog_summary_for_account(
+                profile_id,
+                &provider,
+                reply_account,
+                accounts,
+                providers,
+            ) else {
                 respond_provider_models_unavailable(
                     completed,
                     &provider,
@@ -4432,11 +4445,13 @@ async fn finish_provider_models_refresh(
                 }
             };
             let summaries = catalog_summaries(accounts, providers);
-            let Some(summary) = summaries
-                .iter()
-                .find(|summary| summary.provider == provider)
-                .cloned()
-            else {
+            let Some(summary) = catalog_summary_for_account(
+                profile_id,
+                &provider,
+                reply_account,
+                accounts,
+                providers,
+            ) else {
                 respond_provider_models_unavailable(
                     completed,
                     &provider,
@@ -4459,8 +4474,13 @@ async fn finish_provider_models_refresh(
             });
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unsupported { reason })) => {
-            if let Some(summary) = catalog_summary(&provider, accounts, providers)
-                && matches!(summary.availability, ProviderAvailabilityWire::Available)
+            if let Some(summary) = catalog_summary_for_account(
+                profile_id,
+                &provider,
+                reply_account,
+                accounts,
+                providers,
+            ) && matches!(summary.availability, ProviderAvailabilityWire::Available)
                 && let Ok(revision) = store.management_revision().await
             {
                 completed.complete(ResponseBody::ProviderModelsRefresh {
@@ -4483,7 +4503,13 @@ async fn finish_provider_models_refresh(
             // fetch is retained in inventory as informational provenance.
             if haider_provider::model_list_forbidden(&reason)
                 && haider_provider::has_subscription_static_catalog(&provider)
-                && let Some(summary) = catalog_summary(&provider, accounts, providers)
+                && let Some(summary) = catalog_summary_for_account(
+                    profile_id,
+                    &provider,
+                    reply_account,
+                    accounts,
+                    providers,
+                )
                 && let Ok(revision) = store.management_revision().await
             {
                 completed.complete(ResponseBody::ProviderModelsRefresh {
@@ -4918,6 +4944,34 @@ fn catalog_summary(
 ) -> Option<ProviderSummaryWire> {
     let summary = providers.summary(provider, &provider_credential_ready_for_summary(accounts))?;
     Some(with_catalog_scope(summary, accounts, providers))
+}
+
+/// A refresh reply describes its requested account even when a different
+/// account's positive inventory remains in the shared live slot.
+fn catalog_summary_for_account(
+    profile_id: &str,
+    provider: &str,
+    account_alias: Option<&CredentialAlias>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<ProviderSummaryWire> {
+    let catalog_profiles = providers.catalog_profiles();
+    let descriptors = accounts.list().to_vec();
+    let catalog_evidence = CatalogEvidenceContext {
+        profile: profile_id.to_owned(),
+        cache: providers.catalog_evidence_cache(),
+    }
+    .project(&descriptors, &catalog_profiles);
+    let mut view = ManagementView {
+        descriptors,
+        providers: vec![catalog_summary(provider, accounts, providers)?],
+        catalog_owners: providers.catalog_owners(),
+        catalog_profiles,
+        catalog_evidence,
+        ..ManagementView::default()
+    };
+    view.scope_catalog_for_account(provider, account_alias.map(CredentialAlias::as_str));
+    view.providers.into_iter().next()
 }
 
 fn with_catalog_scope(

@@ -2861,3 +2861,221 @@ async fn catalog_owner_inactive_rejection_blocks_saved_static_model() {
 async fn catalog_control_healthy_inactive_saved_static_model_is_admitted() {
     saved_static_admission_respects_its_accounts_rejection(false).await;
 }
+
+#[tokio::test]
+async fn catalog_owner_unsupported_reply_does_not_import_foreign_limits() {
+    let mut first = catalog(2048);
+    first.models[0].slug = "remote-only-probe-model".into();
+    let mut f = Fixture::custom(vec![
+        Ok(first),
+        Err(CatalogError::Unsupported {
+            reason: "server returned 404 for /models".into(),
+        }),
+    ])
+    .await;
+    f.publish_a().await;
+    let mut request = f.creation(true, 4096);
+    if let RequestBody::SessionCreateWithPermissionOverrides { model, .. } = &mut request {
+        *model = "remote-only-probe-model".into();
+    }
+    let response = f.admit(request).await;
+    let ResponseBody::SessionCreate { metadata, .. } = response else {
+        panic!("B's unsupported listing must not reuse A's 2048 limit: {response:?}");
+    };
+    assert_eq!(metadata.account_alias.as_deref(), Some("b"));
+    assert_eq!(metadata.model, "remote-only-probe-model");
+    assert_eq!(
+        metadata.max_tokens, 4096,
+        "B cannot borrow A's output ceiling"
+    );
+    f.close().await;
+}
+
+async fn runtime_refresh_miss(rejected: bool) {
+    let failure = if rejected {
+        CatalogError::Unauthorized
+    } else {
+        CatalogError::Unavailable {
+            reason: "synthetic transient timeout / 503".into(),
+        }
+    };
+    let mut f = Fixture::custom(vec![Ok(catalog(8192)), Err(failure)]).await;
+    f.pin("b", "runtime-probe-pin-b").await;
+    let first = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    first.await.expect("B completion").expect("B catalog");
+    let mut request = f.selection(false, Some(4096));
+    if let RequestBody::SessionSelectModel { model, .. } = &mut request {
+        *model = "unlisted-runtime-probe".into();
+    }
+    let response = f.admit(request).await;
+    if rejected {
+        assert!(
+            matches!(response, ResponseBody::Error { .. }),
+            "a rejection learned during B's refresh must block this admission: {response:?}"
+        );
+    } else {
+        assert!(
+            matches!(response, ResponseBody::SessionSelectModel { .. }),
+            "transient advisory failure must keep B's unlisted selection available: {response:?}"
+        );
+        let metadata = f
+            .hub
+            .session_metadata(&f.session)
+            .await
+            .expect("metadata read")
+            .expect("session");
+        assert_eq!(metadata.model, "unlisted-runtime-probe");
+        assert_eq!(metadata.max_tokens, 4096);
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_refresh_rejection_blocks_current_selection() {
+    runtime_refresh_miss(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_refresh_transient_preserves_unlisted_selection() {
+    runtime_refresh_miss(false).await;
+}
+
+async fn runtime_negative_write_failure(check_owner: bool) {
+    let provider_dir = tempfile::tempdir().expect("synthetic provider store");
+    let profile = Fixture::custom_registry(false)
+        .get(CUSTOM)
+        .expect("configured custom profile")
+        .clone();
+    let provider_store =
+        crate::provider_registry::JsonProviderRegistryStore::new(provider_dir.path());
+    provider_store
+        .save(&[profile.clone()])
+        .expect("synthetic provider document");
+    let providers = ProviderRegistry::new(
+        Box::new(provider_store.clone()) as Box<dyn ProviderRegistryStoreLike>,
+        Vec::new(),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("JSON-backed registry");
+    let f = Fixture::start(
+        vec![
+            Err(CatalogError::Unsupported {
+                reason: "server returned 404 for /models".into(),
+            }),
+            Ok(catalog(8192)),
+            Err(CatalogError::Unauthorized),
+        ],
+        Some("a"),
+        false,
+        CUSTOM,
+        AuthMethod::ApiKey,
+        providers,
+        None,
+    )
+    .await;
+    let refusal = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    let _refusal = refusal.await.expect("A refusal completion");
+    let healthy = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    healthy.await.expect("B completion").expect("B catalog");
+    let facade = f.hub.accounts().expect("facade read").expect("facade");
+    let factory = AccountsProviderFactory::new_with_management(
+        facade.snapshot.clone(),
+        facade.management.clone(),
+        VaultProvision::Available(facade.vault.clone().expect("synthetic vault")),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("metadata read")
+        .expect("A-pinned saved session");
+    assert_eq!(metadata.account_alias.as_deref(), Some("a"));
+    assert!(
+        factory.admit_persisted_model(&metadata).is_ok(),
+        "A's earlier unsupported-listing proof must permit the configured session before rejection"
+    );
+    let mut b_metadata = metadata.clone();
+    b_metadata.account_alias = Some("b".into());
+    assert!(factory.admit_persisted_model(&b_metadata).is_ok());
+
+    // Damage only this disposable JSON fixture; SQLite and B's catalog stay live.
+    let document = provider_dir.path().join("providers.json");
+    std::fs::remove_file(&document).expect("remove synthetic provider document");
+    std::fs::create_dir(&document).expect("force reliable document I/O failure");
+    assert!(
+        provider_store.save(&[profile]).is_err(),
+        "real JSON write failure"
+    );
+    let rejected = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    assert!(
+        rejected.await.expect("A rejected completion").is_err(),
+        "failed persistence must be reported"
+    );
+    if check_owner {
+        assert!(
+            factory.admit_persisted_model(&metadata).is_err(),
+            "A's known rejection must outrank its older unsupported proof even when persistence fails"
+        );
+    } else {
+        assert!(
+            factory.admit_persisted_model(&b_metadata).is_ok(),
+            "A's rejected write must not poison B's healthy catalog"
+        );
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_failed_rejection_write_blocks_saved_model() {
+    runtime_negative_write_failure(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_failed_rejection_write_preserves_other_owner() {
+    runtime_negative_write_failure(false).await;
+}
+
+async fn runtime_configured_scope(foreign: bool) {
+    let f = Fixture::custom(vec![Err(CatalogError::Unsupported {
+        reason: "server returned 404 for /models".into(),
+    })])
+    .await;
+    let refusal = f.begin_refresh_for("b").await;
+    f.discoverer.release.notify_one();
+    let _refusal = refusal.await.expect("B listing refusal completion");
+    let facade = f.hub.accounts().expect("facade read").expect("facade");
+    let factory = AccountsProviderFactory::new_with_management(
+        facade.snapshot.clone(),
+        facade.management.clone(),
+        VaultProvision::Available(facade.vault.clone().expect("synthetic vault")),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    let alias = if foreign { "a" } else { "b" };
+    let summary = factory
+        .provider_profile_for_account(CUSTOM, Some(alias))
+        .expect("scoped provider profile");
+    let selectable =
+        crate::model_select::ModelSelectionAuthority::new(None, Some(vec![summary.clone()]))
+            .validate_selection_with_status(CUSTOM, None, MODEL)
+            .is_ok();
+    assert_eq!(
+        selectable, !foreign,
+        "configured-unverified availability must belong to its own account: {alias}: {summary:?}"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_owner_configured_refusal_cannot_authorize_foreign_account() {
+    runtime_configured_scope(true).await;
+}
+
+#[tokio::test]
+async fn catalog_control_own_configured_refusal_remains_selectable() {
+    runtime_configured_scope(false).await;
+}
