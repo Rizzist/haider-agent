@@ -3105,7 +3105,11 @@ async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
     {
         *selected = model.into();
     }
-    let response = f.admit(request).await;
+    f.connection
+        .request(RequestId::new("own-maintained"), request)
+        .await
+        .expect("owned maintained selection");
+    let response = response_for(&mut f.frames, "own-maintained").await;
     assert!(
         matches!(response, ResponseBody::SessionSelectModel { .. }),
         "A's maintained model remains selectable after its listing refusal: {response:?}"
