@@ -98,6 +98,7 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -110,6 +111,7 @@ pub fn transcript() -> Vec<WireFrame> {
         cwd: "/tmp/workspace".into(),
         provider: "anthropic".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "claude-test".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -412,6 +414,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 command_id: CommandId::new("command-create"),
                 cwd: "/tmp/workspace".into(),
                 provider: "anthropic".into(),
+                expected_catalog_key: None,
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
@@ -433,6 +436,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -445,6 +449,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     cwd: "/tmp/workspace".into(),
                     provider: "anthropic".into(),
                     account_alias: None,
+                    model_catalog_key: None,
                     model: "claude-test".into(),
                     max_tokens: 4096,
                     max_tokens_source: None,
@@ -721,6 +726,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-providers"),
             body: ResponseBody::ProviderList {
                 providers: vec![ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
@@ -800,6 +808,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-default-model"),
             body: ResponseBody::AccountSetDefaultModel {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
@@ -856,6 +867,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-provider-configure"),
             body: ResponseBody::ProviderConfigure {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "local-lab".into(),
                     api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                     endpoint: Some("http://127.0.0.1:11434".into()),
@@ -928,6 +942,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-provider-models-refresh"),
             body: ResponseBody::ProviderModelsRefresh {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai-oauth".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://chatgpt.com/backend-api/codex/responses".into()),
@@ -1081,6 +1098,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 command_id: CommandId::new("command-create-overrides"),
                 cwd: "/tmp/workspace".into(),
                 provider: "anthropic".into(),
+                expected_catalog_key: None,
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: Some(SessionPermissionOverridesV1 {
@@ -1383,6 +1401,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-gemini-provider"),
             body: ResponseBody::ProviderList {
                 providers: vec![ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "gemini".into(),
                     api_family: ProviderApiFamilyWire::GeminiGenerateContent,
                     endpoint: Some("https://generativelanguage.googleapis.com/v1beta".into()),
@@ -2680,6 +2701,9 @@ fn append_acp_agent_family_tail(frames: &mut Vec<WireFrame>) {
         request_id: RequestId::new("request-acp-agent-provider"),
         body: ResponseBody::ProviderList {
             providers: vec![ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "google-antigravity".into(),
                 api_family: ProviderApiFamilyWire::AcpAgent,
                 endpoint: None,
@@ -2714,6 +2738,7 @@ fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
             command_id: CommandId::new("command-create-dated-workspace"),
             cwd: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
             provider: "anthropic".into(),
+            expected_catalog_key: None,
             model: "claude-test".into(),
             max_tokens: 4096,
             permission_overrides: None,
@@ -2743,6 +2768,8 @@ fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
 /// identity in `identity`, never secret material.
 pub fn golden_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("anthropic-0123456789abcdef01234567"),
         provider: "anthropic".into(),
         base_url: None,
@@ -2776,6 +2803,8 @@ pub fn golden_account_source() -> AccountSourceWire {
 
 pub fn golden_oauth_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("fake-oauth-0123456789abcdef01234567"),
         provider: "fake-oauth".into(),
         base_url: None,

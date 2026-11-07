@@ -41,6 +41,7 @@ fn every_session_origin_seeds_the_run_budget_snapshot() {
     let budget_source = SessionOutputBudgetSourceV1::UserSet { requested: 20_000 };
     store
         .select_session_model(&SessionSelectModelCommand {
+            model_catalog_key: None,
             command_id: "budget-origin-select".into(),
             request_digest: "budget-origin-select-digest".into(),
             request_json: "{}".into(),
@@ -134,12 +135,14 @@ fn every_session_origin_seeds_the_run_budget_snapshot() {
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"session_id":"{session_id}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

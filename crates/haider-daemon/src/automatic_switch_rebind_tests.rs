@@ -64,6 +64,8 @@ pub(super) async fn start_ordering_run(
             .expect("typed");
         let lease = hub.acquire_worker_lease(sid.clone()).await.expect("lease");
         let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+            resolved_model: None,
+            model_catalog_key: None,
             provider: metadata.provider.clone(),
             model: metadata.model.clone(),
             max_tokens: metadata.max_tokens,
@@ -152,6 +154,8 @@ async fn switch_rebind_variants(stale_target: bool) {
                             turn_selection: Arc::new(tokio::sync::Mutex::new(original.clone())),
                         };
                         let switch = haider_core::ProviderPairSwitch {
+                            model_catalog_key: None,
+                            output_budget: None,
                             run_id: run.clone(),
                             switch_ordinal: 0,
                             source_rebind_seq: 0,
@@ -414,6 +418,8 @@ async fn core_continues_on_healthy_rebind_when_pre_resolved_fallback_is_declined
     }));
     config.provider_attempt_resolver = Some(Arc::new(StaleAutomaticFallback {
         target: haider_core::ProviderPairSwitchTarget {
+            model_catalog_key: None,
+            output_budget: None,
             provider: stale_provider.clone(),
             account: haider_protocol::ids::CredentialAlias::new("automatic-account"),
             account_incarnation: Some(1),
@@ -525,6 +531,8 @@ async fn automatic_switch_after_selector_reset_retains_generation_without_disabl
         let seq = haider_core::ProviderPairSwitchCommitter::commit(
             &committer,
             &haider_core::ProviderPairSwitch {
+                model_catalog_key: None,
+                output_budget: None,
                 run_id: run.clone(),
                 switch_ordinal: ordinal,
                 source_rebind_seq: original.selection_epoch.unwrap_or(0),
@@ -613,6 +621,7 @@ async fn automatic_target_transaction_fences_rebind_after_route_read() {
         .expect("typed");
     let result = hub
         .select_session_model(haider_store::SessionSelectModelCommand {
+            model_catalog_key: None,
             command_id: "store-stale-target".into(),
             request_digest: "store-stale-target".into(),
             request_json: "{}".into(),
@@ -721,6 +730,8 @@ async fn next_turn_selection_control(reset_route: bool) {
     let seq = haider_core::ProviderPairSwitchCommitter::commit(
         &committer,
         &haider_core::ProviderPairSwitch {
+            model_catalog_key: None,
+            output_budget: None,
             run_id: run.clone(),
             switch_ordinal: 0,
             source_rebind_seq,
@@ -809,6 +820,8 @@ async fn legacy_automatic_receipt_owns_switch_after_reset_and_rejects_later_ordi
         let selected_seq = haider_core::ProviderPairSwitchCommitter::commit(
             &committer,
             &haider_core::ProviderPairSwitch {
+                model_catalog_key: None,
+                output_budget: None,
                 run_id: run.clone(),
                 switch_ordinal: 0,
                 source_rebind_seq: original.selection_epoch.unwrap_or(0),

@@ -98,6 +98,8 @@ async fn recovered_selector_free_route_can_switch_again_in_every_run_mode() {
         let selection_seq = haider_core::ProviderPairSwitchCommitter::commit(
             &committer,
             &haider_core::ProviderPairSwitch {
+                model_catalog_key: None,
+                output_budget: None,
                 run_id: run.clone(),
                 switch_ordinal: 0,
                 source_rebind_seq: original.selection_epoch.unwrap_or(0),
@@ -151,6 +153,8 @@ async fn recovered_selector_free_route_can_switch_again_in_every_run_mode() {
             inner: inner.clone(),
             resolver: Arc::new(StaleAutomaticFallback {
                 target: haider_core::ProviderPairSwitchTarget {
+                    model_catalog_key: None,
+                    output_budget: None,
                     provider: healthy.clone(),
                     account: haider_protocol::ids::CredentialAlias::new("second-automatic"),
                     account_incarnation: Some(2),
@@ -283,6 +287,8 @@ async fn core_continues_when_rebind_commits_between_route_read_and_store_install
     }));
     config.provider_attempt_resolver = Some(Arc::new(StaleAutomaticFallback {
         target: haider_core::ProviderPairSwitchTarget {
+            model_catalog_key: None,
+            output_budget: None,
             provider: stale_provider.clone(),
             account: haider_protocol::ids::CredentialAlias::new("automatic-account"),
             account_incarnation: Some(1),

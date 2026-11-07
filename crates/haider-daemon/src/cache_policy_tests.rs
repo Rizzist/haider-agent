@@ -10,6 +10,7 @@ use crate::cache_policy::{assess_cache_change, blocks_change, combine_cache_chan
 
 fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -22,6 +23,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "openai".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "gpt-5.6-terra".into(),
         max_tokens: 4096,
         max_tokens_source: None,

@@ -785,6 +785,8 @@ pub enum GraphSwitchOutcome {
 /// Secret-free, stable coordinates for an atomic `session.create`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCreateCommand {
+    /// Separately admitted coordinate when the public creation spelling differs.
+    pub resolved_model: Option<String>,
     pub command_id: String,
     pub request_digest: String,
     pub request_json: String,
@@ -792,6 +794,7 @@ pub struct SessionCreateCommand {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     pub max_tokens: u64,
     /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
     /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
@@ -1096,6 +1099,7 @@ pub struct SessionSelectModelCommand {
     pub worker_generation: u64,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     /// rev933b finding 7: an AUTOMATIC mid-turn switch is only valid
     /// against the pair it observed (compare-and-swap). `Some` refuses the
     /// commit with RevisionConflict when the durable pair moved underneath
@@ -1133,6 +1137,8 @@ pub struct SelectedModel {
     pub session_id: SessionId,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     pub selected_seq: u64,
     pub worker_generation: u64,
     /// Budget committed with this selection; absent in pre-973 receipts.
@@ -1459,6 +1465,8 @@ pub struct SessionProviderRebindCommand {
 /// Committed session selection at a journal boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutputPairSnapshot {
+    pub resolved_model: Option<String>,
+    pub model_catalog_key: Option<String>,
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
@@ -4676,8 +4684,9 @@ impl Store {
         let keep: HashSet<&str> = keep_account_keys.iter().map(String::as_str).collect();
         let legacy: HashSet<&str> = authenticated_providers.iter().map(String::as_str).collect();
         for key in keys {
-            let unread_account =
-                key.starts_with(ACCOUNT_SCOPED_PREFIX) || key.starts_with("account:");
+            let unread_account = key.starts_with(ACCOUNT_SCOPED_PREFIX)
+                || key.starts_with("account-v2:")
+                || key.starts_with("account:");
             if (unread_account && !keep.contains(key.as_str())) || legacy.contains(key.as_str()) {
                 transaction
                     .execute("DELETE FROM provider_models WHERE provider = ?1", [&key])
@@ -4710,6 +4719,18 @@ impl Store {
                     etag,
                     to_sqlite_integer(fetched_at_ms)?
                 ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Removes one catalog coordinate after a configuration boundary.
+    pub fn delete_provider_models(&self, provider: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM provider_models WHERE provider = ?1",
+                [provider],
             )
             .map_err(map_sqlite_error)?;
         Ok(())
@@ -5170,7 +5191,7 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let mut metadata = typed_session_metadata(&transaction, session_id)?;
         if metadata.provider != expected_provider
-            || metadata.model != expected_model
+            || metadata.model_coordinate() != expected_model
             || metadata.selection_epoch.unwrap_or(0) != expected_epoch
         {
             // A selection committed after this request captured metadata.
@@ -5249,7 +5270,10 @@ impl Store {
                 ModelSelected {
                     selection_epoch: Some(epoch),
                     provider: metadata.provider.clone(),
-                    model: metadata.model.clone(),
+                    model: metadata.model_coordinate().to_owned(),
+                    // A route-only fact keeps the selected pair, so it keeps
+                    // the catalog owner that pair was admitted under.
+                    model_catalog_key: metadata.model_catalog_key.clone(),
                     route_only: true,
                     cleared_account_pin: None,
                     cleared_provider_endpoint: None,
@@ -9256,6 +9280,7 @@ impl Store {
             ));
         }
         let mut metadata = SessionMetadataV1 {
+            resolved_model: command.resolved_model.clone(),
             selection_epoch: Some(0),
             route_reset_epoch: Some(0),
             budget_clamp_notice_epoch: None,
@@ -9273,6 +9298,7 @@ impl Store {
                 .as_ref()
                 .map_or(account_alias, |parent| parent.account_alias.clone()),
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             max_tokens: command.max_tokens,
             max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
@@ -10491,7 +10517,8 @@ impl Store {
         }
         if command.automatic_run.is_none()
             && let Some((expected_provider, expected_model)) = &command.expected_pair
-            && (&metadata.provider != expected_provider || &metadata.model != expected_model)
+            && (&metadata.provider != expected_provider
+                || metadata.model_coordinate() != expected_model)
         {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -10511,7 +10538,7 @@ impl Store {
                 .expected_pair
                 .as_ref()
                 .is_none_or(|(provider, model)| {
-                    &metadata.provider == provider && &metadata.model == model
+                    &metadata.provider == provider && metadata.model_coordinate() == model
                 });
         let publish_selection = if let Some(automatic) = &command.automatic_run {
             publish_pair_matches && (metadata.selection_epoch == automatic.selection_epoch
@@ -10536,6 +10563,8 @@ impl Store {
         let no_op = command.automatic_run.is_none()
             && metadata.provider == command.provider
             && metadata.model == command.model
+            && metadata.model_catalog_key == command.model_catalog_key
+            && metadata.resolved_model.is_none()
             && command
                 .account_alias
                 .as_ref()
@@ -10581,6 +10610,8 @@ impl Store {
             }
             metadata.provider = command.provider.clone();
             metadata.model = command.model.clone();
+            metadata.resolved_model = None;
+            metadata.model_catalog_key = command.model_catalog_key.clone();
             metadata.selection_epoch = Some(selection_epoch);
         }
         if publish_selection && let Some(budget) = command.output_budget {
@@ -10628,6 +10659,7 @@ impl Store {
             selection_epoch: Some(fact_selection_epoch),
             provider: command.provider.clone(),
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             route_only: !publish_selection,
             cleared_account_pin: cleared_account_pin.clone(),
             cleared_provider_endpoint: cleared_provider_endpoint.clone(),
@@ -10645,6 +10677,9 @@ impl Store {
             selected_payload["automatic_rebind_seq"] = automatic.rebind_seq.into();
             selected_payload["automatic_resolved_alias"] = automatic.resolved_alias.clone().into();
             selected_payload["automatic_only"] = (!publish_selection).into();
+            if let Some(budget) = command.output_budget {
+                selected_payload["automatic_output_budget"] = serde_json::json!(budget);
+            }
         }
         let mut envelopes = vec![unstamped_raw_command_envelope(
             command.event_id.clone(),
@@ -10670,6 +10705,7 @@ impl Store {
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             selected_seq: selection_epoch,
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,
@@ -12858,6 +12894,8 @@ impl Store {
             }
             if !same_run_delivery {
                 let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                    resolved_model: spec.resolved_model.clone(),
+                    model_catalog_key: spec.model_catalog_key.clone(),
                     route_snapshot: Some(
                         haider_protocol::session::RunOutputRouteSnapshotV1::capture(&metadata),
                     ),
@@ -16425,6 +16463,10 @@ fn validate_headless_turn_admission(
     if metadata.cwd != spec.cwd
         || metadata.provider != spec.provider
         || metadata.model != spec.model
+        || spec
+            .resolved_model
+            .as_ref()
+            .is_some_and(|model| metadata.resolved_model.as_ref() != Some(model))
         || metadata.max_tokens != spec.max_output_tokens
         || metadata.effort != spec.effort
         || metadata.fast != spec.fast
@@ -24912,7 +24954,7 @@ fn inherited_fork_cache_segment(
         let cache_epoch = source_view.get("cache_epoch")?.as_str()?;
         let stable_history_end = source_view.get("stable_history_end")?.as_u64()?;
         if provider != source_metadata.provider
-            || model != source_metadata.model
+            || model != source_metadata.model_coordinate()
             || max_tokens != source_metadata.max_tokens
             || account_scope.is_empty()
             || cache_epoch.is_empty()

@@ -23,6 +23,10 @@ mod direct_ssh_tests;
 #[path = "activity_wire_tests.rs"]
 mod activity_wire_tests;
 
+#[cfg(test)]
+#[path = "inventory_refresh_tests.rs"]
+mod inventory_refresh_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -345,6 +349,7 @@ struct TurnSubmitInput {
 }
 
 struct SessionSelectModelInput {
+    expected_catalog_key: Option<String>,
     command_id: CommandId,
     session_id: SessionId,
     worker_generation: u64,
@@ -1271,12 +1276,40 @@ fn fleet_now_ms() -> u64 {
 }
 
 pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
+    let model = summary.canonical_model_selector(model);
+    // Explicit deployments use the shared availability decision as published.
+    // A rejected selection must not silently fetch its way around that proof;
+    // manual refresh and the stale-catalog actor update discovery separately.
+    let requested_is_configured = summary.configured_models.iter().any(|name| name == model);
+    if requested_is_configured {
+        return false;
+    }
+    let listed = summary.models.iter().any(|known| known == model);
+    let advisory = summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    let selectable_uncertainty = matches!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::Stale { .. }
+    ) || matches!(
+        summary.inventory,
+        haider_rpc::ModelInventoryWire::Configured
+    ) && advisory;
+    // The actor already refreshes stale inventory with bounded backoff. An
+    // eligible cached row or advisory passthrough never waits for that work.
+    if selectable_uncertainty && summary.model_is_selectable(model) && (listed || advisory) {
+        return false;
+    }
     summary.inventory.needs_refresh()
+        // An unavailable legacy configured inventory can still probe on a
+        // miss. Declared deployments were handled above; Azure unsupported
+        // discovery remains terminal.
+        || matches!(summary.inventory, haider_rpc::ModelInventoryWire::Configured)
+            && summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory
+            && !summary.endpoint.as_deref().is_some_and(haider_provider::azure_openai_origin)
         || matches!(
             summary.inventory,
             haider_rpc::ModelInventoryWire::Fetched { .. }
                 | haider_rpc::ModelInventoryWire::Stale { .. }
-        ) && !summary.models.iter().any(|known| known == model)
+        ) && !listed
 }
 
 /// Projects one replayed truth into the summary's additive wire fields.
@@ -2355,6 +2388,7 @@ mod observe_cache_retention_tests {
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
         let session_id = SessionId::new("observe-byte-identical-rebuild");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "observe-byte-identical-create".into(),
             request_digest: "observe-byte-identical-digest".into(),
             request_json: "{}".into(),
@@ -2364,6 +2398,7 @@ mod observe_cache_retention_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2600,12 +2635,14 @@ mod observe_cache_retention_tests {
         for ordinal in 1..=WARMUP_CYCLES + CYCLES {
             let session_id = SessionId::new(format!("retain-soak-{ordinal}"));
             hub.create_internal_session(SessionCreateCommand {
+                resolved_model: None,
                 command_id: format!("retain-soak-create-{ordinal}"),
                 request_digest: format!("retain-soak-create-digest-{ordinal}"),
                 request_json: "{}".into(),
                 session_id: session_id.clone(),
                 cwd: cwd.clone(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 max_tokens_source: None,
@@ -3759,7 +3796,7 @@ pub(super) fn resolve_session_output_limit(
 /// the user's request and is clamped to the new explicit ceiling with a typed
 /// notice. Legacy metadata without a recorded source is classified first.
 /// Model switches therefore never fail on the output budget.
-pub(super) fn reapply_session_output_budget(
+pub(crate) fn reapply_session_output_budget(
     current: &haider_protocol::session::SessionMetadataV1,
     selection: &crate::model_select::ValidatedModelSelection,
 ) -> haider_protocol::output_budget::SessionOutputBudgetV1 {
@@ -4066,6 +4103,7 @@ impl HubConnection {
                 account_alias,
                 resolve_provider,
                 resolve_model,
+                expected_catalog_key,
                 effort,
                 fast,
             } => {
@@ -4093,6 +4131,7 @@ impl HubConnection {
                     account_alias,
                     resolve_provider,
                     resolve_model,
+                    expected_catalog_key,
                     effort,
                     fast,
                 )
@@ -4129,6 +4168,7 @@ impl HubConnection {
                     None,
                     false,
                     false,
+                    None,
                     None,
                     None,
                 )
@@ -5386,6 +5426,7 @@ impl HubConnection {
                 provider,
                 confirm_new_epoch,
                 max_tokens,
+                expected_catalog_key,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -5418,6 +5459,7 @@ impl HubConnection {
                         provider,
                         confirm_new_epoch,
                         max_tokens,
+                        expected_catalog_key,
                     },
                 )
                 .await
@@ -8490,6 +8532,7 @@ impl HubConnection {
                     .session_select_model(
                         request_id.clone(),
                         SessionSelectModelInput {
+                            expected_catalog_key: None,
                             command_id,
                             session_id,
                             worker_generation: generation,
@@ -8502,8 +8545,11 @@ impl HubConnection {
                     .await?;
             }
             ParkedCommandContinuation::Provider(provider) => {
-                let model = match self.provider_default_model(&session_id, &provider).await {
-                    Ok(Some(model)) => model,
+                let (model, expected_catalog_key) = match self
+                    .provider_default_model(&session_id, &provider)
+                    .await
+                {
+                    Ok(Some(selection)) => selection,
                     Ok(None) => {
                         return Ok(ResponseBody::Error {
                             code: ERROR_CODE_INVALID_ARGUMENT.into(),
@@ -8532,6 +8578,7 @@ impl HubConnection {
                     .session_select_model(
                         request_id.clone(),
                         SessionSelectModelInput {
+                            expected_catalog_key,
                             command_id,
                             session_id,
                             worker_generation: generation,
@@ -8575,7 +8622,7 @@ impl HubConnection {
         &self,
         session_id: &SessionId,
         provider: &str,
-    ) -> Result<Option<String>, SessionHubError> {
+    ) -> Result<Option<(String, Option<String>)>, SessionHubError> {
         let facade = self.hub.accounts()?;
         if let Some(facade) = facade.as_ref() {
             let view = facade.management.read().ok_or_else(|| {
@@ -8589,7 +8636,15 @@ impl HubConnection {
                 return Ok(summary
                     .default_model
                     .clone()
-                    .or_else(|| summary.models.first().cloned()));
+                    .or_else(|| summary.models.first().cloned())
+                    .map(|model| {
+                        let key = crate::model_select::ModelSelectionAuthority::new(
+                            None,
+                            Some(vec![summary.clone()]),
+                        )
+                        .model_catalog_key(provider, &model);
+                        (model, key)
+                    }));
             }
         }
         let metadata_model = self
@@ -8597,7 +8652,7 @@ impl HubConnection {
             .session_metadata(session_id)
             .await?
             .filter(|metadata| metadata.provider == provider)
-            .map(|metadata| metadata.model);
+            .map(|metadata| (metadata.model, metadata.model_catalog_key));
         if metadata_model.is_some() || facade.is_some() {
             return Ok(metadata_model);
         }
@@ -9014,7 +9069,7 @@ impl HubConnection {
                         summary
                             .model_details
                             .iter()
-                            .find(|detail| detail.name == metadata.model)
+                            .find(|detail| detail.name == metadata.model_coordinate())
                     })
                 {
                     efforts.extend(detail.supported_efforts.clone());
@@ -10052,7 +10107,7 @@ impl HubConnection {
                     &metadata,
                     Some(&scope),
                     &metadata.provider,
-                    &metadata.model,
+                    metadata.model_coordinate(),
                     Some(target_auth_scope),
                     changed_fields,
                     false,
@@ -12214,6 +12269,7 @@ impl HubConnection {
             provider,
             confirm_new_epoch,
             max_tokens,
+            expected_catalog_key,
         } = input;
         if command_id.as_str().trim().is_empty() || model.trim().is_empty() {
             return self.respond_error(
@@ -12231,6 +12287,9 @@ impl HubConnection {
             "provider": &provider,
             "confirm_new_epoch": confirm_new_epoch,
         });
+        if let Some(key) = &expected_catalog_key {
+            request_coordinates["expected_catalog_key"] = serde_json::json!(key);
+        }
         // Present only when requested, so pre-973 receipt digests replay.
         if let Some(max_tokens) = max_tokens {
             request_coordinates["max_tokens"] = serde_json::json!(max_tokens);
@@ -12261,6 +12320,7 @@ impl HubConnection {
         // fetch outside the per-session lock, then validate the same pair
         // under the lock through the durable commit. If another writer moved
         // it while fetching, discard the snapshot and retry.
+        let facade = self.hub.accounts()?;
         let (_selection, current, summaries, descriptors) = loop {
             let Some(before) = (match self.hub.session_metadata(&session_id).await {
                 Ok(metadata) => metadata,
@@ -12310,7 +12370,9 @@ impl HubConnection {
             };
             if (
                 before.provider.as_str(),
-                before.model.as_str(),
+                before.model_coordinate(),
+                before.model_catalog_key.as_deref(),
+                before.selection_epoch,
                 before.max_tokens,
                 before.max_tokens_source,
                 before.provider_base_url.as_deref(),
@@ -12318,7 +12380,9 @@ impl HubConnection {
                 before.account_alias.as_deref(),
             ) != (
                 current.provider.as_str(),
-                current.model.as_str(),
+                current.model_coordinate(),
+                current.model_catalog_key.as_deref(),
+                current.selection_epoch,
                 current.max_tokens,
                 current.max_tokens_source,
                 current.provider_base_url.as_deref(),
@@ -12343,10 +12407,22 @@ impl HubConnection {
             }
             break (selection, current, summaries, descriptors);
         };
+        let selected_provider = provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or(&current.provider);
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
-            summaries,
-        );
+            facade.as_ref().map(|_| summaries),
+        )
+        .scoped_to_session_route(&current, selected_provider);
+        if expected_catalog_key
+            .as_ref()
+            .is_some_and(|key| !authority.catalog_key_is_current(selected_provider, key))
+        {
+            return self.respond_retired_catalog_selection(request_id);
+        }
         let validated = match authority.validate_selection_with_status(
             &current.provider,
             provider.as_deref(),
@@ -12374,6 +12450,16 @@ impl HubConnection {
             },
             None => reapply_session_output_budget(&current, &validated),
         };
+        let model_catalog_key = expected_catalog_key
+            .as_ref()
+            .and_then(|_| authority.model_catalog_key(&validated.provider, &validated.model))
+            .or_else(|| {
+                authority.model_settings_catalog_key(
+                    &validated.provider,
+                    &validated.model,
+                    &output_budget,
+                )
+            });
         #[cfg(test)]
         self.hub
             .pause_model_selection_after_budget(&session_id)
@@ -12416,7 +12502,7 @@ impl HubConnection {
         if current.provider != resolved_provider {
             changed_fields.push("provider".to_owned());
         }
-        if current.model != resolved_model {
+        if current.model_coordinate() != resolved_model.as_str() {
             changed_fields.push("model".to_owned());
         }
         let current_scope =
@@ -12462,6 +12548,7 @@ impl HubConnection {
             session_id,
             worker_generation,
             provider: resolved_provider,
+            model_catalog_key,
             model: resolved_model,
             expected_pair: None,
             automatic_run: None,
@@ -12484,6 +12571,19 @@ impl HubConnection {
         self.respond_model_selected(request_id, selected)
     }
 
+    fn respond_retired_catalog_selection(
+        &self,
+        request_id: RequestId,
+    ) -> Result<(), SessionHubError> {
+        self.respond_error(
+            request_id,
+            ERROR_CODE_REVISION_CONFLICT,
+            "the model catalog changed; refresh and explicitly reselect a model",
+            false,
+            None,
+        )
+    }
+
     fn respond_selection_refusal(
         &self,
         request_id: RequestId,
@@ -12491,7 +12591,7 @@ impl HubConnection {
     ) -> Result<(), SessionHubError> {
         use crate::model_select::SelectionRefusal;
         let (code, data) = match refusal {
-            SelectionRefusal::ProviderUnavailable { provider } => (
+            SelectionRefusal::ProviderUnavailable { provider, .. } => (
                 haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
                 Some(ErrorData::ProviderUnavailable {
                     provider: provider.clone(),
@@ -12526,6 +12626,7 @@ impl HubConnection {
             body: ResponseBody::SessionSelectModel {
                 session_id: selected.session_id,
                 provider: selected.provider,
+                model_catalog_key: selected.model_catalog_key,
                 model: selected.model,
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
@@ -14687,9 +14788,11 @@ impl HubConnection {
             );
         };
         let authority = self.tuning_authority()?;
-        if let Err(refusal) =
-            authority.validate_effort(&current.provider, &current.model, effort.as_deref())
-        {
+        if let Err(refusal) = authority.validate_effort(
+            &current.provider,
+            current.model_coordinate(),
+            effort.as_deref(),
+        ) {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         let changed_fields = if current.effort != effort {
@@ -14704,7 +14807,7 @@ impl HubConnection {
             &current,
             current_scope.as_ref(),
             &current.provider,
-            &current.model,
+            current.model_coordinate(),
             current_scope
                 .as_ref()
                 .map(|scope| scope.auth_scope.as_str()),
@@ -14899,7 +15002,9 @@ impl HubConnection {
             );
         };
         let authority = self.tuning_authority()?;
-        if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
+        if let Err(refusal) =
+            authority.validate_fast(&current.provider, current.model_coordinate(), enabled)
+        {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         let changed_fields = if current.fast != enabled {
@@ -14914,7 +15019,7 @@ impl HubConnection {
             &current,
             current_scope.as_ref(),
             &current.provider,
-            &current.model,
+            current.model_coordinate(),
             current_scope
                 .as_ref()
                 .map(|scope| scope.auth_scope.as_str()),
@@ -14951,12 +15056,13 @@ impl HubConnection {
     fn tuning_authority(
         &self,
     ) -> Result<crate::model_select::ModelSelectionAuthority, SessionHubError> {
-        let summaries = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
+        let summaries = self.hub.accounts()?.map(|facade| {
+            facade
+                .management
+                .read()
+                .map(|view| view.providers)
+                .unwrap_or_default()
+        });
         Ok(crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -16986,6 +17092,7 @@ impl HubConnection {
         account_alias: Option<CredentialAlias>,
         resolve_provider: bool,
         resolve_model: bool,
+        expected_catalog_key: Option<String>,
         effort: Option<String>,
         fast: Option<bool>,
     ) -> Result<(), SessionHubError> {
@@ -17004,6 +17111,9 @@ impl HubConnection {
             "model": &model,
             "max_tokens": max_tokens,
         });
+        if let Some(key) = &expected_catalog_key {
+            request_coordinates["expected_catalog_key"] = serde_json::json!(key);
+        }
         if resolve_provider {
             request_coordinates["resolve_provider"] = serde_json::Value::Bool(true);
         }
@@ -17197,6 +17307,7 @@ impl HubConnection {
                 None,
             );
         }
+        let mut resolved_catalog_key = None;
         if resolve_model {
             if !model.is_empty() {
                 return self.respond_error(
@@ -17213,7 +17324,15 @@ impl HubConnection {
                         view.providers
                             .iter()
                             .find(|summary| summary.provider == provider)
-                            .map(|summary| summary.default_model.clone())
+                            .map(|summary| {
+                                (
+                                    summary.default_model.clone(),
+                                    summary
+                                        .catalog_scope
+                                        .as_ref()
+                                        .map(|scope| scope.key.clone()),
+                                )
+                            })
                     }) else {
                         return self.respond_error(
                             request_id,
@@ -17223,12 +17342,13 @@ impl HubConnection {
                             None,
                         );
                     };
-                    provider_default
+                    Some(provider_default)
                 }
                 None => None,
             };
-            if let Some(Some(default_model)) = provider_default {
+            if let Some(Some((Some(default_model), key))) = provider_default {
                 model = default_model;
+                resolved_catalog_key = key;
             } else if provider_default.is_some() || resolve_provider {
                 let message = format!("provider `{provider}` publishes no default model");
                 return self.respond_error(request_id, "no_default_model", &message, false, None);
@@ -17279,9 +17399,9 @@ impl HubConnection {
                 None,
             );
         }
-        let mut summaries = self
-            .hub
-            .accounts()?
+        let facade = self.hub.accounts()?;
+        let mut summaries = facade
+            .as_ref()
             .and_then(|facade| facade.management.read())
             .map_or_else(Vec::new, |view| view.providers);
         match self
@@ -17300,7 +17420,17 @@ impl HubConnection {
                 );
             }
         }
-        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority = crate::model_select::ModelSelectionAuthority::new(
+            creatable,
+            facade.as_ref().map(|_| summaries),
+        );
+        if [expected_catalog_key.as_ref(), resolved_catalog_key.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|key| !authority.catalog_key_is_current(&provider, key))
+        {
+            return self.respond_retired_catalog_selection(request_id);
+        }
         let validated = match authority.validate_selection_with_status(&provider, None, &model) {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
@@ -17317,11 +17447,24 @@ impl HubConnection {
                 );
             }
         };
-        if let Err(refusal) = authority.validate_effort(&provider, &model, effort.as_deref()) {
+        let model_catalog_key = (resolve_model || expected_catalog_key.is_some())
+            .then(|| authority.model_catalog_key(&validated.provider, &validated.model))
+            .flatten()
+            .or_else(|| {
+                authority.model_settings_catalog_key(
+                    &validated.provider,
+                    &validated.model,
+                    &output_budget,
+                )
+            });
+        if let Err(refusal) =
+            authority.validate_effort(&validated.provider, &validated.model, effort.as_deref())
+        {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
         if let Some(enabled) = fast
-            && let Err(refusal) = authority.validate_fast(&provider, &model, enabled)
+            && let Err(refusal) =
+                authority.validate_fast(&validated.provider, &validated.model, enabled)
         {
             return self.respond_tuning_refusal(request_id, &refusal);
         }
@@ -17351,6 +17494,7 @@ impl HubConnection {
         };
         let session_id = SessionId::new(random_id("session")?);
         let command = SessionCreateCommand {
+            resolved_model: (validated.model != model).then_some(validated.model),
             command_id: command_id.0,
             request_digest,
             request_json,
@@ -17358,6 +17502,7 @@ impl HubConnection {
             cwd: workspace.canonical().to_owned(),
             provider,
             model,
+            model_catalog_key,
             max_tokens: output_budget.max_tokens,
             max_tokens_source: Some(output_budget.source),
             permission_overrides,
@@ -17848,6 +17993,10 @@ impl HubConnection {
                     .try_send(WireFrame::AccountsChanged { revision })
                     .is_err()
                 {
+                    // A subscribed client no longer polls. A refused signal
+                    // must close the transport so reconnect restores its
+                    // current snapshot and connection-scoped watch.
+                    sink.close_after_required_delivery_failure();
                     break;
                 }
             }

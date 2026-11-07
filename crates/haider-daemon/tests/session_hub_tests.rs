@@ -865,6 +865,46 @@ async fn sidecar_at_coverage(path: &std::path::Path, expected_coverage: u64) -> 
     })
 }
 
+#[tokio::test]
+async fn sidecar_wait_requires_committed_coverage_before_returning() {
+    let root = tempfile::tempdir().expect("sidecar fixture directory");
+    let settled = "{\"role\":\"user\",\"seq\":1}\n{\"coverage\":3,\"generation\":1}\n";
+    for (name, predecessor) in [
+        ("old-row", Some("{\"role\":\"user\",\"seq\":1}\n")),
+        (
+            "unsettled-current-row",
+            Some("{\"role\":\"user\",\"seq\":3}\n"),
+        ),
+        ("old-coverage", Some("{\"coverage\":1,\"generation\":1}\n")),
+        ("partial", Some("{\"coverage\":")),
+        ("empty", Some("")),
+        ("missing", None),
+    ] {
+        let path = root.path().join(format!("{name}.pipe"));
+        if let Some(predecessor) = predecessor {
+            std::fs::write(&path, predecessor).expect("predecessor writes");
+        }
+        let wait = sidecar_at_coverage(&path, 3);
+        tokio::pin!(wait);
+        // The producer is deliberately held. Biased polling observes an early
+        // return before the control timer even when both wake under load.
+        tokio::select! {
+            biased;
+            body = &mut wait => panic!("{name} returned before coverage committed: {body}"),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        std::fs::write(&path, settled).expect("committed coverage writes");
+        assert_eq!(wait.await, settled, "{name} observes the committed body");
+    }
+    let path = root.path().join("already-current.pipe");
+    std::fs::write(&path, settled).expect("current sidecar writes");
+    assert_eq!(
+        sidecar_at_coverage(&path, 3).await,
+        settled,
+        "an unchanged current file is a valid positive control"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn sidecar_coverage_waits_for_delayed_writer_from_unsettled_tails() {
     let root = tempfile::tempdir().expect("sidecar fixture");
@@ -1347,6 +1387,7 @@ async fn create_and_attach_typed_session(
 async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId, provider: &str) {
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(
@@ -1355,6 +1396,7 @@ async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId,
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: provider.into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -4805,6 +4847,7 @@ fn model_selected_envelope(
     *envelope.payload = ModelSelected {
         selection_epoch: None,
         provider: provider.into(),
+        model_catalog_key: None,
         model: model.into(),
         route_only: false,
         cleared_account_pin: None,
@@ -8559,32 +8602,45 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
     store.close().await.expect("store closes");
 }
 
-/// A sink that admits the initial replay and caught-up marker, then answers
-/// `Busy` to every further event with a drain signal that never advances —
-/// the genuinely stuck client shape.
-struct StalledAfterCaughtUpSink {
-    collected: CollectSink,
-    saw_caught_up: AtomicBool,
-    /// Admission tickets that deliberately never fire — the stuck shape.
-    parked: Mutex<Vec<AdmissionTicket>>,
-    confirmed_parked: AtomicBool,
-    parked_changed: Notify,
+const STALLED_OUTBOX_BYTE_BUDGET: usize = 1_800;
+
+#[derive(Default)]
+struct ReplayParking {
+    confirmed: AtomicBool,
+    changed: Notify,
 }
 
-impl StalledAfterCaughtUpSink {
-    async fn wait_until_parked(&self) {
+impl ReplayParking {
+    fn confirm(&self) {
+        self.confirmed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self) {
         tokio::time::timeout(DEADLINE, async {
             loop {
-                let changed = self.parked_changed.notified();
-                if self.confirmed_parked.load(Ordering::Acquire) {
+                let changed = self.changed.notified();
+                if self.confirmed.load(Ordering::Acquire) {
                     return;
                 }
                 changed.await;
             }
         })
         .await
-        .expect("stalled sink confirms busy admission before commit pressure");
+        .expect("replay parking deadline");
     }
+}
+
+/// A sink that admits the initial replay and caught-up marker, then answers
+/// `Busy` to every further event with a drain signal that never advances —
+/// the genuinely stuck client shape.
+#[derive(Default)]
+struct StalledAfterCaughtUpSink {
+    collected: CollectSink,
+    saw_caught_up: AtomicBool,
+    parking: ReplayParking,
+    /// Admission tickets that deliberately never fire — the stuck shape.
+    parked: Mutex<Vec<AdmissionTicket>>,
 }
 
 impl FrameSink for StalledAfterCaughtUpSink {
@@ -8617,8 +8673,7 @@ impl FrameSink for StalledAfterCaughtUpSink {
     ) -> SendAdmission {
         let admission = self.offer(attachment_id, frame);
         if matches!(admission, SendAdmission::Busy) {
-            self.confirmed_parked.store(true, Ordering::Release);
-            self.parked_changed.notify_waiters();
+            self.parking.confirm();
         }
         admission
     }
@@ -8641,20 +8696,14 @@ impl FrameSink for StalledAfterCaughtUpSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 1_800,
+        catch_up_byte_budget: STALLED_OUTBOX_BYTE_BUDGET,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
     let session_id = SessionId::new("stalled-outbox");
     let generation = store.worker_generation();
     append_one(&hub, &session_id, generation, "initial").await;
-    let sink = Arc::new(StalledAfterCaughtUpSink {
-        collected: CollectSink::default(),
-        saw_caught_up: AtomicBool::new(false),
-        parked: Mutex::new(Vec::new()),
-        confirmed_parked: AtomicBool::new(false),
-        parked_changed: Notify::new(),
-    });
+    let sink = Arc::new(StalledAfterCaughtUpSink::default());
     let connection = hub
         .open_connection(
             capabilities(),
@@ -8687,26 +8736,33 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         }
     ));
 
-    // The first live event establishes the genuinely stuck sink. Later
-    // commits must overflow its catch-up ledger while admission is busy;
-    // reaching caught-up alone does not establish that replay has parked.
-    for index in 0..8 {
-        let mut event = vec![envelope(
-            &session_id,
-            format!("pressure-{index}"),
-            generation,
-        )];
-        *event[0].payload = serde_json::json!({
-            "type": "future_test_event",
-            "blob": "x".repeat(400),
-        });
-        hub.append(&mut event)
-            .await
-            .expect("pressure append commits");
-        if index == 0 {
-            sink.wait_until_parked().await;
-        }
-    }
+    // A fitting live event must reach a confirmed Busy admission before
+    // pressure is published. AttachCaughtUp alone does not prove parking:
+    // an early oversized commit can instead trigger store re-registration.
+    let mut first = vec![envelope(&session_id, "park-replay", generation)];
+    let first_weight = haider_protocol::envelope::envelope_weight_bytes(&first[0]);
+    assert!(
+        first_weight <= STALLED_OUTBOX_BYTE_BUDGET,
+        "the parking event must fit the catch-up budget: {first_weight}"
+    );
+    hub.append(&mut first).await.expect("parking event commits");
+    sink.parking.wait().await;
+
+    // One explicitly oversized commit now exercises lag while the replay
+    // is parked on a real admission ticket that deliberately never fires.
+    let mut pressure = vec![envelope(&session_id, "pressure", generation)];
+    *pressure[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(700),
+    });
+    let pressure_weight = haider_protocol::envelope::envelope_weight_bytes(&pressure[0]);
+    assert!(
+        pressure_weight > STALLED_OUTBOX_BYTE_BUDGET,
+        "the pressure event must exceed the catch-up budget: {pressure_weight}"
+    );
+    hub.append(&mut pressure)
+        .await
+        .expect("pressure append commits");
     assert!(matches!(
         sink.collected.next().await,
         WireFrame::Lagged {
@@ -8894,23 +8950,12 @@ struct UndeliveredResponseSink {
     collected: CollectSink,
     pending: Mutex<Option<RequestId>>,
     parked: Mutex<Vec<AdmissionTicket>>,
-    confirmed_parked: AtomicBool,
-    parked_changed: Notify,
+    parking: ReplayParking,
 }
 
 impl UndeliveredResponseSink {
     async fn wait_until_parked(&self) {
-        tokio::time::timeout(DEADLINE, async {
-            loop {
-                let changed = self.parked_changed.notified();
-                if self.confirmed_parked.load(Ordering::Acquire) {
-                    return;
-                }
-                changed.await;
-            }
-        })
-        .await
-        .expect("replay parking deadline");
+        self.parking.wait().await;
     }
 }
 
@@ -8950,8 +8995,7 @@ impl FrameSink for UndeliveredResponseSink {
     ) -> SendAdmission {
         let admission = self.offer(attachment_id, frame);
         if matches!(admission, SendAdmission::Busy) {
-            self.confirmed_parked.store(true, Ordering::Release);
-            self.parked_changed.notify_waiters();
+            self.parking.confirm();
         }
         admission
     }
@@ -8979,7 +9023,7 @@ impl FrameSink for UndeliveredResponseSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lagged() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 1_800,
+        catch_up_byte_budget: STALLED_OUTBOX_BYTE_BUDGET,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
@@ -9018,6 +9062,11 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
         "type": "future_test_event",
         "blob": "x".repeat(700),
     });
+    let pressure_weight = haider_protocol::envelope::envelope_weight_bytes(&event[0]);
+    assert!(
+        pressure_weight > STALLED_OUTBOX_BYTE_BUDGET,
+        "the pressure event must exceed the catch-up budget: {pressure_weight}"
+    );
     hub.append(&mut event).await.expect("pressure commits");
 
     match sink.collected.next().await {

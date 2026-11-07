@@ -26,6 +26,9 @@ pub struct AccountIdentity {
 }
 
 impl AccountIdentity {
+    /// Maximum number of characters retained from one identity claim.
+    pub const MAX_FIELD_CHARS: usize = 512;
+
     /// Normalizes one untrusted informational claim before it can reach a
     /// descriptor or operator surface.
     #[must_use]
@@ -33,7 +36,7 @@ impl AccountIdentity {
         let value: String = value
             .chars()
             .filter(|character| !character.is_control())
-            .take(512)
+            .take(Self::MAX_FIELD_CHARS)
             .collect();
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_owned())
@@ -85,6 +88,18 @@ pub struct CredentialDescriptor {
     /// written before v0.0.964 retain `None` rather than inventing a date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
+    /// Durable account generation. Zero denotes a pre-incarnation record and
+    /// is replaced on load before an authenticated catalog can be hydrated.
+    #[serde(default, skip_serializing_if = "incarnation_is_zero")]
+    pub incarnation: u64,
+    /// Digest of credential bytes observed at intake. Equality proves
+    /// byte-identical intake; it is never exposed in a catalog key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_digest: Option<String>,
+}
+
+fn incarnation_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

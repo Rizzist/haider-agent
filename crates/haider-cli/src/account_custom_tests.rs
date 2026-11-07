@@ -53,6 +53,9 @@ impl AccountClient for FakeClient {
 
 fn provider() -> ProviderSummaryWire {
     ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "router".into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:8080".into()),
@@ -61,7 +64,7 @@ fn provider() -> ProviderSummaryWire {
         semantic_progress_timeout_ms: None,
         models: vec!["alpha".into(), "beta".into()],
         model_details: Vec::new(),
-        catalog: haider_rpc::ProviderCatalogKindWire::Unknown,
+        catalog: haider_rpc::ProviderCatalogKindWire::Custom,
         inventory: haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 },
         inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![AuthMethod::ApiKey],
@@ -75,6 +78,8 @@ fn provider() -> ProviderSummaryWire {
 
 fn descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: CredentialAlias::new("router"),
         provider: "router".into(),
         base_url: None,
@@ -86,6 +91,251 @@ fn descriptor() -> CredentialDescriptor {
         account_identity: None,
         created_at_ms: None,
     }
+}
+
+fn readd_options() -> CustomAccountOptions {
+    CustomAccountOptions {
+        alias: "router".into(),
+        base_url: Some("http://127.0.0.1:8080".into()),
+        secret: Some(SecretInput::Direct(haider_rpc::SecretWire::new(
+            "fixture-secret",
+        ))),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        trust: None,
+        json: true,
+    }
+}
+
+#[tokio::test]
+async fn removed_custom_account_can_be_readded_to_its_retained_profile() {
+    let mut retained = provider();
+    retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![retained.clone()],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::AccountList {
+            descriptors: Vec::new(),
+            revision: Some(9),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::VaultStage {
+            stage_id: "stage".into(),
+            vault_reference: "vaultref-new".into(),
+            expires_at_ms: 99,
+        },
+        ResponseBody::ProviderConfigure {
+            provider: retained.clone(),
+            revision: 9,
+        },
+        ResponseBody::AccountLoginApi {
+            descriptor: descriptor(),
+        },
+        ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+    ]);
+    assert!(
+        matches!(execute_custom(&client, readd_options(), true).await, Ok(code) if code == ExitCode::SUCCESS)
+    );
+    assert!(client.requests().iter().any(|request| matches!(
+        request,
+        RequestBody::AccountLoginApi {
+            replace_existing: false,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn update_cannot_recreate_a_removed_credential_in_a_retained_custom_profile() {
+    for secret in [
+        None,
+        Some(SecretInput::NoAuth),
+        Some(SecretInput::Direct(haider_rpc::SecretWire::new(
+            "fixture-key",
+        ))),
+    ] {
+        for unrelated_account in [false, true] {
+            let mut other = descriptor();
+            other.alias = CredentialAlias::new("other");
+            let client = FakeClient::new([
+                ResponseBody::ProviderList {
+                    providers: vec![provider()],
+                    revision: 8,
+                    availability: Some(SnapshotAvailabilityWire::Available),
+                },
+                ResponseBody::AccountList {
+                    descriptors: if unrelated_account {
+                        vec![other]
+                    } else {
+                        Vec::new()
+                    },
+                    revision: Some(9),
+                    provider_active: Vec::new(),
+                    provider_defaults: Vec::new(),
+                    sources: Vec::new(),
+                    availability: Some(SnapshotAvailabilityWire::Available),
+                },
+            ]);
+            let mut options = readd_options();
+            options.secret = secret.clone();
+            assert!(matches!(
+                execute_custom(&client, options, false).await,
+                Err(AccountError::MissingAlias(alias)) if alias == "router"
+            ));
+            assert_eq!(
+                client.requests().len(),
+                2,
+                "refusal precedes every mutation"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_auth_custom_profile_can_be_rekeyed_without_a_credential_descriptor() {
+    let mut anonymous = provider();
+    anonymous.auth_methods.clear();
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![anonymous],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::VaultStage {
+            stage_id: "stage".into(),
+            vault_reference: "vaultref-new".into(),
+            expires_at_ms: 99,
+        },
+        ResponseBody::ProviderConfigure {
+            provider: provider(),
+            revision: 9,
+        },
+        ResponseBody::AccountLoginApi {
+            descriptor: descriptor(),
+        },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+    ]);
+    assert!(matches!(
+        execute_custom(&client, readd_options(), false).await,
+        Ok(code) if code == ExitCode::SUCCESS
+    ));
+    assert!(
+        client
+            .requests()
+            .iter()
+            .all(|request| !matches!(request, RequestBody::AccountList { .. }))
+    );
+    assert!(client.requests().iter().any(|request| matches!(
+        request,
+        RequestBody::AccountLoginApi {
+            replace_existing: true,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn add_never_replaces_an_existing_account_or_builtin_or_no_auth_profile() {
+    for (active, status) in [
+        (true, CredentialStatus::Ok),
+        (false, CredentialStatus::Ok),
+        (true, CredentialStatus::Expired),
+        (false, CredentialStatus::Revoked),
+        (true, CredentialStatus::Limited { until_ms: 99 }),
+        (
+            false,
+            CredentialStatus::NeedsAttention {
+                reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+            },
+        ),
+    ] {
+        let mut retained = provider();
+        retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+        let mut account = descriptor();
+        account.active = active;
+        account.status = status;
+        let client = FakeClient::new([
+            ResponseBody::ProviderList {
+                providers: vec![retained],
+                revision: 8,
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+            ResponseBody::AccountList {
+                descriptors: vec![account],
+                revision: Some(9),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+                sources: Vec::new(),
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+        ]);
+        assert!(matches!(
+            execute_custom(&client, readd_options(), true).await,
+            Err(AccountError::Protocol(_))
+        ));
+        assert_eq!(client.requests().len(), 2);
+    }
+    for no_auth in [true, false] {
+        let mut retained = provider();
+        if no_auth {
+            retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+            retained.auth_methods.clear();
+        } else {
+            retained.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
+        }
+        let client = FakeClient::new([ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        }]);
+        assert!(matches!(
+            execute_custom(&client, readd_options(), true).await,
+            Err(AccountError::Protocol(_))
+        ));
+        assert_eq!(client.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn readd_requires_an_available_account_snapshot() {
+    let mut retained = provider();
+    retained.catalog = haider_rpc::ProviderCatalogKindWire::Custom;
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![retained],
+            revision: 8,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::AccountList {
+            descriptors: Vec::new(),
+            revision: Some(9),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
+            availability: Some(SnapshotAvailabilityWire::Unknown),
+        },
+    ]);
+    assert!(matches!(
+        execute_custom(&client, readd_options(), true).await,
+        Err(AccountError::SnapshotUnavailable(_))
+    ));
+    assert_eq!(client.requests().len(), 2);
 }
 
 #[test]
@@ -209,6 +459,11 @@ async fn keyed_add_reserves_one_stage_for_the_durable_login() {
         ResponseBody::AccountLoginApi {
             descriptor: descriptor(),
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -229,7 +484,21 @@ async fn keyed_add_reserves_one_stage_for_the_durable_login() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 5);
     assert!(matches!(requests[0], RequestBody::ProviderList { .. }));
     assert!(matches!(requests[1], RequestBody::VaultStage { .. }));
     assert!(matches!(
@@ -267,6 +536,11 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
             provider: configured,
             revision: 4,
         },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
     ]);
     let result = execute(
         &client,
@@ -285,7 +559,21 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 2);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 3);
     assert!(matches!(
         &requests[1],
         RequestBody::ProviderConfigure {
@@ -381,6 +669,14 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             revision: 20,
             availability: Some(SnapshotAvailabilityWire::Available),
         },
+        ResponseBody::AccountList {
+            descriptors: vec![descriptor()],
+            revision: Some(20),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
         ResponseBody::VaultStage {
             stage_id: "update-stage".into(),
             vault_reference: "update-vault-ref".into(),
@@ -392,6 +688,11 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
         },
         ResponseBody::AccountLoginApi {
             descriptor: descriptor(),
+        },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
         },
     ]);
     let result = execute(
@@ -413,9 +714,23 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 6);
     assert!(matches!(
-        &requests[2],
+        &requests[3],
         RequestBody::ProviderConfigure {
             api_family: None,
             origin: Some(origin),
@@ -431,7 +746,7 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             && models.is_empty()
     ));
     assert!(matches!(
-        &requests[3],
+        &requests[4],
         RequestBody::AccountLoginApi {
             provider,
             alias: Some(alias),
@@ -454,6 +769,14 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             revision: 30,
             availability: Some(SnapshotAvailabilityWire::Available),
         },
+        ResponseBody::AccountList {
+            descriptors: vec![descriptor()],
+            revision: Some(20),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            sources: Vec::new(),
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
         ResponseBody::ProviderConfigure {
             provider: configured,
             revision: 31,
@@ -470,6 +793,11 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             removed_alias: haider_protocol::ids::CredentialAlias::new("router"),
             replacement_active_alias: None,
             revision: 32,
+        },
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 12,
+            availability: Some(SnapshotAvailabilityWire::Available),
         },
     ]);
     let result = execute(
@@ -489,9 +817,23 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
     .await;
     assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
     let requests = client.requests();
-    assert_eq!(requests.len(), 4);
+    assert!(
+        matches!(requests.last(), Some(RequestBody::ProviderList { .. })),
+        "intake is read after commit"
+    );
+    assert!(
+        requests.iter().all(|request| !matches!(
+            request,
+            RequestBody::ProviderConfigure {
+                default_model: Some(_),
+                ..
+            }
+        )),
+        "fetched defaults are never echoed as config"
+    );
+    assert_eq!(requests.len(), 6);
     assert!(matches!(
-        &requests[1],
+        &requests[2],
         RequestBody::ProviderConfigure {
             provider,
             auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::None),
@@ -500,9 +842,9 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             ..
         } if provider == "router"
     ));
-    assert!(matches!(requests[2], RequestBody::AccountList { .. }));
+    assert!(matches!(requests[3], RequestBody::AccountList { .. }));
     assert!(matches!(
-        &requests[3],
+        &requests[4],
         RequestBody::AccountRemove {
             alias,
             expected_revision: Some(31),

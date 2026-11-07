@@ -182,12 +182,14 @@ async fn activity_refused_signal_closes_transport_and_reconnect_read_repairs_inv
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session = SessionId::new("activity-reconnect");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: "activity-create".into(),
         request_digest: "activity-create-digest".into(),
         request_json: "{}".into(),
         session_id: session.clone(),
         cwd: root.path().to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

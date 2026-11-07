@@ -67,6 +67,8 @@ async fn assert_active_budget_from_origin(origin: &str) {
     let run_id = RunId::new("active-budget-run");
     let source = SessionOutputBudgetSourceV1::UserSet { requested: 20_000 };
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
+        model_catalog_key: None,
         command_id: "active-budget-create".into(),
         request_digest: "active-budget-create-digest".into(),
         request_json: "{}".into(),
@@ -89,6 +91,8 @@ async fn assert_active_budget_from_origin(origin: &str) {
     if origin == "internal-child" {
         let child_id = SessionId::new("active-budget-internal-child");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
+            model_catalog_key: None,
             command_id: "active-budget-child-create".into(),
             request_digest: "active-budget-child-create-digest".into(),
             request_json: "{}".into(),
@@ -315,6 +319,7 @@ async fn assert_active_budget_from_origin(origin: &str) {
     hub.activate_lockdown_turn(&session_id, &run_id)
         .expect("activate");
     hub.select_session_model(haider_store::SessionSelectModelCommand {
+        model_catalog_key: None,
         command_id: "active-budget-queued-select".into(),
         request_digest: "active-budget-select-digest".into(),
         request_json: "{}".into(),
@@ -368,6 +373,8 @@ async fn assert_active_budget_from_origin(origin: &str) {
     })).expect("profile")
     };
     let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
         alias: haider_protocol::ids::CredentialAlias::new("budget-account"),
         provider: "mock-b".into(),
         base_url: None,
@@ -571,6 +578,8 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
         .expect("hub");
     let session_id = SessionId::new("slow-inventory-session");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
+        model_catalog_key: None,
         command_id: "slow-create".into(),
         request_digest: "slow-create-digest".into(),
         request_json: "{}".into(),
@@ -601,8 +610,18 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
             ]
         })).expect("profile")
     };
+    let mut source_profile = profile(
+        "mock-a",
+        serde_json::json!({"state":"stale","fetched_at_ms":0,"reason":"test"}),
+    );
     let mut target_profile = profile("mock-b", serde_json::json!({"state":"static"}));
     if operation == "model" {
+        // C1 serves eligible cached stale rows without waiting for discovery.
+        // A real inventory miss is required to exercise the network fence.
+        source_profile.models.retain(|model| model == "small");
+        source_profile
+            .model_details
+            .retain(|model| model.name == "small");
         target_profile.models.retain(|model| model == "small");
         target_profile
             .model_details
@@ -615,13 +634,7 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
         management: crate::accounts::ManagementSnapshot::new(
             1,
             Vec::new(),
-            vec![
-                profile(
-                    "mock-a",
-                    serde_json::json!({"state":"stale","fetched_at_ms":0,"reason":"test"}),
-                ),
-                target_profile,
-            ],
+            vec![source_profile, target_profile],
         ),
         vault_supported: false,
         discovery_disabled: true,
@@ -720,6 +733,7 @@ async fn assert_slow_inventory_fetch_is_unfenced(operation: &str) {
             }
         } else {
             RequestBody::SessionSelectModel {
+                expected_catalog_key: None,
                 command_id: haider_rpc::CommandId::new("slow-select-command"),
                 session_id: select_session,
                 worker_generation: generation,
@@ -878,12 +892,14 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
         let run_id = RunId::new(format!("held-run-{index}"));
         let device_id = DeviceId::new("rebind-policy-test");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "create".into(),
             request_digest: "create-digest".into(),
             request_json: "{}".into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "executing-provider".into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -927,6 +943,7 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
             session_id: session_id.clone(),
             worker_generation: store.worker_generation(),
             provider: "pending-provider".into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             expected_pair: None,
             automatic_run: None,
@@ -972,6 +989,8 @@ async fn provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selec
         );
         drop(selection);
         let descriptor = haider_protocol::credential::CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: haider_protocol::ids::CredentialAlias::new("pending-account"),
             provider: "pending-provider".into(),
             base_url: None,
@@ -1205,6 +1224,8 @@ async fn pair_and_budget_writers_serialize_all_seven_snapshot_variants() {
             .expect("hub");
         let session_id = SessionId::new(format!("budget-race-{label}"));
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
+            model_catalog_key: None,
             command_id: format!("create-{label}"),
             request_digest: format!("digest-{label}"),
             request_json: "{}".into(),
@@ -1308,6 +1329,7 @@ async fn pair_and_budget_writers_serialize_all_seven_snapshot_variants() {
                 .request(
                     RequestId::new("select"),
                     RequestBody::SessionSelectModel {
+                        expected_catalog_key: None,
                         command_id: haider_rpc::CommandId::new("select-command"),
                         session_id: selected_session,
                         worker_generation: generation,

@@ -452,12 +452,14 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-peer-route".into(),
         request_digest: "create-peer-route-digest".into(),
         request_json: r#"{"title":"peer-route"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 1_024,
         max_tokens_source: None,
@@ -608,12 +610,14 @@ pub(crate) async fn live_peer_fixture(
     let hub =
         crate::session_hub::SessionHub::new(store.clone(), Default::default()).expect("peer hub");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{id}"),
         request_digest: format!("digest-{id}"),
         request_json: "{}".into(),
         session_id: SessionId::new(id),
         cwd: root.to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 1024,
         max_tokens_source: None,

@@ -733,3 +733,55 @@ fn the_openai_models_request_carries_client_version() {
         "the Anthropic request adds no query: {anthropic}"
     );
 }
+
+/// Exercise the HTTP discovery boundary, including the retained validator.
+/// Empty array success must survive the same transport as ordinary catalogs.
+#[tokio::test]
+async fn successful_http_empty_catalog_is_fetch_evidence() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    for anthropic in [false, true] {
+        for usable_document in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fake listener");
+            let origin = format!("http://{}/v1", listener.local_addr().expect("fake address"));
+            let body = if usable_document {
+                r#"{"data":[]}"#
+            } else {
+                r#"{"data":[{}]}"#
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("fake request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.expect("request headers");
+                    assert!(count != 0 && request.len() < 8192);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: empty-catalog\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(reply.as_bytes())
+                    .await
+                    .expect("catalog reply");
+            });
+            let source = if anthropic {
+                CatalogSource::AnthropicCompatible { origin }
+            } else {
+                CatalogSource::OpenAiCompatible { origin }
+            };
+            let result = haider_provider::discover_models(source, None, None).await;
+            server.await.expect("fake server stops");
+            if usable_document {
+                let catalog = result.expect("HTTP empty success");
+                assert!(catalog.models.is_empty());
+                assert_eq!(catalog.etag.as_deref(), Some("empty-catalog"));
+            } else {
+                assert!(matches!(result, Err(CatalogError::Empty)));
+            }
+        }
+    }
+}

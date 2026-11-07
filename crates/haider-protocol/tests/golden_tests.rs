@@ -401,6 +401,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(encoded["effort"], "max");
     assert_eq!(encoded["fast"], true);
     let versioned = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: Some(42),
         route_reset_epoch: Some(0),
         budget_clamp_notice_epoch: None,
@@ -1648,6 +1649,8 @@ fn golden_credentials() {
     golden(
         "credential_descriptor_oauth",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("personal-max"),
             provider: "anthropic".into(),
             base_url: None,
@@ -1663,6 +1666,8 @@ fn golden_credentials() {
     golden(
         "credential_descriptor_keychain_locked",
         &CredentialDescriptor {
+            incarnation: 0,
+            credential_digest: None,
             alias: CredentialAlias::new("claude-code"),
             provider: "anthropic-oauth".into(),
             base_url: None,

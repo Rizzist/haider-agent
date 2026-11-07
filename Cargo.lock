@@ -1769,6 +1769,7 @@ version = "0.0.972"
 dependencies = [
  "async-trait",
  "base64",
+ "haider-accounts",
  "haider-client",
  "haider-platform",
  "haider-protocol",
@@ -2082,6 +2083,7 @@ dependencies = [
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
+ "haider-store",
  "haider-stt",
  "haider-tools",
  "image",

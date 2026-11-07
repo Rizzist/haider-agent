@@ -101,6 +101,8 @@ pub(super) fn at(
                 route.select_legacy(metadata.provider != selected.provider, &selected);
                 metadata.provider = selected.provider;
                 metadata.model = selected.model;
+                metadata.resolved_model = None;
+                metadata.model_catalog_key = selected.model_catalog_key;
                 if let Some(receipt) = selections.get(&event.seq) {
                     if let Some(budget) = receipt.output_budget {
                         metadata.max_tokens = budget.max_tokens;
@@ -122,6 +124,8 @@ pub(super) fn at(
         }
     }
     Ok(Some(SessionOutputPairSnapshot {
+        resolved_model: metadata.resolved_model,
+        model_catalog_key: metadata.model_catalog_key,
         route,
         provider: metadata.provider,
         model: metadata.model,

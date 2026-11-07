@@ -143,12 +143,12 @@ impl HubConnection {
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
-            view.providers.clone(),
+            Some(view.providers.clone()),
         );
         let validated = match authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
-            &current.model,
+            current.model_coordinate(),
         ) {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),

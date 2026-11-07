@@ -222,6 +222,7 @@ impl DaemonMobileChatBridge {
                         command_id: CommandId::new(self.next_coordinate("model")),
                         session_id: session.session_id,
                         worker_generation: session.worker_generation,
+                        expected_catalog_key: None,
                         model,
                         provider: Some(provider),
                         confirm_new_epoch,
@@ -276,6 +277,7 @@ fn mobile_session_create_request(
         command_id: CommandId::new(command_id),
         cwd,
         provider,
+        expected_catalog_key: None,
         model,
         max_tokens: 0,
         permission_overrides: Some(SessionPermissionOverridesV1 {
