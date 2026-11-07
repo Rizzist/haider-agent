@@ -4163,11 +4163,6 @@ async fn finish_provider_models_refresh(
         providers,
         completed,
     } = context;
-    let reply_account = if explicit_account {
-        account_alias
-    } else {
-        None
-    };
     let descriptor = account_alias.map_or_else(
         || accounts.active_for_provider(&provider),
         |alias| accounts.get(alias),
@@ -4345,7 +4340,7 @@ async fn finish_provider_models_refresh(
             let Some(summary) = catalog_summary_for_account(
                 profile_id,
                 &provider,
-                reply_account,
+                account_alias,
                 accounts,
                 providers,
             ) else {
@@ -4448,7 +4443,7 @@ async fn finish_provider_models_refresh(
             let Some(summary) = catalog_summary_for_account(
                 profile_id,
                 &provider,
-                reply_account,
+                account_alias,
                 accounts,
                 providers,
             ) else {
@@ -4477,7 +4472,7 @@ async fn finish_provider_models_refresh(
             if let Some(summary) = catalog_summary_for_account(
                 profile_id,
                 &provider,
-                reply_account,
+                account_alias,
                 accounts,
                 providers,
             ) && matches!(summary.availability, ProviderAvailabilityWire::Available)
@@ -4506,7 +4501,7 @@ async fn finish_provider_models_refresh(
                 && let Some(summary) = catalog_summary_for_account(
                     profile_id,
                     &provider,
-                    reply_account,
+                    account_alias,
                     accounts,
                     providers,
                 )
@@ -4946,7 +4941,7 @@ fn catalog_summary(
     Some(with_catalog_scope(summary, accounts, providers))
 }
 
-/// A refresh reply describes its requested account even when a different
+/// A refresh reply describes its producing account even when a different
 /// account's positive inventory remains in the shared live slot.
 fn catalog_summary_for_account(
     profile_id: &str,

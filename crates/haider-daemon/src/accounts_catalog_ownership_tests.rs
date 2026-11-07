@@ -3079,3 +3079,45 @@ async fn catalog_owner_configured_refusal_cannot_authorize_foreign_account() {
 async fn catalog_control_own_configured_refusal_remains_selectable() {
     runtime_configured_scope(false).await;
 }
+
+#[tokio::test]
+async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
+    let model = haider_provider::subscription_static_model_ids(PROVIDER)
+        .iter()
+        .copied()
+        .find(|model| *model != INITIAL_MODEL)
+        .expect("another maintained model");
+    let mut f = Fixture::new(
+        vec![Err(CatalogError::Unsupported {
+            reason: "synthetic unsupported listing".into(),
+        })],
+        Some("a"),
+        false,
+    )
+    .await;
+    let refresh = f.begin_refresh_for("a").await;
+    f.discoverer.release.notify_one();
+    let _refresh = refresh.await.expect("A listing refusal completion");
+    let mut request = f.selection(false, Some(4096));
+    if let RequestBody::SessionSelectModel {
+        model: selected, ..
+    } = &mut request
+    {
+        *selected = model.into();
+    }
+    let response = f.admit(request).await;
+    assert!(
+        matches!(response, ResponseBody::SessionSelectModel { .. }),
+        "A's maintained model remains selectable after its listing refusal: {response:?}"
+    );
+    let metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("saved selection read")
+        .expect("saved selection");
+    assert_eq!(metadata.account_alias.as_deref(), Some("a"));
+    assert_eq!(metadata.model, model);
+    assert_eq!(f.discoverer.calls.load(Ordering::SeqCst), 1);
+    f.close().await;
+}

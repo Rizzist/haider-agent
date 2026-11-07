@@ -2166,7 +2166,12 @@ fn provider_summary(
             }
         })
     };
-    let inventory_authority = if matches!(inventory, haider_rpc::ModelInventoryWire::Configured) {
+    // A listing refusal cannot turn maintained-only rows into an advisory
+    // passthrough catalog. Explicit deployments and adapters without maintained
+    // rows retain their configured-unverified policy.
+    let configured_passthrough = matches!(inventory, haider_rpc::ModelInventoryWire::Configured)
+        && (!static_subscription || !profile.configured_models.is_empty());
+    let inventory_authority = if configured_passthrough {
         haider_rpc::ModelInventoryAuthorityWire::Advisory
     } else {
         match profile.provenance {

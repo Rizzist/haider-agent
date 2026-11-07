@@ -10799,6 +10799,14 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         } => {
             assert_eq!(request_id.as_str(), "refresh-models");
             assert_eq!(revision, 2);
+            assert_eq!(
+                provider
+                    .catalog_scope
+                    .as_ref()
+                    .and_then(|scope| scope.account_alias.as_deref()),
+                Some(fallback_alias.as_str()),
+                "fallback refresh reply keeps its producing account"
+            );
             assert!(provider.models.contains(&"frontier-refresh".to_owned()));
             assert!(provider.models.contains(&"gpt-6-astra".to_owned()));
             assert_eq!(provider.default_model.as_deref(), Some("gpt-6-astra"));
