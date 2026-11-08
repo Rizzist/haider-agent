@@ -3538,3 +3538,47 @@ fn window_only_catalog_rows_project_an_unpublished_output_maximum() {
         assert!(selection.explicit_max_output_tokens >= 60_000);
     }
 }
+
+#[test]
+fn another_owners_rejection_preserves_unsupported_discovery_evidence() {
+    let dir = tempfile::tempdir().expect("synthetic profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile]).expect("synthetic provider profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_rejection("work", "owner-A", "synthetic A rejection".into())
+        .expect("A rejection");
+    registry
+        .record_catalog_unsupported("work", "owner-B", "synthetic B listing unsupported".into())
+        .expect("B listing result");
+    let restarted = ProviderRegistry::new(store, vec![], model_source([])).expect("restart");
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-B")
+            .expect("B evidence"),
+        "A's rejection cannot discard B's independently produced unsupported-listing evidence"
+    );
+    assert!(
+        restarted
+            .summary("work", &|_| true)
+            .expect("B summary")
+            .model_is_selectable("deployment"),
+        "B's own configured deployment remains selectable after its listing refusal"
+    );
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("A evidence")
+    );
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("A summary")
+            .model_is_selectable("deployment"),
+        "recording B's uncertainty must preserve A's rejection"
+    );
+}

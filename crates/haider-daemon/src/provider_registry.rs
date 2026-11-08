@@ -827,12 +827,8 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         scope: &str,
         reason: String,
     ) -> Result<(), HaiderError> {
-        if matches!(
-            self.model_source.inventory(provider),
-            ProviderInventory::Rejected { .. }
-        ) {
-            return Ok(());
-        }
+        // The live slot can describe another account's rejection. Persist this
+        // producer's scoped evidence; same-owner rejection remains stronger.
         self.models_unsupported(provider, reason.clone());
         self.persist_catalog_evidence(provider, scope, reason, true)
     }
