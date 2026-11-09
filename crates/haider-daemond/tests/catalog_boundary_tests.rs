@@ -207,6 +207,32 @@ async fn import_case(provider: &str, source: &str, path_var: &str, malformed_id_
         b.incarnation > a.incarnation,
         "a different import must mint an account incarnation"
     );
+    if source != "codex" {
+        assert_ne!(
+            a.alias, b.alias,
+            "different unverified imports stay separate"
+        );
+        assert!(
+            !b.active,
+            "adding inactive B preserves A's active selection"
+        );
+    }
+    // Importing another account does not select it. Commit the actual switch
+    // while A's catalog is paused before asserting anything about B's view.
+    let selected = req(
+        &mut c,
+        "select-b",
+        RequestBody::AccountSetActive {
+            command_id: CommandId::new("select-b"),
+            alias: b.alias.as_str().into(),
+            confirm_new_epoch: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(selected, ResponseBody::AccountSetActive { .. }),
+        "select B: {selected:?}"
+    );
     let listed = req(
         &mut c,
         "list-b",
@@ -615,13 +641,14 @@ async fn api_stage(c: &mut UdsClient, id: &str, secret: &str) -> String {
     };
     vault_reference
 }
-async fn api_configure(
+async fn api_configure_response(
     c: &mut UdsClient,
     id: &str,
     provider: &str,
-    model: &str,
+    models: Vec<String>,
+    default_model: Option<String>,
     stage: Option<String>,
-) {
+) -> ResponseBody {
     let r = req(
         c,
         &format!("revision-{id}"),
@@ -646,8 +673,8 @@ async fn api_configure(
                 .then(|| "http://127.0.0.1:18080/v1".into()),
             auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
             enabled: true,
-            models: vec![model.into()],
-            default_model: Some(model.into()),
+            models,
+            default_model,
             response_open_timeout_ms: None,
             chunk_idle_timeout_ms: None,
             semantic_progress_timeout_ms: None,
@@ -655,6 +682,24 @@ async fn api_configure(
             trust: None,
             expected_revision: revision,
         },
+    )
+    .await;
+    r
+}
+async fn api_configure(
+    c: &mut UdsClient,
+    id: &str,
+    provider: &str,
+    model: &str,
+    stage: Option<String>,
+) {
+    let r = api_configure_response(
+        c,
+        id,
+        provider,
+        vec![model.into()],
+        Some(model.into()),
+        stage,
     )
     .await;
     assert!(
@@ -1214,4 +1259,121 @@ async fn identityless_codex_import_must_not_reuse_prior_account_catalog() {
 #[tokio::test]
 async fn malformed_identity_codex_import_must_not_reuse_prior_account_catalog() {
     import_case("openai-oauth", "codex", "HAIDER_CODEX_AUTH_PATH", true).await;
+}
+
+#[tokio::test]
+async fn staged_probe_cannot_authorize_an_unstated_or_unserved_default() {
+    let provider = "astra-api-boundary";
+    let root = test_root("staged-choice-boundary-");
+    let config = DaemonConfig::new("staged-choice", root.path().join("store"), root.path());
+    let task = ready_with_dependencies(
+        &config,
+        DaemonDependencies {
+            accounts: AccountsDependencies {
+                model_discoverer: Some(Arc::new(SyntheticApiBoundary)),
+                validator: Arc::new(SyntheticApiBoundary),
+                provider_endpoint_validator: Arc::new(SyntheticApiBoundary),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut c = UdsClient::connect_control(
+        &config.endpoint_path(),
+        DEFAULT_FRAME_LIMIT,
+        "catalog-boundary",
+        "staged-choice",
+        ClientKind::Cli,
+    )
+    .await;
+    api_configure(
+        &mut c,
+        "choice-configure-A",
+        provider,
+        "astra-api-A-only",
+        None,
+    )
+    .await;
+    let secret = api_stage(&mut c, "choice-stage-A", "synthetic-api-A").await;
+    let logged_in = req(
+        &mut c,
+        "choice-login-A",
+        RequestBody::AccountLoginApi {
+            command_id: CommandId::new("choice-login-A"),
+            provider: provider.into(),
+            alias: Some("choice-account-A".into()),
+            vault_reference: secret,
+            validation_model: Some("astra-api-A-only".into()),
+            replace_existing: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(logged_in, ResponseBody::AccountLoginApi { .. }),
+        "{logged_in:?}"
+    );
+    let fetched = req(
+        &mut c,
+        "choice-fetch-A",
+        RequestBody::ProviderModelsRefresh {
+            provider: provider.into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh {
+        provider: before,
+        revision,
+    } = fetched
+    else {
+        panic!("{fetched:?}")
+    };
+    for (index, stated, default) in [
+        (0, " astra-api-B-only ", "astra-api-B-private-extra"),
+        (1, " never-served ", "never-served"),
+    ] {
+        let id = format!("invalid-staged-choice-{index}");
+        let stage = api_stage(&mut c, &format!("{id}-secret"), "synthetic-api-B").await;
+        let rejected = api_configure_response(
+            &mut c,
+            &id,
+            provider,
+            vec![stated.into()],
+            Some(default.into()),
+            Some(stage),
+        )
+        .await;
+        assert!(
+            matches!(rejected, ResponseBody::Error { ref code, .. } if code == "invalid_argument"),
+            "{rejected:?}"
+        );
+        let listed = req(
+            &mut c,
+            &format!("{id}-readback"),
+            RequestBody::ProviderList {
+                provider: Some(provider.into()),
+            },
+        )
+        .await;
+        let ResponseBody::ProviderList {
+            providers,
+            revision: after_revision,
+            ..
+        } = listed
+        else {
+            panic!("{listed:?}")
+        };
+        assert_eq!(
+            after_revision, revision,
+            "refused choice must not mutate configuration"
+        );
+        assert_eq!(
+            providers[0], before,
+            "refused staged choice must preserve A's owned catalog"
+        );
+    }
+    drop(c);
+    task.shutdown_handle()
+        .request("staged choice controls complete");
+    task.join().await.expect("daemon stops");
 }

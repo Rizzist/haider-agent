@@ -1163,6 +1163,19 @@ impl ManagementView {
                 *summary =
                     crate::provider_registry::summary_without_discovery(profile, credential_ready);
                 summary.catalog_scope = catalog_scope_for_descriptor(profile, descriptor);
+                // An explicit unlisted wire ID does not borrow a fetched row.
+                // Keep that advisory route usable for a credential-ready owner;
+                // configured deployments still need their own catalog eligibility.
+                if summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory
+                    && summary.configured_models.is_empty()
+                    && summary.enabled
+                    && summary.api_family != ProviderApiFamilyWire::Unknown
+                    && summary.endpoint.is_some()
+                    && credential_ready
+                {
+                    summary.availability = ProviderAvailabilityWire::Available;
+                    summary.availability_reason = None;
+                }
             } else {
                 // Injected snapshots may omit registry configuration. They
                 // can retain only independently maintained facts, never any
@@ -7432,7 +7445,12 @@ async fn handle_provider_configure(
                 // incarnation, so its private rows cannot become the active
                 // account's fetched inventory or durable catalog. Normal validation
                 // retains only scoped facts and existing explicit deployments.
-                discovered_slugs = None;
+                discovered_slugs = (!job.input.models.is_empty()).then(|| {
+                    slugs
+                        .into_iter()
+                        .filter(|slug| job.input.models.iter().any(|model| model.trim() == slug))
+                        .collect()
+                });
             } else {
                 catalog_producer = auth_requirement.and_then(|auth| {
                     configure_catalog_producer(
