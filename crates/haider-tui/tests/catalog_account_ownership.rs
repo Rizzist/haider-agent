@@ -246,3 +246,59 @@ fn catalog_control_tui_configured_limits_are_account_independent() {
     );
     assert!(model.context_meter().auto_compact_at.is_some());
 }
+
+fn injected_adapter_scope_fixture(pin: Option<&str>) -> AppModel {
+    let mut model = fixture(pin, ProviderCatalogKindWire::Adapter);
+    let mut accounts = descriptors();
+    for (index, account) in accounts.iter_mut().enumerate() {
+        account.incarnation = u64::try_from(index + 1).expect("fixture incarnation");
+    }
+    model.accounts.apply_snapshot(
+        accounts.iter().map(AccountRow::from_descriptor).collect(),
+        Some(3),
+    );
+    // LiveDriver records incarnation metadata separately from display rows.
+    model.accounts.catalog_incarnations = accounts
+        .iter()
+        .map(|account| (account.alias.as_str().to_owned(), account.incarnation))
+        .collect();
+    let mut wire = serde_json::to_value(&model.providers.providers[0]).expect("catalog JSON");
+    wire["catalog_scope"] = serde_json::json!({
+        "key": "a".repeat(64),
+        "account_alias": "a",
+        "account_incarnation": 1
+    });
+    model.providers.apply_snapshot(
+        vec![serde_json::from_value(wire).expect("owned adapter catalog")],
+        3,
+    );
+    model
+}
+
+#[test]
+fn catalog_owner_tui_injected_adapter_excludes_foreign_limits() {
+    let mut model = injected_adapter_scope_fixture(Some("b"));
+    model.refresh_context_window();
+    assert_eq!(
+        model.identity.context_window, 0,
+        "an injected adapter's A catalog cannot project B's context window"
+    );
+    assert!(model.context_meter().auto_compact_at.is_none());
+    assert_eq!(model.meter_epoch.output_budget, Some(4096));
+}
+
+#[test]
+fn catalog_control_tui_injected_adapter_preserves_owned_limits() {
+    let mut model = injected_adapter_scope_fixture(Some("a"));
+    model.refresh_context_window();
+    assert_eq!(model.identity.context_window, 8192);
+    assert!(model.context_meter().auto_compact_at.is_some());
+}
+
+#[test]
+fn catalog_control_tui_injected_adapter_without_owner_stays_unscoped() {
+    let mut model = fixture(Some("b"), ProviderCatalogKindWire::Adapter);
+    model.refresh_context_window();
+    assert_eq!(model.identity.context_window, 8192);
+    assert!(model.context_meter().auto_compact_at.is_some());
+}

@@ -3143,3 +3143,114 @@ async fn catalog_control_owned_unsupported_preserves_maintained_selection() {
     }
     f.close().await;
 }
+
+async fn catalog_injected_adapter_admission(owned: bool, creation: bool) {
+    let providers = test_provider_registry()
+        .with_injected_factory(&std::collections::BTreeSet::from([PROVIDER.to_owned()]));
+    let mut f = Fixture::start(
+        vec![Ok(catalog(8192)), Ok(other_catalog())],
+        Some(if owned { "a" } else { "b" }),
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        providers,
+        None,
+    )
+    .await;
+    f.publish_a().await;
+    let view = f
+        .hub
+        .accounts()
+        .expect("accounts")
+        .expect("facade")
+        .management
+        .read()
+        .expect("management");
+    let published = view
+        .providers
+        .iter()
+        .find(|row| row.provider == PROVIDER)
+        .expect("published provider");
+    assert_eq!(
+        published.catalog,
+        haider_rpc::ProviderCatalogKindWire::Adapter
+    );
+    assert_eq!(
+        published
+            .catalog_scope
+            .as_ref()
+            .and_then(|scope| scope.account_alias.as_deref()),
+        Some("a")
+    );
+    // Permit genuine B discovery without making the test's completion depend
+    // on whether the admission path correctly rejects the foreign cache hit.
+    f.discoverer.release.notify_one();
+    let request = if creation {
+        f.creation(true, 1024)
+    } else {
+        f.selection(false, None)
+    };
+    f.connection
+        .request(RequestId::new("injected-admission"), request)
+        .await
+        .expect("admission request");
+    let response = response_for(&mut f.frames, "injected-admission").await;
+    if owned {
+        assert!(
+            !matches!(response, ResponseBody::Error { .. }),
+            "an injected transport must preserve its own account's catalog: {response:?}"
+        );
+    } else {
+        assert!(
+            matches!(response, ResponseBody::Error { ref code, .. } if code == haider_rpc::ERROR_CODE_MODEL_UNKNOWN),
+            "an injected transport cannot discard a private catalog's account scope: {response:?}"
+        );
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_injected_adapter_foreign_pinned_creation() {
+    catalog_injected_adapter_admission(false, true).await;
+}
+
+#[tokio::test]
+async fn catalog_injected_adapter_foreign_pinned_selection() {
+    catalog_injected_adapter_admission(false, false).await;
+}
+
+#[tokio::test]
+async fn catalog_injected_adapter_owned_catalog_control() {
+    catalog_injected_adapter_admission(true, false).await;
+}
+
+#[tokio::test]
+async fn catalog_injected_adapter_creation_uses_b_output_limit() {
+    let providers = test_provider_registry()
+        .with_injected_factory(&std::collections::BTreeSet::from([PROVIDER.to_owned()]));
+    let mut f = Fixture::start(
+        vec![Ok(catalog(2048)), Ok(catalog(8192))],
+        Some("b"),
+        false,
+        PROVIDER,
+        AuthMethod::OAuth,
+        providers,
+        None,
+    )
+    .await;
+    f.publish_a().await;
+    f.discoverer.release.notify_one();
+    f.connection
+        .request(RequestId::new("injected-budget"), f.creation(true, 4096))
+        .await
+        .expect("create request");
+    let response = response_for(&mut f.frames, "injected-budget").await;
+    let ResponseBody::SessionCreate { metadata, .. } = response else {
+        panic!(
+            "an injected transport must use B's output limit, not A's lower limit: {response:?}"
+        );
+    };
+    assert_eq!(metadata.max_tokens, 4096);
+    assert_eq!(metadata.account_alias.as_deref(), Some("b"));
+    f.close().await;
+}
