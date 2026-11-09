@@ -17304,6 +17304,17 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
             },
         ],
     );
+    let summaries = management.read().expect("fixture inventory").providers;
+    management.publish(
+        1,
+        vec![supervised.clone(), gemini.clone()],
+        summaries,
+        HashMap::from([(
+            GEMINI_PROVIDER_NAME.into(),
+            ProviderModelCacheKey::for_account(GEMINI_PROVIDER_NAME, &gemini),
+        )]),
+        HashMap::new(),
+    );
     let factory = AccountsProviderFactory::new_with_management(
         Arc::new(StdMutex::new(vec![supervised.clone(), gemini.clone()])),
         management,

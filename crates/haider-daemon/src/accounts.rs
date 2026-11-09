@@ -1177,7 +1177,9 @@ impl ManagementView {
                 summary.default_model = summary.models.first().cloned();
                 let available = summary.enabled
                     && summary.api_family != ProviderApiFamilyWire::Unknown
-                    && !summary.models.is_empty()
+                    && (!summary.models.is_empty()
+                        || summary.inventory_authority
+                            == haider_rpc::ModelInventoryAuthorityWire::Advisory)
                     && summary.endpoint.is_some()
                     && credential_ready;
                 summary.availability = if available {
@@ -13012,7 +13014,7 @@ impl AccountsProviderFactory {
                 {
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
-                        "the resolved catalog account changed before model admission",
+                        "model inventory belongs to a different account or endpoint; refresh models before using this selection",
                         true,
                     ));
                 }
@@ -13709,18 +13711,28 @@ impl AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
     ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>, bool), HaiderError> {
-        // A public catalog can refuse an obsolete saved model independently
-        // of credentials. Authenticated catalogs wait for the actual account.
-        if self
+        // Enablement is configuration, independent of the serving account.
+        // Reject it before credential resolution, including keyless profiles.
+        let summary = self
             .management
             .as_ref()
             .and_then(ManagementSnapshot::read)
-            .is_some_and(|view| {
-                view.providers.iter().any(|summary| {
-                    summary.provider == metadata.provider
-                        && summary.catalog == haider_rpc::ProviderCatalogKindWire::Public
-                })
-            })
+            .and_then(|view| {
+                view.providers
+                    .into_iter()
+                    .find(|summary| summary.provider == metadata.provider)
+            });
+        if summary.as_ref().is_some_and(|summary| !summary.enabled) {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "provider is disabled",
+                true,
+            ));
+        }
+        // Public model eligibility is also independent of credentials.
+        // Authenticated catalogs wait for the actual serving account.
+        if summary
+            .is_some_and(|summary| summary.catalog == haider_rpc::ProviderCatalogKindWire::Public)
         {
             self.admit_persisted_model_with_owner(metadata, None)?;
         }

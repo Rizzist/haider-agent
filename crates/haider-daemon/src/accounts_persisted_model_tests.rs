@@ -419,7 +419,10 @@ async fn explicit_model_cannot_borrow_retired_inventory_eligibility() {
                 let error = result.err().expect("retired eligibility refused");
                 assert_eq!(error.code, ErrorCode::ProviderError);
                 assert!(error.retryable);
-                assert!(error.message.contains("different account or endpoint"));
+                assert!(
+                    error.message.contains("different account or endpoint"),
+                    "{error:?}"
+                );
                 assert_eq!(
                     provider.requests().len(),
                     1,
@@ -637,7 +640,7 @@ async fn catalog_derived_session_selection_keeps_its_original_incarnation() {
     metadata.model = "manually-entered-unlisted-model".into();
     let manual = factory.resolve_for_turn(&metadata).await;
     exercise_admitted_turn(&manual).await;
-    assert!(manual.is_ok());
+    assert!(manual.is_ok(), "{:?}", manual.as_ref().err());
     assert_eq!(provider.requests().len(), 3);
 }
 
