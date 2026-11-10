@@ -365,8 +365,21 @@ impl ModelSelectionAuthority {
             if summary.provider == provider
                 && !summary.catalog_matches_session_route(base_url, account)
             {
+                // A credential-ready advisory route admits explicit literals
+                // without discovery. Discarding another endpoint's metadata
+                // must not turn that existing permission into a refusal.
+                let advisory_passthrough = summary.enabled
+                    && summary.api_family != ProviderApiFamilyWire::Unknown
+                    && summary.endpoint.is_some()
+                    && summary.availability == ProviderAvailabilityWire::Available
+                    && summary.inventory_authority == ModelInventoryAuthorityWire::Advisory
+                    && summary.configured_models.is_empty();
                 summary.retire_fetched_catalog();
                 summary.catalog_scope = None;
+                if advisory_passthrough {
+                    summary.availability = ProviderAvailabilityWire::Available;
+                    summary.availability_reason = None;
+                }
             }
         }
         self
