@@ -3254,3 +3254,341 @@ async fn catalog_injected_adapter_creation_uses_b_output_limit() {
     assert_eq!(metadata.account_alias.as_deref(), Some("b"));
     f.close().await;
 }
+
+struct RouteEpochEndpoint {
+    origin: String,
+    arrived: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RouteEpochEndpoint {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl RouteEpochEndpoint {
+    async fn start(hold: bool) -> Self {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("route fixture listener");
+        let origin = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("route fixture address")
+        );
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reached = arrived.clone();
+        let resume = release.clone();
+        let task = tokio::spawn(async move {
+            let mut hold = hold;
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("route fixture accept");
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 4096];
+                    let count = socket
+                        .read(&mut chunk)
+                        .await
+                        .expect("route fixture request");
+                    assert!(
+                        count > 0 && bytes.len() < 65536,
+                        "route fixture complete bounded request"
+                    );
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                assert!(
+                    bytes.starts_with(b"GET "),
+                    "route fixture only validates an endpoint"
+                );
+                if hold {
+                    hold = false;
+                    reached.notify_one();
+                    resume.notified().await;
+                }
+                let body = serde_json::json!({"object":"list","data":[{"id":INITIAL_MODEL,"object":"model"}]}).to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(reply.as_bytes())
+                    .await
+                    .expect("route fixture response");
+                socket.shutdown().await.expect("route fixture EOF");
+            }
+        });
+        Self {
+            origin,
+            arrived,
+            release,
+            task,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RouteEpochCase {
+    Endpoint,
+    DefaultChanged,
+    Removed,
+    Owned,
+    InactiveRemoved,
+    Reset,
+}
+
+async fn route_epoch_publish(f: &Fixture, alias: &str) {
+    let receiver = f.begin_refresh_for(alias).await;
+    f.discoverer.release.notify_one();
+    receiver
+        .await
+        .expect("route fixture refresh reply")
+        .expect("route fixture owned catalog");
+}
+
+async fn route_epoch_account_change(f: &Fixture, remove: bool) {
+    let (sink, mut frames) = channel_sink();
+    let route = LoginRoute {
+        request_id: RequestId::new("route-account-change"),
+        sink,
+    };
+    let command = if remove {
+        AccountCommand::Remove(Box::new(RemoveAccountJob {
+            command_id: "route-remove-a".into(),
+            alias: "a".into(),
+            expected_revision: None,
+            route,
+        }))
+    } else {
+        AccountCommand::SetActive(Box::new(SetActiveJob {
+            command_id: "route-select-a".into(),
+            alias: "a".into(),
+            route,
+        }))
+    };
+    f.actor
+        .commands()
+        .send(command)
+        .await
+        .expect("route fixture account mutation");
+    let reply = response_for(&mut frames, "route-account-change").await;
+    assert!(
+        if remove {
+            matches!(reply, ResponseBody::AccountRemove { .. })
+        } else {
+            matches!(reply, ResponseBody::AccountSetActive { .. })
+        },
+        "route fixture mutation: {reply:?}"
+    );
+}
+
+fn route_epoch_request(
+    f: &Fixture,
+    id: &str,
+    endpoint: Option<&str>,
+    default: bool,
+) -> RequestBody {
+    RequestBody::SessionProviderRebind {
+        command_id: CommandId::new(id),
+        session_id: f.session.clone(),
+        worker_generation: f.store.worker_generation(),
+        provider: CUSTOM.into(),
+        base_url: endpoint.map(str::to_owned),
+        account: (!default).then(|| "a".into()),
+    }
+}
+
+async fn route_epoch_case(case: RouteEpochCase) {
+    let paused = matches!(
+        case,
+        RouteEpochCase::DefaultChanged | RouteEpochCase::Removed | RouteEpochCase::InactiveRemoved
+    );
+    let registry = RouteEpochEndpoint::start(paused).await;
+    let other = RouteEpochEndpoint::start(false).await;
+    let template = Fixture::custom_registry(false);
+    let mut profile = template.get(CUSTOM).expect("route fixture profile").clone();
+    profile.base_url = Some(registry.origin.clone());
+    profile.configured_models.clear();
+    profile.default_model = None;
+    let providers = ProviderRegistry::new(
+        Box::new(TestProviderStore(StdMutex::new(vec![profile])))
+            as Box<dyn ProviderRegistryStoreLike>,
+        Vec::new(),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("route fixture registry");
+    let row = |maximum| {
+        let mut value = catalog(maximum);
+        value.models[0].slug = INITIAL_MODEL.into();
+        value.models[0].display_name = INITIAL_MODEL.into();
+        value
+    };
+    let default = matches!(
+        case,
+        RouteEpochCase::DefaultChanged | RouteEpochCase::InactiveRemoved
+    );
+    let mut results = vec![Ok(row(2048))];
+    if matches!(case, RouteEpochCase::DefaultChanged | RouteEpochCase::Owned) {
+        results.push(Ok(row(8192)));
+    }
+    let mut f = Fixture::start(
+        results,
+        None,
+        false,
+        CUSTOM,
+        AuthMethod::ApiKey,
+        providers,
+        None,
+    )
+    .await;
+    route_epoch_publish(&f, if default { "b" } else { "a" }).await;
+    let before = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("route fixture read")
+        .expect("route fixture metadata");
+    let target = if matches!(case, RouteEpochCase::Endpoint | RouteEpochCase::Reset) {
+        &other.origin
+    } else {
+        &registry.origin
+    };
+    let request = route_epoch_request(&f, "route-first", Some(target), default);
+    if paused {
+        let rebinding = f.connection.request(RequestId::new("route-first"), request);
+        let changing = async {
+            tokio::time::timeout(
+                haider_platform::TEST_WAIT_TIMEOUT,
+                registry.arrived.notified(),
+            )
+            .await
+            .expect("route fixture GET reached");
+            route_epoch_account_change(&f, !matches!(case, RouteEpochCase::DefaultChanged)).await;
+            if matches!(case, RouteEpochCase::DefaultChanged) {
+                route_epoch_publish(&f, "a").await;
+            }
+            registry.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(rebinding, changing);
+        result.expect("route fixture RPC");
+    } else {
+        f.connection
+            .request(RequestId::new("route-first"), request)
+            .await
+            .expect("route fixture RPC");
+    }
+    let response = response_for(&mut f.frames, "route-first").await;
+    let mut metadata = f
+        .hub
+        .session_metadata(&f.session)
+        .await
+        .expect("route readback")
+        .expect("route metadata");
+    if matches!(case, RouteEpochCase::Removed) {
+        assert!(
+            matches!(response, ResponseBody::Error { ref code, .. } if code == "account_unknown"),
+            "a target removed during route validation must be refused: {response:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&metadata).expect("metadata JSON"),
+            serde_json::to_value(&before).expect("prior metadata JSON"),
+            "refused rebind must mutate no session field"
+        );
+    } else {
+        assert!(
+            matches!(response, ResponseBody::SessionProviderRebind { .. }),
+            "valid route rebind: {response:?}"
+        );
+        if matches!(case, RouteEpochCase::Reset) {
+            f.connection
+                .request(
+                    RequestId::new("route-reset"),
+                    route_epoch_request(&f, "route-reset", None, false),
+                )
+                .await
+                .expect("reset route RPC");
+            let reset = response_for(&mut f.frames, "route-reset").await;
+            assert!(
+                matches!(reset, ResponseBody::SessionProviderRebind { .. }),
+                "reset registry route: {reset:?}"
+            );
+            metadata = f
+                .hub
+                .session_metadata(&f.session)
+                .await
+                .expect("reset readback")
+                .expect("reset metadata");
+            assert_eq!(
+                metadata.provider_base_url, None,
+                "None restores the registry endpoint"
+            );
+        }
+        let expected = if matches!(
+            case,
+            RouteEpochCase::Endpoint | RouteEpochCase::DefaultChanged
+        ) {
+            4096
+        } else {
+            2048
+        };
+        assert_eq!(
+            metadata.max_tokens, expected,
+            "a rebind budget must belong to the requested endpoint and current default account"
+        );
+        if matches!(case, RouteEpochCase::Owned) {
+            route_epoch_publish(&f, "a").await;
+            f.connection
+                .request(
+                    RequestId::new("route-replay"),
+                    route_epoch_request(&f, "route-first", Some(target), false),
+                )
+                .await
+                .expect("replay route RPC");
+            let replay = response_for(&mut f.frames, "route-replay").await;
+            assert!(
+                matches!(replay, ResponseBody::SessionProviderRebind { .. }),
+                "receipt replays before current inventory: {replay:?}"
+            );
+            let replayed = f
+                .hub
+                .session_metadata(&f.session)
+                .await
+                .expect("replayed readback")
+                .expect("replayed metadata");
+            assert_eq!(
+                serde_json::to_value(&replayed).expect("replayed JSON"),
+                serde_json::to_value(&metadata).expect("committed JSON"),
+                "changed catalog must not rewrite a durable rebind replay"
+            );
+        }
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn catalog_route_epoch_new_endpoint_excludes_registry_limits() {
+    route_epoch_case(RouteEpochCase::Endpoint).await;
+}
+#[tokio::test]
+async fn catalog_route_epoch_default_change_during_probe_uses_current_owner() {
+    route_epoch_case(RouteEpochCase::DefaultChanged).await;
+}
+#[tokio::test]
+async fn catalog_route_epoch_removed_target_during_probe_is_refused() {
+    route_epoch_case(RouteEpochCase::Removed).await;
+}
+#[tokio::test]
+async fn catalog_route_epoch_owned_endpoint_keeps_limits_and_receipt() {
+    route_epoch_case(RouteEpochCase::Owned).await;
+}
+#[tokio::test]
+async fn catalog_route_epoch_inactive_removal_keeps_default_limits() {
+    route_epoch_case(RouteEpochCase::InactiveRemoved).await;
+}
+#[tokio::test]
+async fn catalog_route_epoch_reset_recovers_registry_limits() {
+    route_epoch_case(RouteEpochCase::Reset).await;
+}

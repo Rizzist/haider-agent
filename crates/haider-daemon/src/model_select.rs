@@ -341,21 +341,32 @@ impl ModelSelectionAuthority {
 
     /// Session overrides cannot inherit the active route's discovery evidence.
     pub(crate) fn scoped_to_session_route(
-        mut self,
+        self,
         current: &haider_protocol::session::SessionMetadataV1,
         provider: &str,
     ) -> Self {
         if current.provider == provider {
-            for summary in &mut self.summaries {
-                if summary.provider == provider
-                    && !summary.catalog_matches_session_route(
-                        current.provider_base_url.as_deref(),
-                        current.account_alias.as_deref(),
-                    )
-                {
-                    summary.retire_fetched_catalog();
-                    summary.catalog_scope = None;
-                }
+            return self.scoped_to_route(
+                provider,
+                current.provider_base_url.as_deref(),
+                current.account_alias.as_deref(),
+            );
+        }
+        self
+    }
+
+    pub(crate) fn scoped_to_route(
+        mut self,
+        provider: &str,
+        base_url: Option<&str>,
+        account: Option<&str>,
+    ) -> Self {
+        for summary in &mut self.summaries {
+            if summary.provider == provider
+                && !summary.catalog_matches_session_route(base_url, account)
+            {
+                summary.retire_fetched_catalog();
+                summary.catalog_scope = None;
             }
         }
         self

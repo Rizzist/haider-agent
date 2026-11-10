@@ -658,7 +658,7 @@ async fn api_configure_response(
     let ResponseBody::ProviderList { revision, .. } = r else {
         panic!("revision: {r:?}")
     };
-    let r = req(
+    req(
         c,
         id,
         RequestBody::ProviderConfigure {
@@ -683,8 +683,7 @@ async fn api_configure_response(
             expected_revision: revision,
         },
     )
-    .await;
-    r
+    .await
 }
 async fn api_configure(
     c: &mut UdsClient,

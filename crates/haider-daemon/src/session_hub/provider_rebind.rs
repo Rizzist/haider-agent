@@ -6,6 +6,8 @@ mod tests;
 use super::*;
 use crate::provider_registry::{ProductionProviderEndpointValidator, ProviderEndpointValidator};
 
+type RebindView = Result<crate::accounts::ManagementView, (&'static str, &'static str)>;
+
 impl HubConnection {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn session_provider_rebind(
@@ -62,58 +64,10 @@ impl HubConnection {
                 None,
             );
         };
-        let view = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read());
-        let Some(mut view) = view else {
-            return self.respond_error(
-                request_id,
-                "provider_unknown",
-                "provider registry is unavailable",
-                false,
-                None,
-            );
-        };
-        view.scope_catalog_for_account(&provider, account.as_deref());
-        let Some(profile) = view.providers.iter().find(|p| p.provider == provider) else {
-            return self.respond_error(
-                request_id,
-                "provider_unknown",
-                "provider is not registered",
-                false,
-                None,
-            );
-        };
-        if !profile.enabled {
-            return self.respond_error(
-                request_id,
-                haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
-                "provider is disabled",
-                false,
-                None,
-            );
-        }
-        if let Some(alias) = account.as_deref() {
-            let Some(descriptor) = view.descriptors.iter().find(|d| d.alias.as_str() == alias)
-            else {
-                return self.respond_error(
-                    request_id,
-                    "account_unknown",
-                    "account is not registered",
-                    false,
-                    None,
-                );
-            };
-            if descriptor.provider != provider {
-                return self.respond_error(
-                    request_id,
-                    "account_provider_mismatch",
-                    "account does not belong to the requested provider",
-                    false,
-                    None,
-                );
-            }
+        // Reject invalid targets before any endpoint probe, then read the
+        // account projection again after the network wait.
+        if let Err((code, message)) = self.provider_rebind_view(&provider, account.as_deref())? {
+            return self.respond_error(request_id, code, message, false, None);
         }
         // Custom endpoint validation probes its inventory over the network.
         // It depends only on the requested route; validate before fencing the
@@ -142,10 +96,17 @@ impl HubConnection {
                 None,
             );
         };
+        let view = match self.provider_rebind_view(&provider, account.as_deref())? {
+            Ok(view) => view,
+            Err((code, message)) => {
+                return self.respond_error(request_id, code, message, false, None);
+            }
+        };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             Some(view.providers.clone()),
-        );
+        )
+        .scoped_to_route(&provider, base_url.as_deref(), account.as_deref());
         let validated = match authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
@@ -225,6 +186,47 @@ impl HubConnection {
             Err(error) => return Err(error),
         };
         self.respond_provider_rebound(request_id, selected)
+    }
+
+    /// Both preflight and post-probe admission use the same account rules.
+    fn provider_rebind_view(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<RebindView, SessionHubError> {
+        let Some(mut view) = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+        else {
+            return Ok(Err((
+                "provider_unknown",
+                "provider registry is unavailable",
+            )));
+        };
+        view.scope_catalog_for_account(provider, account);
+        let Some(profile) = view.providers.iter().find(|p| p.provider == provider) else {
+            return Ok(Err(("provider_unknown", "provider is not registered")));
+        };
+        if !profile.enabled {
+            return Ok(Err((
+                haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
+                "provider is disabled",
+            )));
+        }
+        if let Some(alias) = account {
+            let Some(descriptor) = view.descriptors.iter().find(|d| d.alias.as_str() == alias)
+            else {
+                return Ok(Err(("account_unknown", "account is not registered")));
+            };
+            if descriptor.provider != provider {
+                return Ok(Err((
+                    "account_provider_mismatch",
+                    "account does not belong to the requested provider",
+                )));
+            }
+        }
+        Ok(Ok(view))
     }
 
     fn respond_provider_rebound(
