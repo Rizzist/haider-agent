@@ -12,10 +12,13 @@ import java.util.UUID
 
 /** Owner-only files. No credentials or ambient paths are accepted by this API. */
 internal object PrivateDaemonFiles {
+    // Linux O_CLOEXEC works on API 26, but OsConstants exposes it publicly only from API 27.
+    private const val O_CLOEXEC = 0x80000
+
     // Os.open owns the handle. Android's streams constructed from a FileDescriptor
     // borrow it, so closing those streams does not close the underlying descriptor.
     private inline fun <T> withDescriptor(file: File, flags: Int, mode: Int = 0, use: (FileDescriptor) -> T): T {
-        val fd = Os.open(file.path, flags or OsConstants.O_CLOEXEC, mode)
+        val fd = Os.open(file.path, flags or O_CLOEXEC, mode)
         return try { use(fd) } finally { Os.close(fd) }
     }
 
