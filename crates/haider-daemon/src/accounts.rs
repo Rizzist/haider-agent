@@ -16713,6 +16713,10 @@ mod persisted_model_tests;
 mod accounts_tests;
 
 #[cfg(test)]
+#[path = "accounts_catalog_ownership_tests.rs"]
+mod catalog_ownership;
+
+#[cfg(test)]
 #[path = "accounts_partial_write_tests.rs"]
 mod partial_write_tests;
 

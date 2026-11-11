@@ -377,7 +377,7 @@ pub(super) fn test_store_dir() -> tempfile::TempDir {
     }
 }
 
-fn empty_source_registry() -> Arc<StdMutex<CredentialSourceRegistry>> {
+pub(super) fn empty_source_registry() -> Arc<StdMutex<CredentialSourceRegistry>> {
     let dir = test_store_dir();
     Arc::new(StdMutex::new(
         CredentialSourceRegistry::load(dir.path())
@@ -385,7 +385,7 @@ fn empty_source_registry() -> Arc<StdMutex<CredentialSourceRegistry>> {
     ))
 }
 
-fn empty_source_snapshot() -> AccountSourcesSnapshot {
+pub(super) fn empty_source_snapshot() -> AccountSourcesSnapshot {
     Arc::new(StdMutex::new(Vec::new()))
 }
 
@@ -833,7 +833,7 @@ async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
 }
 
 #[derive(Default)]
-pub(super) struct TestProviderStore(StdMutex<Vec<ProviderProfileV1>>);
+pub(super) struct TestProviderStore(pub(super) StdMutex<Vec<ProviderProfileV1>>);
 
 impl ProviderRegistryStoreLike for TestProviderStore {
     fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
@@ -9645,14 +9645,14 @@ impl crate::oauth::OAuthIdentityVerifier for UnusedIdentityVerifier {
 
 type ModelDiscoveryObservation = (CatalogSource, Option<String>, Option<String>);
 
-struct BlockingModelDiscoverer {
-    started: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-    seen: StdMutex<Vec<ModelDiscoveryObservation>>,
-    results: StdMutex<std::collections::VecDeque<ModelDiscoveryFixture>>,
+pub(super) struct BlockingModelDiscoverer {
+    pub(super) started: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
+    pub(super) seen: StdMutex<Vec<ModelDiscoveryObservation>>,
+    pub(super) results: StdMutex<std::collections::VecDeque<ModelDiscoveryFixture>>,
 }
 
-enum ModelDiscoveryFixture {
+pub(super) enum ModelDiscoveryFixture {
     Return(Result<DiscoveredCatalog, CatalogError>),
     Panic,
 }
@@ -10047,7 +10047,7 @@ async fn automatic_catalog_flight_coalesces_foreground_and_honors_discovery_disa
     store.close().await.expect("close disabled store");
 }
 
-fn refresh_oauth_catalog() -> OAuthProviderCatalog {
+pub(super) fn refresh_oauth_catalog() -> OAuthProviderCatalog {
     let registration = crate::oauth::OAuthProviderRegistration::new(
         OPENAI_OAUTH_PROVIDER_NAME,
         "http://127.0.0.1:32111",
@@ -10068,7 +10068,9 @@ fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
     refresh_oauth_bundle_with_access(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1")
 }
 
-fn refresh_oauth_bundle_with_access(access_token: &[u8]) -> haider_accounts::OAuthTokenBundleV1 {
+pub(super) fn refresh_oauth_bundle_with_access(
+    access_token: &[u8],
+) -> haider_accounts::OAuthTokenBundleV1 {
     haider_accounts::OAuthTokenBundleV1::new(
         OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         "http://127.0.0.1:32111".to_owned(),
@@ -15500,12 +15502,12 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
 /// Records the [`ProviderTuning`] each construction was given, so the W-B
 /// web-capability degrade is an OBSERVED build input rather than an
 /// inference about a downstream request body.
-struct TuningRecordingBuilder {
+pub(super) struct TuningRecordingBuilder {
     tunings: StdMutex<Vec<(String, ProviderTuning)>>,
 }
 
 impl TuningRecordingBuilder {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             tunings: StdMutex::new(Vec::new()),
         })
@@ -21646,9 +21648,6 @@ async fn run_route_recovery_tests_fallback_honors_explicit_selectors() {
         }
     }
 }
-
-#[path = "accounts_catalog_ownership_tests.rs"]
-mod catalog_ownership;
 
 #[test]
 fn daemon_descriptor_store_reserves_incarnations_on_disk() {

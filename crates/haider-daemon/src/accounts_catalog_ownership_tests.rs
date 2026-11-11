@@ -1,8 +1,17 @@
+#![allow(clippy::expect_used)]
 //! Real account actor publication followed by account-scoped model decisions.
 //! The actor constructs and publishes every shared summary. Discovery results
 //! and queued raw catalog completions are injectable; summaries are not mocked.
+use super::accounts_tests::{
+    BlockingModelDiscoverer, ModelDiscoveryFixture, TestProviderStore, TuningRecordingBuilder,
+    UnreachableGcloud, channel_sink, empty_source_registry, empty_source_snapshot, memory_accounts,
+    open_store, refresh_oauth_bundle_with_access, refresh_oauth_catalog, test_provider_registry,
+    test_store_dir,
+};
 use super::*;
+use crate::provider_registry::ProviderProfileV1;
 use crate::session_hub::{HubConnection, SessionHub, SessionHubConfig};
+use haider_core::SqliteStoreHandle;
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_rpc::{AttachMode, Capability, CommandId, RequestBody};
 
