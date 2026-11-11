@@ -54,8 +54,8 @@ fn workspace_notice_is_visible_and_not_counted_unknown() {
     assert!(model.projection.entries().iter().any(|entry| {
         matches!(
             entry,
-            haider_tui::projection::TranscriptEntry::Note { text, .. }
-                if text.contains("workspace unavailable") && text.contains("/gone")
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("workspace unavailable") && haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/gone")
         )
     }));
 
@@ -67,6 +67,43 @@ fn workspace_notice_is_visible_and_not_counted_unknown() {
         None,
         "a new turn drops the prior turn's availability result before its own probe fact"
     );
+}
+
+#[test]
+fn workspace_event_note_masks_path_without_changing_event_truth() {
+    let mut model = live_model();
+    model
+        .projection
+        .apply_workspace_event(&unavailable("/Users/bob/project"));
+    assert_eq!(
+        model
+            .projection
+            .workspace_unavailable()
+            .map(|notice| notice.path.as_str()),
+        Some("/Users/bob/project")
+    );
+    assert!(model.projection.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/Users/<user>/project") && !haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("/Users/bob")
+        )
+    }));
+    model
+        .projection
+        .apply_workspace_event(&WorkspaceEventPayload::WorkspaceSelected(
+            haider_protocol::workspace::WorkspaceSelected {
+                path: "/Users/bob/next".to_owned(),
+                previous_path: None,
+            },
+        ));
+    assert!(model.projection.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            haider_tui::projection::TranscriptEntry::Workspace { event }
+                if haider_tui::toolview::workspace_event_text(event, &model.tool_path_context()).contains("⇄ workspace → /Users/<user>/next")
+        )
+    }));
 }
 
 #[test]
@@ -130,4 +167,22 @@ fn retry_offers_current_cwd_then_maps_to_workspace_set_wire() {
             "· workspace recovery failed — connected daemon does not advertise session_workspace_set_v1"
         )
     );
+}
+
+#[test]
+fn retry_notice_masks_workspace_but_request_keeps_real_path() {
+    let mut model = live_model();
+    model.cwd = "/Users/bob/project".to_owned();
+    model
+        .projection
+        .apply_workspace_event(&unavailable("/gone"));
+    model.issue_run_retry();
+    assert_eq!(
+        model.flash.as_deref(),
+        Some("· /retry — re-root to /Users/<user>/project")
+    );
+    assert!(matches!(
+        model.requests.last(),
+        Some(AppRequest::WorkspaceSet { path, .. }) if path == "/Users/bob/project"
+    ));
 }

@@ -1247,6 +1247,34 @@ fn tui_origin_registration_round_trips_and_stale_cas_soft_attaches() {
     );
 }
 
+/// The header shows the display projection of a pending leaf, never the raw
+/// path: own home as `~`, another user's home masked as `<user>`, and `/`
+/// separators on every OS (Windows CI temp dirs live under
+/// `C:\Users\RUNNER~1\...`). The projection must still end in the leaf's
+/// `/`-joined date and id, so it identifies the same leaf.
+fn pending_display(leaf: &str) -> String {
+    let display = haider_tui::live::workspace_display_path(leaf);
+    let path = std::path::Path::new(leaf);
+    let date = path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("dated leaf parent");
+    let id = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("dated leaf id");
+    assert!(
+        display.ends_with(&format!("/{date}/{id}")),
+        "display {display:?} must name leaf {leaf:?}"
+    );
+    assert!(
+        !display.contains('\\'),
+        "display {display:?} is not /-normalised"
+    );
+    display
+}
+
 #[test]
 fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     let mut model = live_model();
@@ -1271,7 +1299,7 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     };
     model.cwd = first.leaf.clone();
     model.pending_workspace_allocation = Some(first.clone());
-    model.pending_workspace_display = Some(first.leaf.clone());
+    model.pending_workspace_display = Some(pending_display(&first.leaf));
     let mut driver = LiveDriver::new("allocation-test");
     assert!(!daily_root.exists());
     assert!(!first_leaf.exists());
@@ -1296,8 +1324,8 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_eq!(second.daily_root, first.daily_root);
     assert_eq!(model.cwd, second.leaf);
     assert_eq!(
-        model.pending_workspace_display.as_deref(),
-        Some(second.leaf.as_str())
+        model.pending_workspace_display,
+        Some(pending_display(&second.leaf))
     );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());
@@ -1325,8 +1353,8 @@ fn each_new_session_in_one_tui_process_gets_a_fresh_lazy_leaf() {
     assert_eq!(third.daily_root, first.daily_root);
     assert_eq!(model.cwd, third.leaf);
     assert_eq!(
-        model.pending_workspace_display.as_deref(),
-        Some(third.leaf.as_str())
+        model.pending_workspace_display,
+        Some(pending_display(&third.leaf))
     );
     assert!(!daily_root.exists());
     assert!(!std::path::Path::new(&first.leaf).exists());

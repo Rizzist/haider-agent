@@ -220,6 +220,59 @@ fn markdown_renders_from_a_fixture_journal() {
 }
 
 #[test]
+fn markdown_workspace_labels_use_shared_path_projection() {
+    let account = "foreign-export-account-9e61";
+    for (cwd, expected) in [
+        (format!("/Users/{account}/project"), "/Users/<user>/project"),
+        (
+            format!("/Volumes/Bob's Passport/Users/{account}/project"),
+            "/Volumes/Bob's Passport/Users/<user>/project",
+        ),
+        (
+            format!(r"C:\Users\{account}\project"),
+            "C:/Users/<user>/project",
+        ),
+        (
+            format!(r"\\srv\Users\{account}\project"),
+            "//srv/Users/<user>/project",
+        ),
+        ("/opt/project".into(), "/opt/project"),
+        (
+            "D:/Program Files (x86)/project".into(),
+            "D:/Program Files (x86)/project",
+        ),
+        ("src/my app(v2)".into(), "src/my app(v2)"),
+    ] {
+        let mut meta = fixture_meta();
+        meta.cwd = cwd.clone();
+        let export = SessionExport::project(meta, &fixture_events());
+        for masked in [false, true] {
+            let markdown = export.to_markdown(masked);
+            assert!(
+                markdown.contains(&format!("- workspace: `{expected}`")),
+                "{markdown}"
+            );
+        }
+        // The action path in the structured export remains the original value.
+        let json: Value = serde_json::from_str(&export.to_json(false)).expect("JSON export");
+        assert_eq!(json["cwd"], cwd);
+        assert_eq!(export.meta.cwd, cwd);
+    }
+    let home = haider_client::launch_origin::preferred_process_home().expect("usable test home");
+    let mut meta = fixture_meta();
+    meta.cwd = home
+        .join("export-project/src")
+        .to_string_lossy()
+        .into_owned();
+    let export = SessionExport::project(meta, &fixture_events());
+    let markdown = export.to_markdown(false);
+    assert!(
+        markdown.contains("- workspace: `~/export-project/src`"),
+        "{markdown}"
+    );
+}
+
+#[test]
 fn json_renders_a_stable_public_schema() {
     let rendered = fixture_export().to_json(false);
     let value: Value = serde_json::from_str(&rendered).expect("json");
@@ -792,6 +845,26 @@ fn opencode_requires_confirmation() {
         matches!(err, export::ExportError::OpenCodeUnconfirmed),
         "{err}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn export_summary_escapes_path_but_writes_to_real_filename() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join("report\nname.md");
+    let options = ExportOptions {
+        session_id: "sess-abc".to_owned(),
+        format: Format::Markdown,
+        out: Some(path.clone()),
+        masked: false,
+        confirm: false,
+        no_spawn: true,
+        since: None,
+    };
+    let summary = export::write_export(&fixture_export(), &options).expect("export");
+    assert!(path.is_file(), "real path is used for IO");
+    assert!(!summary.contains('\n'));
+    assert!(summary.contains("\\u{000a}"), "{summary}");
 }
 
 // ---------------------------------------------------------------------------
