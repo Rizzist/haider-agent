@@ -57,6 +57,7 @@ daemon-codex-import-receipt	all	haider-daemon	lib	codex_import_commits_refreshab
 client-authenticated-candidate	linux	haider-client	test:client_tests	authenticated_daemon_candidate_is_not_treated_as_a_race_loser	crates/haider-client/tests/client_tests.rs
 client-racing-launcher	macos	haider-client	test:client_tests	racing_launcher_never_owns_the_other_launchers_winner	crates/haider-client/tests/client_tests.rs
 client-deadline-terminal-race	linux	haider-client	lib	durable_request_deadline_reason_wins_terminal_race_as_timeout	crates/haider-client/src/headless_tests.rs
+client-display-home-isolation	macos	haider-client	lib	concurrent_projections_keep_home_candidates_isolated	crates/haider-client/src/launch_origin_tests.rs
 client-lost-spawn-race	linux	haider-client	lib	genuine_lost_race_keeps_the_loser_reap_wait	crates/haider-client/src/spawn.rs
 tools-concurrent-patches	macos	haider-tools	test:filesystem_tools_tests	concurrent_patches_cannot_both_apply_the_same_stale_preimage	crates/haider-tools/tests/filesystem_tools_tests.rs
 tools-finalizer-race	macos	haider-tools	test:filesystem_tools_tests	finalizer_and_unknown_race_forces_the_loser_before_the_winner_append	crates/haider-tools/tests/filesystem_tools_tests.rs

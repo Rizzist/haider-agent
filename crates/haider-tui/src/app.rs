@@ -2285,6 +2285,14 @@ impl ChipModel {
                 format!("peer {sender}: {text}")
             }
             crate::projection::TranscriptEntry::Note { text, .. } => text.clone(),
+            crate::projection::TranscriptEntry::Workspace { event } => match event {
+                haider_protocol::workspace::WorkspaceEventPayload::WorkspaceUnavailable(_) => {
+                    "workspace unavailable".to_owned()
+                }
+                haider_protocol::workspace::WorkspaceEventPayload::WorkspaceSelected(_) => {
+                    "workspace selected".to_owned()
+                }
+            },
             crate::projection::TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -2520,18 +2528,30 @@ fn monitor_interval(interval_ms: u64) -> String {
 
 /// What one monitor WATCHES, in one line: `timer 60s`,
 /// `poll gh run 123 · until conclusion`, `cli codex exec …`, `file src/x.rs`.
-/// The daemon's own `source_summary` wins when it sent one — this is the
-/// client's honest fallback for the typed source it already holds.
+/// The typed file path is projected before display. For other sources the
+/// daemon's summary wins when present.
 #[must_use]
 pub fn monitor_source_summary(monitor: &haider_rpc::MonitorRegistrationWire) -> String {
+    monitor_source_summary_with_context(monitor, &crate::toolview::PathContext::process_homes())
+}
+
+/// Session-owned monitor rows share the home snapshot of the other rows.
+#[must_use]
+pub fn monitor_source_summary_with_context(
+    monitor: &haider_rpc::MonitorRegistrationWire,
+    paths: &crate::toolview::PathContext,
+) -> String {
+    use haider_rpc::MonitorSourceWire as S;
+    if let S::File { path } = &monitor.source {
+        return format!("file {}", monitor_excerpt(&paths.shorten(path)));
+    }
     if !monitor.source_summary.trim().is_empty() {
         return monitor_excerpt(&monitor.source_summary);
     }
-    use haider_rpc::MonitorSourceWire as S;
     match &monitor.source {
         S::Sms => "sms".to_owned(),
         S::Process { command, .. } => format!("process {}", monitor_excerpt(command)),
-        S::File { path } => format!("file {}", monitor_excerpt(path)),
+        S::File { path } => format!("file {}", monitor_excerpt(&paths.shorten(path))),
         S::Poll {
             command,
             interval_ms,
@@ -3646,12 +3666,15 @@ impl SshProfileForm {
     }
 
     pub(crate) fn credential_display(&self) -> String {
+        // SSH form paths belong to the configured host/user and must remain
+        // exact while the owner edits them; local HOME cannot classify them.
         match self.auth {
             SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial => {
                 "•".repeat(self.secret.chars().count())
             }
             SshFormAuthKind::Agent | SshFormAuthKind::Keep => "—".into(),
-            SshFormAuthKind::KeyFile => self.credential.clone(),
+            SshFormAuthKind::KeyFile if !self.credential.is_empty() => self.credential.clone(),
+            SshFormAuthKind::KeyFile => String::new(),
         }
     }
 
@@ -5808,10 +5831,10 @@ pub struct AppModel {
     /// (it materialises on the first write). Set by the live driver's
     /// presence probe; the session header and origin line speak it.
     pub session_workspace_uncreated: bool,
-    /// The user's home directory, ABSOLUTE, when the host process knows it
-    /// (the executable seeds it from `HOME`). Tool rows shorten paths under
-    /// it to `~/…`; `None` (every test fixture) shortens nothing.
-    pub home_dir: Option<String>,
+    /// Valid local display homes collected by the executable from the process
+    /// environment. Tool rows use them to render own-home paths as `~/…`.
+    /// An empty list leaves home matching disabled while account masks apply.
+    pub display_homes: Vec<std::path::PathBuf>,
     /// The full-detail view of one tool row (973-tui-toolview): ⌃O on a
     /// focused row, or a click on its `… +N lines` affordance. It COVERS
     /// the transcript and owns the keys while open; closing it (Esc, ⌃O,
@@ -6494,7 +6517,7 @@ impl Default for AppModel {
             session_dir: "~/dev/enterprise-suite".to_owned(),
             session_workspace_cwd: None,
             session_workspace_uncreated: false,
-            home_dir: None,
+            display_homes: Vec::new(),
             tool_detail: None,
             card_seq: 0,
             vfs: vfs_seed(),
@@ -7937,7 +7960,7 @@ impl AppModel {
         }
     }
 
-    fn transcript_search_text(entry: &crate::projection::TranscriptEntry) -> String {
+    fn transcript_search_text(&self, entry: &crate::projection::TranscriptEntry) -> String {
         use haider_protocol::item::TurnItem;
         use std::fmt::Write as _;
 
@@ -7949,6 +7972,12 @@ impl AppModel {
             crate::projection::TranscriptEntry::User { text: value, .. }
             | crate::projection::TranscriptEntry::Note { text: value, .. }
             | crate::projection::TranscriptEntry::Error { text: value, .. } => text.push_str(value),
+            crate::projection::TranscriptEntry::Workspace { event } => {
+                text.push_str(&crate::toolview::workspace_event_text(
+                    event,
+                    &self.tool_path_context(),
+                ));
+            }
             crate::projection::TranscriptEntry::Peer {
                 sender,
                 text: value,
@@ -8004,11 +8033,11 @@ impl AppModel {
     }
 
     fn refresh_transcript_search(&mut self) {
-        let Some(search) = self.transcript_search.as_mut() else {
+        let Some(search) = self.transcript_search.as_ref() else {
             return;
         };
         let needle = search.query.to_lowercase();
-        search.matches = if needle.is_empty() {
+        let matches = if needle.is_empty() {
             Vec::new()
         } else {
             self.projection
@@ -8016,13 +8045,17 @@ impl AppModel {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    Self::transcript_search_text(entry)
+                    self.transcript_search_text(entry)
                         .to_lowercase()
                         .contains(&needle)
                         .then_some(index)
                 })
                 .collect()
         };
+        let Some(search) = self.transcript_search.as_mut() else {
+            return;
+        };
+        search.matches = matches;
         search.selected = search.selected.min(search.matches.len().saturating_sub(1));
         *self.search_jump.borrow_mut() = search.matches.get(search.selected).copied();
     }
@@ -8088,11 +8121,10 @@ impl AppModel {
                 }
             }
         };
-        let cwd = self
+        let real_cwd = self
             .session_workspace_cwd
             .as_deref()
-            .or_else(|| (!self.session_dir.is_empty()).then_some(self.session_dir.as_str()));
-        let real_cwd = cwd.filter(|path| std::path::Path::new(path).is_dir());
+            .filter(|path| std::path::Path::new(path).is_dir());
         let mut scan_truncated = false;
         if let Some(cwd) = real_cwd {
             let root = std::path::Path::new(cwd);
@@ -9267,7 +9299,10 @@ impl AppModel {
             }
             let path = self.cwd.clone();
             let retry_after = self.projection.run_errored() || self.projection.retrying().is_some();
-            self.flash = Some(format!("· /retry — re-root to {path}"));
+            self.flash = Some(format!(
+                "· /retry — re-root to {}",
+                self.display_path(&path)
+            ));
             self.retry_inflight = true;
             self.requests.push(AppRequest::WorkspaceSet {
                 session,
@@ -17231,14 +17266,9 @@ impl AppModel {
                     .or_else(|| blurb.clone())
                     .unwrap_or_else(|| entry.id.as_str().to_owned());
                 let dir = if active {
-                    self.session_workspace_cwd
-                        .clone()
-                        .unwrap_or_else(|| self.session_dir.clone())
+                    self.session_dir.clone()
                 } else {
-                    entry
-                        .workspace_cwd
-                        .clone()
-                        .unwrap_or_else(|| entry.dir.clone())
+                    entry.dir.clone()
                 };
                 let model_short = if active {
                     self.identity.model_short.clone()
@@ -19417,7 +19447,7 @@ impl AppModel {
                 kind: RowKind::Shell,
                 kind_label: RowKind::Shell.label().to_owned(),
                 name: if shell.title.trim().is_empty() {
-                    shell.cwd_or_host.clone()
+                    self.display_path(&shell.cwd_or_host)
                 } else {
                     shell.title.clone()
                 },
@@ -19431,7 +19461,7 @@ impl AppModel {
             rows.push(Row {
                 kind: RowKind::Monitor,
                 kind_label: RowKind::Monitor.label().to_owned(),
-                name: monitor_source_summary(monitor),
+                name: monitor_source_summary_with_context(monitor, &self.tool_path_context()),
                 activity: monitor
                     .last_event
                     .as_ref()
@@ -19638,8 +19668,15 @@ impl AppModel {
             .or_else(|| (!self.cwd.is_empty()).then(|| self.cwd.clone()));
         crate::toolview::PathContext {
             workspace,
-            home: self.home_dir.clone(),
+            homes: self.display_homes.clone(),
         }
+    }
+
+    /// Session-owned path labels use the same home snapshot as tool rows.
+    /// Roots and notices keep their full label rather than becoming `.`.
+    #[must_use]
+    pub fn display_path(&self, path: &str) -> String {
+        crate::live::workspace_display_path_with_homes(path, &self.display_homes)
     }
 
     /// Open the full-detail view of one tool row of the VIEWED transcript.
@@ -22560,9 +22597,11 @@ impl AppModel {
             }
         }
         if let Some(workspace) = &summary.workspace_cwd {
+            let display = self.display_path(workspace);
             if self.active_session.as_ref() == Some(&summary.session_id) {
                 if self.session_workspace_cwd.as_ref() != Some(workspace) {
                     self.session_workspace_cwd = Some(workspace.clone());
+                    self.session_dir = display.clone();
                     self.dirty = true;
                 }
             } else if let Some(entry) = self
@@ -22572,6 +22611,7 @@ impl AppModel {
                 && entry.workspace_cwd.as_ref() != Some(workspace)
             {
                 entry.workspace_cwd = Some(workspace.clone());
+                entry.dir = display;
                 self.dirty = true;
             }
         }

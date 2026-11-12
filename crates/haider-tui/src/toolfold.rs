@@ -1199,20 +1199,53 @@ where
 /// without a frame.
 #[must_use]
 pub fn arg_summary(args: &serde_json::Value) -> String {
+    arg_summary_with_context(args, &crate::toolview::PathContext::process_homes())
+}
+
+#[must_use]
+pub fn arg_summary_with_context(
+    args: &serde_json::Value,
+    paths: &crate::toolview::PathContext,
+) -> String {
     if let Some(desc) = args.get("desc").and_then(|v| v.as_str()) {
         return desc.to_owned();
     }
     if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
         return computer_action_summary(action, args);
     }
-    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-        return path.to_owned();
+    if let Some(path) = [
+        "path",
+        "file_path",
+        "file",
+        "cwd",
+        "root",
+        "directory",
+        "workspace",
+    ]
+    .iter()
+    .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+    {
+        return paths.shorten(path);
     }
     if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-        return match args.get("glob").and_then(|v| v.as_str()) {
-            Some(glob) => format!("\"{query}\" {glob}"),
+        return match args
+            .get("glob")
+            .or_else(|| args.get("include"))
+            .and_then(|v| v.as_str())
+        {
+            Some(glob) => format!(
+                "\"{query}\" {}",
+                crate::toolview::project_pattern_in_context(glob, paths)
+            ),
             None => format!("\"{query}\""),
         };
+    }
+    if let Some(glob) = args
+        .get("glob")
+        .or_else(|| args.get("include"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return crate::toolview::project_pattern_in_context(glob, paths);
     }
     String::new()
 }
@@ -1225,6 +1258,16 @@ pub fn arg_summary(args: &serde_json::Value) -> String {
 /// not know the tool name; transcript rows should prefer this function.
 #[must_use]
 pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
+    semantic_summary_with_context(name, args, &crate::toolview::PathContext::process_homes())
+}
+
+/// Session-aware form used by plain rendering and tool-row fallbacks.
+#[must_use]
+pub fn semantic_summary_with_context(
+    name: &str,
+    args: &serde_json::Value,
+    paths: &crate::toolview::PathContext,
+) -> String {
     let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str);
     let count = |keys: &[&str]| {
         keys.iter().find_map(|key| {
@@ -1237,28 +1280,45 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
         })
     };
     let command = text("command").or_else(|| text("cmd"));
-    let path = text("path")
-        .or_else(|| text("file"))
-        .or_else(|| text("file_path"));
-    let query = text("query")
-        .or_else(|| text("pattern"))
+    let file_path = text("path")
+        .or_else(|| text("file_path"))
+        .or_else(|| text("file"));
+    let query = text("pattern")
+        .or_else(|| text("query"))
         .or_else(|| text("search"));
+    let scope = file_path.or_else(|| text("root"));
+    let path = file_path
+        .or_else(|| text("cwd"))
+        .or_else(|| text("root"))
+        .or_else(|| text("directory"))
+        .or_else(|| text("workspace"));
+    let path_summary = || {
+        path.map(|path| paths.shorten(path))
+            .unwrap_or_else(|| arg_summary_with_context(args, paths))
+    };
     let glob = text("glob").or_else(|| text("include"));
     let description = text("description").or_else(|| text("desc"));
     match name {
         // `test_run` summarizes by its command like the other shell-ish
         // tools while keeping its own fold noun ("test_run calls").
         "bash" | "shell" | "sh" | "zsh" | "process_exec" | "test_run" | "ssh_shell" | "command" => {
+            if command.is_none()
+                && let Some(path) = path
+            {
+                return paths.shorten(path);
+            }
             match (command, description) {
                 (Some(command), Some(description)) if command != description => {
                     format!("{command} — {description}")
                 }
                 (Some(command), _) | (_, Some(command)) => command.to_owned(),
-                _ => arg_summary(args),
+                _ => arg_summary_with_context(args, paths),
             }
         }
         "fs_read" | "read" | "read_file" | "file_read" => {
-            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            let mut summary = path
+                .map(|path| paths.shorten(path))
+                .unwrap_or_else(|| arg_summary_with_context(args, paths));
             if let Some(range) = text("line_range").or_else(|| text("lines")) {
                 summary.push_str(" · ");
                 summary.push_str(range);
@@ -1266,12 +1326,18 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             summary
         }
         "fs_search" | "grep" | "ripgrep" | "search" | "file_search" => {
-            let mut summary = match (query, glob, path) {
-                (Some(query), Some(glob), _) => format!("\"{query}\" {glob}"),
-                (Some(query), None, Some(path)) => format!("\"{query}\" in {path}"),
-                (Some(query), None, None) => format!("\"{query}\""),
-                _ => arg_summary(args),
-            };
+            let mut summary = query.map_or_else(path_summary, |query| {
+                let mut summary = format!("\"{query}\"");
+                if let Some(path) = scope {
+                    summary.push_str(" in ");
+                    summary.push_str(&paths.shorten(path));
+                }
+                if let Some(glob) = glob {
+                    summary.push(' ');
+                    summary.push_str(&crate::toolview::project_pattern_in_context(glob, paths));
+                }
+                summary
+            });
             if let Some(matches) = count(&["match_count", "matches", "count", "results"]) {
                 summary.push_str(" · ");
                 summary.push_str(&matches);
@@ -1279,18 +1345,40 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             }
             summary
         }
+        "fs_glob" | "glob" => {
+            let mut summary = query
+                .or(glob)
+                .map(|pattern| crate::toolview::project_pattern_in_context(pattern, paths))
+                .unwrap_or_else(path_summary);
+            if let Some(path) = scope
+                && query.or(glob).is_some()
+            {
+                summary.push_str(" in ");
+                summary.push_str(&paths.shorten(path));
+            }
+            summary
+        }
         "agent_spawn" | "task" | "task_spawn" | "subagent" => {
             let label = text("label").or_else(|| text("name")).or(description);
             let state = text("state").or_else(|| text("status"));
-            match (label, state) {
+            let mut summary = match (label, state) {
                 (Some(label), Some(state)) => format!("{label} · {state}"),
                 (Some(label), None) => label.to_owned(),
                 (None, Some(state)) => state.to_owned(),
-                _ => arg_summary(args),
+                _ => path_summary(),
+            };
+            if (label.is_some() || state.is_some())
+                && let Some(path) = path
+            {
+                summary.push_str(" in ");
+                summary.push_str(&paths.shorten(path));
             }
+            summary
         }
         "fs_edit" | "edit" | "write" | "file_edit" => {
-            let mut summary = path.map(str::to_owned).unwrap_or_else(|| arg_summary(args));
+            let mut summary = path
+                .map(|path| paths.shorten(path))
+                .unwrap_or_else(|| arg_summary_with_context(args, paths));
             if let Some(operation) = text("operation").or_else(|| text("action"))
                 && !operation.is_empty()
                 && operation != "edit"
@@ -1299,9 +1387,10 @@ pub fn semantic_summary(name: &str, args: &serde_json::Value) -> String {
             }
             summary
         }
-        _ => description
-            .map(str::to_owned)
-            .unwrap_or_else(|| arg_summary(args)),
+        _ => path
+            .map(|path| paths.shorten(path))
+            .or_else(|| description.map(str::to_owned))
+            .unwrap_or_else(|| arg_summary_with_context(args, paths)),
     }
 }
 

@@ -54,6 +54,7 @@ fn demo_script_produces_the_expected_transcript() {
             TranscriptEntry::User { .. } => "user",
             TranscriptEntry::Peer { .. } => "peer",
             TranscriptEntry::Note { .. } => "note",
+            TranscriptEntry::Workspace { .. } => "workspace",
             TranscriptEntry::Refusal { .. } => "refusal",
             TranscriptEntry::Error { .. } => "error",
             TranscriptEntry::Shell { .. } => "shell",
@@ -74,6 +75,7 @@ fn demo_script_produces_the_expected_transcript() {
         TranscriptEntry::User { .. }
         | TranscriptEntry::Peer { .. }
         | TranscriptEntry::Note { .. }
+        | TranscriptEntry::Workspace { .. }
         | TranscriptEntry::Refusal { .. }
         | TranscriptEntry::Error { .. }
         | TranscriptEntry::Shell { .. } => true,

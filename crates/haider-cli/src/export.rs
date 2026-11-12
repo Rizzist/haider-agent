@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use haider_client::launch_origin::display_path;
 use haider_client::notify::mask_text;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -560,7 +561,7 @@ impl SessionExport {
         }
         out.push_str(&format!(
             "- workspace: `{}`\n- model: `{}` · `{}`\n- created: {}\n\n",
-            self.meta.cwd,
+            display_path(Path::new(&self.meta.cwd)),
             self.meta.provider,
             self.meta.model,
             iso8601_ms(self.meta.created_at_ms),
@@ -1179,7 +1180,7 @@ pub fn write_opencode(
 ) -> Result<OpenCodeWriteReport, ExportError> {
     use rusqlite::{Connection, OpenFlags, params};
     if !db_path.is_file() {
-        return Err(ExportError::OpenCodeMissing(db_path.display().to_string()));
+        return Err(ExportError::OpenCodeMissing(display_path(db_path)));
     }
     // READ_WRITE without CREATE — we never bring a harness store into being.
     let connection = Connection::open_with_flags(
@@ -1270,7 +1271,7 @@ pub fn write_opencode(
 /// Map a rusqlite error to a lock vs generic IO failure.
 fn classify_sqlite(error: rusqlite::Error, db_path: &Path) -> ExportError {
     if is_lock_error(&error) {
-        ExportError::OpenCodeLocked(db_path.display().to_string())
+        ExportError::OpenCodeLocked(display_path(db_path))
     } else {
         ExportError::Io(format!("opencode sqlite: {error}"))
     }
@@ -1480,7 +1481,7 @@ pub fn write_new_file(path: &Path, contents: &str) -> Result<(), ExportError> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
-            ExportError::Io(format!("cannot create {}: {error}", parent.display()))
+            ExportError::Io(format!("cannot create {}: {error}", display_path(parent)))
         })?;
     }
     // M2: `create_new` makes existence-check + create ONE atomic, symlink-safe
@@ -1494,17 +1495,17 @@ pub fn write_new_file(path: &Path, contents: &str) -> Result<(), ExportError> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(ExportError::Collision(path.display().to_string()));
+            return Err(ExportError::Collision(display_path(path)));
         }
         Err(error) => {
             return Err(ExportError::Io(format!(
                 "cannot write {}: {error}",
-                path.display()
+                display_path(path)
             )));
         }
     };
     file.write_all(contents.as_bytes())
-        .map_err(|error| ExportError::Io(format!("cannot write {}: {error}", path.display())))
+        .map_err(|error| ExportError::Io(format!("cannot write {}: {error}", display_path(path))))
 }
 
 /// M3: write the codex rollout and append its `history.jsonl` as a RECOVERABLE
@@ -1533,16 +1534,16 @@ pub fn append_file(path: &Path, contents: &str) -> Result<(), ExportError> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
-            ExportError::Io(format!("cannot create {}: {error}", parent.display()))
+            ExportError::Io(format!("cannot create {}: {error}", display_path(parent)))
         })?;
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|error| ExportError::Io(format!("cannot open {}: {error}", path.display())))?;
+        .map_err(|error| ExportError::Io(format!("cannot open {}: {error}", display_path(path))))?;
     file.write_all(contents.as_bytes())
-        .map_err(|error| ExportError::Io(format!("cannot append {}: {error}", path.display())))
+        .map_err(|error| ExportError::Io(format!("cannot append {}: {error}", display_path(path))))
 }
 
 /// The default codex sessions root (`~/.codex`).
@@ -1856,9 +1857,9 @@ pub fn write_export(
             match &options.out {
                 Some(path) => {
                     std::fs::write(path, &body).map_err(|error| {
-                        ExportError::Io(format!("cannot write {}: {error}", path.display()))
+                        ExportError::Io(format!("cannot write {}: {error}", display_path(path)))
                     })?;
-                    Ok(format!("wrote {}", path.display()))
+                    Ok(format!("wrote {}", display_path(path)))
                 }
                 None => {
                     // Corked: one buffered writer instead of the line-buffered
@@ -1902,7 +1903,7 @@ pub fn write_export(
             )?;
             Ok(format!(
                 "wrote codex rollout {} (id {})",
-                rollout_path.display(),
+                display_path(&rollout_path),
                 codex.uuid
             ))
         }
@@ -1915,7 +1916,7 @@ pub fn write_export(
             write_new_file(&path, &claude.jsonl)?;
             Ok(format!(
                 "wrote claude-code session {} ({})",
-                path.display(),
+                display_path(&path),
                 claude.session_uuid
             ))
         }
@@ -1934,7 +1935,7 @@ pub fn write_export(
                 report.session_id,
                 report.messages,
                 report.parts,
-                db_path.display(),
+                display_path(&db_path),
             ))
         }
     }

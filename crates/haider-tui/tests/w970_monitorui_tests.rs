@@ -813,6 +813,26 @@ fn the_source_summary_says_what_each_kind_watches() {
     );
 }
 
+#[test]
+fn typed_file_monitor_summary_masks_account_even_with_daemon_summary() {
+    let mut file = monitor(
+        "f",
+        haider_rpc::MonitorSourceWire::File {
+            path: "/Users/bob/watch.txt".to_owned(),
+        },
+        haider_rpc::MonitorStateWire::Armed,
+    );
+    file.source_summary = "/Users/bob/watch.txt".to_owned();
+    assert_eq!(
+        haider_tui::app::monitor_source_summary(&file),
+        "file /Users/<user>/watch.txt"
+    );
+    assert!(matches!(
+        file.source,
+        haider_rpc::MonitorSourceWire::File { ref path } if path == "/Users/bob/watch.txt"
+    ));
+}
+
 fn policy() -> haider_rpc::MonitorControlPolicyWire {
     use haider_rpc::Capability;
     haider_rpc::MonitorControlPolicyWire {

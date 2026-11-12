@@ -1,3 +1,132 @@
+# Wave 973 integration resolutions
+
+## ci-winpath integration on 2026-11-07
+
+Integrates wave `b4db15478f938467ac3e1de6292cb96886d0be2f` into lane
+candidate `ccbb96bfdac917f2cfdc04bc868a242150a8476b` with both histories
+retained. The textual conflicts are this integration record and the shared test
+baseline; both resolution histories are retained below.
+
+The wave's catalog ownership, management-watch and saved-model settings changes
+remain alongside the lane's session-owned display context. The merged creation
+and summary handlers retain the catalog metadata and use the saved display home
+for path labels. Actual workspace and origin paths retain their I/O authority.
+The wave's macOS installer changes are retained without lane edits.
+
+The merged source counts 7572 tests using xtask's exact file/marker rule.
+The scheduled actual xtask update/check/count must confirm this value. No prior
+candidate gate receipt is credited to this merge. The Sol finisher runs the
+TARGETED tier; the separate Astra gate owns full workspace and packaging gates.
+
+## ci-winpath integration on 2026-10-30
+
+Integrates wave `5837b85ad9746a3a6adbbad74e1e0f23b106d566` into lane
+candidate `882dca65b27f94e342bab58df2b5aeae4d7707d2`. The only textual
+conflict is the shared test baseline. Both parents' source changes are retained.
+
+The wave's fork prompt history keeps its subject session, owning agent and
+source branch, including delayed ownership snapshots and manifest replay. Its
+launch-origin revision handling and subject-session guard remain intact. The
+merged summary handlers still project path labels through the model's saved
+home context. Raw workspace paths and origin records retain their authority;
+display labels do not replace I/O paths.
+
+The merged source counts 7339 tests by xtask's file/marker rule: the prior lane
+count of 7312 plus the wave's 27 new tests. The actual xtask update/check/count
+must confirm this value under the build scheduler. Validation runs afresh on
+the committed merge. Under the current owner gate-tier rule, the Sol finisher
+runs TARGETED checks; the separate Astra gate owns the full workspace and
+packaging matrix. No earlier candidate receipt is credited to this merge.
+
+## ci-winpath integration on 2026-10-29
+
+Integrates wave `183a99f63568100539b15d25ae4ceda34618c546` into the lane
+including glob enclosure repair `d370acfc6c6a04b5fe33a70b09e5ab23df6f386b`.
+The four textual conflicts were LiveDriver summary routing, the plain and rich
+extension chains, and the test baseline. Both histories are retained by a merge.
+
+The wave's complete-list/incremental-roster split is retained. The moved summary
+handler continues using the model's home snapshot for path labels; the existing
+context regression now exercises both reply kinds with own/other account rows.
+Plain and rich extension rendering retains both helper-stop notices/results and
+context-aware image projection. Other wave changes are preserved. No actual I/O
+path is replaced by a display label, and this lane adds no daemon/store schema.
+
+The merged source count is 7312 using xtask's exact file/marker rule; the
+queued actual xtask update/check must confirm it. All native, platform, class,
+mutation and live gates run afresh on the committed merged candidate. No receipt
+from the earlier candidate is credited to this integration.
+
+## ci-winpath integration on 2026-10-26
+
+Integrates wave `b08f4d823d9aee1aee5a2dbd67acd557949da7a7` into
+ci-winpath candidate `06459d9e5e0493d55f887f56d078401b0739e68b`.
+The only textual conflict is `test-baseline.txt`: the merged source contains
+7163 tests by xtask's exact source-count rule. The queued lint gate will
+regenerate and check that value with the actual xtask executable.
+
+The provider-budget and route-epoch changes in AppModel and LiveDriver are
+retained alongside the lane's session-owned path projection. No new path
+display producer was introduced by those changes. Startup home seeding,
+plain/TUI path parity, the glob branch scanner, and SSH panel clearing are
+preserved. Both histories are retained with a merge commit. No previous
+candidate build or test receipt is reused for this integration.
+
+The first local all-target Clippy check found that the lane's display-context
+shell fixture omitted the wave's optional `setup_error` field. The fixture now
+sets it to `None`, matching the other running-shell fixtures. Validation is
+repeated on the repaired candidate.
+
+## ci-winpath integration on 2026-10-24
+
+Integrates wave `6fa2a72d4199b798834cee2d72c5fd2767a6373b` into
+ci-winpath candidate `c1e5ae07e016c563c0a26dfaa369cfb306cd1607`.
+The textual conflicts were this integration record and `test-baseline.txt`.
+Both lanes' resolution histories are retained below. The merged source counts
+7089 tests by xtask's `rust_files` / `is_test_marker` rule; the queued lint
+gate regenerates and checks that value with the actual xtask executable.
+
+The input-owner, terminal-read and SSH setup/history changes are retained.
+The path-context projection, independent startup-home snapshot, and clearing
+of both SSH panel footprints remain in place. No path label replaces an I/O
+path. External review packages use the same vendored Crossterm patch as the
+workspace, and the full local matrix includes the new Crossterm member.
+
+## ci-winpath history
+
+
+Merge commit 1b4be0208b4a58fca34ac125b55d3be0dda443a1 = lane 98ae98571df63bfb6410fcf74b258f2aee37c37d + origin/wave-973
+56e4a29a3bfa58f422f705302b28b0a15648531b (fresh fetch 2026-10-23T16:2xZ, unchanged since Sol cap1). Merge commit, no rebase.
+
+Textual conflicts: only test-baseline.txt (6575 lane vs 6625 wave). Neither describes the merged tree; regenerated with
+the xtask counting rule to 6719 (the lint phase runs `xtask test-count` against it).
+
+Semantic adaptations (no textual conflict):
+- The wave added `activity: Option<ActivityStateV1>` to tool-call items. Lane-owned fixtures in plain_tests, toolview_tests
+  and tui-exe display_path_tests set `activity: None`.
+- image_created_tui_tests: the lane routes image rows through the session PathContext; the fixture now pins the session
+  workspace and passes model.tool_path_context() to the plain renderer too (same context for styled and plain).
+- toolview_tests: the broad-alias test asserts is_multiuser_workspace_root on the canonical alias and the filesystem-root
+  alias, with a narrow-workspace negative control (kills the prior-broad-alias-lexical survivor from 16-opus-impl).
+
+Wave path-producer audit: the wave's additions to haider-tui/src, haider-tui-exe/src, haider-client/src and
+haider-cli/src (activity icons, fleet glyphs, stream-lock fix, update lock, terminal backend) add no path/cwd/home
+display producers. The lane touches no daemon store, schema or protocol file.
+
+Repairs carried in the merge commit (found by Sol finisher capture/source review):
+- Startup home snapshot independent of a readable cwd (seed_display_dirs / apply_cwd_for_path take Option<&Path>).
+- SSH profile list and form panels render Clear over their own footprint.
+
+Sol finisher review (2026-10-24): retained the merged implementation and tests.
+The startup-home change refreshes display homes even when `current_dir()` fails,
+while preserving the model's existing directory context. Both SSH panels clear
+only their own footprint; remote form values retain their exact spelling.
+No store schema or daemon record format changed in this lane. Runtime and gate
+results are recorded separately in the lane's evidence directory.
+
+
+## Model list lane integration history
+
 Merge of origin/wave-973 at b3aeb633 into lane-973-accounts-ux, round 23.
 
 - accounts_tests.rs: preserve the second discovery release required by the lane's two account discoveries; use upstream's fixture-ready TEST_WAIT_TIMEOUT instead of the two-second load bound.
@@ -49,9 +178,8 @@ Continuation on 2026-10-20 merged fresh wave `56e4a29a3bfa58f422f705302b28b0a156
 
 The continuation's complete matrix found that the source-test reachability guard could not see the partial-write module declared inside `accounts_tests.rs`, although its 15 tests had executed in the daemon library. The module is now declared directly in the existing `cfg(test)` section of `accounts.rs`. Its explicit fixture imports use account-module-only visibility. The guard, test bodies and baseline count remain intact; the failed receipt is retained and the repaired candidate is checked separately.
 
----
 
-# Wave 973 merge resolution
+## terminal UI lane history
 
 The round 9 merge integrates `a8b218079422dd0a70c6997a56fc6a4f5d4b051f` into the terminal UI lane based on `a97534c62a6005545df9796db68a475a14fc9ffd`.
 
@@ -87,3 +215,19 @@ Merge wave `7eebe6d09402823ea17b13fc498e5932e7361614` while retaining the produc
 An inactive account's failed refresh records its own durable rejection without replacing another account's live inventory. Management publications carry the inventory owner and registry configuration together, so defaults and remote limits can be rebuilt for the requested account. Public and explicitly configured provider facts retain their existing behavior.
 
 Both parents' regression cases remain. Test fixtures use the merged request and discoverer APIs, with their original assertions retained. The actual `cargo run --locked -p xtask -- test-count --update` on the combined source derived **7,654** tests. Final source, runtime and platform checks are recorded against the committed merge in the round 26 continuation evidence.
+
+
+## Accounts round 28 wave merge
+
+Merged wave `65e89efb076dd80fb96dd7caabcbb6f1d05aa4fa` into the accounts lane at
+`8b8ad5cd2fd2a190db92be4252dfaeffc46cce03`, retaining both resolution histories.
+Only this document and the shared test baseline conflicted. Product source
+merged automatically; this round adds no product source changes.
+
+The actual `cargo run --locked -p xtask -- test-count --update` derived **7,794**
+test markers on the merged source. The common base derives 7,472, the accounts
+lane adds 222, and the incoming wave adds 100: 7,472 + 222 + 100 = 7,794.
+Both parents' tests are retained; neither parent's baseline was selected.
+The round 28 evidence contains the update output and per-file count audit.
+TARGETED gates run on the merge commit; Astra owns the subsequent FULL gate.
+No push is authorized in this round.
