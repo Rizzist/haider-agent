@@ -6,6 +6,157 @@ use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire,
 };
 
+#[test]
+fn aging_projection_keeps_configured_ids_selectable_at_the_exact_boundary() {
+    for models in [vec!["other"], vec![]] {
+        for catalog in ["public", "authenticated", "custom", "adapter", "offline"] {
+            let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                "provider": "work", "api_family": "openai_chat_completions",
+                "endpoint": "http://127.0.0.1:19373/v1", "enabled": true,
+                "models": models, "configured_models": ["deployment"],
+                "catalog": catalog, "inventory_authority": "authoritative",
+                "inventory": {"state":"fetched", "fetched_at_ms":100},
+                "availability": if models.is_empty() { "unavailable" } else { "available" }
+            }))
+            .expect("fresh negative listing");
+            summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1, &[]);
+            assert!(!summary.model_is_selectable("deployment"));
+            summary.project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+            assert!(
+                summary.model_is_selectable("deployment"),
+                "{catalog}: {summary:?}"
+            );
+            assert!(summary.models.contains(&"deployment".into()));
+            assert!(
+                summary.model_details.is_empty(),
+                "no fetched metadata invented"
+            );
+            assert!(
+                summary
+                    .selection_reason(None)
+                    .expect("stale reason")
+                    .contains("refresh")
+            );
+
+            let mut credential_missing = summary.clone();
+            credential_missing.inventory =
+                haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 100 };
+            credential_missing.auth_methods = vec![AuthMethod::ApiKey];
+            credential_missing.availability = ProviderAvailabilityWire::Unavailable;
+            credential_missing
+                .project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[]);
+            assert!(!credential_missing.model_is_selectable("deployment"));
+            let mut disabled = summary.clone();
+            disabled.enabled = false;
+            disabled.project_inventory_at_time(u64::MAX, &[]);
+            assert!(!disabled.model_is_selectable("deployment"));
+            let mut rejected = summary;
+            rejected.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "authentication failed".into(),
+            };
+            rejected.availability = ProviderAvailabilityWire::Unavailable;
+            rejected.project_inventory_at_time(u64::MAX, &[]);
+            assert!(!rejected.model_is_selectable("deployment"));
+        }
+    }
+    // An advisory custom provider need not declare picker IDs. Its empty
+    // successful list still becomes uncertainty at the same TTL boundary,
+    // permitting explicit input without inventing rows or a default.
+    for catalog in ["custom", "public", "authenticated", "adapter", "offline"] {
+        for authority in ["advisory", "authoritative"] {
+            for ready in [false, true] {
+                let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                    "provider":"work", "api_family":"openai_chat_completions",
+                    "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+                    "auth_methods":["api_key"], "models":[], "configured_models":[],
+                    "catalog":catalog, "inventory_authority":authority,
+                    "inventory":{"state":"fetched", "fetched_at_ms":100},
+                    "availability":"unavailable"
+                }))
+                .expect("fresh empty advisory listing");
+                let mut disabled = summary.clone();
+                disabled.enabled = false;
+                let mut rejected = summary.clone();
+                rejected.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                    reason: "authentication failed".into(),
+                };
+                summary.project_inventory_at_time_with_credential_ready(
+                    100 + haider_rpc::MODEL_INVENTORY_TTL_MS - 1,
+                    ready,
+                );
+                assert!(!summary.model_is_selectable("explicit-unlisted"));
+                summary.project_inventory_at_time_with_credential_ready(
+                    100 + haider_rpc::MODEL_INVENTORY_TTL_MS,
+                    ready,
+                );
+                assert_eq!(
+                    summary.model_is_selectable("explicit-unlisted"),
+                    authority == "advisory" && ready,
+                    "{catalog}/{authority}, credential_ready={ready}: {summary:?}"
+                );
+                assert!(summary.models.is_empty());
+                assert!(summary.model_details.is_empty());
+                assert!(summary.default_model.is_none());
+                for negative in [&mut disabled, &mut rejected] {
+                    negative.project_inventory_at_time_with_credential_ready(u64::MAX, true);
+                    assert!(!negative.model_is_selectable("explicit-unlisted"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn aging_projection_preserves_account_health_evidence() {
+    use haider_protocol::credential::{
+        CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+    };
+    for method in [AuthMethod::ApiKey, AuthMethod::OAuth] {
+        for (status, active, provider, ready) in [
+            (CredentialStatus::Ok, true, "work", true),
+            (
+                CredentialStatus::Limited { until_ms: u64::MAX },
+                true,
+                "work",
+                true,
+            ),
+            (CredentialStatus::Expired, true, "work", false),
+            (CredentialStatus::Revoked, true, "work", false),
+            (
+                CredentialStatus::NeedsAttention {
+                    reason: CredentialAttentionReason::SourceUnreadable,
+                },
+                true,
+                "work",
+                false,
+            ),
+            (CredentialStatus::Ok, false, "work", false),
+            (CredentialStatus::Ok, true, "other", false),
+        ] {
+            let descriptor: CredentialDescriptor = serde_json::from_value(serde_json::json!({
+                "alias":"synthetic", "provider":provider, "auth_method":method,
+                "identity":"synthetic", "status":status, "active":active
+            }))
+            .expect("metadata-only account");
+            let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                "provider":"work", "api_family":"openai_chat_completions",
+                "endpoint":"http://127.0.0.1:19373/v1", "enabled":true,
+                "auth_methods":[method], "configured_models":["deployment"],
+                "inventory":{"state":"fetched", "fetched_at_ms":100},
+                "availability":"unavailable"
+            }))
+            .expect("fresh empty listing");
+            summary
+                .project_inventory_at_time(100 + haider_rpc::MODEL_INVENTORY_TTL_MS, &[descriptor]);
+            assert_eq!(
+                summary.model_is_selectable("deployment"),
+                ready,
+                "{method:?}: {status:?}, active={active}, provider={provider}"
+            );
+        }
+    }
+}
+
 /// MUTATION CHECK: remove `serde(default)` from
 /// `ProviderSummaryWire::model_details`. Expected runtime failure: decoding
 /// this old-daemon summary returns a missing-field error.
@@ -30,6 +181,9 @@ fn provider_summary_without_model_details_decodes_an_empty_vector() {
 #[test]
 fn provider_summary_model_details_round_trip_token_limits() {
     let summary = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "openai".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
@@ -44,6 +198,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
                 display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
                 max_output_tokens: Some(128_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -56,6 +211,7 @@ fn provider_summary_model_details_round_trip_token_limits() {
                 display_name: None,
                 context_window: None,
                 max_output_tokens: None,
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -92,6 +248,51 @@ fn provider_summary_model_details_round_trip_token_limits() {
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);
+}
+
+/// 973-output-cap-fixes B2: the output-maximum provenance is additive. An
+/// older detail without it decodes as absent and re-encodes byte-identically;
+/// each known spelling round-trips; an unknown future spelling decodes as
+/// `Unknown` instead of failing the whole provider summary.
+/// MUTATION CHECK: drop `serde(other)` from `ModelOutputLimitSourceWire`, or
+/// `skip_serializing_if` from the field. Expected runtime failure: the future
+/// spelling fails to decode, or the old detail gains a `null` key.
+#[test]
+fn model_detail_output_limit_source_is_additive_and_tolerant() {
+    use haider_rpc::ModelOutputLimitSourceWire;
+    let old = serde_json::json!({"name": "m", "max_output_tokens": 8192});
+    let decoded: ModelDetailWire = serde_json::from_value(old.clone()).expect("old detail decodes");
+    assert_eq!(decoded.max_output_tokens_source, None);
+    assert_eq!(serde_json::to_value(&decoded).expect("encode"), old);
+    for (spelling, expected) in [
+        ("declared", ModelOutputLimitSourceWire::Declared),
+        ("static", ModelOutputLimitSourceWire::Static),
+        ("fallback", ModelOutputLimitSourceWire::Fallback),
+        (
+            "published_by_a_future_daemon",
+            ModelOutputLimitSourceWire::Unknown,
+        ),
+    ] {
+        let decoded: ModelDetailWire = serde_json::from_value(serde_json::json!({
+            "name": "m",
+            "max_output_tokens": 8192,
+            "max_output_tokens_source": spelling,
+        }))
+        .expect("detail with a provenance decodes");
+        assert_eq!(
+            decoded.max_output_tokens_source,
+            Some(expected),
+            "{spelling}"
+        );
+    }
+    let declared = ModelDetailWire {
+        max_output_tokens_source: Some(ModelOutputLimitSourceWire::Declared),
+        ..serde_json::from_value(old).expect("old detail decodes")
+    };
+    assert_eq!(
+        serde_json::to_value(&declared).expect("encode")["max_output_tokens_source"],
+        "declared"
+    );
 }
 
 #[test]
@@ -285,4 +486,242 @@ fn future_model_source_decodes_without_losing_the_row() {
         detail.source,
         Some(haider_rpc::ModelDetailSourceWire::Unknown)
     );
+}
+
+#[test]
+fn catalog_selection_policy_is_shared_across_provider_kinds_and_uncertainty() {
+    for catalog in ["custom", "public", "authenticated", "offline", "adapter"] {
+        let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+            "provider":"synthetic", "api_family":"openai_chat_completions", "models":["listed"],
+            "configured_models":["deployment"], "auth_methods":[], "availability":"available",
+            "enabled":true, "catalog":catalog
+        }))
+        .expect("summary");
+        summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+            fetched_at_ms: u64::MAX,
+        };
+        assert!(summary.model_is_selectable("listed"));
+        assert!(
+            !summary.model_is_selectable("deployment"),
+            "fresh negative membership: {catalog}"
+        );
+        summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+            fetched_at_ms: 1,
+            reason: "catalog refresh due".into(),
+        };
+        assert!(
+            summary.model_is_selectable("deployment"),
+            "staleness is uncertainty: {catalog}"
+        );
+        summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+        assert!(
+            summary.model_is_selectable("deployment"),
+            "unsupported or transient configured fallback: {catalog}"
+        );
+        summary.availability = ProviderAvailabilityWire::Unavailable;
+        assert!(!summary.model_is_selectable("deployment"));
+        summary.availability = ProviderAvailabilityWire::Available;
+        summary.enabled = false;
+        assert!(!summary.model_is_selectable("listed"));
+        assert_eq!(
+            summary.selection_reason(Some("listed")).as_deref(),
+            Some("provider is disabled")
+        );
+    }
+}
+
+#[test]
+fn static_catalog_does_not_admit_unfetched_extra_deployments() {
+    let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"synthetic", "api_family":"openai_chat_completions", "models":["known-static"],
+        "model_details":[{"name":"known-static","source":"static"}],
+        "static_models":["known-static"], "configured_models":["deployment"],
+        "auth_methods":["api_key"], "availability":"available", "enabled":true,
+        "inventory_authority":"authoritative"
+    }))
+    .expect("summary");
+    // Assign the typed inventory so this regression also pins policy rather
+    // than relying on an unrelated JSON representation.
+    summary.inventory = haider_rpc::ModelInventoryWire::Static;
+    assert!(summary.model_is_selectable("known-static"));
+    assert!(!summary.model_is_selectable("deployment"));
+    summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "synthetic 503".into(),
+    };
+    summary.availability_reason = Some("synthetic 503 — static catalog available".into());
+    assert!(summary.model_is_selectable("known-static"));
+    assert!(!summary.model_is_selectable("deployment"));
+    assert!(
+        summary
+            .selection_reason(Some("deployment"))
+            .expect("reason")
+            .contains("503")
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    assert!(
+        summary.model_is_selectable("deployment"),
+        "prior successful listing is uncertainty"
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    assert!(
+        summary.model_is_selectable("deployment"),
+        "unsupported discovery is selectable"
+    );
+    summary.availability = ProviderAvailabilityWire::Unavailable;
+    assert!(
+        !summary.model_is_selectable("known-static"),
+        "credential rejection still wins"
+    );
+}
+
+#[test]
+fn selector_aliases_share_configured_negative_evidence_and_uncertainty() {
+    for (declared, aliases) in [
+        (
+            "deployment",
+            vec![
+                "deployment",
+                "DEPLOYMENT",
+                "de.ploy_ment",
+                " de-ploy ment ",
+                "\tDEPLOY\r\nMENT",
+                "de\u{a0}ploy\u{2003}ment",
+            ],
+        ),
+        (
+            "MÖDEL.東京 Δ",
+            vec!["MÖDEL.東京 Δ", "mödel_東京-δ", "MÖDEL\u{2003}東京.Δ"],
+        ),
+        ("İ-model", vec!["İ-model", "i\u{307}.mo_DEL"]),
+    ] {
+        for authority in ["advisory", "authoritative"] {
+            for catalog in ["public", "authenticated", "custom", "adapter", "offline"] {
+                let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+                    "provider":"work", "api_family":"openai_chat_completions", "enabled":true,
+                    "models":["healthy"], "configured_models":[declared], "catalog":catalog,
+                    "inventory_authority":authority,
+                    "inventory":{"state":"fetched", "fetched_at_ms":u64::MAX},
+                    "availability":"available"
+                }))
+                .expect("fresh successful inventory");
+                for alias in &aliases {
+                    assert_eq!(summary.canonical_model_selector(alias), declared);
+                    assert!(!summary.model_is_selectable(alias), "{catalog}: {alias}");
+                    assert_eq!(
+                        summary.selection_reason(Some(alias)).as_deref(),
+                        Some("deployment is absent from the latest model list")
+                    );
+                }
+                assert!(summary.model_is_selectable("HEALTHY"));
+                summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+                    fetched_at_ms: 1,
+                    reason: "server returned 503 for /models".into(),
+                };
+                for alias in &aliases {
+                    assert!(summary.model_is_selectable(alias), "stale success: {alias}");
+                    assert!(
+                        summary
+                            .selection_reason(Some(alias))
+                            .expect("visible uncertainty")
+                            .contains("503")
+                    );
+                }
+                summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+                summary.availability_reason =
+                    Some("configured (unverified): server returned 405 for /models".into());
+                for alias in &aliases {
+                    assert!(summary.model_is_selectable(alias));
+                }
+                summary.availability = ProviderAvailabilityWire::Unavailable;
+                summary.availability_reason = Some("authentication failed".into());
+                for alias in &aliases {
+                    assert!(!summary.model_is_selectable(alias));
+                    assert_eq!(
+                        summary.selection_reason(Some(alias)).as_deref(),
+                        Some("authentication failed")
+                    );
+                }
+            }
+        }
+    }
+    let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider":"work", "api_family":"openai_chat_completions", "enabled":true,
+        "models":["de-ployment"], "configured_models":["deployment"], "catalog":"custom",
+        "inventory_authority":"advisory", "inventory":{"state":"fetched", "fetched_at_ms":u64::MAX},
+        "availability":"available"
+    }))
+    .expect("literal priority controls");
+    assert!(!summary.model_is_selectable("deployment"));
+    assert!(summary.model_is_selectable("de-ployment"));
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "de-ployment"
+    );
+    assert!(summary.model_is_selectable("DEPLOY.MENT"));
+    assert_eq!(
+        summary.canonical_model_selector("future/model"),
+        "future/model"
+    );
+    assert!(summary.model_is_selectable("future/model"));
+    for literal in [
+        "deploy%6dent",
+        "de\u{2010}ployment",
+        "de\u{200b}ployment",
+        "deployment/",
+    ] {
+        assert_eq!(summary.canonical_model_selector(literal), literal);
+        assert!(
+            summary.model_is_selectable(literal),
+            "non-alias advisory literal: {literal}"
+        );
+    }
+    summary.models.push("de-ployment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "de-ployment"
+    );
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "identical listed rows are one identity"
+    );
+    summary.models.push("deploy_ment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "DEPLOY.MENT"
+    );
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "ambiguous advisory literal remains passthrough"
+    );
+    summary.models.clear();
+    summary.configured_models.push("de-ployment".into());
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "DEPLOY.MENT"
+    );
+    assert!(!summary.model_is_selectable("deployment"));
+    summary.models = vec!["healthy".into()];
+    summary.configured_models = vec!["deployment".into(), "deployment".into()];
+    assert_eq!(
+        summary.canonical_model_selector("DEPLOY.MENT"),
+        "deployment"
+    );
+    assert!(
+        !summary.model_is_selectable("DEPLOY.MENT"),
+        "repeated declared IDs cannot bypass fresh absence"
+    );
+    summary.inventory = haider_rpc::ModelInventoryWire::Stale {
+        fetched_at_ms: 1,
+        reason: "refresh due".into(),
+    };
+    assert!(
+        summary.model_is_selectable("DEPLOY.MENT"),
+        "duplicate IDs do not block uncertainty"
+    );
+    summary.enabled = false;
+    assert!(!summary.model_is_selectable("future/model"));
 }

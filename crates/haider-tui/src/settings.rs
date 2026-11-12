@@ -46,6 +46,11 @@ struct SettingsDto {
     last_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model_catalog_key: Option<String>,
+    /// Distinguishes a proven unowned choice from a legacy ownerless pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model_scope_version: Option<u32>,
     /// 971-tui-collapse: the tool-output verbosity mode. Additive — files
     /// written before this wave omit it and load as `normal` (the default),
     /// so old settings stay valid.
@@ -57,6 +62,11 @@ struct SettingsDto {
     /// still loads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     tool_rows: BTreeMap<String, ToolRowsDto>,
+    /// 973-activity-icons: subagent activity glyphs (`emoji` · `text` ·
+    /// `off`). Additive — absent means "not chosen": boot then follows
+    /// `HAIDER_ACTIVITY_ICONS`, `NO_COLOR` and `TERM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity_icons: Option<String>,
 }
 
 /// One session's persisted disclosure state.
@@ -76,6 +86,14 @@ struct ToolRowsDto {
 
 /// The current [`ToolRowsDto`] shape.
 const TOOL_ROWS_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastModelPick {
+    pub provider: String,
+    pub model: String,
+    pub catalog_key: Option<String>,
+    pub scope_known: bool,
+}
 
 /// One session's disclosure state, decoded. Unknown names are dropped
 /// rather than guessed — a stale row simply opens collapsed.
@@ -114,7 +132,7 @@ pub struct SettingsStore {
     last_saved_notifications: Option<bool>,
     /// Model retention: the `(provider, model)` pair mirrored into every
     /// write so a theme/notification save never drops it. Seeded at boot.
-    last_model: Option<(String, String)>,
+    last_model: Option<LastModelPick>,
     /// The tool-output verbosity mirrored into every write, so a theme or
     /// model save never drops it. Seeded from the file at boot.
     verbosity: Verbosity,
@@ -122,6 +140,10 @@ pub struct SettingsStore {
     /// Per-session disclosure mirrored into every write (F3), so a theme,
     /// model or verbosity save never drops it. Seeded from the file at boot.
     tool_rows: BTreeMap<String, ToolRowsRecord>,
+    /// 973-activity-icons: the explicitly chosen activity display, mirrored
+    /// into every write. `None` = never chosen.
+    activity_icons: Option<haider_protocol::activity::ActivityDisplay>,
+    activity_icons_dirty: bool,
 }
 
 impl SettingsStore {
@@ -137,6 +159,51 @@ impl SettingsStore {
             verbosity: Verbosity::default(),
             last_saved_verbosity: None,
             tool_rows: BTreeMap::new(),
+            activity_icons: None,
+            activity_icons_dirty: false,
+        }
+    }
+
+    /// 973-activity-icons: the persisted activity display choice, `None`
+    /// when never chosen (or on a missing/corrupt/foreign file or an
+    /// unknown name — defaults, never damage).
+    #[must_use]
+    pub fn load_activity_icons(&self) -> Option<haider_protocol::activity::ActivityDisplay> {
+        self.load_dto()?
+            .activity_icons
+            .as_deref()
+            .and_then(haider_protocol::activity::ActivityDisplay::parse)
+    }
+
+    /// Seed the tracked choice (boot-time load) so other saves preserve it.
+    pub fn set_activity_icons(&mut self, mode: Option<haider_protocol::activity::ActivityDisplay>) {
+        self.activity_icons = mode;
+        self.activity_icons_dirty = false;
+    }
+
+    /// Whether an explicit choice has not yet been durably written.
+    #[must_use]
+    pub const fn activity_icons_dirty(&self) -> bool {
+        self.activity_icons_dirty
+    }
+
+    /// Persist an explicit `/icons` choice, carrying everything else.
+    /// Reaffirming a choice writes again: a failed or externally replaced
+    /// settings path must never receive a cached success acknowledgment.
+    pub fn save_activity_icons_if_changed(
+        &mut self,
+        theme: ThemeChoice,
+        mode: haider_protocol::activity::ActivityDisplay,
+    ) -> bool {
+        self.activity_icons = Some(mode);
+        self.activity_icons_dirty = true;
+        if self.write_dto(theme, self.notifications) {
+            self.last_saved = Some(theme);
+            self.last_saved_notifications = Some(self.notifications);
+            self.last_saved_verbosity = Some(self.verbosity);
+            true
+        } else {
+            false
         }
     }
 
@@ -310,25 +377,29 @@ impl SettingsStore {
     /// pick, or `None` on a missing/corrupt/foreign file or a pre-retention
     /// file (either half absent).
     #[must_use]
-    pub fn load_last_model(&self) -> Option<(String, String)> {
+    pub fn load_last_model(&self) -> Option<LastModelPick> {
         let dto = self.load_dto()?;
-        Some((dto.last_provider?, dto.last_model?))
+        Some(LastModelPick {
+            provider: dto.last_provider?,
+            model: dto.last_model?,
+            catalog_key: dto.last_model_catalog_key,
+            scope_known: dto.last_model_scope_version == Some(1),
+        })
     }
 
     /// Seed the tracked pair (from a boot-time load) so a later theme or
     /// notification save preserves it.
-    pub fn set_last_model(&mut self, pair: Option<(String, String)>) {
+    pub fn set_last_model(&mut self, pair: Option<LastModelPick>) {
         self.last_model = pair;
     }
 
     /// Persist a committed model pick, carrying the current theme +
     /// notification toggle. A no-op when the pair is unchanged.
-    pub fn save_last_model_if_changed(&mut self, theme: ThemeChoice, provider: &str, model: &str) {
-        let pair = (provider.to_owned(), model.to_owned());
-        if self.last_model.as_ref() == Some(&pair) {
+    pub fn save_last_model_if_changed(&mut self, theme: ThemeChoice, pair: Option<LastModelPick>) {
+        if self.last_model == pair {
             return;
         }
-        self.last_model = Some(pair);
+        self.last_model = pair;
         if self.write_dto(theme, self.notifications) {
             self.last_saved = Some(theme);
             self.last_saved_notifications = Some(self.notifications);
@@ -366,16 +437,21 @@ impl SettingsStore {
         }
     }
 
-    fn write_dto(&self, theme: ThemeChoice, notifications: bool) -> bool {
+    fn write_dto(&mut self, theme: ThemeChoice, notifications: bool) -> bool {
         let dto = SettingsDto {
             version: SETTINGS_VERSION,
             theme: theme.name().to_owned(),
             notifications,
-            last_provider: self
+            last_provider: self.last_model.as_ref().map(|pick| pick.provider.clone()),
+            last_model: self.last_model.as_ref().map(|pick| pick.model.clone()),
+            last_model_catalog_key: self
                 .last_model
                 .as_ref()
-                .map(|(provider, _)| provider.clone()),
-            last_model: self.last_model.as_ref().map(|(_, model)| model.clone()),
+                .and_then(|pick| pick.catalog_key.clone()),
+            last_model_scope_version: self
+                .last_model
+                .as_ref()
+                .and_then(|pick| pick.scope_known.then_some(1)),
             tool_verbosity: Some(self.verbosity.name().to_owned()),
             tool_rows: self
                 .tool_rows
@@ -396,6 +472,7 @@ impl SettingsStore {
                     )
                 })
                 .collect(),
+            activity_icons: self.activity_icons.map(|mode| mode.name().to_owned()),
         };
         let Ok(json) = serde_json::to_string(&dto) else {
             return false;
@@ -404,8 +481,12 @@ impl SettingsStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes())
+        let saved = std::fs::write(&tmp, json.as_bytes())
             .and_then(|()| std::fs::rename(&tmp, &self.path))
-            .is_ok()
+            .is_ok();
+        if saved {
+            self.activity_icons_dirty = false;
+        }
+        saved
     }
 }

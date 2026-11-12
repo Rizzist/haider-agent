@@ -66,7 +66,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
-const DEADLINE: Duration = Duration::from_secs(10);
+// This only caps a missing event; scheduler latency is not an acceptance bound.
+const DEADLINE: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 fn envelope(
     session_id: &SessionId,
@@ -135,6 +136,7 @@ fn footprint_envelope(
 ) -> RawEnvelope {
     let mut envelope = envelope(session_id, event_id, worker_generation);
     let footprint = ContextFootprint {
+        selection_epoch: None,
         input_tokens: used_tokens,
         output_tokens: 0,
         cached_input_tokens: 0,
@@ -833,23 +835,151 @@ fn sidecar_path(root: &tempfile::TempDir, session_id: &SessionId) -> std::path::
     root.path().join("pipe").join(format!("{session_id}.pipe"))
 }
 
-/// #6 (935): sidecar maintenance runs off the publish path on a per-session
-/// writer task, so a read right after `append` can race the write. Poll the
-/// file until it is non-empty and STABLE across a tick — the atomic
-/// temp+rename rebuild converges to exactly the steady state
-/// `hub.shutdown()` guarantees, with no intermediate stable point.
-async fn stable_sidecar(path: &std::path::Path) -> String {
-    let mut prev: Option<String> = None;
-    for _ in 0..300 {
-        if let Ok(cur) = std::fs::read_to_string(path) {
-            if !cur.is_empty() && prev.as_deref() == Some(cur.as_str()) {
-                return cur;
+/// Sidecar maintenance runs on a queued writer, so even repeated equal reads
+/// can precede a pending append. Wait for its complete coverage tail to reach
+/// the expected journal head; callers still assert the actual rows and generation.
+async fn sidecar_at_coverage(path: &std::path::Path, expected_coverage: u64) -> String {
+    let mut last_read = None;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                let coverage = body
+                    .lines()
+                    .last()
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|tail| tail.get("coverage").and_then(serde_json::Value::as_u64));
+                if body.ends_with('\n') && coverage == Some(expected_coverage) {
+                    return body;
+                }
+                last_read = Some(body);
             }
-            prev = Some(cur);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "sidecar {} did not reach coverage {expected_coverage}: {last_read:?}",
+            path.display()
+        )
+    })
+}
+
+#[tokio::test]
+async fn sidecar_wait_requires_committed_coverage_before_returning() {
+    let root = tempfile::tempdir().expect("sidecar fixture directory");
+    let settled = "{\"role\":\"user\",\"seq\":1}\n{\"coverage\":3,\"generation\":1}\n";
+    for (name, predecessor) in [
+        ("old-row", Some("{\"role\":\"user\",\"seq\":1}\n")),
+        (
+            "unsettled-current-row",
+            Some("{\"role\":\"user\",\"seq\":3}\n"),
+        ),
+        ("old-coverage", Some("{\"coverage\":1,\"generation\":1}\n")),
+        ("partial", Some("{\"coverage\":")),
+        ("empty", Some("")),
+        ("missing", None),
+    ] {
+        let path = root.path().join(format!("{name}.pipe"));
+        if let Some(predecessor) = predecessor {
+            std::fs::write(&path, predecessor).expect("predecessor writes");
+        }
+        let wait = sidecar_at_coverage(&path, 3);
+        tokio::pin!(wait);
+        // The producer is deliberately held. Biased polling observes an early
+        // return before the control timer even when both wake under load.
+        tokio::select! {
+            biased;
+            body = &mut wait => panic!("{name} returned before coverage committed: {body}"),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        std::fs::write(&path, settled).expect("committed coverage writes");
+        assert_eq!(wait.await, settled, "{name} observes the committed body");
+    }
+    let path = root.path().join("already-current.pipe");
+    std::fs::write(&path, settled).expect("current sidecar writes");
+    assert_eq!(
+        sidecar_at_coverage(&path, 3).await,
+        settled,
+        "an unchanged current file is a valid positive control"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_waits_for_delayed_writer_from_unsettled_tails() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    for initial in [
+        None,
+        Some(""),
+        Some("{\"coverage\":1,\"generation\":7}\n"),
+        Some("{\"role\":\"user\",\"seq\":2}\n"),
+        Some("{\"coverage\":"),
+        Some("{\"coverage\":2,\"generation\":7}"),
+        Some("{\"coverage\":3,\"generation\":7}\n"),
+    ] {
+        if let Some(body) = initial {
+            std::fs::write(&path, body).expect("initial tail");
+        }
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            // Longer than the old helper's two equal reads, without wall-clock timing.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let temporary = writer_path.with_extension("tmp");
+            std::fs::write(&temporary, expected).expect("queued batch");
+            std::fs::rename(temporary, writer_path).expect("publish batch");
+        });
+        assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+        writer.await.expect("writer joins");
+        std::fs::remove_file(&path).expect("fixture resets");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_coverage_returns_ready_content_without_waiting_or_rewriting() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    let expected =
+        "{\"role\":\"user\",\"text\":\"kept\",\"seq\":1}\n{\"coverage\":2,\"generation\":7}\n";
+    std::fs::write(&path, expected).expect("ready sidecar");
+    let start = tokio::time::Instant::now();
+    assert_eq!(sidecar_at_coverage(&path, 2).await, expected);
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged file"),
+        expected
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "did not reach coverage 2")]
+async fn sidecar_coverage_deadline_rejects_a_stalled_writer() {
+    let root = tempfile::tempdir().expect("sidecar fixture");
+    let path = root.path().join("session.pipe");
+    std::fs::write(&path, "{\"coverage\":1,\"generation\":7}\n").expect("stale tail");
+    sidecar_at_coverage(&path, 2).await;
+}
+
+/// Warm the live writer with a complete seed projection, including coverage.
+/// An unchanged file can still precede queued work; final observations instead
+/// join the writer with `hub.shutdown()` before reading.
+async fn wait_for_sidecar(path: &std::path::Path, expected: &str) {
+    let mut observed = None;
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if body == expected {
+                return;
+            }
+            observed = Some(body);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    prev.unwrap_or_default()
+    panic!(
+        "sidecar did not reach the seed projection: expected={expected:?}; observed={observed:?}"
+    )
 }
 
 async fn append_delta(
@@ -1257,6 +1387,7 @@ async fn create_and_attach_typed_session(
 async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId, provider: &str) {
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(
@@ -1265,6 +1396,7 @@ async fn create_typed_session(store: &SqliteStoreHandle, session_id: &SessionId,
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: provider.into(),
+            model_catalog_key: None,
             model: "test-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2719,6 +2851,7 @@ async fn append_fleet_metrics(
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         }))
         .expect("tool event"),
@@ -2922,6 +3055,7 @@ async fn a_stale_v5_file_rebuilds_with_rejected_tool_status() {
                 name: "fs_write".into(),
                 args: serde_json::json!({"path": "guarded"}),
                 status: ToolStatus::Rejected,
+                activity: None,
             },
         }),
     );
@@ -3856,6 +3990,19 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
 
     append_one(&hub, &session_id, generation, "fills-one-slot-buffer").await;
     append_one(&hub, &session_id, generation, "overflows-one-slot-buffer").await;
+    // Append acknowledges durability before synchronous fanout. Keep replay
+    // parked until publication really filled/overflowed the one-slot receiver;
+    // otherwise it can drain seq 3 before seq 4 is published and never need a
+    // re-registration (so waiting specifically for AttachCaughtUp(4) hangs).
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if matches!(control.observed.recv().await,
+                Some(HubObservation::Published { session_id: ref published, through_seq: 4 }) if published == &session_id)
+            {
+                break;
+            }
+        }
+    }).await.expect("overflow publication observed before releasing replay");
     control.release();
 
     let mut delivered = Vec::new();
@@ -4264,13 +4411,66 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
     store.close().await.expect("store closes");
 }
 
+async fn poison_unlisted_recency_metadata(
+    root: &tempfile::TempDir,
+    store: &SqliteStoreHandle,
+    session_count: usize,
+) -> (SessionId, String) {
+    // Selecting only recency keys does not warm any summary/observe fold.
+    let keys = store
+        .session_recency_page(None, session_count)
+        .await
+        .expect("fixture recency keys read");
+    assert_eq!(keys.len(), session_count);
+    let session_id = keys
+        .last()
+        .expect("unlisted last row")
+        .key
+        .session_id
+        .clone();
+    let connection = rusqlite::Connection::open(root.path().join("store.sqlite"))
+        .expect("fixture database opens");
+    let original = connection
+        .query_row(
+            "SELECT meta_json FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("fixture metadata reads");
+    connection
+        .execute(
+            "UPDATE sessions SET meta_json = '{' WHERE id = ?1",
+            [session_id.as_str()],
+        )
+        .expect("install unlisted metadata tripwire");
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .await
+            .expect_err("tripwire rejects a summary read")
+            .code,
+        ErrorCode::StoreCorrupt
+    );
+    (session_id, original)
+}
+
+fn restore_recency_metadata(root: &tempfile::TempDir, session_id: &SessionId, original: &str) {
+    rusqlite::Connection::open(root.path().join("store.sqlite"))
+        .expect("fixture database opens")
+        .execute(
+            "UPDATE sessions SET meta_json = ?1 WHERE id = ?2",
+            rusqlite::params![original, session_id.as_str()],
+        )
+        .expect("restore valid fixture metadata");
+}
+
 /// P0 session-loss regression: a cold 400-session profile is listed newest
 /// first on page one, independent of ids/titles, with durable metadata and
 /// lineage present. Exactly 40 rows are marked seen; the other 360 exercise
 /// the production `NULL seen_at_ms` shape.
 #[tokio::test]
 async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() {
-    let (_root, store, hub) = open_hub(None, 8).await;
+    let (root, store, hub) = open_hub(None, 8).await;
     let generation = store.worker_generation();
     let latest = SessionId::new("session-000");
     let child = SessionId::new("session-001");
@@ -4373,7 +4573,10 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
             ConnectionTransport::LocalSameUid,
         )
         .expect("connection");
-    let list_400_started = std::time::Instant::now();
+    // An unreadable last-row metadata record is a deterministic tripwire
+    // against materializing summaries outside the selected page. Restore it
+    // before deliberately paging through all 400 rows below.
+    let (unlisted_400, metadata_400) = poison_unlisted_recency_metadata(&root, &store, 400).await;
     connection
         .request(
             RequestId::new("recency-list-400"),
@@ -4396,11 +4599,12 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     else {
         panic!("expected first recency page");
     };
-    let list_400_elapsed = list_400_started.elapsed();
     assert!(
-        list_400_elapsed < Duration::from_millis(500),
-        "full cold session.list at 400 sessions exceeded 500 ms: {list_400_elapsed:?}"
+        sessions
+            .iter()
+            .all(|summary| summary.session_id != unlisted_400)
     );
+    restore_recency_metadata(&root, &unlisted_400, &metadata_400);
     assert_eq!(sessions.len(), 100, "MAX_LIST_PAGE remains the page cap");
     assert!(
         cursor.starts_with("hr1."),
@@ -4508,7 +4712,8 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     assert_eq!(all_ids.len(), 400, "all four pages have no skips");
 
     // Scale the same cold-list path without warming the new rows' observe
-    // folds. Fixture creation is intentionally outside the timed region.
+    // folds. The indexed query has a SQLite-instruction budget in the store
+    // suite; this RPC fixture pins page-bounded summary materialization.
     for index in 400..5_000_u16 {
         create_typed_session(
             &store,
@@ -4517,7 +4722,8 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
         )
         .await;
     }
-    let list_5000_started = std::time::Instant::now();
+    let (unlisted_5000, metadata_5000) =
+        poison_unlisted_recency_metadata(&root, &store, 5_000).await;
     connection
         .request(
             RequestId::new("recency-list-5000"),
@@ -4536,16 +4742,13 @@ async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() 
     else {
         panic!("expected 5,000-session recency page");
     };
-    let list_5000_elapsed = list_5000_started.elapsed();
     assert_eq!(sessions.len(), 100);
     assert!(
-        list_5000_elapsed < Duration::from_millis(500),
-        "full cold session.list at 5,000 sessions exceeded 500 ms: {list_5000_elapsed:?}"
+        sessions
+            .iter()
+            .all(|summary| summary.session_id != unlisted_5000)
     );
-    eprintln!(
-        "full cold session.list page: 400 sessions {list_400_elapsed:?}; \
-         5,000 sessions {list_5000_elapsed:?} (500ms budget each)"
-    );
+    restore_recency_metadata(&root, &unlisted_5000, &metadata_5000);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -4642,8 +4845,14 @@ fn model_selected_envelope(
 ) -> RawEnvelope {
     let mut envelope = envelope(session_id, event_id, worker_generation);
     *envelope.payload = ModelSelected {
+        selection_epoch: None,
         provider: provider.into(),
+        model_catalog_key: None,
         model: model.into(),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("model selection serializes");
@@ -5014,6 +5223,7 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
         name: "fs_read".into(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let mut started = envelope(&session_id, "metrics-started", generation);
     started.run_id = Some(run_id.clone());
@@ -6615,6 +6825,38 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
         live_node.children[0].parent_agent_id.as_ref(),
         Some(&live.agent_id)
     );
+    // 973-activity-icons: every child only STARTED a model-requested
+    // `fs_read` item — no effect was ever dispatched — so no node reads
+    // (F1: a requested tool name alone sets no icon and no history). The
+    // live parent still orchestrates its live child, and terminal nodes are
+    // quiet.
+    {
+        use haider_protocol::activity::ActivityKind;
+        assert_eq!(live_node.activity, Some(ActivityKind::Orchestrate));
+        assert_eq!(live_node.activities, vec![ActivityKind::Orchestrate]);
+        assert_eq!(live_node.children[0].activity, None);
+        assert!(live_node.children[0].activities.is_empty());
+        for node in &snapshot.roots {
+            if matches!(
+                node.state,
+                FleetAgentStateWire::Done
+                    | FleetAgentStateWire::Failed
+                    | FleetAgentStateWire::Cancelled
+            ) {
+                assert_eq!(node.activity, None, "{}", node.agent_id);
+                assert!(node.activities.is_empty(), "{}", node.agent_id);
+            }
+        }
+        let json = serde_json::to_value(&snapshot).expect("fleet json");
+        let live_json = json["roots"]
+            .as_array()
+            .expect("roots")
+            .iter()
+            .find(|node| node["agent_id"] == "fleet-agent-live")
+            .expect("live json node");
+        assert_eq!(live_json["activity"], "orchestrate");
+        assert_eq!(live_json["activities"], serde_json::json!(["orchestrate"]));
+    }
 
     let denied_sink = Arc::new(CollectSink::default());
     let denied = hub
@@ -8360,12 +8602,43 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
     store.close().await.expect("store closes");
 }
 
+const STALLED_OUTBOX_BYTE_BUDGET: usize = 1_800;
+
+#[derive(Default)]
+struct ReplayParking {
+    confirmed: AtomicBool,
+    changed: Notify,
+}
+
+impl ReplayParking {
+    fn confirm(&self) {
+        self.confirmed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.confirmed.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("replay parking deadline");
+    }
+}
+
 /// A sink that admits the initial replay and caught-up marker, then answers
 /// `Busy` to every further event with a drain signal that never advances —
 /// the genuinely stuck client shape.
+#[derive(Default)]
 struct StalledAfterCaughtUpSink {
     collected: CollectSink,
     saw_caught_up: AtomicBool,
+    parking: ReplayParking,
     /// Admission tickets that deliberately never fire — the stuck shape.
     parked: Mutex<Vec<AdmissionTicket>>,
 }
@@ -8392,6 +8665,19 @@ impl FrameSink for StalledAfterCaughtUpSink {
         }
     }
 
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let admission = self.offer(attachment_id, frame);
+        if matches!(admission, SendAdmission::Busy) {
+            self.parking.confirm();
+        }
+        admission
+    }
+
     fn drain_ticket(&self) -> Option<AdmissionTicket> {
         let ticket = Arc::new(Notify::new());
         self.parked
@@ -8410,18 +8696,14 @@ impl FrameSink for StalledAfterCaughtUpSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 1_800,
+        catch_up_byte_budget: STALLED_OUTBOX_BYTE_BUDGET,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
     let session_id = SessionId::new("stalled-outbox");
     let generation = store.worker_generation();
     append_one(&hub, &session_id, generation, "initial").await;
-    let sink = Arc::new(StalledAfterCaughtUpSink {
-        collected: CollectSink::default(),
-        saw_caught_up: AtomicBool::new(false),
-        parked: Mutex::new(Vec::new()),
-    });
+    let sink = Arc::new(StalledAfterCaughtUpSink::default());
     let connection = hub
         .open_connection(
             capabilities(),
@@ -8454,23 +8736,33 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         }
     ));
 
-    // Each append either fits the momentarily-empty catch-up channel or trips
-    // the byte ledger while the replay task is blocked awaiting outbox
-    // capacity that never comes; the trip converges within a few commits.
-    for index in 0..8 {
-        let mut event = vec![envelope(
-            &session_id,
-            format!("pressure-{index}"),
-            generation,
-        )];
-        *event[0].payload = serde_json::json!({
-            "type": "future_test_event",
-            "blob": "x".repeat(400),
-        });
-        hub.append(&mut event)
-            .await
-            .expect("pressure append commits");
-    }
+    // A fitting live event must reach a confirmed Busy admission before
+    // pressure is published. AttachCaughtUp alone does not prove parking:
+    // an early oversized commit can instead trigger store re-registration.
+    let mut first = vec![envelope(&session_id, "park-replay", generation)];
+    let first_weight = haider_protocol::envelope::envelope_weight_bytes(&first[0]);
+    assert!(
+        first_weight <= STALLED_OUTBOX_BYTE_BUDGET,
+        "the parking event must fit the catch-up budget: {first_weight}"
+    );
+    hub.append(&mut first).await.expect("parking event commits");
+    sink.parking.wait().await;
+
+    // One explicitly oversized commit now exercises lag while the replay
+    // is parked on a real admission ticket that deliberately never fires.
+    let mut pressure = vec![envelope(&session_id, "pressure", generation)];
+    *pressure[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(700),
+    });
+    let pressure_weight = haider_protocol::envelope::envelope_weight_bytes(&pressure[0]);
+    assert!(
+        pressure_weight > STALLED_OUTBOX_BYTE_BUDGET,
+        "the pressure event must exceed the catch-up budget: {pressure_weight}"
+    );
+    hub.append(&mut pressure)
+        .await
+        .expect("pressure append commits");
     assert!(matches!(
         sink.collected.next().await,
         WireFrame::Lagged {
@@ -8658,23 +8950,12 @@ struct UndeliveredResponseSink {
     collected: CollectSink,
     pending: Mutex<Option<RequestId>>,
     parked: Mutex<Vec<AdmissionTicket>>,
-    confirmed_parked: AtomicBool,
-    parked_changed: Notify,
+    parking: ReplayParking,
 }
 
 impl UndeliveredResponseSink {
     async fn wait_until_parked(&self) {
-        tokio::time::timeout(DEADLINE, async {
-            loop {
-                let changed = self.parked_changed.notified();
-                if self.confirmed_parked.load(Ordering::Acquire) {
-                    return;
-                }
-                changed.await;
-            }
-        })
-        .await
-        .expect("replay parking deadline");
+        self.parking.wait().await;
     }
 }
 
@@ -8714,8 +8995,7 @@ impl FrameSink for UndeliveredResponseSink {
     ) -> SendAdmission {
         let admission = self.offer(attachment_id, frame);
         if matches!(admission, SendAdmission::Busy) {
-            self.confirmed_parked.store(true, Ordering::Release);
-            self.parked_changed.notify_waiters();
+            self.parking.confirm();
         }
         admission
     }
@@ -8743,7 +9023,7 @@ impl FrameSink for UndeliveredResponseSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lagged() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 1_800,
+        catch_up_byte_budget: STALLED_OUTBOX_BYTE_BUDGET,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
@@ -8782,6 +9062,11 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
         "type": "future_test_event",
         "blob": "x".repeat(700),
     });
+    let pressure_weight = haider_protocol::envelope::envelope_weight_bytes(&event[0]);
+    assert!(
+        pressure_weight > STALLED_OUTBOX_BYTE_BUDGET,
+        "the pressure event must exceed the catch-up budget: {pressure_weight}"
+    );
     hub.append(&mut event).await.expect("pressure commits");
 
     match sink.collected.next().await {
@@ -9699,9 +9984,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
     events[3].branch_id = Some(BranchId::new("branch-sidecar"));
 
     hub.append(&mut events).await.expect("pipe batch commits");
-    let bytes = stable_sidecar(&sidecar_path(&root, &session_id))
-        .await
-        .into_bytes();
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let bytes = std::fs::read(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     assert_eq!(
         bytes,
         expected_sidecar(&session_id, 1, &events).into_bytes()
@@ -9710,7 +9994,8 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         String::from_utf8(bytes).expect("sidecar utf8"),
         stored_sidecar(&store, &session_id, 1).await
     );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     let values: Vec<serde_json::Value> = sidecar
         .lines()
         .skip(1)
@@ -9742,7 +10027,6 @@ async fn native_pipe_sidecar_matches_shared_renderer_for_all_body_kinds() {
         .filter_map(haider_protocol::pipe::sidecar_row_line)
         .collect();
     assert_eq!(row_lines, expected_rows);
-    hub.shutdown().await.expect("hub stops");
 }
 
 /// MUTATION CHECK: read sealed reasoning from `payload.delta.text` or emit the
@@ -9923,7 +10207,11 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
         "before",
     )];
     hub.append(&mut seed).await.expect("seed commits");
-    let _ = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    wait_for_sidecar(
+        &sidecar_path(&root, &session_id),
+        &expected_sidecar(&session_id, 1, &seed),
+    )
+    .await;
 
     let mut tool_call = pipe_event(
         &session_id,
@@ -9936,6 +10224,7 @@ async fn native_pipe_hot_eof_flushes_tool_before_terminal_compaction_boundary() 
                 name: "shell".into(),
                 args: serde_json::json!({"cmd": "printf hot"}),
                 status: haider_protocol::item::ToolStatus::Completed,
+                activity: None,
             },
         }),
     );
@@ -10233,7 +10522,6 @@ async fn native_pipe_truncates_a_torn_tail_before_resume() {
     // #6 (935): drain the writer task (shutdown) before reading the settled
     // sidecar — maintenance no longer completes on the publish path.
     hub.shutdown().await.expect("second hub stops");
-    hub.shutdown().await.expect("second hub stops");
     assert_eq!(
         std::fs::read_to_string(&path).expect("settled sidecar reads"),
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
@@ -10282,9 +10570,8 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         .await
         .expect("offline delta commits");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
-    append_delta(&hub, &session_id, generation, "resume-trigger").await;
-
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    let head = append_delta(&hub, &session_id, generation, "resume-trigger").await;
+    let sidecar = sidecar_at_coverage(&sidecar_path(&root, &session_id), head).await;
     let rows: Vec<&str> = sidecar
         .lines()
         .filter(|line| line.contains("\"role\""))
@@ -10294,7 +10581,15 @@ async fn native_pipe_mixed_row_and_coverage_tail_resumes_from_coverage() {
         serde_json::from_str(sidecar.lines().last().expect("tail")).expect("tail JSON");
     assert_eq!(tail["coverage"], missed[0].seq + 1);
     assert_eq!(tail["generation"], 1);
-    hub.shutdown().await.expect("second hub stops");
+
+    hub.shutdown()
+        .await
+        .expect("second hub joins sidecar writer");
+    assert_eq!(
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads"),
+        sidecar,
+        "joining the writer preserves the observed complete coverage"
+    );
 }
 
 #[tokio::test]
@@ -10320,11 +10615,10 @@ async fn native_pipe_first_touch_reconciles_events_committed_while_down() {
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     append_one(&hub, &session_id, generation, "non-rendering-trigger").await;
-    assert_eq!(
-        stable_sidecar(&sidecar_path(&root, &session_id)).await,
-        stored_sidecar(&store, &session_id, 1).await
-    );
-    let sidecar = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    hub.shutdown().await.expect("hub joins sidecar writer");
+    let sidecar =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
+    assert_eq!(sidecar, stored_sidecar(&store, &session_id, 1).await);
     let tail: serde_json::Value =
         serde_json::from_str(sidecar.lines().last().expect("coverage tail"))
             .expect("coverage tail JSON");
@@ -11368,4 +11662,207 @@ async fn closed_session_read_and_attach_return_explicit_error_without_recreation
         0
     );
     hub.shutdown().await.expect("hub stops");
+}
+
+/// F1: the cold list snapshot used by TUI/CLI/launcher agrees with attach,
+/// including typed recovery and origin-only legacy rows. Real CAS still wins.
+#[tokio::test]
+async fn recovered_origin_list_snapshot_matches_fresh_attach_cas() {
+    for projection in ["missing", "foreign", "legacy"] {
+        let (root, store, hub) = open_hub(None, 8).await;
+        let session = SessionId::new(format!("recovered-list-{projection}"));
+        create_typed_session(&store, &session, "fake").await;
+        let sink = Arc::new(CollectSink::default());
+        let connection = hub
+            .open_connection_with_client_kind(
+                capabilities(),
+                sink.clone(),
+                ClientKind::Tui,
+                ConnectionTransport::LocalSameUid,
+            )
+            .expect("local TUI connection");
+        let generation = store.worker_generation();
+        for revision in 0..4 {
+            let response = attach_with_origin_response(
+                &connection,
+                &sink,
+                &format!("open-{revision}"),
+                &session,
+                0,
+                launch_origin_registration(
+                    &format!("origin-{revision}"),
+                    &format!("open-{revision}"),
+                    generation,
+                    revision,
+                    "~/own",
+                ),
+            )
+            .await;
+            assert!(matches!(response, ResponseBody::SessionAttach { .. }));
+        }
+        let origin = store
+            .latest_launch_origin(&session)
+            .await
+            .expect("lookup")
+            .expect("own origin");
+        let db = rusqlite::Connection::open(root.path().join("store.sqlite")).expect("fixture DB");
+        let sql = match projection {
+            "foreign" => {
+                "UPDATE sessions SET meta_json=json_set(meta_json,'$.launch_origin.subject_session_id','foreign-parent') WHERE id=?1"
+            }
+            "legacy" => "UPDATE sessions SET meta_json='{}' WHERE id=?1",
+            _ => {
+                "UPDATE sessions SET meta_json=json_remove(meta_json,'$.launch_origin') WHERE id=?1"
+            }
+        };
+        db.execute(sql, [session.as_str()])
+            .expect("replace projection only");
+        drop(db);
+        connection
+            .request(
+                RequestId::new("cold-list"),
+                RequestBody::SessionList {
+                    limit: 10,
+                    cursor: None,
+                    order: Default::default(),
+                },
+            )
+            .await
+            .expect("list routes");
+        let row = loop {
+            if let WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionList { sessions, .. },
+            } = sink.next().await
+                && request_id.as_str() == "cold-list"
+            {
+                break sessions
+                    .into_iter()
+                    .find(|row| row.session_id == session)
+                    .expect("listed session");
+            }
+        };
+        // Serialize to keep the pre-fix reproduction compilable: the old
+        // summary has no recovered-origin field, so this assertion fails.
+        let wire = serde_json::to_value(&row).expect("summary wire");
+        assert_eq!(
+            wire.get("launch_origin"),
+            Some(&serde_json::to_value(&origin).expect("origin wire")),
+            "{projection}"
+        );
+        if let Some(metadata) = &row.metadata {
+            assert_eq!(metadata.launch_origin.as_ref(), Some(&origin));
+        }
+        let stale = attach_with_origin_response(
+            &connection,
+            &sink,
+            "stale-open",
+            &session,
+            0,
+            launch_origin_registration("stale-origin", "stale-open", generation, 0, "~/stale"),
+        )
+        .await;
+        assert!(
+            matches!(stale, ResponseBody::Error { ref code, .. } if code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT)
+        );
+        let fresh = attach_with_origin_response(
+            &connection,
+            &sink,
+            "fresh-open",
+            &session,
+            0,
+            launch_origin_registration(
+                "fresh-origin",
+                "fresh-open",
+                generation,
+                origin.revision,
+                "~/fresh",
+            ),
+        )
+        .await;
+        assert!(
+            matches!(fresh, ResponseBody::SessionAttach { launch_origin: Some(ref current), .. } if current.revision == 5)
+        );
+        connection.close().await.expect("connection closes");
+        hub.shutdown().await.expect("hub stops");
+        store.close().await.expect("store closes");
+    }
+}
+
+#[tokio::test]
+async fn prompt_owners_are_listed_before_delegated_and_nested_turns_exist() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("prompt-owner-root");
+    let child = SessionId::new("prompt-owner-child");
+    let nested = SessionId::new("prompt-owner-nested");
+    for session in [&root, &child, &nested] {
+        create_typed_session(&store, session, "fake").await;
+    }
+    let child_record = fleet_delegation(&root, &root, &child, "prompt-owner-child", None, 1);
+    let nested_record = fleet_delegation(
+        &root,
+        &child,
+        &nested,
+        "prompt-owner-nested",
+        Some(child_record.agent_id.clone()),
+        2,
+    );
+    store
+        .create_delegation(child_record.clone())
+        .await
+        .expect("child delegation");
+    store
+        .create_delegation(nested_record.clone())
+        .await
+        .expect("nested delegation");
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection_with_client_kind(
+            capabilities(),
+            sink.clone(),
+            ClientKind::Tui,
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("local TUI connection");
+    connection
+        .request(
+            RequestId::new("owner-list"),
+            RequestBody::SessionList {
+                limit: 10,
+                cursor: None,
+                order: Default::default(),
+            },
+        )
+        .await
+        .expect("list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("session list response");
+    };
+    for (session, owner) in [
+        (&root, None),
+        (&child, Some(&child_record.agent_id)),
+        (&nested, Some(&nested_record.agent_id)),
+    ] {
+        let row = sessions
+            .iter()
+            .find(|row| &row.session_id == session)
+            .expect("listed session");
+        assert!(
+            row.agent_metrics.is_none(),
+            "fixture has no agent turns yet"
+        );
+        let wire = serde_json::to_value(row).expect("summary wire");
+        assert_eq!(
+            wire.get("owner_agent_id")
+                .and_then(serde_json::Value::as_str),
+            owner.map(AgentId::as_str)
+        );
+    }
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }

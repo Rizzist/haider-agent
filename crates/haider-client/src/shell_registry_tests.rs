@@ -27,6 +27,7 @@ fn shell() -> ShellWire {
         id: "sh-0123456789abcdef0123".into(),
         kind: ShellKindWire::Local,
         status: ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "/workspace".into(),
         created_at_ms: 1,

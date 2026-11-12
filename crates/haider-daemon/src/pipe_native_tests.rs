@@ -224,6 +224,7 @@ fn queued_head_delays_unresolved_tool_eof_flush() {
                 name: "shell".into(),
                 args: serde_json::json!({"cmd": "printf queued"}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }),
     );
@@ -274,12 +275,14 @@ async fn incremental_projection_matches_cold_oracle_across_branch_compaction_for
     let branch_b = BranchId::new("pipe-branch-b");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-pipe-incremental-oracle".into(),
             request_digest: "create-pipe-incremental-oracle-digest".into(),
             request_json: r#"{"session":"pipe-incremental-oracle"}"#.into(),
             session_id: session_id.clone(),
             cwd: root.path().to_string_lossy().into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4_096,
             max_tokens_source: None,

@@ -759,7 +759,7 @@ fn prepare_child_directory(
             }
         };
         let mut receipt = OwnedDirectoryReceipt::new(staging_path, anchor);
-        let working = match rustix::io::dup(&receipt.anchor) {
+        let working = match crate::duplicate_workspace_directory(&receipt.anchor) {
             Ok(working) => working,
             Err(error) => {
                 let source = EndpointError::io(

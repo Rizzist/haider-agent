@@ -165,6 +165,7 @@ fn snapshot(
         started_at_ms: SPAWN_MS,
         terminal_at_ms: (!live).then_some(SPAWN_MS + RUN_MS),
         live,
+        activity: None,
         tool_attempts: 3,
         usage: Some(usage(auth, cost_microusd)),
     }
@@ -420,6 +421,9 @@ fn chip_clock_is_monotone_and_stops_at_terminal() {
 
 fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionSummary {
     haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
+        latest_context_footprint: None,
         session_id: SessionId::new(session_id),
         head_seq,
         worker_generation: 7,
@@ -539,6 +543,7 @@ fn chip_row_tokens_is_truth_ordered() {
     assert_eq!(chip_row_tokens(&model.sessions, chip), Some(2_000));
     // …and a chip-scoped durable footprint outranks everything.
     let footprint = ContextFootprint {
+        selection_epoch: None,
         input_tokens: 900,
         output_tokens: 50,
         cached_input_tokens: 50,
@@ -817,6 +822,9 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
     note_child_metrics(&mut model, &child);
     let main = snapshot(None, sid().as_str(), 11, false, AuthMethod::ApiKey, 130_000);
     model.note_summary_counts(&haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
+        latest_context_footprint: None,
         session_id: sid(),
         head_seq: 11,
         worker_generation: 7,

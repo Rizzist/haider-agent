@@ -45,6 +45,7 @@ fn picker_keeps_403_subscription_static_row_selectable() {
         display_name: None,
         context_window: Some(1_000_000),
         max_output_tokens: None,
+        max_output_tokens_source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -186,7 +187,11 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
 
     run_slash(&mut model, "/model");
     let initial = live_pass(&mut driver, &mut model, None, std::time::Instant::now()).commands;
-    assert!(initial.contains(&LiveCommand::ProviderList));
+    assert!(
+        initial
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ProviderListAt { .. }))
+    );
     let followups = driver.apply(
         &mut model,
         LiveReply::Providers {
@@ -194,9 +199,8 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
             revision: 2,
         },
     );
-    assert!(followups.contains(&LiveCommand::RefreshProviderModels {
-        provider: "openai".to_owned(),
-    }));
+    assert!(followups.iter().any(|command| matches!(command,
+        LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai")));
 
     driver.apply(
         &mut model,
@@ -212,9 +216,8 @@ fn opening_model_picker_refreshes_a_stale_selected_provider() {
             revision: 3,
         },
     );
-    assert!(retry.contains(&LiveCommand::RefreshProviderModels {
-        provider: "openai".to_owned(),
-    }));
+    assert!(retry.iter().any(|command| matches!(command,
+        LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "openai")));
 }
 
 /// `/provider` lists the registry with honest health; `/account` lists live

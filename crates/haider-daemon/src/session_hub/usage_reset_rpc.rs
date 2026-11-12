@@ -115,7 +115,7 @@ impl HubConnection {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "reset account identity is incomplete",
+                "reset account identity is incomplete; refresh this account or sign in again before applying a reset",
                 false,
                 None,
             );

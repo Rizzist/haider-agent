@@ -52,7 +52,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !state.capabilities_seen.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
@@ -65,7 +65,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
     assert!(mutex_lock(&state.recent_sms).entries.is_empty());
     let mut byte = [0u8; 1];
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), first.read(&mut byte))
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, first.read(&mut byte))
             .await
             .unwrap()
             .unwrap(),
@@ -86,7 +86,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
         .send(ActorCommand::Request {
             body: json!({"type":"a11y.snapshot"}),
             reply,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            deadline: tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
         })
         .await
         .unwrap();
@@ -113,7 +113,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
         .send(ActorCommand::Request {
             body: json!({"type":"a11y.tap","x":1,"y":1,"control":true}),
             reply,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            deadline: tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
         })
         .await
         .unwrap();
@@ -125,7 +125,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
         .send(ActorCommand::Request {
             body: json!({"type":"a11y.snapshot"}),
             reply,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            deadline: tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
         })
         .await
         .unwrap();
@@ -147,7 +147,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
         .send(ActorCommand::Request {
             body: json!({"type":"a11y.snapshot"}),
             reply,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            deadline: tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
         })
         .await
         .unwrap();
@@ -166,7 +166,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
         .send(ActorCommand::Request {
             body: json!({"type":"a11y.snapshot"}),
             reply,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            deadline: tokio::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT,
         })
         .await
         .unwrap();
@@ -182,7 +182,7 @@ async fn mobile_standalone_uds_hello_reconnect_push_request_and_cleanup() {
     .unwrap();
     assert_eq!(current_result.await.unwrap().unwrap()["fixture"], "current");
     let _silent_handshake = tokio::net::UnixStream::connect(&path).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, server.shutdown())
         .await
         .unwrap();
     assert!(!path.exists());

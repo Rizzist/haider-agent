@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Menu {
     pub id: MenuId,
+    #[serde(with = "compatible_menu_kind")]
     pub kind: MenuKind,
     pub title: String,
     #[serde(default)]
@@ -29,6 +30,81 @@ pub struct Menu {
     /// Option index selected when ttl expires (defaults to none = turn errored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_option: Option<u32>,
+}
+
+// Recovery readers decode every stored menu. Keep the released Choice carrier
+// on disk and add typed approval coordinates that old readers can ignore.
+mod compatible_menu_kind {
+    use super::MenuKind;
+    use crate::credential::UsageResetAccountBinding;
+    use crate::effect::EffectClass;
+    use crate::ids::CredentialAlias;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct DeferredApproval {
+        approval_id: String,
+        effect: EffectClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<CredentialAlias>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<UsageResetAccountBinding>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum ApprovalCarrier {
+        Choice { deferred_approval: DeferredApproval },
+    }
+
+    #[derive(Deserialize)]
+    struct CompatibleKind {
+        #[serde(flatten)]
+        kind: MenuKind,
+        #[serde(default)]
+        deferred_approval: Option<DeferredApproval>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        kind: &MenuKind,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match kind {
+            MenuKind::DeferredApproval {
+                approval_id,
+                effect,
+                account,
+                binding,
+            } => ApprovalCarrier::Choice {
+                deferred_approval: DeferredApproval {
+                    approval_id: approval_id.clone(),
+                    effect: effect.clone(),
+                    account: account.clone(),
+                    binding: binding.clone(),
+                },
+            }
+            .serialize(serializer),
+            kind => kind.serialize(serializer),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<MenuKind, D::Error> {
+        let value = CompatibleKind::deserialize(deserializer)?;
+        match (value.kind, value.deferred_approval) {
+            (MenuKind::Choice, Some(approval)) => Ok(MenuKind::DeferredApproval {
+                approval_id: approval.approval_id,
+                effect: approval.effect,
+                account: approval.account,
+                binding: approval.binding,
+            }),
+            (kind, None) => Ok(kind),
+            (_, Some(_)) => Err(serde::de::Error::custom(
+                "deferred approval requires a choice carrier",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

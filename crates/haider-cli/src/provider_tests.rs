@@ -30,6 +30,9 @@ fn provider_list_json_golden_exposes_lockdown_trust() {
         schema: "haider.providers.v1",
         revision: 7,
         providers: vec![ProviderSummaryWire {
+            catalog_scope: None,
+            configured_models: Vec::new(),
+            static_models: Vec::new(),
             provider: "research".into(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             endpoint: None,
@@ -73,6 +76,9 @@ fn provider_list_json_golden_exposes_lockdown_trust() {
 #[test]
 fn provider_list_json_does_not_omit_full_trust() {
     let provider = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "built-in".into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
@@ -103,6 +109,9 @@ fn provider_list_json_does_not_omit_full_trust() {
 #[test]
 fn provider_show_json_golden_includes_the_fixed_envelope_and_quota() {
     let provider = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "research".into(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("https://research.example.invalid/v1".into()),

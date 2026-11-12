@@ -310,6 +310,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
 
     fn create_command(session_id: &SessionId, device_id: &DeviceId) -> SessionCreateCommand {
         SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("digest-{session_id}"),
             request_json: format!(r#"{{"session":"{session_id}"}}"#),
@@ -319,6 +320,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -481,6 +483,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
                     name: "spawn_subagent".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -759,6 +762,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
         .expect("open first");
     first
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-branch-recovery".into(),
             request_digest: "create-branch-recovery-digest".into(),
             request_json: r#"{"session":"branch-recovery"}"#.into(),
@@ -768,6 +772,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -977,7 +982,8 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1174,6 +1180,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
         .expect("open first");
     first
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-failed-start".into(),
             request_digest: "create-failed-start-digest".into(),
             request_json: r#"{"session":"failed-start"}"#.into(),
@@ -1183,6 +1190,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -1334,7 +1342,8 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(

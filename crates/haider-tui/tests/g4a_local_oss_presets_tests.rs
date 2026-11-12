@@ -36,6 +36,9 @@ fn live_model() -> AppModel {
 fn keyless_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderSummaryWire {
     let available = !models.is_empty();
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
@@ -179,7 +182,7 @@ fn keyless_commit_skips_the_key_card_and_chains_discovery() {
     let refresh_queued = model.requests.iter().any(|request| {
         matches!(request, AppRequest::ProviderModelsRefresh { provider } if provider == "ollama")
     }) || pass.commands.iter().any(|command| {
-        matches!(command, LiveCommand::RefreshProviderModels { provider } if provider == "ollama")
+        matches!(command, LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "ollama")
     });
     assert!(refresh_queued, "commit chains straight into discovery");
     assert!(

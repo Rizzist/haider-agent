@@ -128,17 +128,9 @@ pub async fn ssh_command_with_terminal(
     let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(CliSshError::Io(error)) => {
-            eprintln!("haider ssh: {error}");
-            ExitCode::from(EX_IOERR)
-        }
-        Err(CliSshError::Refused { code, message }) => {
-            eprintln!("haider ssh: {code}: {message}");
-            ExitCode::from(exit_code_for_refusal(&code))
-        }
         Err(error) => {
             eprintln!("haider ssh: {error}");
-            ExitCode::from(EX_PROTOCOL)
+            ExitCode::from(error.exit_code())
         }
     }
 }
@@ -148,6 +140,7 @@ enum CliSshError {
     Client(haider_client::client::ClientError),
     Io(io::Error),
     Refused { code: String, message: String },
+    SetupTimeout(String),
     FeatureAbsent,
     Protocol,
     Interactive(String),
@@ -159,6 +152,7 @@ impl std::fmt::Display for CliSshError {
             Self::Client(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Refused { code, message } => write!(formatter, "{code}: {message}"),
+            Self::SetupTimeout(message) => write!(formatter, "ssh_timeout: {message}"),
             Self::FeatureAbsent => formatter.write_str("daemon does not advertise ssh_profiles_v1"),
             Self::Protocol => formatter.write_str("daemon answered with an unexpected body"),
             Self::Interactive(message) => formatter.write_str(message),
@@ -169,6 +163,29 @@ impl std::fmt::Display for CliSshError {
 impl From<haider_client::client::ClientError> for CliSshError {
     fn from(error: haider_client::client::ClientError) -> Self {
         Self::Client(error)
+    }
+}
+
+impl CliSshError {
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Io(_) => EX_IOERR,
+            Self::Refused { code, .. } => exit_code_for_refusal(code),
+            _ => EX_PROTOCOL,
+        }
+    }
+}
+
+fn terminal_error(error: TerminalError) -> CliSshError {
+    match error {
+        TerminalError::Client(haider_client::SshProfilesClientError::Refused {
+            code,
+            message,
+            ..
+        }) if code == "ssh_timeout" => CliSshError::SetupTimeout(message),
+        TerminalError::Client(error) => error.into(),
+        TerminalError::Io(error) => CliSshError::Io(error),
+        TerminalError::Other(message) => CliSshError::Interactive(message),
     }
 }
 
@@ -259,14 +276,7 @@ async fn execute_with_terminal(
             name,
             command: None,
         } => {
-            let exit_code = terminal
-                .run(client, &name)
-                .await
-                .map_err(|error| match error {
-                    TerminalError::Client(error) => error.into(),
-                    TerminalError::Io(error) => CliSshError::Io(error),
-                    TerminalError::Other(message) => CliSshError::Interactive(message),
-                })?;
+            let exit_code = terminal.run(client, &name).await.map_err(terminal_error)?;
             if let Some(code) = exit_code
                 && code != 0
             {

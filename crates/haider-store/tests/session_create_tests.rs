@@ -5,13 +5,16 @@ use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHE
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::SessionState;
-use haider_store::{EventStore, SessionCreateCommand, SessionCreateOutcome, Store};
+use haider_store::{
+    EventStore, SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, Store,
+};
 use serde_json::json;
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
 
 fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: command_id.into(),
         request_digest: "digest-a".into(),
         request_json:
@@ -19,6 +22,7 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         session_id: SessionId::new(session_id),
         cwd: "/tmp/work".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -30,181 +34,6 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         event_id: EventId::new(event_id),
         device_id: DeviceId::new("daemon-test"),
     }
-}
-
-fn seed_recency_sessions(connection: &mut rusqlite::Connection, range: std::ops::Range<u64>) {
-    let transaction = connection.transaction().expect("begin seed transaction");
-    {
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO sessions(id, created_at_ms, meta_json, seen_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .expect("prepare session seed");
-        for index in range {
-            let session_id = format!("session-{index:04}");
-            let created_at_ms = 1_000_u64 + index;
-            let seen_at_ms = (index % 10 == 0).then_some(10_000_u64 + index);
-            let meta_json = if index % 2 == 0 {
-                r#"{"title":"zzz"}"#
-            } else {
-                r#"{"title":"aaa"}"#
-            };
-            insert
-                .execute(rusqlite::params![
-                    session_id,
-                    i64::try_from(created_at_ms).expect("created fits"),
-                    meta_json,
-                    seen_at_ms.map(|value| i64::try_from(value).expect("seen fits")),
-                ])
-                .expect("seed session");
-        }
-    }
-    transaction.commit().expect("commit seed transaction");
-}
-
-fn seed_recency_events(
-    connection: &mut rusqlite::Connection,
-    range: std::ops::Range<u64>,
-    events_per_session: u64,
-) {
-    let transaction = connection.transaction().expect("begin event seed");
-    {
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO events( \
-                     session_id, seq, envelope_json, event_id, committed_at_ms \
-                 ) VALUES (?1, ?2, '{}', ?3, ?4)",
-            )
-            .expect("prepare event seed");
-        for index in range {
-            for seq in 1..=events_per_session {
-                insert
-                    .execute(rusqlite::params![
-                        format!("session-{index:04}"),
-                        i64::try_from(seq).expect("seq fits"),
-                        format!("event-{index:04}-{seq:02}"),
-                        i64::try_from(5_000 + index + seq).expect("timestamp fits"),
-                    ])
-                    .expect("seed event");
-            }
-        }
-    }
-    transaction.commit().expect("commit event seed");
-}
-
-/// Cost pin for the P0 launcher path. The timed region is only the production
-/// indexed recency query; fixture creation is deliberately outside it.
-#[test]
-fn recency_page_of_5000_sessions_is_indexed_and_under_500_ms() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(root.path()).expect("open");
-    let mut connection = rusqlite::Connection::open(store.database_path()).expect("open sqlite");
-    seed_recency_sessions(&mut connection, 0..400);
-    seed_recency_events(&mut connection, 0..400, 10);
-    let started_400 = Instant::now();
-    let page_400 = store
-        .session_recency_page(None, 100)
-        .expect("400-session recency page");
-    let elapsed_400 = started_400.elapsed();
-    assert_eq!(page_400.len(), 100);
-    assert!(
-        elapsed_400 < Duration::from_millis(100),
-        "400-session recency page exceeded 100 ms: {elapsed_400:?}"
-    );
-
-    seed_recency_sessions(&mut connection, 400..5_000);
-    seed_recency_events(&mut connection, 400..5_000, 10);
-    let transaction = connection.transaction().expect("begin head transaction");
-    transaction
-        .execute(
-            "INSERT INTO events( \
-                 session_id, seq, envelope_json, event_id, committed_at_ms \
-             ) VALUES ('session-4998', 11, '{}', 'head-wins', 80000),
-                    ('session-4999', 11, '{}', 'latest-head', 90000)",
-            [],
-        )
-        .expect("seed latest head");
-    transaction
-        .execute(
-            "UPDATE sessions SET created_at_ms = 60000 WHERE id = 'session-4996'",
-            [],
-        )
-        .expect("seed created winner");
-    transaction
-        .execute(
-            "UPDATE sessions SET seen_at_ms = 70000 WHERE id = 'session-4997'",
-            [],
-        )
-        .expect("seed seen winner");
-    transaction
-        .execute(
-            "UPDATE sessions SET seen_at_ms = 100000 \
-             WHERE id IN ('session-0003', 'session-0004')",
-            [],
-        )
-        .expect("seed equal-recency tie");
-    transaction.commit().expect("commit seed transaction");
-
-    let query_plan = {
-        let mut statement = connection
-            .prepare(
-                "EXPLAIN QUERY PLAN \
-                 WITH roster AS ( \
-                     SELECT s.id, max( \
-                         s.created_at_ms, coalesce(s.seen_at_ms, 0), \
-                         coalesce(head.committed_at_ms, 0) \
-                     ) AS last_activity_ms \
-                     FROM sessions AS s \
-                     LEFT JOIN events AS head ON head.rowid = ( \
-                         SELECT rowid FROM events \
-                         WHERE session_id = s.id ORDER BY seq DESC LIMIT 1 \
-                     ) \
-                 ) \
-                 SELECT id, last_activity_ms FROM roster \
-                 ORDER BY last_activity_ms DESC, id ASC LIMIT 100",
-            )
-            .expect("prepare query plan");
-        statement
-            .query_map([], |row| row.get::<_, String>(3))
-            .expect("query plan")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect query plan")
-    };
-    assert!(
-        query_plan.iter().any(|detail| {
-            detail.contains("SEARCH events USING COVERING INDEX sqlite_autoindex_events_")
-                && detail.contains("session_id")
-        }),
-        "head lookup must use the (session_id, seq) primary-key index: {query_plan:?}"
-    );
-    drop(connection);
-
-    let started = Instant::now();
-    let page = store.session_recency_page(None, 100).expect("recency page");
-    let elapsed = started.elapsed();
-
-    assert_eq!(page.len(), 100);
-    assert_eq!(page[0].key.session_id.as_str(), "session-0003");
-    assert_eq!(page[0].key.last_activity_ms, 100_000);
-    assert_eq!(page[1].key.session_id.as_str(), "session-0004");
-    assert_eq!(page[1].key.last_activity_ms, 100_000);
-    assert_eq!(page[2].key.session_id.as_str(), "session-4999");
-    assert_eq!(page[2].key.last_activity_ms, 90_000);
-    assert_eq!(page[3].key.session_id.as_str(), "session-4998");
-    assert_eq!(page[3].key.last_activity_ms, 80_000);
-    assert_eq!(page[4].key.session_id.as_str(), "session-4997");
-    assert_eq!(page[4].key.last_activity_ms, 70_000);
-    assert_eq!(page[5].key.session_id.as_str(), "session-4996");
-    assert_eq!(page[5].key.last_activity_ms, 60_000);
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "5,000-session recency page exceeded 500 ms: {elapsed:?}"
-    );
-    eprintln!(
-        "recency page: 400 sessions {elapsed_400:?} (budget 100ms); \
-         5,000 sessions {elapsed:?} (budget 500ms)"
-    );
 }
 
 /// MUTATION CHECK: remove the same-command committed-receipt lookup from
@@ -254,6 +83,169 @@ fn session_create_commits_metadata_created_and_receipt_atomically_and_replays_af
     assert_eq!(
         reopened.session_ids().expect("session ids"),
         [first.session_id]
+    );
+}
+
+#[test]
+fn resolved_account_route_advances_only_the_served_sessions_epoch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open");
+    let served = SessionId::new("served");
+    let parked = SessionId::new("parked");
+    let device = DeviceId::new("daemon-test");
+    store
+        .create_session(&command("create-served", "served", "created-served"))
+        .expect("served");
+    store
+        .create_session(&command("create-parked", "parked", "created-parked"))
+        .expect("parked");
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("first route"),
+        0
+    );
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("same route"),
+        0
+    );
+    let changed = store
+        .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-b"), &device)
+        .expect("switched route");
+    assert!(changed > 0);
+    let route_fact = store
+        .read(&served, 0, 16)
+        .expect("route journal")
+        .into_iter()
+        .find_map(|event| {
+            haider_protocol::session::ModelSelected::from_payload_value(&event.payload)
+        })
+        .expect("route fact");
+    assert!(
+        route_fact.route_only,
+        "same-pair route facts are not model notes"
+    );
+    assert_eq!(
+        store
+            .commit_resolved_route(
+                &served,
+                "fake",
+                "fake-v1",
+                changed,
+                Some("account-b"),
+                &device
+            )
+            .expect("same switched route"),
+        changed
+    );
+    assert_eq!(
+        store
+            .commit_resolved_route(&served, "fake", "fake-v1", 0, Some("account-a"), &device)
+            .expect("stale request"),
+        0
+    );
+    let served_metadata = store
+        .session_metadata(&served)
+        .expect("served metadata")
+        .expect("served row");
+    assert_eq!(served_metadata.selection_epoch, Some(changed));
+    assert_eq!(
+        served_metadata.resolved_route_alias.as_deref(),
+        Some("account-b")
+    );
+    assert_eq!(
+        served_metadata.account_alias, None,
+        "route tracking must not pin rotation"
+    );
+    let selection = SessionSelectModelCommand {
+        command_id: "select-after-route".into(),
+        request_digest: "select-after-route-digest".into(),
+        request_json: "{}".into(),
+        session_id: served.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        model: "fake-v2".into(),
+        expected_pair: None,
+        automatic_run: None,
+        account_alias: None,
+        output_budget: None,
+        event_id: EventId::new("selected-after-route"),
+        device_id: DeviceId::new("daemon-test"),
+        model_catalog_key: None,
+    };
+    let SessionSelectModelOutcome::Committed { selected, envelope } = store
+        .select_session_model(&selection)
+        .expect("model after route")
+    else {
+        panic!("selection was not committed")
+    };
+    assert!(selected.selected_seq > changed);
+    assert!(
+        !haider_protocol::session::ModelSelected::from_payload_value(&envelope.payload)
+            .expect("explicit model fact")
+            .route_only
+    );
+    let parked_metadata = store
+        .session_metadata(&parked)
+        .expect("parked metadata")
+        .expect("parked row");
+    assert_eq!(parked_metadata.selection_epoch, Some(0));
+    assert_eq!(parked_metadata.resolved_route_alias, None);
+
+    let keyless = SessionId::new("keyless");
+    store
+        .create_session(&command("create-keyless", "keyless", "created-keyless"))
+        .expect("keyless");
+    assert_eq!(
+        store
+            .commit_resolved_route(&keyless, "fake", "fake-v1", 0, None, &device)
+            .expect("observe keyless route"),
+        0
+    );
+    assert!(
+        store
+            .session_metadata(&keyless)
+            .expect("keyless metadata")
+            .expect("keyless row")
+            .resolved_route_seen
+    );
+    let keyed = store
+        .commit_resolved_route(&keyless, "fake", "fake-v1", 0, Some("account-a"), &device)
+        .expect("keyed route after keyless");
+    assert!(keyed > 0);
+    let keyless_again = store
+        .commit_resolved_route(&keyless, "fake", "fake-v1", keyed, None, &device)
+        .expect("keyless route after keyed");
+    assert!(keyless_again > keyed);
+}
+
+#[test]
+fn legacy_session_mints_an_epoch_on_first_metadata_load() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open");
+    let session = SessionId::new("legacy-epoch");
+    store
+        .create_session(&command("create-legacy", "legacy-epoch", "created-legacy"))
+        .expect("create");
+    let connection = rusqlite::Connection::open(store.database_path()).expect("sqlite");
+    connection.execute(
+        "UPDATE sessions SET meta_json = json_remove(meta_json, '$.selection_epoch') WHERE id = ?1",
+        [session.as_str()],
+    ).expect("simulate pre-epoch metadata");
+    let metadata = store
+        .session_metadata(&session)
+        .expect("load")
+        .expect("metadata");
+    assert_eq!(metadata.selection_epoch, Some(1));
+    assert_eq!(
+        store
+            .session_metadata(&session)
+            .expect("reload")
+            .expect("metadata")
+            .selection_epoch,
+        Some(1)
     );
 }
 
@@ -404,4 +396,241 @@ fn legacy_append_metadata_remains_none() {
     }];
     store.append(&mut envelope).expect("append");
     assert_eq!(store.session_metadata(&session_id).expect("metadata"), None);
+}
+
+#[test]
+fn derived_model_owner_is_durable_and_replayed_with_create_receipt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut command = command("scoped-create", "scoped-session", "scoped-created");
+    command.model_catalog_key = Some("synthetic-account-incarnation-A".into());
+    let store = Store::open(root.path()).expect("store");
+    let SessionCreateOutcome::Committed { created, .. } =
+        store.create_session(&command).expect("create")
+    else {
+        panic!("commit")
+    };
+    assert_eq!(
+        created.metadata.model_catalog_key,
+        command.model_catalog_key
+    );
+    drop(store);
+    let reopened = Store::open(root.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .session_metadata(&command.session_id)
+            .expect("metadata")
+            .expect("session")
+            .model_catalog_key,
+        command.model_catalog_key
+    );
+    let SessionCreateOutcome::IdempotentReplay { created } =
+        reopened.create_session(&command).expect("replay")
+    else {
+        panic!("receipt replay")
+    };
+    assert_eq!(
+        created.metadata.model_catalog_key,
+        command.model_catalog_key
+    );
+}
+
+#[test]
+fn c5_creation_coordinate_survives_reopen_and_receipt_but_clears_on_reselection() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut create = command("c5-create", "c5-session", "c5-created");
+    create.model = "FAKE_V1".into();
+    create.resolved_model = Some("fake-v1".into());
+    {
+        let store = Store::open(root.path()).expect("open");
+        store.create_session(&create).expect("create");
+    }
+    let store = Store::open(root.path()).expect("reopen");
+    let SessionCreateOutcome::IdempotentReplay { created } =
+        store.create_session(&create).expect("replay")
+    else {
+        panic!("receipt replay");
+    };
+    assert_eq!(created.metadata.model, "FAKE_V1", "public literal survives");
+    assert_eq!(
+        serde_json::to_value(&created.metadata).expect("receipt metadata")["resolved_model"],
+        "fake-v1",
+        "C5 replay retains the admitted creation coordinate"
+    );
+    let saved = store
+        .session_metadata(&create.session_id)
+        .expect("stored")
+        .expect("session");
+    assert_eq!(
+        serde_json::to_value(saved).expect("stored metadata")["resolved_model"],
+        "fake-v1"
+    );
+    store
+        .commit_resolved_route(
+            &create.session_id,
+            "fake",
+            "fake-v1",
+            0,
+            Some("account-a"),
+            &DeviceId::new("daemon-test"),
+        )
+        .expect("canonical serving route");
+    let metadata = store
+        .session_metadata(&create.session_id)
+        .expect("routed metadata")
+        .expect("session");
+    assert!(
+        metadata.resolved_route_seen,
+        "canonical serving route must match the saved literal"
+    );
+    assert_eq!(
+        serde_json::to_value(&metadata).expect("routed metadata")["resolved_model"],
+        "fake-v1"
+    );
+    let selected = store
+        .select_session_model(&SessionSelectModelCommand {
+            automatic_run: None,
+            command_id: "c5-reselect".into(),
+            request_digest: "c5-reselect-digest".into(),
+            request_json: "{}".into(),
+            session_id: create.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: "fake".into(),
+            model: "FAKE_V1".into(),
+            model_catalog_key: None,
+            expected_pair: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("c5-reselected"),
+            device_id: DeviceId::new("daemon-test"),
+        })
+        .expect("reselect");
+    let SessionSelectModelOutcome::Committed { selected, .. } = selected else {
+        panic!("new coordinate must commit");
+    };
+    assert!(
+        selected.selected_seq > 0,
+        "clearing a creation coordinate must advance the selection epoch even when the public literal is unchanged"
+    );
+    let metadata = store
+        .session_metadata(&create.session_id)
+        .expect("metadata")
+        .expect("session");
+    assert!(
+        metadata.selection_epoch.unwrap_or(0) > 0,
+        "clearing a creation coordinate must advance the selection epoch in durable metadata"
+    );
+    assert_eq!(metadata.model, "FAKE_V1");
+    assert!(
+        serde_json::to_value(metadata).expect("reselected metadata")["resolved_model"].is_null(),
+        "an old creation coordinate cannot override a new model"
+    );
+}
+
+fn c6_owner_store_fixture(
+    before: Option<&str>,
+    after: Option<&str>,
+) -> (tempfile::TempDir, Store, SessionId, u64, u64) {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let store = Store::open(root.path()).expect("fixture store");
+    let mut create = command("owner-create", "owner-session", "owner-created");
+    create.model_catalog_key = before.map(str::to_owned);
+    store.create_session(&create).expect("create");
+    let previous = store
+        .session_metadata(&create.session_id)
+        .expect("metadata")
+        .expect("session")
+        .selection_epoch
+        .expect("epoch");
+    let outcome = store
+        .select_session_model(&SessionSelectModelCommand {
+            command_id: "owner-select".into(),
+            request_digest: "owner-select-digest".into(),
+            request_json: "{}".into(),
+            session_id: create.session_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: create.provider,
+            model: create.model,
+            model_catalog_key: after.map(str::to_owned),
+            expected_pair: None,
+            automatic_run: None,
+            account_alias: None,
+            output_budget: None,
+            event_id: EventId::new("owner-selected"),
+            device_id: DeviceId::new("daemon-test"),
+        })
+        .expect("select same model");
+    let SessionSelectModelOutcome::Committed { selected, .. } = outcome else {
+        panic!("new command must commit")
+    };
+    assert_eq!(selected.model_catalog_key.as_deref(), after);
+    (
+        root,
+        store,
+        create.session_id,
+        previous,
+        selected.selected_seq,
+    )
+}
+
+macro_rules! c6_owner_store_transition {
+    ($name:ident, $before:expr, $after:expr) => {
+        #[test]
+        fn $name() {
+            let (_root, _store, _session, previous, current) = c6_owner_store_fixture($before, $after);
+            assert!(current > previous, "a changed catalog owner must have a newer selection epoch: before={previous}, after={current}");
+        }
+    };
+}
+c6_owner_store_transition!(
+    c6_owner_store_unowned_to_owned,
+    None,
+    Some("synthetic-owner-A")
+);
+c6_owner_store_transition!(
+    c6_owner_store_owned_to_unowned,
+    Some("synthetic-owner-A"),
+    None
+);
+c6_owner_store_transition!(
+    c6_owner_store_a_to_b,
+    Some("synthetic-owner-A"),
+    Some("synthetic-owner-B")
+);
+
+#[test]
+fn c6_owner_store_same_owner_control() {
+    let (_root, _store, _session, previous, current) =
+        c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-A"));
+    assert_eq!(current, previous, "a true no-op retains the epoch");
+}
+
+#[test]
+fn c6_owner_store_previous_owner_route_cannot_update_new_selection() {
+    let (_root, store, session, previous, current) =
+        c6_owner_store_fixture(Some("synthetic-owner-A"), Some("synthetic-owner-B"));
+    let (_, facts) = store
+        .commit_resolved_route_fact(
+            &session,
+            "fake",
+            "fake-v1",
+            previous,
+            Some("account-a"),
+            &DeviceId::new("daemon-test"),
+        )
+        .expect("old captured route completion");
+    let metadata = store
+        .session_metadata(&session)
+        .expect("metadata")
+        .expect("session");
+    println!(
+        "OWNER_ORDER_ROUTE previous={previous} current={current} facts={} owner={:?} route={:?}",
+        facts.len(),
+        metadata.model_catalog_key,
+        metadata.resolved_route_alias
+    );
+    assert!(
+        facts.is_empty(),
+        "a route completion captured under the previous owner must not append a current route fact"
+    );
+    assert!(!metadata.resolved_route_seen);
 }

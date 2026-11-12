@@ -1,7 +1,7 @@
 {
   "restricted_child_definitions": [
     {
-      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -430,7 +430,7 @@
       "name": "process_exec"
     },
     {
-      "description": "delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
+      "description": "delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -439,6 +439,10 @@
             "maxLength": 64,
             "minLength": 1,
             "type": "string"
+          },
+          "background": {
+            "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id.",
+            "type": "boolean"
           },
           "model": {
             "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
@@ -488,6 +492,12 @@
             "maxLength": 80,
             "minLength": 1,
             "type": "string"
+          },
+          "wait_ms": {
+            "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues.",
+            "maximum": 86400000,
+            "minimum": 1,
+            "type": "integer"
           },
           "workflow": {
             "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
@@ -583,7 +593,7 @@
       "name": "web_search"
     },
     {
-      "description": "durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy",
+      "description": "durable sms/task/agent/process/file/poll/timer/cli watches; task and agent sources watch IDs and return completion digests; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy",
       "input_schema": {
         "properties": {
           "action": {
@@ -697,18 +707,26 @@
           "source": {
             "additionalProperties": false,
             "properties": {
+              "agent_id": {
+                "type": "string"
+              },
               "interval_ms": {
                 "type": "integer"
               },
               "kind": {
                 "enum": [
                   "sms",
+                  "task",
+                  "agent",
                   "file",
                   "timer"
                 ],
                 "type": "string"
               },
               "path": {
+                "type": "string"
+              },
+              "task_id": {
                 "type": "string"
               }
             },
@@ -780,7 +798,7 @@
       {
         "default": "not_applicable",
         "manifest": {
-          "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+          "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
           "dispatch": "await",
           "effects": [],
           "input_schema": {
@@ -1534,7 +1552,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "description": "Delegate a local child under AgentSpawn policy. By default wait for its report; background=true returns a durable handle immediately and wait_ms bounds only the observation. Use haider agent wait/list/message/cancel on the returned parent session and child id; cancel stops only that child, cancel <session> --all stops every subagent, and stopping this turn leaves children running. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
           "dispatch": "deferred",
           "effects": [
             {
@@ -1549,6 +1567,10 @@
                 "maxLength": 64,
                 "minLength": 1,
                 "type": "string"
+              },
+              "background": {
+                "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id.",
+                "type": "boolean"
               },
               "model": {
                 "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
@@ -1598,6 +1620,12 @@
                 "maxLength": 80,
                 "minLength": 1,
                 "type": "string"
+              },
+              "wait_ms": {
+                "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues.",
+                "maximum": 86400000,
+                "minimum": 1,
+                "type": "integer"
               },
               "workflow": {
                 "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
@@ -1837,7 +1865,7 @@
       {
         "default": "not_applicable",
         "manifest": {
-          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.",
+          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, task, agent, workspace-file, and native timer watches. Task and agent IDs report terminal digests through the session hub.",
           "dispatch": "await",
           "effects": [],
           "input_schema": {
@@ -1953,18 +1981,26 @@
               "source": {
                 "additionalProperties": false,
                 "properties": {
+                  "agent_id": {
+                    "type": "string"
+                  },
                   "interval_ms": {
                     "type": "integer"
                   },
                   "kind": {
                     "enum": [
                       "sms",
+                      "task",
+                      "agent",
                       "file",
                       "timer"
                     ],
                     "type": "string"
                   },
                   "path": {
+                    "type": "string"
+                  },
+                  "task_id": {
                     "type": "string"
                   }
                 },
@@ -2048,7 +2084,7 @@
       {
         "default": "not_applicable",
         "manifest": {
-          "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+          "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
           "dispatch": "await",
           "effects": [],
           "input_schema": {
@@ -2802,7 +2838,7 @@
       {
         "default": "allow",
         "manifest": {
-          "description": "Delegate one bounded task to a depth-capped local child under AgentSpawn policy; waits for the child report before returning its tool result. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
+          "description": "Delegate a local child under AgentSpawn policy. By default wait for its report; background=true returns a durable handle immediately and wait_ms bounds only the observation. Use haider agent wait/list/message/cancel on the returned parent session and child id; cancel stops only that child, cancel <session> --all stops every subagent, and stopping this turn leaves children running. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.",
           "dispatch": "deferred",
           "effects": [
             {
@@ -2817,6 +2853,10 @@
                 "maxLength": 64,
                 "minLength": 1,
                 "type": "string"
+              },
+              "background": {
+                "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id.",
+                "type": "boolean"
               },
               "model": {
                 "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
@@ -2866,6 +2906,12 @@
                 "maxLength": 80,
                 "minLength": 1,
                 "type": "string"
+              },
+              "wait_ms": {
+                "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues.",
+                "maximum": 86400000,
+                "minimum": 1,
+                "type": "integer"
               },
               "workflow": {
                 "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
@@ -2984,7 +3030,7 @@
       {
         "default": "not_applicable",
         "manifest": {
-          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, workspace-file, and native timer watches. Reports use the canonical session hub.",
+          "description": "Register, list, update, pause, resume, trigger, or remove durable SMS, task, agent, workspace-file, and native timer watches. Task and agent IDs report terminal digests through the session hub.",
           "dispatch": "await",
           "effects": [],
           "input_schema": {
@@ -3100,18 +3146,26 @@
               "source": {
                 "additionalProperties": false,
                 "properties": {
+                  "agent_id": {
+                    "type": "string"
+                  },
                   "interval_ms": {
                     "type": "integer"
                   },
                   "kind": {
                     "enum": [
                       "sms",
+                      "task",
+                      "agent",
                       "file",
                       "timer"
                     ],
                     "type": "string"
                   },
                   "path": {
+                    "type": "string"
+                  },
+                  "task_id": {
                     "type": "string"
                   }
                 },

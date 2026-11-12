@@ -72,6 +72,9 @@ const CANCELLABLE_SHELL_REQUEST_JSON: &str = r#"{"command":"powershell-wait"}"#;
 
 fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
         endpoint: None,
@@ -254,8 +257,7 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             context_window,
             max_output_tokens,
             explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
-                provider,
-                model,
+                haider_provider::output_limit_provenance(provider, model, None),
                 max_output_tokens,
                 context_window,
             ),
@@ -284,8 +286,9 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             super::rpc::resolve_session_output_limit(haider_provider::MAX_OUTPUT_LIMIT, &custom)
                 .expect("up to the adapter maximum")
                 .max_tokens,
-            haider_provider::MAX_OUTPUT_LIMIT
+            384_000
         );
+        assert_eq!(haider_provider::MAX_OUTPUT_LIMIT, 384_000);
         assert!(matches!(
             super::rpc::resolve_session_output_limit(
                 haider_provider::MAX_OUTPUT_LIMIT + 1,
@@ -294,7 +297,8 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
             Err((
                 _,
                 haider_rpc::ErrorData::ModelOutputLimit {
-                    max_output_tokens: haider_provider::MAX_OUTPUT_LIMIT,
+                    requested: 384_001,
+                    max_output_tokens: 384_000,
                     ..
                 }
             ))
@@ -309,6 +313,84 @@ fn unverified_fallback_rows_admit_larger_explicit_budgets() {
     let sourced = selection("anthropic", "claude-sonnet-4-5", Some(200_000));
     assert_eq!(sourced.explicit_max_output_tokens, 64_000);
     assert!(super::rpc::resolve_session_output_limit(64_001, &sourced).is_err());
+}
+
+/// 973-output-cap-fixes B1: Kimi Code and Haider Code publish a context
+/// window but no output maximum. The derived budget keeps the conservative
+/// 30,000 default, an explicit 60,000 is admitted on create and on a config
+/// update (both `resolve_session_output_limit`), and a stored user-set 60,000
+/// survives a model switch between them unclamped (`reapply_session_output_budget`).
+/// Only the global/context bound still refuses.
+/// MUTATION CHECK: mark these rows `output_limit_sourced: context_window.is_some()`
+/// again. Expected runtime failure: 60,000 is refused with `ModelOutputLimit`
+/// (max 30,000) and the switch clamps to 30,000.
+#[test]
+fn published_window_without_output_maximum_admits_larger_explicit_budgets() {
+    use haider_protocol::output_budget::SessionOutputBudgetSourceV1;
+    let selection = |provider: &str, model: &str| {
+        let context_window = haider_provider::static_model_limits(provider, model).context_window;
+        let max_output_tokens =
+            haider_provider::model_output_limit(provider, model, None, context_window);
+        crate::model_select::ValidatedModelSelection {
+            provider: provider.into(),
+            model: model.into(),
+            inventory_status: haider_rpc::ModelInventoryStatusWire::Listed,
+            context_window,
+            max_output_tokens,
+            explicit_max_output_tokens: haider_provider::explicit_output_ceiling(
+                haider_provider::output_limit_provenance(provider, model, None),
+                max_output_tokens,
+                context_window,
+            ),
+        }
+    };
+    let kimi = selection("kimi-oauth", "kimi-for-coding");
+    let glm = selection("haider-code", "glm-5.3");
+    for (row, bound) in [(&kimi, 384_000), (&glm, 100_000)] {
+        assert_eq!(row.max_output_tokens, 30_000, "{}", row.model);
+        assert_eq!(
+            super::rpc::resolve_session_output_limit(0, row)
+                .expect("derived")
+                .max_tokens,
+            30_000
+        );
+        let explicit =
+            super::rpc::resolve_session_output_limit(60_000, row).expect("explicit 60,000");
+        assert_eq!(explicit.max_tokens, 60_000, "{}", row.model);
+        assert_eq!(
+            explicit.source,
+            SessionOutputBudgetSourceV1::UserSet { requested: 60_000 }
+        );
+        assert_eq!(explicit.clamped, None);
+        assert_eq!(row.explicit_max_output_tokens, bound, "{}", row.model);
+        assert!(matches!(
+            super::rpc::resolve_session_output_limit(bound + 1, row),
+            Err((_, haider_rpc::ErrorData::ModelOutputLimit { max_output_tokens, .. }))
+                if max_output_tokens == bound
+        ));
+    }
+    let stored = |provider: &str, model: &str| {
+        let mut metadata: haider_protocol::session::SessionMetadataV1 =
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/workspace",
+                "provider": provider,
+                "model": model,
+                "max_tokens": 60_000,
+                "created_at_ms": 1_u64,
+            }))
+            .expect("metadata fixture");
+        metadata.max_tokens_source =
+            Some(SessionOutputBudgetSourceV1::UserSet { requested: 60_000 });
+        metadata
+    };
+    for (current, target) in [
+        (stored("kimi-oauth", "kimi-for-coding"), &glm),
+        (stored("haider-code", "glm-5.3"), &kimi),
+    ] {
+        let budget = super::rpc::reapply_session_output_budget(&current, target);
+        assert_eq!(budget.max_tokens, 60_000, "switch to {}", target.model);
+        assert_eq!(budget.clamped, None, "switch to {}", target.model);
+    }
 }
 
 /// The attachment replay preflight must keep immutable-blob validation out of
@@ -566,6 +648,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     let session_id = SessionId::new("graph-node-scoped-wait");
     let generation = store.worker_generation();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-graph-node-scoped-wait".into(),
         request_digest: "create-graph-node-scoped-wait-digest".into(),
         request_json: r#"{"session":"graph-node-scoped-wait"}"#.into(),
@@ -575,6 +658,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -735,10 +819,12 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         RunState::Queued,
     );
     *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        resolved_model: None,
         agent_spawn: None,
         continuation_of: None,
         cwd: "workflow-idle-ttl-workspace".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "workflow-idle-ttl-model".into(),
         max_output_tokens: 64,
         effort: None,
@@ -868,6 +954,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session_id = SessionId::new("delete-barrier-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-delete-barrier-session".into(),
         request_digest: "create-delete-barrier-session-digest".into(),
         request_json: r#"{"session":"delete-barrier-session"}"#.into(),
@@ -877,6 +964,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -993,6 +1081,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
         let original_generation = store.worker_generation();
         let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-branch-rpc-session".into(),
             request_digest: "create-branch-rpc-session-digest".into(),
             request_json: r#"{"session":"branch-rpc-receipt"}"#.into(),
@@ -1002,6 +1091,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -1288,6 +1378,65 @@ async fn create_fork_ready_source(
         })
         .expect("fork source node");
     (source, node_id, seq)
+}
+
+#[tokio::test]
+async fn daemon_fork_keeps_the_explicit_account_and_endpoint_route() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, node, seq) = create_fork_ready_source(&hub, &store, "explicit-route-fork").await;
+    let rebind_json =
+        r#"{"provider":"fake","base_url":"https://synthetic.invalid","account":"bed-b"}"#
+            .to_owned();
+    hub.rebind_session_provider(haider_store::SessionProviderRebindCommand {
+        command_id: "explicit-route-parent-rebind".into(),
+        request_digest: blake3::hash(rebind_json.as_bytes()).to_hex().to_string(),
+        request_json: rebind_json,
+        session_id: source.clone(),
+        worker_generation: store.worker_generation(),
+        provider: "fake".into(),
+        base_url: Some("https://synthetic.invalid".into()),
+        account: Some("bed-b".into()),
+        event_id: EventId::new("explicit-route-parent-rebound"),
+        device_id: DeviceId::new("worker-law-test"),
+        max_tokens: 4096,
+        max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+        clamped: None,
+        active_output_budget: None,
+    })
+    .await
+    .expect("explicit parent rebind");
+    let parent = store
+        .session_metadata(&source)
+        .await
+        .expect("parent metadata")
+        .expect("typed");
+    let child = SessionId::new("explicit-route-fork-child");
+    hub.fork_session(private_fork_command(
+        &store,
+        "explicit-route",
+        source.clone(),
+        child.clone(),
+        node,
+        seq,
+    ))
+    .await
+    .expect("daemon fork");
+    let copied = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata")
+        .expect("typed");
+    assert_eq!(copied.account_alias, parent.account_alias);
+    assert_eq!(copied.provider_base_url, parent.provider_base_url);
+    assert_eq!(copied.provider_rebind_id, parent.provider_rebind_id);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 async fn observe_fork_outcome(
@@ -2381,7 +2530,8 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         created_at_ms: None,
     };
     let mut provider = provider_summary("fake");
-    provider.models = vec!["fake-v1".into()];
+    provider.models = vec!["fake-v1".into(), "fake-v2".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     let active_other = haider_protocol::credential::CredentialDescriptor {
         incarnation: 0,
@@ -2391,16 +2541,26 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         active: true,
         ..descriptor.clone()
     };
+    let active_fake = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
+        active: true,
+        ..descriptor.clone()
+    };
     let mut other_provider = provider_summary("other");
     other_provider.models = vec!["other-v1".into()];
+    other_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     other_provider.default_model = Some("other-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
         oauth: None,
-        snapshot: Arc::new(Mutex::new(vec![descriptor.clone(), active_other.clone()])),
+        snapshot: Arc::new(Mutex::new(vec![
+            descriptor.clone(),
+            active_fake.clone(),
+            active_other.clone(),
+        ])),
         management: crate::accounts::ManagementSnapshot::new(
             0,
-            vec![descriptor, active_other],
+            vec![descriptor, active_fake, active_other],
             vec![provider, other_provider],
         ),
         vault_supported: false,
@@ -2437,6 +2597,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                     .to_string_lossy()
                     .into_owned(),
                 provider: String::new(),
+                expected_catalog_key: None,
                 model: String::new(),
                 max_tokens: 4_096,
                 permission_overrides: None,
@@ -2473,10 +2634,310 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Autonomous
     );
+    let pinned_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "resolved-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("pinned id");
+
+    // An ordinary create follows the provider's active account on each
+    // turn. The RPC must not turn that mutable default into an explicit pin.
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("ordinary-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("ordinary-create-command"),
+                cwd: std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                workspace_allocation: None,
+                cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+                ssh_scope: None,
+                account_alias: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
+                expected_catalog_key: None,
+            },
+        )
+        .await
+        .expect("ordinary create request");
+    let ordinary = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { metadata, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(metadata.clone()),
+            _ => None,
+        })
+        .expect("ordinary create response");
+    assert_eq!(ordinary.account_alias, None);
+
+    let ordinary_id = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { session_id, .. },
+            } if request_id.as_str() == "ordinary-create" => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("ordinary session id");
+    connection
+        .request(
+            RequestId::new("ordinary-attach"),
+            RequestBody::SessionAttach {
+                session_id: ordinary_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attach");
+    let select = |command: &str, provider: Option<&str>, model: &str, max_tokens| {
+        RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new(command),
+            session_id: ordinary_id.clone(),
+            worker_generation: store.worker_generation(),
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+            confirm_new_epoch: true,
+            max_tokens,
+            expected_catalog_key: None,
+        }
+    };
+    let initial_epoch = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("initial metadata")
+        .expect("typed metadata")
+        .selection_epoch;
+    connection
+        .request(
+            RequestId::new("ordinary-noop"),
+            select("ordinary-noop-command", None, "fake-v1", None),
+        )
+        .await
+        .expect("no-op selection");
+    let no_op = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("no-op metadata")
+        .expect("typed metadata");
+    assert_eq!(no_op.account_alias, None);
+    assert_eq!(no_op.selection_epoch, initial_epoch);
+    connection
+        .request(
+            RequestId::new("ordinary-budget"),
+            select("ordinary-budget-command", None, "fake-v1", Some(2_048)),
+        )
+        .await
+        .expect("budget selection");
+    let budget = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("budget metadata")
+        .expect("typed metadata");
+    assert_eq!(budget.account_alias, None);
+    assert_eq!(budget.max_tokens, 2_048);
+    connection
+        .request(
+            RequestId::new("ordinary-model"),
+            select("ordinary-model-command", None, "fake-v2", None),
+        )
+        .await
+        .expect("model selection");
+    let model = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("model metadata")
+        .expect("typed metadata");
+    assert_eq!(model.account_alias, None);
+    assert_eq!(model.model, "fake-v2");
+    connection
+        .request(
+            RequestId::new("ordinary-provider"),
+            select("ordinary-provider-command", Some("other"), "other-v1", None),
+        )
+        .await
+        .expect("provider selection");
+    let provider = store
+        .session_metadata(&ordinary_id)
+        .await
+        .expect("provider metadata")
+        .expect("typed metadata");
+    assert_eq!(provider.account_alias, None);
+    assert_eq!(
+        (&*provider.provider, &*provider.model),
+        ("other", "other-v1")
+    );
+
+    // A separate explicit create pin survives a same-provider model choice.
+    // Changing providers clears that pin, because the alias belongs to fake.
+    connection
+        .request(
+            RequestId::new("pinned-attach"),
+            RequestBody::SessionAttach {
+                session_id: pinned_id.clone(),
+                after_seq: 0,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("pinned attach");
+    for (name, provider, model, expected_alias) in [
+        ("same", None, "fake-v2", Some("selected-fake")),
+        ("cross", Some("other"), "other-v1", None),
+    ] {
+        connection
+            .request(
+                RequestId::new(format!("pinned-{name}")),
+                RequestBody::SessionSelectModel {
+                    command_id: haider_rpc::CommandId::new(format!("pinned-{name}-command")),
+                    session_id: pinned_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    provider: provider.map(str::to_owned),
+                    model: model.to_owned(),
+                    confirm_new_epoch: true,
+                    max_tokens: None,
+                    expected_catalog_key: None,
+                },
+            )
+            .await
+            .expect("pinned selection");
+        let metadata = store
+            .session_metadata(&pinned_id)
+            .await
+            .expect("pinned metadata")
+            .expect("typed metadata");
+        assert_eq!(metadata.account_alias.as_deref(), expected_alias);
+    }
 
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let archived = SessionId::new("archived-account-route");
+    store
+        .create_session(create_command(&archived, "archived-account-route"))
+        .await
+        .expect("archive fixture");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let child = SessionId::new("child-account-route");
+    hub.create_internal_session(create_command(&child, "child-account-route"))
+        .await
+        .expect("child fixture");
+    let before_archived = store
+        .session_metadata(&archived)
+        .await
+        .expect("archived metadata");
+    let before_child = store
+        .session_metadata(&child)
+        .await
+        .expect("child metadata");
+    let old = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("old-fake"),
+        provider: "fake".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "old fake account".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+        incarnation: 0,
+        credential_digest: None,
+    };
+    let new = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("new-fake"),
+        active: false,
+        ..old.clone()
+    };
+    let (login, mut queued) = tokio::sync::mpsc::channel(1);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(login),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![old, new],
+            vec![provider_summary("fake")],
+        ),
+        vault_supported: false,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(Mutex::new(Vec::new())),
+        vault: None,
+    })
+    .expect("accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+            sink,
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("switch-preflight"),
+            RequestBody::AccountSetActive {
+                command_id: haider_rpc::CommandId::new("switch-preflight-command"),
+                alias: "new-fake".into(),
+                confirm_new_epoch: true,
+            },
+        )
+        .await
+        .expect("switch request");
+    assert!(matches!(
+        queued.try_recv(),
+        Ok(crate::accounts::AccountCommand::SetActive(_))
+    ));
+    assert_eq!(
+        store
+            .session_metadata(&archived)
+            .await
+            .expect("archived after"),
+        before_archived
+    );
+    assert_eq!(
+        store.session_metadata(&child).await.expect("child after"),
+        before_child
+    );
+    drop(connection);
+    hub.shutdown().await.expect("shutdown");
+    store.close().await.expect("close");
 }
 
 /// R2-03: absent storage is the canonical default `All` scope. A later
@@ -2490,6 +2951,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
+    provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     provider.default_model = Some("fake-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
@@ -2525,6 +2987,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
         command_id: haider_rpc::CommandId::new(command_id),
         cwd: cwd.clone(),
         provider: "fake".into(),
+        expected_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         permission_overrides: None,
@@ -2727,6 +3190,8 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
     });
     let mut failure_provider = provider_summary("fake");
     failure_provider.models = vec!["fake-v1".into()];
+    // This working provider lets admission reach the injected scope-write failure.
+    failure_provider.availability = haider_rpc::ProviderAvailabilityWire::Available;
     failure_provider.default_model = Some("fake-v1".into());
     failure_hub
         .install_accounts(crate::accounts::AccountsFacade {
@@ -5614,6 +6079,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     .expect("install scope vault");
     let source = SessionId::new("metafork-review-parent");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-metafork-review-parent".into(),
         request_digest: "create-metafork-review-parent-digest".into(),
         request_json: r#"{"session":"metafork-review-parent"}"#.into(),
@@ -5623,6 +6089,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -6930,7 +7397,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
     store.close().await.expect("store closes");
 }
 
-fn run_state_envelope(
+pub(super) fn run_state_envelope(
     session_id: &SessionId,
     run_id: &RunId,
     generation: u64,
@@ -6982,12 +7449,14 @@ pub(super) fn create_command(session_id: &SessionId, suffix: &str) -> SessionCre
     let cwd = std::env::temp_dir().to_string_lossy().into_owned();
 
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{suffix}"),
         request_digest: format!("create-digest-{suffix}"),
         request_json: format!(r#"{{"fixture":"{suffix}"}}"#),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         max_tokens_source: None,
@@ -7063,6 +7532,7 @@ async fn cancelling_committed_before_worker_done_rejects_done() {
     actor
         .commands
         .send(ActorCommand::CancelTurn {
+            worker_lease: None,
             command: TurnCancelCommand {
                 command_id: "cancel-before-done-command".into(),
                 request_digest: "cancel-before-done-digest".into(),
@@ -7269,8 +7739,14 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
     );
     fact.run_id = None;
     *fact.payload = haider_protocol::session::ModelSelected {
+        selection_epoch: None,
         provider: "fake-b".into(),
+        model_catalog_key: None,
         model: "model-b".into(),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
     }
     .to_payload_value()
     .expect("fact serializes");
@@ -8211,6 +8687,7 @@ async fn panic_exit_after_cancelling_closes_item_and_menu_before_cancelled() {
                     name: "request_input".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -9324,4 +9801,645 @@ async fn customprov_models_probe_requires_control_and_keeps_keyed_probes_local()
     );
     hub.shutdown().await.expect("probe hub stops");
     store.close().await.expect("probe store closes");
+}
+
+/// A current model's budget preflight must use the admitted coordinate while
+/// keeping its public creation spelling. Restoring the raw model argument in
+/// account_set_active makes the recorded alias require an unknown-cost approval.
+#[tokio::test]
+async fn c5_account_switch_cache_preflight_uses_the_recorded_coordinate() {
+    use haider_protocol::cache::{CachePolicyMode, CachePolicySettingsV1};
+    use haider_protocol::provider::{Usage, UsageRequestKind, UsageScope, UsageSource};
+
+    let canonical = "claude-sonnet-4-6";
+    for (index, (literal, coordinate, should_queue)) in [
+        (canonical, None, true),
+        ("CLAUDE_SONNET_4_6", Some(canonical), true),
+        ("literal-unpriced-model", None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().expect("cache preflight profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session = SessionId::new(format!("c5-account-cache-{index}"));
+        let mut create = create_command(&session, &format!("c5-account-cache-{index}"));
+        create.provider = "anthropic".into();
+        create.model = literal.into();
+        create.resolved_model = coordinate.map(str::to_owned);
+        create.cache_policy = CachePolicySettingsV1 {
+            mode: CachePolicyMode::Balanced,
+            cold_cost_threshold_microusd: 1_000_000_000,
+        };
+        store.create_session(create).await.expect("typed session");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let mut usage = run_payload_envelope(
+            &session,
+            &RunId::new("c5-cache-history"),
+            store.worker_generation(),
+            "c5-cache-history",
+            EventPayload::Usage(Usage {
+                input: 4_096,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: Some(UsageScope {
+                    provider: "anthropic".into(),
+                    model: coordinate.unwrap_or(literal).into(),
+                    account_scope: Some(haider_protocol::ids::CredentialAlias::new(
+                        "old-anthropic",
+                    )),
+                    auth_scope: "api_key".into(),
+                    api_family: None,
+                    effort: None,
+                    speed: None,
+                    cache_epoch: "c5-cache-history".into(),
+                    stable_prefix_tokens: 4_096,
+                    cache_boundaries: None,
+                    request_kind: UsageRequestKind::MainTurn,
+                    run: None,
+                    agent: None,
+                    prefix_digests: None,
+                }),
+                cache_cost: None,
+                request: None,
+            }),
+        );
+        usage.run_id = None;
+        haider_core::StoreHandle::append(&store, &mut [usage])
+            .await
+            .expect("cache scope commits");
+        assert!(
+            crate::cache_policy::latest_main_cache_scope(&store, &session)
+                .await
+                .expect("cache scope")
+                .is_some(),
+            "the preflight must actually inspect a cached prefix"
+        );
+        let old = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("old-anthropic"),
+            provider: "anthropic".into(),
+            base_url: None,
+            auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+            identity: "synthetic cache account".into(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+            incarnation: 0,
+            credential_digest: None,
+        };
+        let new = haider_protocol::credential::CredentialDescriptor {
+            alias: haider_protocol::ids::CredentialAlias::new("new-anthropic"),
+            active: false,
+            ..old.clone()
+        };
+        let mut summary = provider_summary("anthropic");
+        summary.models = vec![canonical.into()];
+        summary.static_models = summary.models.clone();
+        let (login, mut queued) = tokio::sync::mpsc::channel(1);
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: Some(login),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(vec![old.clone(), new.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(0, vec![old, new], vec![summary]),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([haider_rpc::Capability::Control]),
+                Arc::new(CapturingFrameSink::default()),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection");
+        connection
+            .request(
+                RequestId::new("c5-account-switch"),
+                RequestBody::AccountSetActive {
+                    command_id: haider_rpc::CommandId::new("c5-account-switch"),
+                    alias: "new-anthropic".into(),
+                    confirm_new_epoch: false,
+                },
+            )
+            .await
+            .expect("preflight routes");
+        assert_eq!(
+            matches!(
+                queued.try_recv(),
+                Ok(crate::accounts::AccountCommand::SetActive(_))
+            ),
+            should_queue,
+            "C5 account-switch cache preflight uses the admitted coordinate: {literal}"
+        );
+        assert_eq!(
+            store
+                .session_metadata(&session)
+                .await
+                .expect("metadata")
+                .expect("typed metadata")
+                .model,
+            literal,
+            "preflight preserves the public literal"
+        );
+        drop(connection);
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}
+
+/// Successful deletion must reclaim this session's retained stopped runs,
+/// while leaving another session's stop defenses intact (Opus gate M7).
+#[tokio::test]
+async fn session_delete_reclaims_only_its_retained_stopped_runs() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store, SessionHubConfig::default()).expect("hub");
+    let deleted = SessionId::new("delete-stopped-session");
+    let retained = SessionId::new("retain-stopped-session");
+    let runs = [
+        RunId::new("unsettled-stopped-run"),
+        RunId::new("other-stopped-run"),
+    ];
+    for session in [&deleted, &retained] {
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: format!("create-{session}"),
+            request_digest: format!("digest-{session}"),
+            request_json: format!("{{\"session\":\"{session}\"}}"),
+            session_id: session.clone(),
+            cwd: root.path().to_string_lossy().into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            resolved_model: None,
+            model_catalog_key: None,
+            max_tokens: 4096,
+            max_tokens_source: None,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("created-{session}")),
+            device_id: DeviceId::new("delete-stopped-device"),
+        })
+        .await
+        .expect("create session");
+    }
+    let fences = hub.inner_monitor().stop_fences().clone();
+    for run in &runs {
+        fences.mark_run_stopped(&deleted, run);
+        fences.mark_run_stopped(&retained, run);
+        assert!(fences.registration_fenced(&deleted, run));
+        assert!(fences.registration_fenced(&retained, run));
+    }
+    hub.delete_session(deleted.clone())
+        .await
+        .expect("delete session");
+    for run in &runs {
+        assert!(!fences.registration_fenced(&deleted, run));
+        assert!(fences.registration_fenced(&retained, run));
+    }
+}
+
+/// Drain crosses the actual supervisor setup boundary before Shutdown can
+/// be received. Removing the drain cancellation rule makes this Errored.
+#[tokio::test]
+async fn accepted_turn_setup_during_drain_cancels_without_run_failure() {
+    for draining in [true, false] {
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session = SessionId::new(format!("setup-drain-{draining}"));
+        let run = RunId::new(format!("setup-drain-run-{draining}"));
+        hub.create_session(create_command(&session, "setup-drain"))
+            .await
+            .expect("session");
+        let accepted = match hub
+            .accept_turn(accept_command(
+                &session,
+                &run,
+                store.worker_generation(),
+                "setup-drain",
+            ))
+            .await
+            .expect("accept")
+        {
+            haider_store::TurnAcceptOutcome::Committed { accepted, .. }
+            | haider_store::TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
+        };
+        let (arrived, resume) = crate::worker::install_turn_setup_barrier(session.clone());
+        let manager = crate::worker::WorkerManager::start(
+            hub.clone(),
+            crate::worker::WorkerDependencies::unconfigured_for_tests(),
+            false,
+        );
+        let handle = manager.handle();
+        handle.submit(accepted).await.expect("handoff");
+        tokio::time::timeout(Duration::from_secs(20), arrived)
+            .await
+            .expect("setup boundary")
+            .expect("arrived");
+        if draining {
+            handle.begin_draining();
+            hub.begin_draining();
+        }
+        resume.send(()).expect("resume setup");
+        let expected = if draining {
+            RunState::Cancelled
+        } else {
+            RunState::Errored
+        };
+        let actual = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let events = store.read(&session, 0, 1024).await.expect("history");
+                if let Some(state) = events.iter().rev().find_map(|event| {
+                    if event.run_id.as_ref() != Some(&run) {
+                        return None;
+                    }
+                    match event.payload.decode_event() {
+                        Ok(EventPayload::RunState(state)) if state.is_terminal() => Some(state),
+                        _ => None,
+                    }
+                }) {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal outcome");
+        assert_eq!(actual, expected, "drain owns the startup terminal outcome");
+        tokio::time::timeout(Duration::from_secs(20), manager.shutdown())
+            .await
+            .expect("bounded drain")
+            .expect("shutdown");
+        let events = store.read(&session, 0, 1024).await.expect("history");
+        let failed = events.iter().any(|event| {
+            matches!(
+                event.payload.decode_event(),
+                Ok(EventPayload::RunFailed { .. })
+            )
+        });
+        assert_eq!(
+            failed, !draining,
+            "genuine non-drain setup errors remain failures"
+        );
+        hub.shutdown().await.expect("hub close");
+        store.close().await.expect("store close");
+    }
+}
+
+/// Owned cancellation remains available after public admission closes, but
+/// never grants a superseded lease authority or rewrites natural completion.
+#[tokio::test]
+async fn drain_cancellation_is_lease_fenced_and_preserves_terminal_done() {
+    for initial in [RunState::Queued, RunState::RunningTool, RunState::Done] {
+        let terminal = initial == RunState::Done;
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session = SessionId::new(format!("owned-drain-{initial:?}"));
+        let run = RunId::new("owned-drain-run");
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &run,
+            store.worker_generation(),
+            "owned-drain-queued",
+            RunState::Queued,
+        )])
+        .await
+        .expect("queued");
+        let old = hub
+            .acquire_worker_lease(session.clone())
+            .await
+            .expect("old lease");
+        let lease = hub
+            .acquire_worker_lease(session.clone())
+            .await
+            .expect("successor lease");
+        if initial != RunState::Queued {
+            lease
+                .append(&mut [run_state_envelope(
+                    &session,
+                    &run,
+                    store.worker_generation(),
+                    "owned-drain-done",
+                    initial.clone(),
+                )])
+                .await
+                .expect("done");
+        }
+        hub.begin_draining();
+        let before = store.latest_seq(&session).await.expect("head");
+        assert_eq!(
+            old.begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+                .await
+                .expect_err("stale lease refused")
+                .code,
+            ErrorCode::SingleWriterViolation
+        );
+        assert_eq!(store.latest_seq(&session).await.expect("head"), before);
+        let outcome = lease
+            .begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+            .await
+            .expect("owned cancellation");
+        assert_eq!(
+            outcome.status,
+            if terminal {
+                haider_store::TurnCancellationStatus::AlreadyTerminal
+            } else {
+                haider_store::TurnCancellationStatus::Accepted
+            }
+        );
+        let after = store.latest_seq(&session).await.expect("head");
+        if terminal {
+            assert_eq!(after, before);
+        }
+        lease
+            .begin_owned_cancellation(&run, &DeviceId::new("drain-test"))
+            .await
+            .expect("replay");
+        assert_eq!(store.latest_seq(&session).await.expect("head"), after);
+        hub.shutdown().await.expect("hub close");
+        store.close().await.expect("store close");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_stop_lookup_must_not_fence_a_successor_after_queue_wait() {
+    r7_check_stop_lookup_epoch(true, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_terminal_before_lookup_preserves_successor_epoch() {
+    r7_check_stop_lookup_epoch(false, false).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn r7_stop_lookup_must_not_fence_a_successor_after_admission_wait() {
+    r7_check_stop_lookup_epoch(true, true).await;
+}
+#[cfg(unix)]
+async fn r7_check_stop_lookup_epoch(finish_while_waiting: bool, wait_on_admission: bool) {
+    let root = tempfile::tempdir().expect("store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session = SessionId::new(format!(
+        "r7-stop-lookup-session-{finish_while_waiting}-{wait_on_admission}"
+    ));
+    let old = RunId::new("r7-stop-lookup-old");
+    let next = RunId::new("r7-stop-lookup-next");
+    let generation = hub.worker_generation();
+    hub.create_internal_session(create_command(&session, "r7-create"))
+        .await
+        .expect("session");
+    hub.accept_turn(accept_command(&session, &old, generation, "r7-old"))
+        .await
+        .expect("old run");
+    let mut configured =
+        run_state_envelope(&session, &old, generation, "r7-headless", RunState::Queued);
+    *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        agent_spawn: None,
+        continuation_of: None,
+        cwd: root.path().display().to_string(),
+        provider: "fake".into(),
+        model: "fake-v1".into(),
+        resolved_model: None,
+        model_catalog_key: None,
+        max_output_tokens: 64,
+        effort: None,
+        fast: false,
+        seed: None,
+        permission_overrides: Default::default(),
+        trust_hooks: false,
+        budget: RunBudgetV1::default(),
+        request_deadline_unix_ms: None,
+        replay_of: None,
+    })
+    .to_payload_value()
+    .expect("config");
+    hub.append(&mut [
+        configured,
+        run_state_envelope(&session, &old, generation, "r7-stream", RunState::Streaming),
+    ])
+    .await
+    .expect("configure old");
+    if !finish_while_waiting {
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &old,
+            generation,
+            "r7-done",
+            RunState::Done,
+        )])
+        .await
+        .expect("old completes");
+        hub.accept_turn(accept_command(&session, &next, generation, "r7-next"))
+            .await
+            .expect("successor");
+    }
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let registered = hub
+        .inner_monitor()
+        .client_register(
+            &hub,
+            crate::monitor::MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("r7-successor-monitor-register"),
+                session_id: session.clone(),
+                worker_generation: generation,
+                source: haider_rpc::MonitorSourceWire::Timer {
+                    interval_ms: 3_600_000,
+                },
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: Some("successor follow-up".into()),
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    let monitor_id = match registered.outcome {
+        haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } => monitor.monitor_id,
+        outcome => panic!("successor monitor registration failed: {outcome:?}"),
+    };
+    let monitor_for_boundary = hub.inner_monitor();
+    let serial = if wait_on_admission {
+        monitor_for_boundary.admission_lock().await
+    } else {
+        hub.inner.stop_operations.lock().await
+    };
+    let (lookup, lookup_resume) = if wait_on_admission {
+        super::rpc::stop_boundary_hook::install_at(
+            super::rpc::stop_boundary_hook::Boundary::StopAdmission,
+            &session,
+        )
+    } else {
+        super::rpc::stop_boundary_hook::install_at(
+            super::rpc::stop_boundary_hook::Boundary::StopOperation,
+            &session,
+        )
+    };
+    let old_for_request = old.clone();
+    let stop = tokio::spawn(async move {
+        connection
+            .request(
+                haider_rpc::RequestId::new("r7-stop"),
+                haider_rpc::RequestBody::HeadlessRunStop {
+                    command_id: haider_rpc::CommandId::new("r7-stop"),
+                    run_id: old_for_request,
+                    scope: haider_rpc::RunStopScopeWire::All,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, lookup)
+        .await
+        .expect("stop lookup reached")
+        .expect("lookup barrier");
+    lookup_resume.send(()).expect("resume lookup");
+    if finish_while_waiting {
+        hub.append(&mut [run_state_envelope(
+            &session,
+            &old,
+            generation,
+            "r7-done",
+            RunState::Done,
+        )])
+        .await
+        .expect("old completes while stop waits");
+        hub.accept_turn(accept_command(&session, &next, generation, "r7-next"))
+            .await
+            .expect("successor while stop waits");
+    }
+    let fences = hub.inner_monitor().stop_fences().clone();
+    let before = fences.epoch(&session, &monitor_id);
+    let report = crate::monitor::MonitorReport {
+        report_id: "r7-successor-report".into(),
+        monitor_id: monitor_id.clone(),
+        session_id: session.clone(),
+        branch_id: None,
+        agent_id: None,
+        source: haider_tools::MonitorSourceKind::Timer,
+        occurrence: haider_tools::MonitorOccurrence::Every,
+        status: crate::monitor::MonitorReportStatus::Matched,
+        events: vec![],
+        coalesced_count: 1,
+        omitted_count: 0,
+        action: haider_tools::MonitorAction {
+            report: true,
+            follow_up: Some("successor follow-up".into()),
+        },
+    };
+    let mut pending = run_state_envelope(
+        &session,
+        &next,
+        generation,
+        "r7-pending-report",
+        RunState::Queued,
+    );
+    *pending.payload = serde_json::json!({"type":"monitor_report_pending","pending":{"report":&report,"queue_order":1,"queued_at_ms":1}});
+    hub.append(&mut [pending])
+        .await
+        .expect("persist successor monitor report");
+    let before_journal = crate::completion::load(&hub, &session)
+        .await
+        .expect("initial outbox");
+    assert!(
+        before_journal
+            .projection
+            .pending
+            .contains_key("monitor:r7-successor-report"),
+        "successor report must have a durable obligation"
+    );
+    let (arrived, resume) = crate::completion::astra22_boundary_hook::install(&session);
+    let wake_hub = hub.clone();
+    let wake =
+        tokio::spawn(async move { crate::completion::wake_monitor(&wake_hub, report).await });
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, arrived)
+        .await
+        .expect("current report reaches admission")
+        .expect("barrier");
+    drop(serial);
+    stop.await.expect("stop joins").expect("stop response");
+    let after = fences.epoch(&session, &monitor_id);
+    resume.send(()).expect("release successor report");
+    let delivery = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, wake)
+        .await
+        .expect("delivery finishes")
+        .expect("delivery joins");
+    let live = crate::delegation::DelegationHandle::new(hub.clone())
+        .live_session_runs(&session)
+        .await
+        .expect("live runs");
+    assert!(
+        live.contains(&next),
+        "the successor must remain live; this check is about its report, not successor cancellation"
+    );
+    let journal = crate::completion::load(&hub, &session)
+        .await
+        .expect("completion journal");
+    let dismissed=journal.events.iter().filter(|e| matches!(e,haider_protocol::completion::CompletionEvent::CompletionDismissed{obligation_id,..} if obligation_id=="monitor:r7-successor-report")).count();
+    eprintln!(
+        "r7 schedule finish_while_waiting={finish_while_waiting}; wait_on_admission={wait_on_admission}; epoch {before}->{after}; dismissed={dismissed}; delivery={delivery:?}"
+    );
+    let frames = sink.0.lock().expect("frames").clone();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            WireFrame::Response {
+                body: haider_rpc::ResponseBody::HeadlessRunStop {
+                    status: haider_rpc::CancelStatus::AlreadyTerminal,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{frames:?}"
+    );
+    hub.shutdown().await.expect("hub stop");
+    store.close().await.expect("store closes");
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen durable store");
+    let persisted = reopened
+        .read(&session, 0, 1024)
+        .await
+        .expect("reopened journal");
+    let persisted_dismissed=persisted.iter().filter(|e| matches!(e.payload.decode::<haider_protocol::completion::CompletionEvent>(),Ok(haider_protocol::completion::CompletionEvent::CompletionDismissed{obligation_id,..}) if obligation_id=="monitor:r7-successor-report")).count();
+    reopened.close().await.expect("reopened store closes");
+    eprintln!("r7 reopened persisted dismissals={persisted_dismissed}");
+    assert_eq!(
+        persisted_dismissed, dismissed,
+        "live and reopened completion truth must agree"
+    );
+    assert_eq!(
+        dismissed, 0,
+        "stop of the completed original run durably dismissed the successor monitor report"
+    );
+    assert_eq!(
+        after, before,
+        "stop of the completed original run changed the successor session's monitor epoch; a report that captured the old epoch is now durably dismissed"
+    );
 }

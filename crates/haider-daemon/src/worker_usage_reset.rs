@@ -205,13 +205,20 @@ impl BrokerToolDispatcher {
 fn usage_reset_tool_result(
     result: &UsageResetApplyResultV1,
 ) -> Result<ToolDispatchResult, HaiderError> {
-    let preview = serde_json::to_string(result).map_err(|error| {
+    let mut payload = serde_json::to_value(result).map_err(|error| {
         HaiderError::new(
             ErrorCode::Internal,
             format!("cannot encode usage reset result: {error}"),
             false,
         )
     })?;
+    if result.reason.as_deref() == Some("credential_identity_incomplete") {
+        payload["message"] = serde_json::Value::String(
+            "Refresh this account or sign in again before applying a reset; its saved identity is incomplete."
+                .into(),
+        );
+    }
+    let preview = payload.to_string();
     Ok(ToolDispatchResult::Completed(BoundedResult {
         preview,
         truncated: false,
@@ -230,4 +237,34 @@ fn usage_reset_tool_result(
         presentation: None,
         orchestration: None,
     }))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use haider_protocol::ids::CredentialAlias;
+
+    #[test]
+    fn incomplete_reset_identity_explains_how_to_refresh_in_the_tool_preview() {
+        let result = usage_reset::failed(
+            "synthetic-approval",
+            &CredentialAlias::new("synthetic-account"),
+            "credential_identity_incomplete",
+        );
+        let ToolDispatchResult::Completed(result) =
+            usage_reset_tool_result(&result).expect("tool result")
+        else {
+            panic!("completed failure preview");
+        };
+        let preview: serde_json::Value = serde_json::from_str(&result.preview).expect("json");
+        assert!(
+            preview["message"]
+                .as_str()
+                .expect("refresh advice")
+                .contains("Refresh this account")
+        );
+        assert_eq!(preview["reason"], "credential_identity_incomplete");
+        assert_eq!(result.status, ToolResultStatus::Failed);
+    }
 }

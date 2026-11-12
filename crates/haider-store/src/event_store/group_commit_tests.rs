@@ -41,6 +41,7 @@ fn batch(session: &SessionId, event_id: impl Into<String>) -> JournalAppendBatch
 
 fn session_create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{suffix}"),
         request_digest: "create-digest".into(),
         request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#
@@ -48,6 +49,7 @@ fn session_create_command(session_id: &SessionId, suffix: &str) -> SessionCreate
         session_id: session_id.clone(),
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         max_tokens_source: None,
@@ -418,6 +420,7 @@ fn receipts_append_and_hook_ack_share_one_outer_commit() {
             interaction_mode: SessionInteractionModeV1::Interactive,
             account_alias: None,
             workspace_allocation: None,
+            inherited_route: None,
         },
         JournalCommitBatch::AcceptTurn {
             command: turn_command(&store, &accepted_session, "grouped"),

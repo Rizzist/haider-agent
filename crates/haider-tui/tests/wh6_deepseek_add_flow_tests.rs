@@ -145,13 +145,13 @@ fn wh6_deepseek_add_card_and_validate_flow() {
         committed
             .commands
             .iter()
-            .any(|command| matches!(command, LiveCommand::AccountList)),
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. })),
         "committed vault+descriptor truth refreshes account rows"
     );
     assert!(
         committed.commands.iter().any(|command| matches!(
             command,
-            LiveCommand::RefreshProviderModels { provider } if provider == "deepseek"
+            LiveCommand::RefreshProviderModelsAt { provider, .. } if provider == "deepseek"
         )),
         "the validated key immediately probes the live DeepSeek /models catalog"
     );

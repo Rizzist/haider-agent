@@ -48,6 +48,7 @@ fn summaries_declaring_vision(vision: Option<bool>) -> Vec<haider_rpc::ProviderS
         display_name: None,
         context_window: Some(1_000_000),
         max_output_tokens: Some(128_000),
+        max_output_tokens_source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -72,9 +73,10 @@ fn live_model(vision: Option<bool>) -> AppModel {
     model.accounts.apply_snapshot(seed_account_rows(), Some(1));
     model.identity.provider = "anthropic".to_owned();
     model.identity.model_short = "claude-opus-5".to_owned();
-    model.identity_pinned = true;
+    model.launcher_identity_pinned = true;
     model.sessions.clear();
     model.upsert_live_session(&sid());
+    model.note_session_metadata_at(&sid(), "anthropic", "claude-opus-5", 30_000, Some(0), None);
     model.open_session(&sid());
     model.screen = Screen::Session;
     model.requests.clear();

@@ -10,6 +10,12 @@ use crate::cache_policy::{assess_cache_change, blocks_change, combine_cache_chan
 
 fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -17,6 +23,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "openai".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "gpt-5.6-terra".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -133,7 +140,7 @@ fn cm3a_tuning_is_gated_and_cm3e_confirmation_is_reversible() {
         !blocks_change(&warning, true),
         "explicit new-epoch confirmation restores the ability to change"
     );
-    assert!(warning.message().contains("repeat the same selection"));
+    assert!(warning.message().contains("--confirm-epoch"));
     // The caller's confirmed second request bypasses only this preflight and
     // commits the requested setting; no setting/model is permanently pinned.
 }

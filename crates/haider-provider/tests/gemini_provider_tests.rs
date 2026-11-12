@@ -772,6 +772,7 @@ fn grounding_metadata_decodes_into_rows_and_sources_tolerantly() {
                 call_id: "gemini-search-1".into(),
                 name: "web_search".into(),
                 args: serde_json::json!({"query": "rust sse decoding"}),
+                activity: Some(haider_protocol::activity::ActivityKind::Web),
             }),
             Ok(StreamEvent::ServerToolResult {
                 call_id: "gemini-search-1".into(),

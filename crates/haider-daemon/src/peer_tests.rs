@@ -46,6 +46,32 @@ impl haider_provider::Provider for HeldPeerProvider {
 
 struct HeldPeerProviderFactory;
 
+/// An explicit outbox drain does not join concurrent maintenance. Subscribe
+/// before scanning so its post-permit settlement cannot race this observer.
+#[cfg(unix)]
+pub(crate) async fn wait_for_peer_delivery_quiescence(hub: &crate::session_hub::SessionHub) {
+    let mut changes = hub.subscribe_peer_reconcile();
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        loop {
+            if hub
+                .daemon_is_durably_quiescent()
+                .await
+                .expect("durable peer quiescence scan")
+            {
+                return;
+            }
+            match changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("peer settlement stream closed before durable quiescence");
+                }
+            }
+        }
+    })
+    .await
+    .expect("peer delivery settles before the fixture watchdog");
+}
+
 #[async_trait::async_trait]
 impl crate::worker::ProviderFactory for HeldPeerProviderFactory {
     async fn resolve_for_turn(
@@ -426,12 +452,14 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-peer-route".into(),
         request_digest: "create-peer-route-digest".into(),
         request_json: r#"{"title":"peer-route"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 1_024,
         max_tokens_source: None,
@@ -582,12 +610,14 @@ pub(crate) async fn live_peer_fixture(
     let hub =
         crate::session_hub::SessionHub::new(store.clone(), Default::default()).expect("peer hub");
     hub.create_internal_session(haider_core::SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{id}"),
         request_digest: format!("digest-{id}"),
         request_json: "{}".into(),
         session_id: SessionId::new(id),
         cwd: root.to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 1024,
         max_tokens_source: None,
@@ -808,6 +838,7 @@ async fn peer_endpoint_refuses_approval_frames_and_notifies_idle_once() {
         client_instance_id: "probe".into(),
         client_kind: haider_rpc::ClientKind::Cli,
         capabilities_requested: [haider_rpc::Capability::Control].into(),
+        features_requested: Default::default(),
         max_receive_frame: 128 * 1024,
         encodings: Vec::new(),
     });

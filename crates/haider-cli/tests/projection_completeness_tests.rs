@@ -94,6 +94,10 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
         ("turn_count", "not surfaced by the sessions view"),
         ("footprint_tokens", "flattened into `footprint`"),
         ("footprint_truth", "flattened into `footprint`"),
+        (
+            "latest_context_footprint",
+            "request-level meter provenance is consumed by the TUI; sessions JSON keeps its compact footprint summary",
+        ),
         ("workspace_cwd", "not surfaced by the sessions view"),
         (
             "agent_metrics",
@@ -120,6 +124,8 @@ fn every_session_summary_wire_field_is_projected_or_deliberately_skipped() {
             "summary.cache_reread_hit_basis_points",
         ),
         ("forked_from", "summary.forked_from"),
+        ("owner_agent_id", "summary.owner_agent_id"),
+        ("launch_origin", "summary.launch_origin"),
     ];
 
     let wire = wire_fields(&frame, "SessionSummary");

@@ -150,7 +150,7 @@ fn seeded_session() -> AppModel {
     model.accounts.apply_snapshot(seed_account_rows(), Some(1));
     model.identity.provider = "anthropic".into();
     model.identity.model_short = "claude-opus-5".into();
-    model.identity_pinned = true;
+    model.launcher_identity_pinned = true;
     model
 }
 
@@ -324,7 +324,10 @@ fn blocking_question_still_outranks_a_local_picker() {
             "{picker:?} stale hit must not answer"
         );
         model.handle(key(KeyCode::Down));
-        assert!(!picker.is_open(&model));
+        assert!(picker.is_open(&model), "{picker:?} stays parked below the question");
+        assert_eq!(model.menu_selection, 1, "{picker:?} forwards Down to the question");
+        let frame = painted(&model);
+        assert!(!frame.contains(picker.painted_marker()));
         model.handle(key(KeyCode::Enter));
         assert_eq!(
             model.outbox[0].answer.option_key.as_deref(),
@@ -365,7 +368,10 @@ fn blocking_chip_question_still_outranks_a_local_picker() {
             "{picker:?} stale hit must not answer"
         );
         model.handle(key(KeyCode::Down));
-        assert!(!picker.is_open(&model));
+        assert!(picker.is_open(&model), "{picker:?} stays parked below the question");
+        assert_eq!(model.menu_selection, 1, "{picker:?} forwards Down to the question");
+        let frame = painted(&model);
+        assert!(!frame.contains(picker.painted_marker()));
         model.handle(key(KeyCode::Enter));
         assert_eq!(
             model.outbox[0].answer.option_key.as_deref(),

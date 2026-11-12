@@ -397,6 +397,9 @@ pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 /// display identity plus its resolved model/provider pair. Every field is
 /// absence-preserving; clients must not infer coordinates when it is absent.
 pub const FEATURE_SESSION_FLEET_IDENTITY_V1: &str = "session_fleet_identity_v1";
+/// Activity fields and provider-transport effects are sent only to clients
+/// that explicitly request this token in Hello and receive it in Welcome.
+pub const FEATURE_SESSION_ACTIVITY_V1: &str = "session_activity_v1";
 /// Daemon implements the reconnectable, per-child-cursor descendant stream.
 pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -417,6 +420,16 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// Daemon implements receipt-backed cancellation of an owned direct child.
 /// The child remains visible and reaches a durable terminal run state.
 pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
+/// Daemon honours `headless.run.stop` `scope` (`all`/`main`/`subagents`) and
+/// serves `agent.cancel_all` (owner decision 2026-09-25). An older daemon
+/// ignores the scope field, so clients must require this feature before
+/// sending a non-default scope.
+pub const FEATURE_RUN_STOP_SCOPE_V1: &str = "run_stop_scope_v1";
+/// Main-only interruption, current-incarnation named stop, and full tree stop
+/// share this negotiated semantic contract (including durable replay).
+pub const FEATURE_HELPER_STOP_V1: &str = "helper_stop_v1";
+pub const HELPER_STOP_UNSUPPORTED_MESSAGE: &str = "This daemon is older than this CLI and cannot end helper tasks reliably. First close older clients attached to this profile (including session --watch and TUI clients) so they cannot restart the old daemon. Stop it with `haider daemon stop`, then run your command again; the current daemon starts automatically.";
+pub const HELPER_STOP_UNSUPPORTED_NO_SPAWN_MESSAGE: &str = "This daemon is older than this CLI and cannot end helper tasks reliably. First close older clients attached to this profile (including session --watch and TUI clients) so they cannot restart the old daemon. Stop it with `haider daemon stop`, then run your command again without --no-spawn so the current daemon can start.";
 /// Daemon implements receipt-backed per-session provider/account/endpoint
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
@@ -639,6 +652,9 @@ pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// SSH setup failures use `ShellWire::setup_error`; uncoded completion is not
+/// inferred to be a setup failure from ordinary terminal output.
+pub const FEATURE_SSH_TYPED_SETUP_ERRORS_V1: &str = "ssh_typed_setup_errors_v1";
 /// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
 pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
@@ -802,6 +818,10 @@ pub struct Hello {
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
+    /// Optional additive feature opt-ins. Old daemons ignore this field;
+    /// unlike an unknown Capability enum value it cannot reject the Hello.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features_requested: BTreeSet<String>,
     /// Largest encoded body this client can receive.
     ///
     /// The daemon must not send a frame larger than the smaller of this value
@@ -1302,6 +1322,12 @@ pub struct ModelDetailWire {
     /// the remote catalog omits the field or cannot be reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Where `max_output_tokens` came from. Additive (973-output-cap-fixes):
+    /// older peers omit it, and a spelling this peer does not know decodes as
+    /// [`ModelOutputLimitSourceWire::Unknown`]; either leaves the daemon to
+    /// derive provenance from its own tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<ModelOutputLimitSourceWire>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.
     /// EMPTY (absent on the wire) means "no declared ladder".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1356,6 +1382,24 @@ impl ModelDetailSourceWire {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Provenance of one [`ModelDetailWire::max_output_tokens`] value. Numeric
+/// equality with a local fallback is never provenance, so the daemon carries
+/// this explicitly from projection to selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOutputLimitSourceWire {
+    /// The provider's model catalog declared the maximum: it is exact.
+    Declared,
+    /// The daemon's pinned table, from a published provider maximum: exact.
+    Static,
+    /// A local value the provider does not publish; explicit budgets may
+    /// exceed it within the global and context-window bounds.
+    Fallback,
+    /// A source this peer does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One provider's read-only management projection.
@@ -1512,9 +1556,28 @@ impl ModelInventoryWire {
     }
 }
 
+/// Opaque catalog producer coordinate. It contains no credential material.
+/// The key also scopes anonymous catalogs to their endpoint/auth context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCatalogScopeWire {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_incarnation: Option<u64>,
+}
+
 /// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_scope: Option<ProviderCatalogScopeWire>,
+    /// Explicit deployment IDs, independent of fetched metadata for those IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_models: Vec<String>,
+    /// Release-owned IDs remain permanent when remote details replace them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_models: Vec<String>,
     pub provider: String,
     pub api_family: ProviderApiFamilyWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1559,7 +1622,268 @@ pub struct ProviderSummaryWire {
     pub trust: ProviderTrustWire,
 }
 
+/// Unicode-safe model selector key: lower-case scalar expansion, dropping
+/// only the punctuation/spacing family the public selector contract names.
+#[must_use]
+pub fn normalize_model_selector(selector: &str) -> String {
+    selector
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl ProviderSummaryWire {
+    /// Permanent names come from an unscoped public catalog or offline
+    /// configuration. A custom profile or account-owned inventory may use
+    /// a public provider namespace without inheriting that meaning.
+    #[must_use]
+    pub fn catalog_has_permanent_names(&self) -> bool {
+        self.catalog == ProviderCatalogKindWire::Offline
+            || (self.catalog == ProviderCatalogKindWire::Public
+                && self.inventory_authority != ModelInventoryAuthorityWire::Advisory
+                && self.auth_methods.is_empty()
+                && self.catalog_scope.as_ref().is_none_or(|scope| {
+                    scope.account_alias.is_none() && scope.account_incarnation.is_none()
+                }))
+    }
+
+    /// Age the entire projection, including configuration-owned IDs. A list
+    /// can expire between publication and read; admission must not wait for
+    /// the producer's next refresh tick to stop treating absence as proof.
+    pub fn project_inventory_at_time(
+        &mut self,
+        now_ms: u64,
+        descriptors: &[haider_protocol::credential::CredentialDescriptor],
+    ) {
+        let credential_ready = self.auth_methods.is_empty()
+            || descriptors.iter().any(|descriptor| {
+                descriptor.provider == self.provider
+                    && descriptor.active
+                    && matches!(
+                        &descriptor.status,
+                        haider_protocol::credential::CredentialStatus::Ok
+                            | haider_protocol::credential::CredentialStatus::Limited { .. }
+                    )
+            });
+        self.project_inventory_at_time_with_credential_ready(now_ms, credential_ready);
+    }
+
+    /// Clients with a typed account projection supply the same readiness
+    /// proof without reconstructing transport descriptors. Aging and model
+    /// availability remain one policy here.
+    pub fn project_inventory_at_time_with_credential_ready(
+        &mut self,
+        now_ms: u64,
+        credential_ready: bool,
+    ) {
+        let fetched = matches!(self.inventory, ModelInventoryWire::Fetched { .. });
+        self.inventory = self.inventory.clone().at_time(now_ms);
+        if !matches!(self.inventory, ModelInventoryWire::Stale { .. }) {
+            return;
+        }
+        for model in &self.configured_models {
+            if !self.models.contains(model) {
+                // Configuration supplies the ID, never fetched metadata.
+                self.models.push(model.clone());
+            }
+        }
+        if fetched
+            && (!self.configured_models.is_empty()
+                || self.inventory_authority == ModelInventoryAuthorityWire::Advisory)
+            && self.enabled
+            && self.api_family != ProviderApiFamilyWire::Unknown
+            && self.endpoint.is_some()
+            && credential_ready
+        {
+            // Even an empty successful list becomes uncertainty. Credential
+            // rejection uses Unavailable inventory and cannot enter here.
+            self.availability = ProviderAvailabilityWire::Available;
+            self.availability_reason = None;
+        }
+    }
+
+    /// Resolve the same unique selector before membership and admission.
+    /// Exact IDs take priority; listed aliases precede declared aliases.
+    /// Ambiguity preserves the literal request instead of guessing a row.
+    #[must_use]
+    pub fn canonical_model_selector<'a>(&'a self, model: &'a str) -> &'a str {
+        if self
+            .models
+            .iter()
+            .chain(&self.configured_models)
+            .any(|name| name == model)
+        {
+            return model;
+        }
+        let normalized = normalize_model_selector(model);
+        for rows in [&self.models, &self.configured_models] {
+            let mut matches = rows
+                .iter()
+                .filter(|name| normalize_model_selector(name) == normalized);
+            if let Some(only) = matches.next() {
+                return if matches.all(|other| other == only) {
+                    only.as_str()
+                } else {
+                    model
+                };
+            }
+        }
+        model
+    }
+
+    /// Shared admission policy for every consumer of a catalog projection.
+    /// Stale successful inventory remains selectable; a fresh list that omits
+    /// an explicitly configured deployment is definite negative evidence.
+    #[must_use]
+    pub fn model_is_selectable(&self, model: &str) -> bool {
+        self.selection_availability(Some(model)) == ProviderAvailabilityWire::Available
+    }
+
+    /// One availability decision for admission, pickers and summary clients.
+    /// The producer supplies credential/discovery evidence in `availability`;
+    /// consumers must also respect enablement and fresh negative membership.
+    #[must_use]
+    pub fn selection_availability(&self, model: Option<&str>) -> ProviderAvailabilityWire {
+        let model = model.map(|model| self.canonical_model_selector(model));
+        if !self.enabled
+            || model.is_some_and(|model| {
+                (matches!(self.inventory, ModelInventoryWire::Fetched { .. })
+                    || (matches!(
+                        self.inventory,
+                        ModelInventoryWire::Static | ModelInventoryWire::Unavailable { .. }
+                    ) && self.inventory_authority
+                        == ModelInventoryAuthorityWire::Authoritative
+                        && self.has_static_models()))
+                    && self.configured_models.iter().any(|name| name == model)
+                    && !self.models.iter().any(|name| name == model)
+            })
+        {
+            ProviderAvailabilityWire::Unavailable
+        } else {
+            self.availability
+        }
+    }
+
+    #[must_use]
+    pub fn selection_reason(&self, model: Option<&str>) -> Option<String> {
+        if !self.enabled {
+            return Some("provider is disabled".into());
+        }
+        if self.availability == ProviderAvailabilityWire::Available
+            && self.selection_availability(model) == ProviderAvailabilityWire::Unavailable
+        {
+            return Some(
+                if matches!(self.inventory, ModelInventoryWire::Fetched { .. }) {
+                    "deployment is absent from the latest model list".into()
+                } else {
+                    self.availability_reason.clone().unwrap_or_else(|| {
+                        "model list not fetched for this deployment — fetch models".into()
+                    })
+                },
+            );
+        }
+        self.availability_reason
+            .clone()
+            .or_else(|| match &self.inventory {
+                ModelInventoryWire::Stale { reason, .. } => Some(format!("{reason} — refresh due")),
+                _ => None,
+            })
+    }
+
+    /// Private discovery belongs to the published route, including anonymous
+    /// endpoints. An explicit model name does not transfer its metadata.
+    #[must_use]
+    pub fn catalog_matches_session_route(
+        &self,
+        base_url: Option<&str>,
+        account: Option<&str>,
+    ) -> bool {
+        self.catalog_scope.as_ref().is_none_or(|scope| {
+            base_url.is_none_or(|url| self.endpoint.as_deref() == Some(url))
+                && account
+                    .zip(scope.account_alias.as_deref())
+                    .is_none_or(|(selected, published)| selected == published)
+        })
+    }
+
+    /// Retire discovery while preserving configuration and release-owned IDs.
+    pub fn retire_fetched_catalog(&mut self) {
+        for detail in &mut self.model_details {
+            if detail.source == Some(ModelDetailSourceWire::Remote)
+                && (self.configured_models.contains(&detail.name)
+                    || self.static_models.contains(&detail.name))
+            {
+                // Keep the explicit declaration, discard every fetched field.
+                detail.source = Some(if self.static_models.contains(&detail.name) {
+                    ModelDetailSourceWire::Static
+                } else {
+                    ModelDetailSourceWire::Configured
+                });
+                detail.display_name = None;
+                detail.context_window = None;
+                detail.max_output_tokens = None;
+                detail.max_output_tokens_source = None;
+                detail.supported_efforts.clear();
+                detail.default_effort = None;
+                detail.supported_speeds.clear();
+                detail.supports_thinking_type = None;
+                detail.supports_vision = None;
+            }
+        }
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.model_details.iter().any(|detail| &detail.name == name) {
+                self.model_details.push(ModelDetailWire {
+                    max_output_tokens_source: None,
+                    source: Some(if self.static_models.contains(name) {
+                        ModelDetailSourceWire::Static
+                    } else {
+                        ModelDetailSourceWire::Configured
+                    }),
+                    name: name.clone(),
+                    display_name: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                    supported_speeds: Vec::new(),
+                    supports_thinking_type: None,
+                    supports_vision: None,
+                });
+            }
+        }
+        self.model_details.retain(|detail| {
+            matches!(
+                detail.source,
+                Some(ModelDetailSourceWire::Static | ModelDetailSourceWire::Configured)
+            )
+        });
+        self.models
+            .retain(|name| self.model_details.iter().any(|detail| &detail.name == name));
+        for name in self.configured_models.iter().chain(&self.static_models) {
+            if !self.models.contains(name) {
+                self.models.push(name.clone());
+            }
+        }
+        self.default_model = self
+            .default_model
+            .take()
+            .filter(|name| self.models.contains(name));
+        if self.has_static_models() {
+            self.inventory = ModelInventoryWire::Static;
+            self.availability_reason = (self.availability != ProviderAvailabilityWire::Available)
+                .then(|| "active account changed — refresh provider state".into());
+        } else {
+            self.inventory = if self.models.is_empty() {
+                ModelInventoryWire::NeverFetched
+            } else {
+                ModelInventoryWire::Configured
+            };
+            self.availability = ProviderAvailabilityWire::Unavailable;
+            self.availability_reason = Some("active account changed — fetch models".into());
+        }
+    }
+
     /// Whether a pickable row comes from the maintained static catalog.
     #[must_use]
     pub fn has_static_models(&self) -> bool {
@@ -1945,12 +2269,23 @@ pub enum ShellStatusWire {
     Closed,
 }
 
+/// Coded refusal during asynchronous shell setup, before a remote command
+/// starts. Kept separate from the remote command's numeric exit status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSetupErrorWire {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 /// Public, secret-free projection of one entry in the unified shell registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellWire {
     pub id: String,
     pub kind: ShellKindWire,
     pub status: ShellStatusWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<ShellSetupErrorWire>,
     pub title: String,
     pub cwd_or_host: String,
     pub created_at_ms: u64,
@@ -2004,6 +2339,14 @@ pub struct AttachState {
 /// Cheap metadata returned by session listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Durable delegation owner, available even before the first agent turn.
+    /// None for roots and summaries from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    /// Current own-subject origin, recovered from the journal when its
+    /// metadata projection is absent. Also available for legacy sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
     pub session_id: SessionId,
     /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,
@@ -2113,6 +2456,10 @@ pub struct SessionSummary {
     /// Present exactly when `footprint_tokens` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_truth: Option<ContextFootprintTruth>,
+    /// The child's own durable snapshot, including its request selection
+    /// epoch. Older daemons omit it; totals above remain usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
     /// Additive G2 field: the committed session title, so launcher rosters
     /// name rows without attaching. `None` for untitled sessions and when
     /// an older daemon omits the field — readers must not infer anything
@@ -2587,6 +2934,17 @@ pub struct FleetNodeWire {
     /// `(terminal_at_ms | snapshot.generated_at_ms) - started_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AgentMetricsSnapshot>,
+    /// 973-activity-icons: what this agent is DOING at `generated_at_ms`
+    /// (not its state), derived from typed tool identity in its own journal
+    /// by [`haider_protocol::activity::ActivityTracker`]. Absent when it is
+    /// quiet, terminal, or the daemon predates the field; old clients ignore
+    /// it. Unknown future kinds decode as `unknown` and render nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<haider_protocol::activity::ActivityKind>,
+    /// Every activity this agent has used so far, highest priority first
+    /// (the detail view's history). Empty when none or when not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<haider_protocol::activity::ActivityKind>,
     /// Exact number of this node's direct durable children omitted by the
     /// snapshot bounds. Zero means the empty `children` list is a real leaf.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -2846,6 +3204,8 @@ pub enum HookTrustStateWire {
 #[non_exhaustive]
 pub enum MonitorSourceKindWire {
     Sms,
+    Task,
+    Agent,
     Process,
     File,
     Poll,
@@ -2861,6 +3221,12 @@ pub enum MonitorSourceKindWire {
 #[non_exhaustive]
 pub enum MonitorSourceWire {
     Sms,
+    Task {
+        task_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
     Process {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3482,6 +3848,12 @@ pub enum MonitorEventPayloadWire {
         body: String,
         received_at_ms: i64,
     },
+    Task {
+        payload: String,
+    },
+    Agent {
+        payload: String,
+    },
     Process {
         line: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3602,6 +3974,9 @@ pub enum RequestBody {
         cwd: String,
         provider: String,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         max_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_overrides: Option<SessionPermissionOverridesV1>,
@@ -3957,14 +4332,24 @@ pub enum RequestBody {
         agent: AgentId,
         text: String,
     },
-    /// Cancel one direct child of the named parent session. The daemon owns
-    /// the child run coordinate and recursively stops its descendants.
+    /// Cancel one direct child of the named parent session: its original run
+    /// and any later active run (messaged or monitor-woken). Only that child
+    /// stops; its own subagents keep running (owner decision 2026-09-25).
     #[serde(rename = "agent.cancel")]
     AgentCancel {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
         agent: AgentId,
+    },
+    /// Stop every subagent in the named session's delegation tree, however
+    /// deep, including descendants started in later child runs, and remove
+    /// those subagents' monitors. The session's own runs are not touched.
+    #[serde(rename = "agent.cancel_all")]
+    AgentCancelAll {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
     },
     /// Branch-capable decode form of `turn.submit`.
     #[serde(rename = "turn.submit")]
@@ -4109,6 +4494,9 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         model: String,
+        /// Catalog owner observed by the client; mismatches require a fresh choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_catalog_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -4594,10 +4982,15 @@ pub enum RequestBody {
     #[serde(rename = "headless.run.status")]
     HeadlessRunStatus { run_id: RunId },
     /// Idempotently stops a detached run after daemon-owned run lookup.
+    /// `scope` absent (the default `all`) stops the run and every subagent
+    /// in its tree; `main` stops only the run; `subagents` stops only the
+    /// subagents in its tree.
     #[serde(rename = "headless.run.stop")]
     HeadlessRunStop {
         command_id: CommandId,
         run_id: RunId,
+        #[serde(default, skip_serializing_if = "RunStopScopeWire::is_all")]
+        scope: RunStopScopeWire,
     },
     /// Indexed state of one typed workflow activation graph. Omission picks
     /// the session's most recently changed activation graph.
@@ -5227,6 +5620,12 @@ pub enum ResponseBody {
     },
     #[serde(rename = "agent.message")]
     AgentMessage { receipt: AgentMessageReceipt },
+    /// Result of `agent.cancel_all`.
+    #[serde(rename = "agent.cancel_all")]
+    AgentCancelAll {
+        session_id: SessionId,
+        stopped: SubagentStopSummaryWire,
+    },
     /// Result of durably cancelling an owned direct child. `terminal_seq` is
     /// present exactly when the target run was already terminal.
     #[serde(rename = "agent.cancel")]
@@ -5324,12 +5723,18 @@ pub enum ResponseBody {
         account: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         session_id: SessionId,
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_catalog_key: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
         /// `model_output_limits_v1`: the per-response budget this selection
@@ -5337,6 +5742,11 @@ pub enum ResponseBody {
         /// budget exceeded the new model's maximum.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+        /// Previous explicit account pin cleared by a cross-provider pick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_account_pin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleared_provider_endpoint: Option<String>,
     },
     /// Durable coordinates of a committed rename (G2): the NORMALIZED title
     /// — never an echo of the request — plus the committed journal sequence
@@ -5733,6 +6143,13 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+        /// Echo of a non-default request scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<RunStopScopeWire>,
+        /// What happened to the run's subagents (additive; absent from older
+        /// daemons).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagents: Option<SubagentStopSummaryWire>,
     },
     #[serde(rename = "workflow.graph.state")]
     WorkflowGraphState {
@@ -5872,6 +6289,43 @@ pub enum SubmitDisposition {
     SubturnPending,
     #[serde(other)]
     Unknown,
+}
+
+/// Scope of `headless.run.stop` (owner decision 2026-09-25).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunStopScopeWire {
+    /// The run plus every subagent in its tree (`haider run --stop`).
+    #[default]
+    All,
+    /// Only the run; its subagents keep running (`--stop-main`).
+    Main,
+    /// Only the subagents in the run's tree; the run keeps going
+    /// (`--stop-subagents`).
+    Subagents,
+    #[serde(other)]
+    Unknown,
+}
+
+impl RunStopScopeWire {
+    #[must_use]
+    pub fn is_all(&self) -> bool {
+        *self == Self::All
+    }
+}
+
+/// Subagent outcome of a stop request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentStopSummaryWire {
+    /// Subagent runs moved to cancelling by this request.
+    pub cancelled_runs: u64,
+    /// Distinct subagent sessions visited in the tree.
+    pub sessions: u64,
+    /// Monitors removed from stopped subagent sessions.
+    pub monitors_removed: u64,
+    /// Subagents left running (a main-only stop leaves them by design).
+    pub still_running: u64,
 }
 
 /// Result of a durable turn-cancellation command.

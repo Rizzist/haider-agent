@@ -561,12 +561,14 @@ fn registered_workflow_is_pinnable_by_name() {
     let session_id = SessionId::new("loom-pin-session");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-loom-pin".into(),
             request_digest: "create-loom-pin-digest".into(),
             request_json: r#"{"session":"loom-pin"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -631,12 +633,14 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
     let session_id = SessionId::new("retained-revision-session");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-retained-revision".into(),
             request_digest: "create-retained-revision-digest".into(),
             request_json: r#"{"session":"retained-revision"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -867,12 +871,14 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     let session_id = SessionId::new("legacy-retained-session");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-legacy-retained".into(),
             request_digest: "create-legacy-retained-digest".into(),
             request_json: r#"{"session":"legacy-retained"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,

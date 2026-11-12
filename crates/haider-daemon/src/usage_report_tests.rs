@@ -1473,6 +1473,7 @@ fn completed_tool(name: &str, args: serde_json::Value) -> serde_json::Value {
                 name: name.into(),
                 args,
                 status: haider_protocol::item::ToolStatus::Completed,
+                activity: None,
             },
         },
     ))
@@ -1546,6 +1547,7 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
                     name: "fs_edit".into(),
                     args: serde_json::json!({"edits":[{"old":"zzz\n","new":"qqq\n"}]}),
                     status: haider_protocol::item::ToolStatus::Failed,
+                    activity: None,
                 },
             },
         ))
@@ -1558,8 +1560,14 @@ fn session_folder_attributes_tokens_cost_duration_and_loc() {
         None,
         7_000,
         ModelSelected {
+            selection_epoch: None,
             provider: "openai".into(),
+            model_catalog_key: None,
             model: "gpt-5.2".into(),
+            route_only: false,
+            cleared_account_pin: None,
+            cleared_provider_endpoint: None,
+            output_budget_clamp: None,
         }
         .to_payload_value()
         .expect("model selected"),
@@ -2089,6 +2097,7 @@ fn mv1_tool_count_uniqueness_started_completed_delta_and_command() {
         name: "fs_read".into(),
         args: serde_json::json!({}),
         status,
+        activity: None,
     };
     let command = TurnItem::CommandExecution {
         call_id: "cmd-1".into(),

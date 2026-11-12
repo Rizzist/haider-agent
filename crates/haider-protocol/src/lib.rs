@@ -10,6 +10,7 @@
 //! [`envelope::RawEnvelope`]; unknown JSON fields are ignored on read and
 //! existing fields are never removed or re-typed within a schema version.
 
+pub mod activity;
 pub mod agent;
 pub mod branch;
 pub mod cache;
@@ -55,6 +56,7 @@ pub mod session;
 pub mod session_fork;
 pub mod spawn_subagent;
 pub mod state;
+pub mod subagent_stop;
 pub mod task;
 pub mod task_outcome;
 pub mod tool;

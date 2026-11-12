@@ -2580,12 +2580,14 @@ mod tests {
         let session_id = SessionId::new("pipe-boot-orphan-sweep");
         store
             .create_session(haider_core::SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-pipe-boot-orphan-sweep".into(),
                 request_digest: "create-pipe-boot-orphan-sweep-digest".into(),
                 request_json: r#"{"session":"pipe-boot-orphan-sweep"}"#.into(),
                 session_id: session_id.clone(),
                 cwd: root.path().to_string_lossy().into_owned(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-model".into(),
                 max_tokens: 4_096,
                 max_tokens_source: None,

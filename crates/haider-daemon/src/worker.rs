@@ -85,12 +85,13 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint, RouteWaitCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    TurnTraceContext, UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
+    ProviderRouteCommitter, ProviderViewAppendRequest, ReducerPageCursor, RequestInputCheckpoint,
+    RouteWaitCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, SubmitRouteWaitTurn, ToolCapabilityProfile, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, TurnTraceContext, UserCommandOutput,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, register_turn_trace, registered_turn_trace,
     sanitized_failure_message,
@@ -213,25 +214,44 @@ pub(crate) fn turn_trace_enabled() -> bool {
 const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(30);
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
-const TEST_CANCEL_SETTLE_DELAY_ENV: &str = "HAIDER_TEST_CANCEL_SETTLE_DELAY_MS";
-const MAX_TEST_CANCEL_SETTLE_DELAY_MS: u64 = 10_000;
-
-async fn delay_fake_provider_cancellation_settlement() {
-    let delay_ms = std::env::var(TEST_CANCEL_SETTLE_DELAY_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|delay| {
-            *delay > 0
-                && *delay <= MAX_TEST_CANCEL_SETTLE_DELAY_MS
-                && std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
-        });
-    if let Some(delay_ms) = delay_ms {
-        // Real-process lifecycle tests use a stalled fake-provider turn to
-        // hold the committed Cancelling state across a short launcher linger.
-        // Production providers never enter this explicit test-only boundary.
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+async fn wait_fake_provider_cancellation_settlement(
+    _drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    #[cfg(unix)]
+    if std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
+        && let Some(path) = std::env::var_os("HAIDER_TEST_CANCEL_SETTLE_GATE")
+    {
+        // Hold the committed cancellation until the real daemon starts drain,
+        // or the owning fixture releases it. No scheduler-sized state window.
+        let result = tokio::time::timeout(
+            haider_platform::TEST_WAIT_TIMEOUT,
+            fake_cancellation_settlement_gate(Path::new(&path), _drain_wakes),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!(?result, "fake cancellation settlement gate failed");
+        }
     }
 }
+
+#[cfg(unix)]
+async fn fake_cancellation_settlement_gate(
+    path: &Path,
+    drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    stream.write_all(&[1]).await?;
+    let mut release = [0];
+    tokio::select! {
+        result = stream.read_exact(&mut release) => result.map(|_| ()),
+        _ = drain_wakes.wait_for(|draining| *draining) => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "cancellation_gate_tests.rs"]
+mod cancellation_gate_tests;
 
 #[cfg(windows)]
 fn windows_test_process_trace_enabled() -> bool {
@@ -293,6 +313,12 @@ pub(crate) struct AcceptedCompaction {
 /// not session identity.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
+    /// Per-fixture wall/monotonic clock pair for paused-time deadline tests.
+    #[cfg(test)]
+    fn deadline_clock_for_test(&self) -> Option<ProviderDeadlineTestClock> {
+        None
+    }
+
     async fn resolve_for_turn(
         &self,
         metadata: &SessionMetadataV1,
@@ -322,6 +348,31 @@ pub trait ProviderFactory: Send + Sync {
     #[doc(hidden)]
     fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
         None
+    }
+}
+
+/// Keep persisted Unix deadlines and Tokio timers on one injected clock.
+/// Each factory owns its fixture clock; concurrent tests share no clock state.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub struct ProviderDeadlineTestClock {
+    unix_ms: u64,
+    monotonic: tokio::time::Instant,
+}
+
+#[cfg(test)]
+impl ProviderDeadlineTestClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            unix_ms: unix_time_ms(),
+            monotonic: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn now_ms(self) -> u64 {
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(self.monotonic);
+        self.unix_ms
+            .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
     }
 }
 
@@ -371,6 +422,68 @@ struct DaemonProviderPairSwitchCommitter {
     branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    turn_selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+struct DaemonProviderRouteCommitter {
+    store: HubStoreHandle,
+    run_id: RunId,
+    /// The pair and epoch admitted for this turn, including its initial
+    /// resolved route. A later selection must not donate its new epoch to
+    /// this older turn's rotation.
+    selection: Arc<Mutex<haider_protocol::session::SessionMetadataV1>>,
+}
+
+impl std::fmt::Debug for DaemonProviderRouteCommitter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderRouteCommitter")
+            .field("session_id", self.store.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRouteCommitter for DaemonProviderRouteCommitter {
+    async fn commit(
+        &self,
+        provider: &str,
+        model: &str,
+        to: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<u64, HaiderError> {
+        let mut selection = self.selection.lock().await.clone();
+        if let Some(pair) = self
+            .store
+            .hub()
+            .run_output_pair(self.store.session_id(), &self.run_id)
+            .await?
+            && pair.provider == provider
+            && pair.model_coordinate() == model
+        {
+            pair.restore_route(&mut selection)?;
+            selection.provider = pair.provider;
+            selection.model = pair.model;
+            selection.resolved_model = pair.resolved_model;
+            selection.model_catalog_key = pair.model_catalog_key;
+        }
+        if selection.provider != provider || selection.model_coordinate() != model {
+            return Ok(selection.selection_epoch.unwrap_or(0));
+        }
+        let epoch = self
+            .store
+            .commit_turn_resolved_route(&self.run_id, &selection, Some(to.as_str()))
+            .await?;
+        let mut current = self.selection.lock().await;
+        if current.provider == selection.provider
+            && current.model == selection.model
+            && current.selection_epoch == selection.selection_epoch
+        {
+            current.selection_epoch = Some(epoch);
+            current.resolved_route_alias = Some(to.as_str().to_owned());
+            current.resolved_route_seen = true;
+        }
+        Ok(epoch)
+    }
 }
 
 impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
@@ -384,7 +497,7 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
-    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+    async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError> {
         let live_source_policy = self
             .store
             .hub()
@@ -448,24 +561,71 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             }));
             return Err(error);
         }
-        let request_json = serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "automatic": true,
             "session_id": self.store.session_id(),
             "run_id": switch.run_id,
+            "branch_id": self.branch_id,
             "switch_ordinal": switch.switch_ordinal,
+            "source_rebind_seq": switch.source_rebind_seq,
+            "target_account": switch.target_account,
             "worker_generation": self.store.worker_generation(),
             "from_provider": switch.from_provider,
             "from_model": switch.from_model,
             "provider": switch.to_provider,
             "model": switch.to_model,
             "cause": switch.cause.as_str(),
-        })
-        .to_string();
+        });
+        if let Some(key) = &switch.model_catalog_key {
+            request_coordinates["model_catalog_key"] = serde_json::json!(key);
+        }
+        if let Some(budget) = switch.output_budget {
+            request_coordinates["output_budget"] = serde_json::json!(budget);
+        }
+        let request_json = request_coordinates.to_string();
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         let command_id = format!(
             "automatic-pair-switch-{}",
             request_digest.get(..24).unwrap_or(&request_digest)
         );
+        let hub = self.store.hub();
+        let _selection = hub.lock_workflow_selection(self.store.session_id()).await;
+        let pair = hub
+            .run_output_pair(self.store.session_id(), &switch.run_id)
+            .await?
+            .ok_or_else(|| {
+                haider_protocol::session::run_route_history_unavailable(
+                    "automatic switch has no active run route",
+                )
+            })?;
+        if pair.latest_rebind_seq != switch.source_rebind_seq {
+            return Err(HaiderError::new(
+                ErrorCode::RevisionConflict,
+                "automatic switch target belongs to an older rebind",
+                true,
+            ));
+        }
+        let mut active_selection = self.turn_selection.lock().await.clone();
+        pair.restore_route(&mut active_selection)?;
+        let selection_epoch = active_selection.selection_epoch;
+        if let Some(key) = &switch.model_catalog_key {
+            let summaries = self
+                .store
+                .hub()
+                .accounts()
+                .map_err(hub_error)?
+                .and_then(|facade| facade.management.read())
+                .map_or_else(Vec::new, |view| view.providers);
+            if !crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
+                .catalog_key_is_current(&switch.to_provider, key)
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::RevisionConflict,
+                    "automatic model selection belongs to a retired catalog",
+                    false,
+                ));
+            }
+        }
         let command = SessionSelectModelCommand {
             command_id,
             request_digest,
@@ -473,22 +633,49 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             session_id: self.store.session_id().clone(),
             worker_generation: self.store.worker_generation(),
             provider: switch.to_provider.clone(),
+            model_catalog_key: switch.model_catalog_key.clone(),
             model: switch.to_model.clone(),
-            // rev933b finding 7: the automatic switch observed this exact
-            // pair; a concurrent explicit selection moves it and must win.
+            // Preserve a later next-turn choice while fencing this active
+            // run against concurrent explicit rebinds.
             expected_pair: Some((switch.from_provider.clone(), switch.from_model.clone())),
-            // No validated model row exists on this path: keep the stored
-            // budget. An oversized budget on the fallback model is recovered
-            // by the provider's one-shot `max_tokens too large` retry.
-            output_budget: None,
+            automatic_run: Some(haider_store::AutomaticRunSelection {
+                run_id: switch.run_id.clone(),
+                branch_id: self.branch_id.clone(),
+                rebind_seq: pair.latest_rebind_seq,
+                resolved_alias: switch.target_account.clone(),
+                selection_epoch,
+            }),
+            account_alias: None,
+            // Production resolution reapplies the stored source to the target
+            // row. Injected legacy lanes without inventory preserve the budget.
+            output_budget: switch.output_budget,
             event_id: self.event_ids.next(),
             device_id: self.device_id.clone(),
         };
-        match self.store.hub().select_session_model(command).await {
+        #[cfg(test)]
+        hub.pause_pair_switch_commit(self.store.session_id()).await;
+        match hub.select_session_model(command).await {
             Ok(
-                SessionSelectModelOutcome::Committed { .. }
-                | SessionSelectModelOutcome::IdempotentReplay { .. },
-            ) => Ok(()),
+                SessionSelectModelOutcome::Committed { selected, .. }
+                | SessionSelectModelOutcome::IdempotentReplay { selected },
+            ) => {
+                let mut current = self.turn_selection.lock().await;
+                // This selection also configures the next turn. The active
+                // run keeps the provenance captured before its first request,
+                // just as core's request/footprint epoch does.
+                if current.provider != selected.provider {
+                    let mut route =
+                        haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current);
+                    route.clear_selectors();
+                    route.restore(&mut current);
+                }
+                current.provider = selected.provider;
+                current.model = selected.model;
+                current.resolved_model = None;
+                current.model_catalog_key = switch.model_catalog_key.clone();
+                Ok(selected.selected_seq)
+            }
+            Err(crate::session_hub::SessionHubError::Store(error)) => Err(error),
             Err(error) => Err(hub_error(error)),
         }
     }
@@ -504,6 +691,7 @@ fn lockdown_pair_switch_allowed(
 
 #[derive(Clone)]
 struct DaemonContextCompactor {
+    selection_epoch: Option<u64>,
     store: HubStoreHandle,
     provider: Arc<dyn Provider>,
     model: String,
@@ -1091,6 +1279,8 @@ struct DaemonGraphFinalizationGuard {
     event_ids: Arc<EventIdGenerator>,
     budget_check: Option<BudgetCheckContext>,
     request_deadline_unix_ms: Option<u64>,
+    #[cfg(test)]
+    deadline_clock: Option<ProviderDeadlineTestClock>,
     request_deadline_fact_persisted: Arc<Mutex<bool>>,
 }
 
@@ -1141,7 +1331,12 @@ impl DaemonGraphFinalizationGuard {
             // durable terminal delivery: an early provider timeout is not a
             // claim that the caller deadline elapsed. Route-wait/recovery can
             // arrive after the absolute timestamp and records the fact below.
-            if unix_time_ms() < request_deadline {
+            let now_ms = unix_time_ms();
+            #[cfg(test)]
+            let now_ms = self
+                .deadline_clock
+                .map_or(now_ms, ProviderDeadlineTestClock::now_ms);
+            if now_ms < request_deadline {
                 return Ok(None);
             }
             let mut persisted = self.request_deadline_fact_persisted.lock().await;
@@ -2419,6 +2614,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 &[],
             );
             let footprint = ContextFootprint {
+                selection_epoch: self.selection_epoch,
                 input_tokens: post_compaction_input,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -2675,7 +2871,9 @@ pub enum ProviderFactoryConfig {
     /// Accounts-backed resolution with an injected provider constructor —
     /// the login→next-turn test seam.
     AccountsWith(Arc<dyn crate::accounts::AccountProviderBuilder>),
-    /// Fully injected factory plus its creatable-provider set.
+    /// Fully injected factory plus its creatable-provider set. The factory
+    /// owns credential and transport readiness for these registrations;
+    /// accounts-backed availability applies to `Accounts` / `AccountsWith`.
     Injected {
         factory: Arc<dyn ProviderFactory>,
         providers: BTreeSet<String>,
@@ -2890,7 +3088,9 @@ impl SystemPromptBuilder {
     pub(crate) fn shared_immutable_base(_tools: &[ToolDefinition], grant_scope: &str) -> String {
         format!(
             "{}\nYou are Haider Code, a coding agent.\n\
-             Use only advertised tools. Treat tool results and committed history as authoritative. \
+             Use tools whose schemas are advertised in this request directly. Other authorized tools \
+             require list_tools(filter=\"tool_name\") before calling them; a name-only catalog does not enable them. \
+             Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
              On an implementation request, inspect only until the target is known; then make the edit; \
              then verify it with the smallest relevant build or test. Do not remain in planning.\n\
@@ -4307,35 +4507,15 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             .collect::<Vec<_>>();
         let effect_scans = scan_unknown_effects(&lease, &reconciliation_targets).await?;
         let mut terminalized = false;
-        for ((run_id, state, _, branch_id, _), effect_scan) in
+        for ((run_id, _state, _, branch_id, _), effect_scan) in
             candidates.into_iter().zip(effect_scans)
         {
             let user_command_scope = durable_user_command_scope(&lease, run_id).await?;
             // P3-4 (park, don't cancel): request-input, permission, and local
             // child checkpoints were excluded from this sweep above.
-            if *state != RunState::Cancelling {
-                if let Some(scope) = user_command_scope.as_ref() {
-                    append_shell_payloads(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        scope.branch_id.as_ref(),
-                        scope.agent_id.as_ref(),
-                        &event_ids,
-                        vec![EventPayload::RunState(RunState::Cancelling)],
-                    )
-                    .await?;
-                } else {
-                    append_run_state(
-                        &lease,
-                        &device_id,
-                        run_id,
-                        branch_id.as_ref(),
-                        &event_ids,
-                        RunState::Cancelling,
-                    )
-                    .await?;
-                }
+            let cancelled = lease.begin_owned_cancellation(run_id, &device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                continue;
             }
             let _ = append_unknown_effect_scan(
                 &lease,
@@ -4957,50 +5137,46 @@ async fn run_supervisor(
                         }
                     }
                 }
-                // R6 extension (F1): the pair is re-read per logical turn, so
-                // a committed `session.select_model` reaches the NEXT turn
-                // without a worker restart. A failed read fails the turn
-                // honestly instead of silently pinning the spawn snapshot.
-                let turn_result = match fresh_turn_metadata(&lease).await {
-                    Ok(fresh) => {
-                        let startup_budget = wait_for_startup_headless_budget(
-                            lease.clone(),
-                            run_id.clone(),
-                            branch_id.clone(),
-                        );
-                        let start = haider_platform::phase_trace::measure_active(
-                            haider_platform::phase_trace::Phase::TurnSetup,
-                            start_turn(
-                                &dependencies,
-                                &fresh,
-                                &lease,
-                                &device_id,
-                                Arc::clone(&event_ids),
-                                pending,
-                            ),
-                        );
-                        tokio::pin!(startup_budget);
-                        tokio::pin!(start);
-                        tokio::select! {
-                            biased;
-                            result = &mut start => result,
-                            expiry = &mut startup_budget => match expiry {
-                                Ok(expiry) => {
-                                    match persist_headless_budget_expiry(
-                                        &lease,
-                                        &device_id,
-                                        &event_ids,
-                                        &expiry,
-                                    ).await {
-                                        Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
-                                        Err(error) => Err(error),
-                                    }
+                #[cfg(test)]
+                wait_for_test_turn_setup_boundary(lease.session_id()).await;
+                // start_turn reads and pins the pair under the selection
+                // fence at pickup; setup failures fail the turn honestly.
+                let turn_result = {
+                    let startup_budget = wait_for_startup_headless_budget(
+                        lease.clone(),
+                        run_id.clone(),
+                        branch_id.clone(),
+                    );
+                    let start = haider_platform::phase_trace::measure_active(
+                        haider_platform::phase_trace::Phase::TurnSetup,
+                        start_turn(
+                            &dependencies,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            pending,
+                        ),
+                    );
+                    tokio::pin!(startup_budget);
+                    tokio::pin!(start);
+                    tokio::select! {
+                        biased;
+                        result = &mut start => result,
+                        expiry = &mut startup_budget => match expiry {
+                            Ok(expiry) => {
+                                match persist_headless_budget_expiry(
+                                    &lease,
+                                    &device_id,
+                                    &event_ids,
+                                    &expiry,
+                                ).await {
+                                    Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
+                                    Err(error) => Err(error),
                                 }
-                                Err(error) => Err(error),
-                            },
-                        }
+                            }
+                            Err(error) => Err(error),
+                        },
                     }
-                    Err(error) => Err(error),
                 };
                 match turn_result {
                     Ok(turn) => {
@@ -5011,6 +5187,32 @@ async fn run_supervisor(
                         break;
                     }
                     Err(error) => {
+                        // Admission may close while setup awaits a hub facade,
+                        // before this supervisor receives Shutdown. Drain owns
+                        // that accepted run's outcome, including its children.
+                        if *drain_wakes.borrow() {
+                            if let Err(drain_error) =
+                                lease.begin_owned_cancellation(&run_id, &device_id).await
+                            {
+                                tracing::error!(%run_id, ?drain_error, "turn setup drain cancellation failed");
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Err(drain_error));
+                                }
+                                let _ = lease.unregister_worker().await;
+                                return true;
+                            }
+                            if durable_run_state(&lease, &run_id)
+                                .await
+                                .is_some_and(|state| {
+                                    state.is_terminal() && state != RunState::Cancelled
+                                })
+                            {
+                                if let Some(ready) = recovery_ready {
+                                    let _ = ready.send(Ok(()));
+                                }
+                                continue;
+                            }
+                        }
                         if matches!(
                             durable_run_state(&lease, &run_id).await,
                             Some(RunState::Cancelling | RunState::Cancelled)
@@ -5339,6 +5541,10 @@ async fn run_supervisor(
                                     parked_checkpoint = true;
                                 }
                             } else {
+                                if let Err(error) = lease.begin_owned_cancellation(&active_run, &device_id).await {
+                                    tracing::error!(%active_run, ?error, "active turn drain cancellation failed");
+                                    return true;
+                                }
                                 active_cancel.cancel();
                             }
                             let cancelled = cancel_durable_queued_turns(
@@ -5407,6 +5613,7 @@ async fn run_supervisor(
                         }
                         let durable_before_close =
                             durable_run_state(&lease, &finished.run_id).await;
+
                         let cancellation_requested = matches!(
                             outcome_state.as_ref(),
                             Some(RunState::Cancelled)
@@ -5548,7 +5755,7 @@ async fn run_supervisor(
                             // effect-history scan on the ordinary no-effect path.
                             durable_run_state(&lease, &finished.run_id).await
                         } else {
-                            durable_before_close
+                            durable_before_close.clone()
                         };
                         if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
@@ -5614,10 +5821,35 @@ async fn run_supervisor(
                             }
                             continue;
                         }
+                        // A user cancellation that raced the harness (its
+                        // next lifecycle commit was refused because the run
+                        // was already durably Cancelling, so core reported
+                        // Errored) must still cross the Cancelled terminal;
+                        // otherwise the run stays Cancelling forever
+                        // (9-verify3 B-1 flake).
                         let cancelled =
-                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
+                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref())
+                                || durable_before_close == Some(RunState::Cancelling);
                         if cancelled {
-                            delay_fake_provider_cancellation_settlement().await;
+                            // Owner decision 2026-09-25: a cancelled main run
+                            // detaches (never cancels) its subagents. Core does
+                            // this on its orderly cancellation path; a harness
+                            // that ended through the raced-error path above
+                            // skipped it, so the supervisor repeats the
+                            // idempotent detach (marker + owed deliveries).
+                            if let Err(error) =
+                                crate::delegation::DelegationHandle::new(lease.hub().clone())
+                                    .detach_parent_run_children(
+                                        lease.session_id(),
+                                        &finished.run_id,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(run_id = %finished.run_id, ?error, "supervisor detach of a cancelled run's subagents failed");
+                            }
+                        }
+                        if cancelled {
+                            wait_fake_provider_cancellation_settlement(&mut drain_wakes).await;
                             // Reduce durable lifecycle truth again after the
                             // harness stops. If core cancellation itself
                             // failed while closing an item/menu, finish those
@@ -6890,17 +7122,28 @@ async fn cancel_durable_queued_turns(
         if active_run == Some(&run_id) || state != RunState::Queued {
             continue;
         }
-        if let Err(error) = append_run_state(
-            store,
-            device_id,
-            &run_id,
-            branch_id.as_ref(),
-            event_ids,
-            RunState::Cancelled,
-        )
-        .await
-        {
-            tracing::warn!(%run_id, ?error, "queued turn could not be terminalized during drain");
+        let terminalized = async {
+            let cancelled = store.begin_owned_cancellation(&run_id, device_id).await?;
+            if cancelled.status == haider_store::TurnCancellationStatus::AlreadyTerminal {
+                return Ok::<_, HaiderError>(());
+            }
+            let mut payloads =
+                cancelled_resumption_payloads(store, store.session_id(), &run_id).await?;
+            payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+            append_payloads(
+                store,
+                device_id,
+                &run_id,
+                branch_id.as_ref(),
+                event_ids,
+                payloads,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = terminalized {
+            tracing::error!(%run_id, ?error, "queued turn could not be terminalized during drain");
+            continue;
         }
         last = Some(run_id);
     }
@@ -7202,7 +7445,7 @@ async fn find_compaction_receipt(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn perform_manual_compaction(
+pub(crate) async fn perform_manual_compaction(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
@@ -7276,21 +7519,6 @@ async fn perform_manual_compaction(
             false,
         ));
     }
-    // A fresh compaction becomes a nonterminal session at the Compacting
-    // append below. Share the native graph-selection lane from the idle check
-    // through that append so graph.pin/switch cannot commit from a stale idle
-    // observation. Receipt recovery already owns a durable run and therefore
-    // needs no new admission fence.
-    let workflow_selection = if existing.is_none() {
-        Some(
-            lease
-                .hub()
-                .lock_workflow_selection(lease.session_id())
-                .await,
-        )
-    } else {
-        None
-    };
     let durable_run_heads = durable_runs(lease).await?;
     if existing.is_none()
         && durable_run_heads
@@ -7336,10 +7564,59 @@ async fn perform_manual_compaction(
     }) {
         web_degrade.anthropic_web_tools = true;
     }
-    let resolved = dependencies
-        .provider_factory
-        .resolve_for_turn_with_web(metadata, web_degrade)
-        .await;
+    // Provider resolution can refresh authentication over the network.
+    // Resolve first, then fence fresh admission and verify that the metadata
+    // used by the factory still describes the current session. Recovery
+    // already owns a durable run and needs no new admission fence.
+    let mut candidate_metadata = metadata.clone();
+    let (workflow_selection, pinned_metadata, resolved) = loop {
+        #[cfg(test)]
+        lease
+            .hub()
+            .pause_selection_network(lease.session_id())
+            .await;
+        let resolved = dependencies
+            .provider_factory
+            .resolve_for_turn_with_web(&candidate_metadata, web_degrade)
+            .await;
+        let selection = if existing.is_none() {
+            Some(
+                lease
+                    .hub()
+                    .lock_workflow_selection(lease.session_id())
+                    .await,
+            )
+        } else {
+            None
+        };
+        if existing.is_none() {
+            let current = lease.session_metadata().await?.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::SessionNotFound,
+                    "manual compaction requires typed session metadata",
+                    false,
+                )
+            })?;
+            if current != candidate_metadata {
+                candidate_metadata = current;
+                drop(selection);
+                continue;
+            }
+            if durable_runs(lease)
+                .await?
+                .iter()
+                .any(|(_, state, _, _, _)| !state.is_terminal())
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "manual context compaction is idle-only",
+                    true,
+                ));
+            }
+        }
+        break (selection, candidate_metadata, resolved);
+    };
+    let metadata = &pinned_metadata;
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -7642,6 +7919,7 @@ async fn perform_manual_compaction(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     });
+    drop(workflow_selection);
     haider_provider::scope_auxiliary_provider_request_recorder(
         provider_request_attempt_recorder,
         dependencies
@@ -7657,7 +7935,6 @@ async fn perform_manual_compaction(
         ));
     }
     let retained_messages = messages.split_off(covered_message_count);
-    drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let cache_cohort = reduce_turn_setup_journal(
         lease,
@@ -7674,6 +7951,11 @@ async fn perform_manual_compaction(
     .await?
     .cache_cohort();
     let compactor = DaemonContextCompactor {
+        selection_epoch: Some(
+            lease
+                .commit_resolved_route(metadata, resolved.account_alias.as_deref())
+                .await?,
+        ),
         store: lease.clone(),
         provider: resolved.provider,
         model: resolved.model,
@@ -7880,15 +8162,7 @@ async fn perform_shell_exec(
         .await;
     }
     if *drain_wakes.borrow() {
-        begin_shell_cancellation(
-            lease,
-            device_id,
-            &event_ids,
-            &run_id,
-            pending.branch_id.as_ref(),
-            pending.agent_id.as_ref(),
-        )
-        .await?;
+        begin_shell_cancellation(lease, device_id, &run_id).await?;
         return cancel_shell_exec(
             lease,
             device_id,
@@ -8102,14 +8376,7 @@ async fn perform_shell_exec(
                     continue;
                 }
                 if *shell_close.borrow_and_update() {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8142,14 +8409,7 @@ async fn perform_shell_exec(
                 }
                 let draining = *drain_wakes.borrow_and_update();
                 if draining {
-                    begin_shell_cancellation(
-                        lease,
-                        device_id,
-                        &event_ids,
-                        &run_id,
-                        pending.branch_id.as_ref(),
-                        pending.agent_id.as_ref(),
-                    )
+                    begin_shell_cancellation(lease, device_id, &run_id)
                     .await?;
                     process_cancel.cancel();
                     let mut cancelled_result = wait.await.ok();
@@ -8327,25 +8587,13 @@ async fn perform_shell_exec(
 async fn begin_shell_cancellation(
     lease: &HubStoreHandle,
     device_id: &DeviceId,
-    event_ids: &EventIdGenerator,
     run_id: &RunId,
-    branch_id: Option<&BranchId>,
-    agent_id: Option<&AgentId>,
 ) -> Result<(), HaiderError> {
     match durable_run_state(lease, run_id).await {
-        Some(RunState::RunningTool) => {
-            append_shell_payloads(
-                lease,
-                device_id,
-                run_id,
-                branch_id,
-                agent_id,
-                event_ids,
-                vec![EventPayload::RunState(RunState::Cancelling)],
-            )
+        Some(RunState::RunningTool | RunState::Cancelling | RunState::Cancelled) => lease
+            .begin_owned_cancellation(run_id, device_id)
             .await
-        }
-        Some(RunState::Cancelling) | Some(RunState::Cancelled) => Ok(()),
+            .map(|_| ()),
         Some(state) if state.is_terminal() => Ok(()),
         state => Err(HaiderError::new(
             ErrorCode::RunNotActive,
@@ -8490,13 +8738,53 @@ fn strip_foreign_provider_opaque_projection(
     projection.latest_compaction_summary_end = summary_before.map(remap);
 }
 
-/// Re-reads THIS session's metadata for one logical turn (F1). The store is
-/// the one truth for the current model selection: a committed
-/// `session.select_model` between turns is picked up here, which is what
-/// makes the receipt's promise — "the next turn resolves the new pair" —
-/// structural rather than aspirational. `None` (row vanished mid-life) and
-/// read failures fail the turn honestly; the spawn-time snapshot is never a
-/// silent fallback.
+#[cfg(test)]
+type TurnSetupBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+fn turn_setup_barriers()
+-> &'static std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<SessionId, TurnSetupBarrier>>,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_turn_setup_barrier(
+    session: SessionId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session, (arrived_tx, resume_rx));
+    (arrived, resume)
+}
+
+#[cfg(test)]
+async fn wait_for_test_turn_setup_boundary(session: &SessionId) {
+    let barrier = turn_setup_barriers()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session);
+    if let Some((arrived, resume)) = barrier {
+        let _ = arrived.send(());
+        let _ = resume.await;
+    }
+}
+
+/// Reads the current session selection for a logical turn or control action.
+/// Native start_turn reads under the selection fence and durably pins the
+/// pair at pickup. Missing metadata and read failures fail honestly; the
+/// supervisor's spawn-time snapshot is never a silent fallback.
 async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1, HaiderError> {
     lease.session_metadata().await?.ok_or_else(|| {
         HaiderError::new(
@@ -8603,7 +8891,6 @@ fn request_budget_with_test_override(
 /// is the failure mode this ordering exists to prevent.
 async fn start_turn(
     dependencies: &WorkerDependencies,
-    metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
     device_id: &DeviceId,
     event_ids: Arc<EventIdGenerator>,
@@ -8648,7 +8935,102 @@ async fn start_turn(
         .turn_start_journal_projection(&accepted.run_id)
         .await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
-    let mut pinned_metadata = metadata.clone();
+    #[cfg(test)]
+    let deadline_clock = dependencies.provider_factory.deadline_clock_for_test();
+    #[cfg(test)]
+    if let Some(clock) = deadline_clock {
+        provider_deadline = headless.as_ref().and_then(|context| {
+            provider_request_deadline_at(&context.spec, context.accepted_at_ms, clock.now_ms())
+        });
+    }
+    // The selection fence fixes the native pair at pickup and makes the
+    // durable pin visible to rebind before provider resolution can suspend.
+    // Recovery reuses that pin rather than the mutable next-turn selection.
+    let (mut pinned_metadata, run_rebind_seq) = {
+        let _selection = lease
+            .hub()
+            .lock_workflow_selection(lease.session_id())
+            .await;
+        let mut fresh = fresh_turn_metadata(lease).await?;
+        let recorded_pair = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?;
+        let needs_pin = recorded_pair.as_ref().is_none_or(|pair| !pair.complete_pin);
+        // An already-started legacy native run also owns its reconstructed
+        // pair. A native turn that is still queued has no legacy start boundary.
+        if let Some(pair) = recorded_pair
+            .as_ref()
+            .filter(|pair| pair.durably_pinned || headless.is_none())
+        {
+            pair.restore_metadata(&mut fresh)?;
+        } else if let Some(context) = headless.as_ref() {
+            if let Some(legacy) = recorded_pair.as_ref() {
+                fresh.max_tokens_source = legacy.source;
+            }
+            provider_rebind::pin_headless_turn_metadata(
+                &mut fresh,
+                &context.spec,
+                lease,
+                &accepted.run_id,
+            )
+            .await?;
+        }
+        if needs_pin {
+            let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                resolved_model: fresh.resolved_model.clone(),
+                model_catalog_key: fresh.model_catalog_key.clone(),
+                route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                    &fresh,
+                )),
+                provider: fresh.provider.clone(),
+                model: fresh.model.clone(),
+                max_tokens: fresh.max_tokens,
+                provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(&fresh),
+                source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                    fresh.max_tokens_source,
+                    fresh.max_tokens,
+                ),
+            };
+            fresh.max_tokens_source = Some(pin.source);
+            append_payloads(
+                lease,
+                device_id,
+                &accepted.run_id,
+                accepted.branch_id.as_ref(),
+                &event_ids,
+                vec![pin.to_event(&accepted.run_id).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?],
+            )
+            .await?;
+        }
+        append_payloads(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            &event_ids,
+            vec![EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!(
+                    "run-worker-pickup-{}-{}",
+                    accepted.run_id,
+                    event_ids.next()
+                )),
+                item: TurnItem::Extension {
+                    kind: "run_worker_pickup_v1".into(),
+                    data: serde_json::json!({}),
+                },
+            })],
+        )
+        .await?;
+        let rebind_seq = lease
+            .hub()
+            .run_output_pair(lease.session_id(), &accepted.run_id)
+            .await?
+            .map_or(0, |pair| pair.latest_rebind_seq);
+        (fresh, rebind_seq)
+    };
     pinned_metadata.context_economy = refresh_context_economy_from_journal(
         lease,
         &pinned_metadata.context_economy,
@@ -9456,6 +9838,46 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    let route_epoch = lease
+        .commit_turn_resolved_route(
+            &accepted.run_id,
+            metadata,
+            resolved.account_alias.as_deref(),
+        )
+        .await?;
+    config.selection_epoch = Some(route_epoch);
+    let mut route_selection = metadata.clone();
+    route_selection.selection_epoch = Some(route_epoch);
+    route_selection
+        .resolved_route_alias
+        .clone_from(&resolved.account_alias);
+    route_selection.resolved_route_seen = true;
+    // A recovered automatic route may have released every selector. Its
+    // durable rebind sequence still owns the run. Only adopt a fresher
+    // sequence when it describes the exact route resolved by this factory.
+    config.provider_rebind_seq = run_rebind_seq;
+    if let Some(pair) = lease
+        .hub()
+        .run_output_pair(lease.session_id(), &accepted.run_id)
+        .await?
+    {
+        let mut current = route_selection.clone();
+        pair.restore_route(&mut current)?;
+        if pair.provider == route_selection.provider
+            && pair.model == route_selection.model
+            && haider_protocol::session::RunOutputRouteSnapshotV1::capture(&current)
+                == haider_protocol::session::RunOutputRouteSnapshotV1::capture(&route_selection)
+        {
+            config.provider_rebind_seq = pair.latest_rebind_seq;
+        }
+    }
+
+    let turn_selection = Arc::new(Mutex::new(route_selection));
+    config.provider_route_committer = Some(Arc::new(DaemonProviderRouteCommitter {
+        store: lease.clone(),
+        run_id: accepted.run_id.clone(),
+        selection: Arc::clone(&turn_selection),
+    }));
     config.turn_trace = turn_trace.clone();
     config.agent_spawn = headless
         .as_ref()
@@ -9659,6 +10081,8 @@ async fn start_turn(
         request_deadline_unix_ms: headless
             .as_ref()
             .and_then(|context| context.spec.request_deadline_unix_ms),
+        #[cfg(test)]
+        deadline_clock,
         request_deadline_fact_persisted: Arc::new(Mutex::new(
             headless
                 .as_ref()
@@ -9671,6 +10095,7 @@ async fn start_turn(
     // take the degraded fallback) — a cost edge, never a correctness one.
     // Re-resolving at compact time needs live-lane threading; tracked.
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
+        selection_epoch: config.selection_epoch,
         store: lease.clone(),
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),
@@ -9716,6 +10141,7 @@ async fn start_turn(
     config.provider_rebind_resolver = Some(Arc::new(
         provider_rebind::DaemonProviderRebindResolver::new(
             lease.clone(),
+            accepted.run_id.clone(),
             Arc::clone(&dependencies.provider_factory),
             metadata.clone(),
             web_degrade,
@@ -9728,6 +10154,7 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
+        turn_selection,
     }));
     config.supervisor_commits_cancelled = true;
     config.prompt_retraction_enabled = true;
@@ -11844,6 +12271,14 @@ fn provider_request_deadline_for(
     spec: &HeadlessRunSpecV1,
     accepted_at_ms: u64,
 ) -> Option<tokio::time::Instant> {
+    provider_request_deadline_at(spec, accepted_at_ms, unix_time_ms())
+}
+
+fn provider_request_deadline_at(
+    spec: &HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    now_ms: u64,
+) -> Option<tokio::time::Instant> {
     let budget_deadline = spec
         .budget
         .max_time_ms
@@ -11854,9 +12289,8 @@ fn provider_request_deadline_for(
         (None, Some(request)) => Some(request),
         (None, None) => None,
     }?;
-    tokio::time::Instant::now().checked_add(Duration::from_millis(
-        deadline_ms.saturating_sub(unix_time_ms()),
-    ))
+    tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
 }
 
 struct HeadlessBudgetExpiry {
@@ -12738,7 +13172,61 @@ async fn append_session_idle(
     store.settle_idle(envelope).await.map(|_| ())
 }
 
-async fn append_payloads(
+/// Prepare a run bookkeeping envelope whose payload depends on an epoch that
+/// is chosen later (by the session actor). Identity, render and agent fields
+/// are the ones `append_payloads` gives every bookkeeping item.
+pub(crate) async fn deferred_bookkeeping_envelope(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_id: EventId,
+    payload: impl FnOnce(u64) -> Result<EventPayload, HaiderError> + Send + 'static,
+) -> Result<crate::session_hub::RunRouteEnvelopeBuilder, HaiderError> {
+    let mut template = supervisor_raw_envelope(
+        store,
+        device_id,
+        branch_id.cloned(),
+        Some(run_id.clone()),
+        event_id,
+        serde_json::Value::Null,
+    );
+    template.render.ui = false;
+    template.agent_id = store
+        .hub()
+        .delegation_for_child_session(store.session_id().clone())
+        .await?
+        .map(|record| record.agent_id);
+    Ok(Box::new(move |epoch| {
+        let payload = payload(epoch)?;
+        if !matches!(
+            &payload,
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { .. },
+                ..
+            })
+        ) {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "a deferred bookkeeping envelope must carry an extension item",
+                false,
+            ));
+        }
+        let mut envelope = template;
+        envelope.payload = serde_json::to_value(payload)
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot serialize supervisor event: {error}"),
+                    false,
+                )
+            })?
+            .into();
+        Ok(vec![envelope])
+    }))
+}
+
+pub(crate) async fn append_payloads(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
@@ -12754,14 +13242,26 @@ async fn append_payloads(
     for payload in payloads {
         let payload_run_id =
             (!matches!(payload, EventPayload::SessionState(_))).then(|| run_id.clone());
-        envelopes.push(supervisor_envelope(
+        let bookkeeping = matches!(&payload,
+            EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
+            if kind == haider_protocol::session::RunOutputPairPinnedV1::KIND || kind == "run_worker_pickup_v1" || kind == haider_protocol::session::RunOutputProviderRouteV1::RESOLVED_KIND);
+        let mut envelope = supervisor_envelope(
             store,
             device_id,
             branch_id.cloned(),
             payload_run_id,
             event_ids.next(),
             payload,
-        )?);
+        )?;
+        if bookkeeping {
+            envelope.render.ui = false;
+            envelope.agent_id = store
+                .hub()
+                .delegation_for_child_session(store.session_id().clone())
+                .await?
+                .map(|record| record.agent_id);
+        }
+        envelopes.push(envelope);
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
     #[cfg(windows)]
@@ -13774,6 +14274,7 @@ mod manager_law_tests {
         let session_id = SessionId::new("queued-turnid-session");
         let device_id = DeviceId::new("queued-turnid-device");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "queued-turnid-create".into(),
             request_digest: "queued-turnid-create-digest".into(),
             request_json: "{}".into(),
@@ -13783,6 +14284,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -13890,6 +14392,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-retirement-recreation");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-retirement-create".into(),
             request_digest: "worker-retirement-create-digest".into(),
             request_json: "{}".into(),
@@ -13899,6 +14402,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -14002,6 +14506,7 @@ mod manager_law_tests {
             .expect("store");
         let session_id = SessionId::new("worker-idle-ttl");
         hub.create_internal_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "worker-idle-create".into(),
             request_digest: "worker-idle-create-digest".into(),
             request_json: "{}".into(),
@@ -14011,6 +14516,7 @@ mod manager_law_tests {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -14207,6 +14713,44 @@ pub(crate) enum RegisteredToolRoute {
     PeerSend,
     SshList,
     SshShell,
+}
+
+impl RegisteredToolRoute {
+    pub(crate) fn activity(self) -> Option<haider_protocol::activity::ActivityKind> {
+        use haider_protocol::activity::ActivityKind;
+        Some(match self {
+            Self::Computer => ActivityKind::Computer,
+            Self::Mobile => ActivityKind::Mobile,
+            Self::WebFetch | Self::WebSearch => ActivityKind::Web,
+            Self::SshShell => ActivityKind::Remote,
+            Self::FsWrite | Self::FsEdit | Self::FsPath => ActivityKind::Edit,
+            Self::ProcessExec
+            | Self::TestRun
+            | Self::ToolScript
+            | Self::TaskOutput
+            | Self::TaskKill => ActivityKind::Run,
+            Self::FsRead
+            | Self::FsGlob
+            | Self::FsSearch
+            | Self::SshList
+            | Self::ListModels
+            | Self::SessionTranscript
+            | Self::PeerList
+            | Self::ListTools => ActivityKind::Read,
+            Self::SpawnSubagent
+            | Self::MessageSubagent
+            | Self::WorkflowAuthor
+            | Self::LoomRegister
+            | Self::PeerSend => ActivityKind::Orchestrate,
+            Self::RequestInput
+            | Self::Plan
+            | Self::TodoWrite
+            | Self::TaskOutcome
+            | Self::GraphEvidence
+            | Self::UsageResetApply
+            | Self::Monitor => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -14452,7 +14996,7 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         registered_tool(
             ToolDefinition {
                 name: "list_tools".into(),
-                description: "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.".into(),
+                description: "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {"filter": {"type": "string", "maxLength": 128}},
@@ -15920,7 +16464,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
         "monitor" => {
-            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/process/file/poll/timer/cli watches; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
+            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable sms/task/agent/process/file/poll/timer/cli watches; task and agent sources watch IDs and return completion digests; register/update need source+action; update/pause/resume/trigger/remove need monitor_id; timeout needs timeout_ms; idle: wake as subturn; busy: queue to next turn boundary; coalesced per monitor; commands: ProcessExec policy for exact argv/cwd/env names; external files: FsRead policy"
         }
         "fs_read" => {
             "fs_read(path, offset?, limit?, column?) — read up to 64 KiB / 2,000 numbered lines; offset/limit page lines, column continues a long line; explicit paths preserve identifiers, secrets stay redacted"
@@ -15964,7 +16508,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "web_search" => "web_search(query) — search the web, returning a bounded text summary",
         "spawn_subagent" => {
-            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+            "spawn_subagent(task, prompt, background?, wait_ms?, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
@@ -16946,12 +17490,28 @@ async fn create_broker_tool_dispatcher(
         device_id: context.device_id.clone(),
         event_ids: Arc::clone(&context.event_ids),
     };
+    // 973-activity-icons: a SUBAGENT names itself on any presence badge it
+    // raises. Best-effort and read-only: a missing record or callsign keeps
+    // the generic badge rather than failing the run.
+    let presence_actor = if context.agent_id.is_some() {
+        context
+            .store
+            .hub()
+            .delegation_for_child_session(session_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.manifest.callsign)
+    } else {
+        None
+    };
     let cu_presence = crate::cu_presence::PresenceLease::for_run(
         presence,
         context.store.hub().clone(),
         session_id.clone(),
         context.run_id.clone(),
-    );
+    )
+    .with_actor(presence_actor);
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         pending_workspace: Mutex::new(pending_workspace),
@@ -17297,6 +17857,9 @@ enum OrchestrationChildDispatch {
 enum OrchestrationChildInterruption {
     Cancelled,
     Deadline,
+    /// The explicit opt-in `no_progress_ms` window passed without any
+    /// observable journal progress.
+    NoProgress,
 }
 
 struct OrchestrationTerminalReason {
@@ -19366,24 +19929,31 @@ impl BrokerToolDispatcher {
         );
         let call_id = format!("orch:{}:{}:{attempt}", state.admitted.script_id, node.slot);
         let started_at_ms = unix_time_ms();
+        // Owner rule (2026-09-23): no default wall that stops productive
+        // automated work. Only EXPLICIT script/child walls and the parent's
+        // explicit run budget bound the operation; absent all three the
+        // persisted deadline is `ORCHESTRATION_NO_DEADLINE_MS`. The explicit
+        // `no_progress_ms` window is enforced on observed journal progress
+        // in `dispatch_orchestration_child`, never as a fixed wall.
         let script_deadline_ms = state
             .admitted
-            .admitted_at_ms
-            .saturating_add(state.admitted.limits.script_wall_ms.unwrap_or(120_000));
-        let child_limit_ms = state
+            .limits
+            .script_wall_ms
+            .map(|wall| state.admitted.admitted_at_ms.saturating_add(wall));
+        let child_deadline_ms = state
             .admitted
             .limits
             .child_wall_ms
-            .unwrap_or(30_000)
-            .min(state.admitted.limits.no_progress_ms.unwrap_or(30_000));
-        let ask_limit_ms = node
+            .map(|wall| started_at_ms.saturating_add(wall));
+        // The ask's `wait_ms` bounds only the wait for the permission answer,
+        // not the child's execution after it is permitted.
+        let ask_wait_ms = node
             .ports
             .iter()
             .find(|port| port.role == OrchPortRoleV1::Control && port.port == "permit")
             .and_then(|port| state.admitted.nodes.get(port.source_slot as usize))
             .and_then(|ask| ask.config.0.get("wait_ms"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(120_000);
+            .and_then(serde_json::Value::as_u64);
         let run_deadline_ms = self.run_deadline.map(|deadline| {
             started_at_ms.saturating_add(
                 u64::try_from(
@@ -19394,10 +19964,11 @@ impl BrokerToolDispatcher {
                 .unwrap_or(u64::MAX),
             )
         });
-        let operation_deadline_ms = started_at_ms
-            .saturating_add(child_limit_ms.min(ask_limit_ms))
-            .min(script_deadline_ms)
-            .min(run_deadline_ms.unwrap_or(u64::MAX));
+        let operation_deadline_ms = [child_deadline_ms, script_deadline_ms, run_deadline_ms]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS);
         let clock = state.call_clocks.entry(node.slot).or_insert_with(|| {
             crate::orchestration::CallClockV1 {
                 started_at_ms,
@@ -19408,6 +19979,8 @@ impl BrokerToolDispatcher {
         let operation_started_at_ms = clock.started_at_ms;
         let deadline_ms = clock.deadline_ms;
         clock.retry_not_before_ms = None;
+        let approval_deadline_ms =
+            ask_wait_ms.map(|wait| operation_started_at_ms.saturating_add(wait));
         let mut activation_parents = vec![
             state.admitted.source_ref.artifact.clone(),
             state.admitted.definition_refs[node.slot as usize]
@@ -19435,7 +20008,8 @@ impl BrokerToolDispatcher {
                 "activated_at_ms": started_at_ms,
                 "operation_started_at_ms": operation_started_at_ms,
                 "deadline_ms": deadline_ms,
-                "script_deadline_ms": script_deadline_ms,
+                "script_deadline_ms": script_deadline_ms
+                    .unwrap_or(crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS),
             }),
             activation_parents,
         )
@@ -19452,6 +20026,7 @@ impl BrokerToolDispatcher {
             deadline_ms,
             started: true,
             approval_waiting: false,
+            approval_deadline_ms,
         };
         state.pending_calls.insert(node.slot, pending.clone());
         let start = EventPayload::Item(ItemEvent::Started {
@@ -19461,6 +20036,7 @@ impl BrokerToolDispatcher {
                 name: tool.to_owned(),
                 args: args.clone(),
                 status: haider_protocol::item::ToolStatus::InProgress,
+                activity: None,
             },
         });
         let mut events = vec![start];
@@ -19513,6 +20089,7 @@ impl BrokerToolDispatcher {
         run_id: &RunId,
         pending: &crate::orchestration::PendingCallV1,
         interaction_observation_invalidated: bool,
+        no_progress_ms: Option<u64>,
         cancel: &CancelToken,
     ) -> Result<OrchestrationChildDispatch, HaiderError> {
         if let Some(result) =
@@ -19522,8 +20099,15 @@ impl BrokerToolDispatcher {
                 ToolDispatchResult::Completed(result),
             ));
         }
-        let remaining_ms = pending.deadline_ms.saturating_sub(unix_time_ms());
-        if remaining_ms == 0 {
+        let now_ms = unix_time_ms();
+        let approval_expired = pending.approval_waiting
+            && pending
+                .approval_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline);
+        let remaining_ms = (pending.deadline_ms
+            != crate::orchestration::ORCHESTRATION_NO_DEADLINE_MS)
+            .then(|| pending.deadline_ms.saturating_sub(now_ms));
+        if approval_expired || remaining_ms == Some(0) {
             return Ok(OrchestrationChildDispatch::Interrupted {
                 kind: OrchestrationChildInterruption::Deadline,
                 settled: None,
@@ -19542,8 +20126,17 @@ impl BrokerToolDispatcher {
             &child_cancel,
         );
         tokio::pin!(child);
-        let deadline = tokio::time::sleep(Duration::from_millis(remaining_ms));
+        let deadline = async move {
+            match remaining_ms {
+                Some(remaining_ms) => {
+                    tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(deadline);
+        let stalled = self.orchestration_no_progress(no_progress_ms);
+        tokio::pin!(stalled);
         tokio::select! {
             biased;
             result = &mut child => Ok(OrchestrationChildDispatch::Settled(result?)),
@@ -19576,6 +20169,51 @@ impl BrokerToolDispatcher {
                         outcome_unknown: true,
                     }),
                 }
+            }
+            _ = &mut stalled => {
+                child_cancel.cancel();
+                match child.await {
+                    Ok(settled) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        outcome_unknown: orchestration_dispatch_outcome_unknown(&settled),
+                        settled: Some(settled),
+                    }),
+                    Err(_) => Ok(OrchestrationChildDispatch::Interrupted {
+                        kind: OrchestrationChildInterruption::NoProgress,
+                        settled: None,
+                        outcome_unknown: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolves only when an EXPLICIT `no_progress_ms` window passes with no
+    /// observable progress: the session journal head (child tool output,
+    /// delegated-child chip updates, results) must advance at least once per
+    /// window. A child that keeps producing work is never stopped by it.
+    /// Absent the opt-in window this never resolves.
+    async fn orchestration_no_progress(&self, no_progress_ms: Option<u64>) {
+        let Some(window_ms) = no_progress_ms.filter(|window| *window > 0) else {
+            return std::future::pending().await;
+        };
+        let window = Duration::from_millis(window_ms);
+        let poll = (window / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let session_id = self.output.store.session_id().clone();
+        let head = |store: HubStoreHandle, session_id: SessionId| async move {
+            StoreHandle::latest_seq(&store, &session_id).await.ok()
+        };
+        let mut observed = head(self.output.store.clone(), session_id.clone()).await;
+        let mut last_progress = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(poll).await;
+            let current = head(self.output.store.clone(), session_id.clone()).await;
+            // An unreadable head is not evidence of a stall.
+            if current.is_none() || current != observed {
+                observed = current;
+                last_progress = tokio::time::Instant::now();
+            } else if last_progress.elapsed() >= window {
+                return;
             }
         }
     }
@@ -19623,6 +20261,11 @@ impl BrokerToolDispatcher {
                     status: ScriptTerminalStatusV1::Cancelled,
                     code: "cancelled",
                     reason: "orchestration was cancelled while a child call was active",
+                },
+                OrchestrationChildInterruption::NoProgress => OrchestrationTerminalReason {
+                    status: ScriptTerminalStatusV1::TimedOut,
+                    code: "child_no_progress",
+                    reason: "a child call made no observable progress within the explicit no_progress_ms window",
                 },
                 OrchestrationChildInterruption::Deadline => OrchestrationTerminalReason {
                     status: ScriptTerminalStatusV1::TimedOut,
@@ -19752,6 +20395,7 @@ impl BrokerToolDispatcher {
             usize::from(group.max_concurrency)
         };
         let interaction_observation_invalidated = state.interaction_observation_invalidated;
+        let no_progress_ms = state.admitted.limits.no_progress_ms;
         for wave in pending.chunks(width) {
             let outcomes = join_all(wave.iter().map(|(_, call)| async move {
                 let result = self
@@ -19759,6 +20403,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         call,
                         interaction_observation_invalidated,
+                        no_progress_ms,
                         cancel,
                     )
                     .await;
@@ -20165,9 +20810,9 @@ impl BrokerToolDispatcher {
                     .finish_orchestration(run_id, Some(&mut state), terminal)
                     .await;
             }
-            if unix_time_ms().saturating_sub(state.admitted.admitted_at_ms)
-                >= state.admitted.limits.script_wall_ms.unwrap_or(120_000)
-            {
+            if state.admitted.limits.script_wall_ms.is_some_and(|wall| {
+                unix_time_ms().saturating_sub(state.admitted.admitted_at_ms) >= wall
+            }) {
                 let terminal = orchestration_terminal(
                     &state,
                     ScriptTerminalStatusV1::TimedOut,
@@ -20296,6 +20941,7 @@ impl BrokerToolDispatcher {
                         run_id,
                         &pending,
                         state.interaction_observation_invalidated,
+                        state.admitted.limits.no_progress_ms,
                         cancel,
                     )
                     .await?
@@ -20638,6 +21284,7 @@ impl BrokerToolDispatcher {
             name: pending.tool.clone(),
             args: pending.args.0.clone(),
             status: result.status.item_status(),
+            activity: None,
         };
         let mut prefix = vec![
             EventPayload::ToolResult {
@@ -20970,8 +21617,107 @@ async fn recover_orchestration_child(
     }
 }
 
+fn live_activity_for_route(
+    name: &str,
+    lockdown_allowed: Option<&[String]>,
+    has_web_search: bool,
+) -> Option<haider_protocol::activity::ActivityKind> {
+    if lockdown_allowed.is_some_and(|allowed| !allowed.iter().any(|tool| tool == name)) {
+        return None;
+    }
+    if name == "web_search" && !has_web_search {
+        return None;
+    }
+    match registered_tool_route(name)? {
+        RegisteredToolRoute::WebSearch => Some(haider_protocol::activity::ActivityKind::Web),
+        RegisteredToolRoute::SessionTranscript
+        | RegisteredToolRoute::ListModels
+        | RegisteredToolRoute::PeerList => Some(haider_protocol::activity::ActivityKind::Read),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_activity_respects_lockdown_and_backend_availability() {
+    use haider_protocol::activity::ActivityKind;
+    let allowed = vec!["web_search".to_owned(), "peer_list".to_owned()];
+    let denied = vec!["peer_list".to_owned()];
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&denied), true),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), false),
+        None
+    );
+    assert_eq!(
+        live_activity_for_route("web_search", Some(&allowed), true),
+        Some(ActivityKind::Web)
+    );
+    assert_eq!(
+        live_activity_for_route("peer_list", Some(&allowed), false),
+        Some(ActivityKind::Read)
+    );
+    assert_eq!(
+        live_activity_for_route("unknown", Some(&allowed), true),
+        None
+    );
+    for name in [
+        "web_search",
+        "session_transcript",
+        "list_models",
+        "peer_list",
+    ] {
+        let only_this = vec![name.to_owned()];
+        assert!(
+            live_activity_for_route(name, Some(&only_this), true).is_some(),
+            "{name} positive control"
+        );
+        assert_eq!(
+            live_activity_for_route(name, Some(&[]), true),
+            None,
+            "empty lockdown {name}"
+        );
+        assert_eq!(
+            live_activity_for_route(name, None, false).is_none(),
+            name == "web_search",
+            "only search requires that backend"
+        );
+    }
+    for name in [
+        "Web_Search",
+        " web_search",
+        "web_search ",
+        "",
+        "computer",
+        "fs_write",
+    ] {
+        assert_eq!(
+            live_activity_for_route(name, None, true),
+            None,
+            "not an effectless live route: {name:?}"
+        );
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
+    fn activity_for_route(&self, name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        registered_tool_route(name).and_then(RegisteredToolRoute::activity)
+    }
+    fn live_activity_for_route(
+        &self,
+        name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        live_activity_for_route(
+            name,
+            self.lockdown
+                .as_ref()
+                .map(|lockdown| lockdown.tools_allowed.as_slice()),
+            self.web_search.is_some(),
+        )
+    }
     fn platform_tool_supported(&self, name: &str) -> bool {
         !crate::android_policy::enabled() || registered_tool_route(name).is_some()
     }
@@ -21913,7 +22659,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     && error.message == crate::delegation::RECURSION_LIMIT_MESSAGE
                 {
                     self.clear_cached_call(run_id, item_id, call_id);
-                    return Ok(ToolDispatchResult::Completed(recursion_limit_result()));
+                    return Ok(ToolDispatchResult::Completed(recursion_limit_result(
+                        &error,
+                    )));
                 }
                 self.clear_cached_call(run_id, item_id, call_id);
                 return Err(error);
@@ -22014,9 +22762,28 @@ impl ToolDispatcher for BrokerToolDispatcher {
             // F1: resolve the child's pair BEFORE any durable spawn work. A
             // typed selection refusal is a completed tool result — the model
             // retries with an explicit pair — never a turn failure.
+            let mut active_parent = self.metadata.clone();
+            {
+                let active = self
+                    .output
+                    .store
+                    .hub()
+                    .run_output_pair(&self.session_id, run_id)
+                    .await?
+                    .ok_or_else(|| {
+                        haider_protocol::session::run_route_history_unavailable(
+                            "child parent has no run boundary",
+                        )
+                    })?;
+                active.restore_route(&mut active_parent)?;
+                active_parent.provider = active.provider;
+                active_parent.model = active.model;
+                active_parent.max_tokens = active.max_tokens;
+                active_parent.max_tokens_source = active.source;
+            }
             let child_metadata = match self
                 .delegation
-                .resolve_child_metadata(&self.metadata, &request)?
+                .resolve_child_metadata(&active_parent, &request)?
             {
                 Ok(metadata) => metadata,
                 Err(refusal) => {
@@ -22075,6 +22842,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
                 Err(error) => return Err(tool_error(error)),
             };
+            let background = request.background;
             let established = match self
                 .delegation
                 .establish(
@@ -22141,10 +22909,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .record_launch_failure(&established.ticket, &error)
                     .await?;
             }
-            self.deferred.lock().await.insert(
-                established.ticket.manifest.agent.clone(),
-                established.ticket.clone(),
-            );
+            if !background {
+                self.deferred.lock().await.insert(
+                    established.ticket.manifest.agent.clone(),
+                    established.ticket.clone(),
+                );
+            }
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         if route == RegisteredToolRoute::MessageSubagent {
@@ -22356,7 +23126,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .and_then(|facade| facade.management.read())
                 .map(|view| view.providers)
                 .unwrap_or_default();
-            let mut page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
+            let mut page = crate::model_select::ModelSelectionAuthority::new(None, Some(summaries))
                 .model_catalog(filter.as_deref(), usize::MAX);
             let cap = haider_tools::LIST_MODELS_ROW_CAP;
             let truncated = page.models.len() > cap;
@@ -22803,9 +23573,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             tokio::pin!(wait);
                             let mut close = shell.close_receiver();
                             let mut close_open = true;
+                            let mut dispatch_cancel_pending = true;
                             let waited = loop {
                                 tokio::select! {
                                     result = &mut wait => break result,
+                                    // The dispatch token (turn cancel, or an
+                                    // orchestration deadline / no-progress
+                                    // stop) terminates the foreground process
+                                    // instead of waiting for it to exit.
+                                    () = cancel.cancelled(), if dispatch_cancel_pending => {
+                                        dispatch_cancel_pending = false;
+                                        process_cancel.cancel();
+                                    }
                                     changed = close.changed(), if close_open => {
                                         if changed.is_err() {
                                             close_open = false;
@@ -23399,7 +24178,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         let attempt = self.record_side_request_attempt(run_id).await?;
                         match executor
                             .search(
-                                &self.metadata.model,
+                                self.metadata.model_coordinate(),
                                 self.session_id.as_str(),
                                 &query,
                                 &attempt,
@@ -23571,16 +24350,34 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     };
                     // A capturable indicator (Linux notification popup) is
                     // taken off screen for the model-facing capture.
-                    let _revealed_after_capture = if matches!(
+                    let revealed_after_capture = if matches!(
                         operation.action(),
                         haider_protocol::computer::ComputerAction::Screenshot
                             | haider_protocol::computer::ComputerAction::Inspect { .. }
                     ) {
-                        self.cu_presence.conceal_for_capture().await
+                        match self.cu_presence.conceal_for_capture().await {
+                            Ok(guard) => Some(guard),
+                            Err(message) => {
+                                let error = ComputerError::Backend { message };
+                                broker
+                                    .journal_computer_outcome(
+                                        &intent,
+                                        EffectOutcome::Failed {
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(computer_failure_result(&error));
+                            }
+                        }
                     } else {
                         None
                     };
-                    match self.computer.execute(operation.action(), &action_cancel).await {
+                    let execution = self.computer.execute(operation.action(), &action_cancel).await;
+                    // The model-facing pixels exist when execute returns. Restore
+                    // Stop before redaction, bounding, journaling or recording.
+                    drop(revealed_after_capture);
+                    match execution {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
                                 .admit_computer_screenshot_region(png, &action_cancel, operation.region())
@@ -24121,18 +24918,40 @@ impl ToolDispatcher for BrokerToolDispatcher {
         Ok(())
     }
 
-    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
-        let tickets = self
-            .deferred
-            .lock()
+    async fn detach_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        self.deferred.lock().await.remove(&ticket.manifest.agent);
+        // The `wait_ms` observation ended and its `child_still_running`
+        // result is committed: the collector has let go of the child. Owe
+        // the parent session its terminal result so the advertised
+        // `agent wait` collects it (Astra 13-final B2). Bookkeeping failure
+        // never fails the parent turn; the child keeps running either way,
+        // and startup recovery re-derives the obligation from the durable
+        // `child_still_running` tool result.
+        if let Err(error) = self
+            .delegation
+            .detach_observed_child(&ticket.manifest.agent)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for ticket in tickets {
-            self.delegation
-                .cancel_ticket(&ticket, self.run_deadline)
-                .await?;
+        {
+            tracing::warn!(agent = %ticket.manifest.agent, ?error, "observation-detached child delivery was not armed");
+        }
+        Ok(())
+    }
+
+    async fn detach_outstanding_deferred(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        // Owner decision 2026-09-25: a main-thread stop never cancels its
+        // subagents. The live map only tracked blocking collectors; the
+        // journal owns every child of the turn, and the coordinator arms
+        // result delivery for waited-on children and records the
+        // still-running marker.
+        self.deferred.lock().await.clear();
+        // Bookkeeping failure must never turn a user stop into an error: the
+        // children are untouched either way.
+        if let Err(error) = self
+            .delegation
+            .detach_parent_run_children(&self.session_id, run_id)
+            .await
+        {
+            tracing::warn!(%run_id, ?error, "detached-subagent bookkeeping after a main-only stop failed");
         }
         Ok(())
     }
@@ -24921,14 +25740,22 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
     }
 }
 
-fn recursion_limit_result() -> BoundedResult {
+/// Only reachable when the operator opted into `HAIDER_SUBAGENT_MAX_DEPTH`;
+/// subagent depth is unbounded by default.
+fn recursion_limit_result(error: &HaiderError) -> BoundedResult {
+    let limit = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("limit"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     BoundedResult {
         preview: serde_json::json!({
             "status": "rejected",
             "error": {
                 "kind": "recursion_depth_limit",
                 "message": crate::delegation::RECURSION_LIMIT_MESSAGE,
-                "limit": crate::delegation::RECURSION_DEPTH_LIMIT,
+                "limit": limit,
             }
         })
         .to_string(),
@@ -27029,7 +27856,7 @@ fn computer_error(error: ComputerError) -> HaiderError {
 }
 
 #[path = "provider_rebind.rs"]
-mod provider_rebind;
+pub(crate) mod provider_rebind;
 
 #[path = "worker_usage_reset.rs"]
 mod usage_reset_tool;

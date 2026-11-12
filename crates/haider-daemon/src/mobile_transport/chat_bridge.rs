@@ -222,6 +222,7 @@ impl DaemonMobileChatBridge {
                         command_id: CommandId::new(self.next_coordinate("model")),
                         session_id: session.session_id,
                         worker_generation: session.worker_generation,
+                        expected_catalog_key: None,
                         model,
                         provider: Some(provider),
                         confirm_new_epoch,
@@ -276,6 +277,7 @@ fn mobile_session_create_request(
         command_id: CommandId::new(command_id),
         cwd,
         provider,
+        expected_catalog_key: None,
         model,
         max_tokens: 0,
         permission_overrides: Some(SessionPermissionOverridesV1 {
@@ -405,6 +407,12 @@ fn monitor_report_chat_text(report: &MonitorReport) -> String {
                 text.push_str(&format!(
                     "\nFile event:\n{}\n",
                     truncate_chars(payload, TOOL_PREVIEW_CHARS),
+                ));
+            }
+            MonitorEventPayload::Task { payload } | MonitorEventPayload::Agent { payload } => {
+                text.push_str(&format!(
+                    "\nCompletion event:\n{}\n",
+                    truncate_chars(payload, TOOL_PREVIEW_CHARS)
                 ));
             }
             MonitorEventPayload::Poll { payload } => {
@@ -1135,6 +1143,7 @@ impl TurnProjection {
                 name,
                 args,
                 status,
+                ..
             } => {
                 let status = if completed {
                     tool_status(status)

@@ -7,12 +7,12 @@
    ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×9; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×10; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×50
 03|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
-04|  BUILD ✓↺2 · command-green · attempt 2/8 · 1g/0r (1 eff)                       |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×1; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×5; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×23
-05|  VERIFY ◉ · all-of-3 · attempt 2/8 · 2g/1r (2 eff)                             |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×1; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×5; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×3; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×29
-06|  SHIP ◌ · human-confirm · attempt 0/8                                          |
-   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×17; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×42
+04|  BUILD ✓↺2 · command-green · attempt 2 · 1g/0r (1 eff)                         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×1; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×2; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×5; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×25
+05|  VERIFY ◉ · all-of-3 · attempt 2 · 2g/1r (2 eff)                               |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×1; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×5; Rgb(255, 133, 119)/Rgb(15, 15, 15)/NONE×3; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×31
+06|  SHIP ◌ · human-confirm · attempt 0                                            |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×5; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×17; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×44
 07|                                                                                |
    ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
 08|→ current: VERIFY · record 3 green evidence slots                               |

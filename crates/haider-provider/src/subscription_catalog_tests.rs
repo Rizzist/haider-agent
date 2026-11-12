@@ -25,10 +25,20 @@ fn subscription_fallbacks_have_distinct_ids_and_limit_metadata() {
                 row.slug
             );
             assert_eq!(row.context_window, limit.context_window);
-            // Every maintained row has a sourced limit, never the 8,192 guess.
-            assert!(
+            // Every maintained row has a known window and never the 8,192
+            // guess. Its output maximum is published only where the provider
+            // publishes one; Kimi Code and Haider Code publish none, so their
+            // 30,000 is the conservative derived default.
+            assert_ne!(
+                limit.max_output_tokens,
+                crate::UNKNOWN_OUTPUT_LIMIT,
+                "fallback limit for {}",
+                row.slug
+            );
+            assert_eq!(
                 limit.output_limit_sourced,
-                "unsourced limit for {}",
+                !matches!(provider, "kimi-oauth" | "haider-code"),
+                "output publication for {provider}/{}",
                 row.slug
             );
         }
@@ -50,7 +60,7 @@ fn subscription_fallbacks_have_distinct_ids_and_limit_metadata() {
         ("openai-oauth", "gpt-5.6-sol", Some(1_050_000), 128_000),
         ("openai-oauth", "gpt-6-sol", Some(1_050_000), 128_000),
         // Kimi and Haider Code publish no output ceiling: the shared default
-        // budget is their sourced maximum. xAI documents 128,000.
+        // budget is their conservative derived maximum. xAI documents 128,000.
         (
             "kimi-oauth",
             "kimi-for-coding",

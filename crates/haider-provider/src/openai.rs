@@ -3331,6 +3331,7 @@ fn hosted_web_search_call_events(
             call_id: call_id.clone(),
             name: "web_search".into(),
             args: action,
+            activity: Some(haider_protocol::activity::ActivityKind::Web),
         },
         StreamEvent::ServerToolResult {
             call_id,

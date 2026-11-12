@@ -42,6 +42,9 @@ fn windowed_summary(
     default: &str,
 ) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -57,6 +60,7 @@ fn windowed_summary(
                 display_name: None,
                 context_window: *window,
                 max_output_tokens: Some(30_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -193,7 +197,10 @@ fn a_late_catalog_updates_even_a_pinned_identity() {
     // F2a: /model opens the picker pre-filtered; ⏎ selects the row.
     run_slash(&mut model, "/model gpt-5.6-sol");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
-    assert!(model.identity_pinned, "/model is an explicit choice");
+    assert!(
+        model.launcher_identity_pinned,
+        "/model is an explicit choice"
+    );
     assert_eq!(
         model.identity.context_window, 0,
         "undeclared → unknown (the seed was {seed})"
@@ -217,7 +224,7 @@ fn a_late_catalog_updates_even_a_pinned_identity() {
         "the pin protects the user's choice, not a stale number"
     );
     assert_eq!(model.identity.model_short, "gpt-5.6-sol");
-    assert!(model.identity_pinned, "the refresh never unpins");
+    assert!(model.launcher_identity_pinned, "the refresh never unpins");
 }
 
 /// MUTATION CHECK (W5g-1): remove the `refresh_context_window` call from

@@ -21,6 +21,7 @@
 pub mod art;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 #[path = "presence/overlay_macos.rs"]
 mod overlay_macos;
 
@@ -29,16 +30,35 @@ mod overlay_macos;
 #[path = "presence/overlay_windows.rs"]
 mod overlay_windows;
 
+/// The Windows overlay's platform-independent state (tested everywhere).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(all(test, not(target_os = "windows")), allow(dead_code))]
+#[path = "presence/overlay_windows_logic.rs"]
+mod overlay_windows_logic;
+
 #[cfg(target_os = "linux")]
 #[path = "presence/overlay_linux.rs"]
 mod overlay_linux;
 
+/// Linux notification posting decisions, shared with tests on every host.
+#[cfg(any(target_os = "linux", test))]
+#[path = "presence/overlay_linux_logic.rs"]
+mod overlay_linux_logic;
+
+#[cfg(any(target_os = "macos", test))]
+#[path = "presence/overlay_macos_logic.rs"]
+mod overlay_macos_logic;
+
+use haider_protocol::activity::ActivityKind;
 use haider_protocol::computer::{CU_PRESENCE_IDLE_SECS, ComputerAction};
 use haider_protocol::mobile::MobileAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Upper sequence range reserved for capture Conceal acknowledgements.
+pub const CONCEAL_ACK_SEQ_START: u64 = 1 << 62;
 
 /// Hidden `haiderd` argument that runs the desktop overlay helper instead of
 /// the daemon. Reusing the shipped daemon executable means no new release
@@ -54,7 +74,8 @@ pub const PRESENCE_HELPER_ENV: &str = "HAIDER_CU_PRESENCE_HELPER";
 pub const PRESENCE_DISABLE_ENV: &str = "HAIDER_CU_PRESENCE";
 
 /// Evidence-only (macOS): `1` makes the overlay capturable so documentation
-/// screenshots can show it. Model-facing captures then include it too.
+/// screenshots can show it. The helper must then prove all panels absent
+/// before acknowledging each model-facing capture.
 pub const PRESENCE_EVIDENCE_CAPTURABLE_ENV: &str = "HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE";
 
 /// Value written into every input event Haider synthesises (macOS
@@ -70,7 +91,7 @@ pub const PRESENCE_IDLE_TIMEOUT: Duration = Duration::from_secs(CU_PRESENCE_IDLE
 pub const STOPPED_LEASE_RETENTION: Duration = Duration::from_secs(600);
 
 /// Upper bound the daemon waits for a surface to take capturable UI off
-/// screen before a model-facing capture. Missing acks never block capture.
+/// screen before a model-facing capture. Missing acks refuse capture.
 pub const CONCEAL_ACK_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Upper bound the daemon waits for an overlay to acknowledge a pointer
@@ -101,6 +122,24 @@ impl PresenceSurface {
         }
     }
 
+    /// 973-activity-icons: the badge when a named SUBAGENT drives this
+    /// surface — `🖥️ Ammar is using your screen`. The activity glyph leads
+    /// (the same vocabulary as the fleet rows); `emoji: false` drops it for
+    /// displays configured for text/no icons.
+    #[must_use]
+    pub fn actor_label(self, actor: &str, emoji: bool) -> String {
+        let (kind, object) = match self {
+            Self::Screen => (ActivityKind::Computer, "your screen"),
+            Self::Phone => (ActivityKind::Mobile, "your phone"),
+            Self::Browser => (ActivityKind::Web, "this browser"),
+        };
+        if emoji {
+            format!("{} {actor} is using {object}", kind.emoji())
+        } else {
+            format!("{actor} is using {object}")
+        }
+    }
+
     /// Short noun used by the TUI header chip.
     #[must_use]
     pub const fn noun(self) -> &'static str {
@@ -110,6 +149,15 @@ impl PresenceSurface {
             Self::Browser => "browser",
         }
     }
+}
+
+/// The named subagent driving a surface (973-activity-icons badge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceActor {
+    /// Display name (the subagent's callsign).
+    pub name: String,
+    /// Lead the badge with the activity emoji.
+    pub emoji: bool,
 }
 
 /// How the agent pointer marks one action.
@@ -285,6 +333,12 @@ pub enum PresenceEvent {
     Ack {
         seq: u64,
     },
+    /// The helper could not prove that every capturable panel has left the
+    /// capture boundary. The daemon must refuse this capture.
+    ConcealFailed {
+        seq: u64,
+        message: String,
+    },
     /// The human pressed Stop.
     Stop,
     /// A non-fatal rendering problem worth logging.
@@ -305,10 +359,14 @@ pub enum PresenceRefusal {
 /// of them stops the run and run end retires all of them.
 #[derive(Debug, Clone)]
 struct Lease {
+    generation: u64,
     /// Surface -> time of its latest activity.
     surfaces: BTreeMap<PresenceSurface, Instant>,
     /// Surface of the action most recently begun (what `finish` refreshes).
     current: PresenceSurface,
+    /// The acting subagent, when one is named (`None` = the generic
+    /// "Haider is controlling …" badge).
+    actor: Option<PresenceActor>,
     in_flight: u32,
     stopped_at: Option<Instant>,
 }
@@ -319,6 +377,14 @@ impl Lease {
     }
 }
 
+/// A displayed or deferred label belongs to one incarnation of a live lease.
+#[derive(Debug, Clone)]
+struct OwnedLabel<K> {
+    owner: K,
+    generation: u64,
+    text: String,
+}
+
 /// Session-scoped presence state. `K` identifies one run (the daemon uses
 /// `session/run`). The machine is pure: callers pass `now` and forward the
 /// returned commands to the matching surface renderer.
@@ -326,6 +392,11 @@ impl Lease {
 pub struct PresenceMachine<K: Ord + Clone> {
     leases: BTreeMap<K, Lease>,
     shown: BTreeSet<PresenceSurface>,
+    /// The badge label each shown surface currently displays, so a different
+    /// actor taking over a shown surface re-labels it (973-activity-icons).
+    labels: BTreeMap<PresenceSurface, OwnedLabel<K>>,
+    /// A relabel waits briefly so rapid actor alternation yields one Show.
+    pending_labels: BTreeMap<PresenceSurface, (OwnedLabel<K>, Instant)>,
     idle_timeout: Duration,
     next_seq: u64,
 }
@@ -342,6 +413,8 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         Self {
             leases: BTreeMap::new(),
             shown: BTreeSet::new(),
+            labels: BTreeMap::new(),
+            pending_labels: BTreeMap::new(),
             idle_timeout,
             next_seq: 1,
         }
@@ -358,27 +431,75 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         point: Option<PresencePoint>,
         now: Instant,
     ) -> Result<(u64, Vec<PresenceCommand>), PresenceRefusal> {
+        self.begin_action_as(key, surface, mark, point, now, None)
+    }
+
+    /// [`Self::begin_action`] naming the acting subagent: a `Show` this
+    /// action raises carries [`PresenceSurface::actor_label`]
+    /// (973-activity-icons). When a different actor (or the main thread)
+    /// acts on an already-shown surface, `Show` is re-issued with its label,
+    /// so the badge always names whoever is acting now.
+    pub fn begin_action_as(
+        &mut self,
+        key: K,
+        surface: PresenceSurface,
+        mark: PresenceMark,
+        point: Option<PresencePoint>,
+        now: Instant,
+        actor: Option<PresenceActor>,
+    ) -> Result<(u64, Vec<PresenceCommand>), PresenceRefusal> {
         if self.leases.get(&key).is_some_and(Lease::stopped) {
             return Err(PresenceRefusal::Stopped);
         }
-        let lease = self.leases.entry(key).or_insert_with(|| Lease {
+        let lease = self.leases.entry(key.clone()).or_insert_with(|| Lease {
+            generation: self.next_seq,
             surfaces: BTreeMap::new(),
             current: surface,
+            actor: None,
             in_flight: 0,
             stopped_at: None,
         });
+        if actor.is_some() {
+            lease.actor = actor;
+        }
         lease.surfaces.insert(surface, now);
         lease.current = surface;
         lease.in_flight = lease.in_flight.saturating_add(1);
         let mut commands = Vec::with_capacity(2);
+        let label = lease.actor.as_ref().map_or_else(
+            || surface.badge_label().to_owned(),
+            |actor| surface.actor_label(&actor.name, actor.emoji),
+        );
+        let owned = OwnedLabel {
+            owner: key,
+            generation: lease.generation,
+            text: label.clone(),
+        };
         if self.shown.insert(surface) {
-            commands.push(PresenceCommand::Show {
-                surface,
-                label: surface.badge_label().to_owned(),
-            });
+            self.pending_labels.remove(&surface);
+            self.labels.insert(surface, owned);
+            commands.push(PresenceCommand::Show { surface, label });
+        } else if self
+            .labels
+            .get(&surface)
+            .is_some_and(|current| current.text == label)
+        {
+            self.labels.insert(surface, owned);
+            self.pending_labels.remove(&surface);
+        } else if let Some((pending, _)) = self.pending_labels.get_mut(&surface)
+            && pending.text == label
+        {
+            // Equal text needs no new debounce, but its owner may have changed.
+            *pending = owned;
+        } else {
+            self.pending_labels.insert(surface, (owned, now));
         }
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.next_seq = if seq >= CONCEAL_ACK_SEQ_START - 1 {
+            1
+        } else {
+            seq + 1
+        };
         commands.push(PresenceCommand::Pointer {
             surface,
             seq,
@@ -433,10 +554,37 @@ impl<K: Ord + Clone> PresenceMachine<K> {
             });
             !lease.surfaces.is_empty() || lease.in_flight > 0
         });
-        expired
+        let mut commands: Vec<_> = expired
             .into_iter()
             .flat_map(|surface| self.hide_if_unused(surface, PresenceEndReason::Idle))
-            .collect()
+            .collect();
+        let ready: Vec<_> = self
+            .pending_labels
+            .iter()
+            .filter(|(surface, (_, changed))| {
+                self.shown.contains(*surface)
+                    && now.saturating_duration_since(*changed) >= Duration::from_millis(150)
+            })
+            .map(|(surface, (label, _))| (*surface, label.clone()))
+            .collect();
+        for (surface, label) in ready {
+            self.pending_labels.remove(&surface);
+            if self.label_is_live(surface, &label) {
+                let changed = self
+                    .labels
+                    .get(&surface)
+                    .is_none_or(|current| current.text != label.text);
+                let text = label.text.clone();
+                self.labels.insert(surface, label);
+                if changed {
+                    commands.push(PresenceCommand::Show {
+                        surface,
+                        label: text,
+                    });
+                }
+            }
+        }
+        commands
     }
 
     /// The human pressed Stop on `surface`. Every active run that uses it is
@@ -464,6 +612,8 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         }
         let mut commands = Vec::new();
         if self.shown.remove(&surface) {
+            self.labels.remove(&surface);
+            self.pending_labels.remove(&surface);
             commands.push(PresenceCommand::Stopping { surface });
             commands.push(PresenceCommand::Hide {
                 surface,
@@ -499,21 +649,62 @@ impl<K: Ord + Clone> PresenceMachine<K> {
         surface: PresenceSurface,
         reason: PresenceEndReason,
     ) -> Vec<PresenceCommand> {
-        let still_used = self
+        let remaining = self
             .leases
-            .values()
-            .any(|lease| !lease.stopped() && lease.surfaces.contains_key(&surface));
-        if !still_used && self.shown.remove(&surface) {
-            vec![PresenceCommand::Hide { surface, reason }]
-        } else {
-            Vec::new()
+            .iter()
+            .filter(|(_, lease)| !lease.stopped() && lease.surfaces.contains_key(&surface))
+            .max_by_key(|(_, lease)| lease.surfaces[&surface]);
+        let Some((owner, lease)) = remaining else {
+            self.labels.remove(&surface);
+            self.pending_labels.remove(&surface);
+            return if self.shown.remove(&surface) {
+                vec![PresenceCommand::Hide { surface, reason }]
+            } else {
+                Vec::new()
+            };
+        };
+        let replacement = OwnedLabel {
+            owner: owner.clone(),
+            generation: lease.generation,
+            text: lease.actor.as_ref().map_or_else(
+                || surface.badge_label().to_owned(),
+                |actor| surface.actor_label(&actor.name, actor.emoji),
+            ),
+        };
+        if self
+            .pending_labels
+            .get(&surface)
+            .is_some_and(|(label, _)| !self.label_is_live(surface, label))
+        {
+            self.pending_labels.remove(&surface);
         }
+        if self
+            .labels
+            .get(&surface)
+            .is_some_and(|label| self.label_is_live(surface, label))
+        {
+            return Vec::new();
+        }
+        // An invalid current owner cannot remain visible for the debounce window.
+        // Rebind immediately to a live lease, keeping its badge on screen.
+        self.pending_labels.remove(&surface);
+        let label = replacement.text.clone();
+        self.labels.insert(surface, replacement);
+        vec![PresenceCommand::Show { surface, label }]
+    }
+
+    fn label_is_live(&self, surface: PresenceSurface, label: &OwnedLabel<K>) -> bool {
+        self.leases.get(&label.owner).is_some_and(|lease| {
+            lease.generation == label.generation
+                && !lease.stopped()
+                && lease.surfaces.contains_key(&surface)
+        })
     }
 }
 
 /// Where to stop when a freedesktop notification server offers no action
 /// buttons (Linux fallback helper).
-pub const LINUX_FALLBACK_STOP_HINT: &str = "To stop: press Esc in the Haider TUI session, or for a headless run use `haider run --stop <run-id>`.";
+pub const LINUX_FALLBACK_STOP_HINT: &str = "For a configured headless run, stop it and all its subagents with `haider run --stop <run-id>`. In the TUI, press Esc if its main thread is controlling the screen. For a subagent, use `haider agent cancel <parent-session> <agent>`.";
 
 /// The Linux notification helper's decision from the server's
 /// `GetCapabilities` reply. Pure so it is unit-tested on every platform.
@@ -559,7 +750,7 @@ impl LinuxNotificationPlan {
     #[must_use]
     pub fn actions(&self) -> Vec<&'static str> {
         if self.stop_button {
-            vec!["stop", "Stop"]
+            vec![LinuxStopRouter::STOP_ACTION, "Stop"]
         } else {
             Vec::new()
         }
@@ -583,6 +774,80 @@ impl LinuxNotificationPlan {
         } else {
             format!("{base}\n{LINUX_FALLBACK_STOP_HINT}")
         }
+    }
+}
+
+/// Routes the Linux notification's Stop action to the presence it belongs to.
+///
+/// The helper closes its notification around every model-facing capture
+/// (`Conceal`) and posts a new one on `Reveal`, so one presence *generation*
+/// (`Show` .. `Hide`) owns several notification ids. An `ActionInvoked` for
+/// an earlier id can still be queued on the bus when `CloseNotification`
+/// returns (verifier finding B3 on 8c614f6c: matching only the current id
+/// dropped that Stop). Every id posted in the active generation therefore
+/// stays live until `Hide`; `Hide` retires them all, so a late action can
+/// never stop a later generation. Pure so it is unit-tested everywhere.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinuxStopRouter {
+    active: bool,
+    stopping: bool,
+    live: BTreeSet<u32>,
+}
+
+impl LinuxStopRouter {
+    /// Action key of the notification's Stop button.
+    pub const STOP_ACTION: &'static str = "stop";
+
+    /// `Show`: starts a generation, or refreshes the active one (a label
+    /// change keeps its ids live).
+    pub fn show(&mut self) {
+        if !self.active {
+            self.live.clear();
+            self.stopping = false;
+        }
+        self.active = true;
+    }
+
+    /// The server returned `id` for a notification of this generation.
+    pub fn posted(&mut self, id: u32) {
+        if self.active && id != 0 {
+            self.live.insert(id);
+        }
+    }
+
+    /// The daemon acknowledged a Stop (`Stopping`).
+    pub fn stopping(&mut self) {
+        self.stopping = true;
+    }
+
+    /// `Hide`: the generation ends and every id it posted is retired.
+    pub fn hide(&mut self) {
+        self.active = false;
+        self.stopping = false;
+        self.live.clear();
+    }
+
+    /// Whether a generation is showing (notification updates are allowed).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Whether a Stop is already on its way.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    /// An `ActionInvoked(id, key)` signal: `true` exactly once per
+    /// generation when it is the Stop button of one of its notifications,
+    /// including ones already closed for a capture.
+    pub fn on_action(&mut self, id: u32, key: &str) -> bool {
+        if key != Self::STOP_ACTION || !self.active || self.stopping || !self.live.contains(&id) {
+            return false;
+        }
+        self.stopping = true;
+        true
     }
 }
 

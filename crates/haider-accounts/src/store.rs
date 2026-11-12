@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use haider_protocol::credential::{AccountIdentity, CredentialDescriptor, CredentialStatus};
@@ -36,25 +35,15 @@ pub trait StoreLike: Send + Sync {
 
     /// Reserve an incarnation before committing a descriptor. Gaps after a
     /// failed descriptor write are intentional: a value is never recycled.
-    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64> {
-        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let mut current = TEST_COUNTER.load(Ordering::SeqCst);
-        loop {
-            let next = current.max(floor).checked_add(1).ok_or_else(|| {
-                accounts_error(ErrorCode::Internal, "account incarnation exhausted", false)
-            })?;
-            match TEST_COUNTER.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return Ok(next),
-                Err(observed) => current = observed,
-            }
-        }
-    }
+    fn reserve_incarnation(&self, floor: u64) -> AccountsResult<u64>;
 }
 
 /// JSON account snapshot stored beside the profile's other metadata.
 #[derive(Debug, Clone)]
 pub struct JsonFileStore {
     path: PathBuf,
+    #[cfg(test)]
+    pub(crate) counter_sync: crate::store_tests::CounterSyncProbe,
 }
 
 impl JsonFileStore {
@@ -63,6 +52,8 @@ impl JsonFileStore {
     pub fn new(profile_dir: impl AsRef<Path>) -> Self {
         Self {
             path: profile_dir.as_ref().join(ACCOUNTS_FILE_NAME),
+            #[cfg(test)]
+            counter_sync: Default::default(),
         }
     }
 
@@ -70,6 +61,22 @@ impl JsonFileStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn sync_counter_file(&self, file: &File) -> std::io::Result<()> {
+        file.sync_all()?;
+        #[cfg(test)]
+        self.counter_sync
+            .record(crate::store_tests::CounterSyncStage::File)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_counter_directory(&self, parent: &Path) -> std::io::Result<()> {
+        haider_platform::sync_directory(parent)?;
+        #[cfg(test)]
+        self.counter_sync
+            .record(crate::store_tests::CounterSyncStage::Directory)?;
+        Ok(())
     }
 }
 
@@ -94,6 +101,10 @@ impl StoreLike for JsonFileStore {
     }
 
     fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
+        #[cfg(test)]
+        self.counter_sync
+            .record(crate::store_tests::CounterSyncStage::Descriptor)
+            .map_err(|error| file_error("sync", &self.path, error))?;
         let parent = self.path.parent().ok_or_else(|| {
             accounts_error(
                 ErrorCode::InvalidArgument,
@@ -168,12 +179,12 @@ impl StoreLike for JsonFileStore {
         temporary
             .write_all(next.to_string().as_bytes())
             .and_then(|()| temporary.write_all(b"\n"))
-            .and_then(|()| temporary.sync_all())
+            .and_then(|()| self.sync_counter_file(&temporary))
             .map_err(|error| file_error("write", &temporary_path, error))?;
         drop(temporary);
         haider_platform::replace_file(&temporary_path, &path)
             .map_err(|error| file_error("replace", &path, error))?;
-        haider_platform::sync_directory(parent)
+        self.sync_counter_directory(parent)
             .map_err(|error| file_error("sync parent directory of", &path, error))?;
         Ok(next)
     }
@@ -278,6 +289,37 @@ fn proven_same_account(previous: &CredentialDescriptor, next: &CredentialDescrip
         && b.verified
         && a.email.as_deref().is_some_and(complete_coordinate)
         && a.email == b.email
+}
+
+/// An owned grant's synthetic coordinate survives token rotation. This
+/// exception is ONLY for manual identity reconciliation; new imports and
+/// re-logins still pass the stricter intake continuity rule.
+fn unchanged_owned_grant(previous: &CredentialDescriptor, next: &CredentialDescriptor) -> bool {
+    let (Some(a), Some(b)) = (&previous.account_identity, &next.account_identity) else {
+        return false;
+    };
+    previous.auth_method == haider_protocol::credential::AuthMethod::OAuth
+        && matches!(
+            previous.provider.as_str(),
+            "kimi-oauth" | "grok-oauth" | "anthropic-oauth"
+        )
+        && previous.provider == next.provider
+        && previous.base_url == next.base_url
+        && a.issuer == b.issuer
+        && a.issuer.as_deref().is_some_and(complete_coordinate)
+        && a.account_id == b.account_id
+        && a.account_id.as_deref().is_some_and(|id| {
+            let prefix = if previous.provider == "anthropic-oauth" {
+                "anthropic:".to_owned()
+            } else {
+                format!("{}:grant-", previous.provider)
+            };
+            complete_coordinate(id)
+                && id.strip_prefix(&prefix).is_some_and(|grant| {
+                    grant.len() == 16 && grant.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
+        && !identity_coordinates_conflict(previous, next)
 }
 
 fn complete_coordinate(value: &str) -> bool {
@@ -515,7 +557,8 @@ impl<S: StoreLike> AccountStore<S> {
         next[index].account_identity = identity;
         next[index].credential_digest = credential_digest;
         if identity_scope_changed(previous, &next[index])
-            || !proven_same_account(previous, &next[index])
+            || !(proven_same_account(previous, &next[index])
+                || unchanged_owned_grant(previous, &next[index]))
         {
             next[index].incarnation = self.next_incarnation()?;
         }

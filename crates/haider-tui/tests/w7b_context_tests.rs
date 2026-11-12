@@ -50,6 +50,7 @@ fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Vec<(Rect, H
 
 fn footprint(truth: ContextFootprintTruth) -> ContextFootprint {
     ContextFootprint {
+        selection_epoch: None,
         input_tokens: 90_000,
         output_tokens: 8_000,
         cached_input_tokens: 2_000,
@@ -140,6 +141,8 @@ fn the_compaction_intent_becomes_the_preannounce_note() {
         .extension_item()
         .expect("carrier");
     apply_extension(&mut model, "fp-2", footprint_item);
+    let current_window = model.context_meter().window;
+    model.projection.set_compaction_note_window(current_window);
     apply_extension(
         &mut model,
         "intent-1",

@@ -20,9 +20,9 @@
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::mobile::MobileAction;
 use haider_tools::presence::{
-    CONCEAL_ACK_TIMEOUT, POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT, PresenceCommand,
-    PresenceEndReason, PresenceEvent, PresenceMachine, PresenceMark, PresencePoint,
-    PresenceRefusal, PresenceSurface,
+    CONCEAL_ACK_SEQ_START, CONCEAL_ACK_TIMEOUT, POINTER_ACK_TIMEOUT, PRESENCE_IDLE_TIMEOUT,
+    PresenceCommand, PresenceEndReason, PresenceEvent, PresenceMachine, PresenceMark,
+    PresencePoint, PresenceRefusal, PresenceSurface,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,11 +62,42 @@ struct LeaseHooks {
     in_flight: Option<StopHook>,
 }
 
+/// Shared capture ownership for one surface (verifier finding B2 on
+/// 8c614f6c). Every model-facing capture holds the surface concealed; the
+/// FIRST holder sends Conceal, the LAST one to retire sends Reveal, so
+/// overlapping captures from different sessions never reveal each other's
+/// capture, and a capture cancelled while awaiting its ack still retires.
+struct CaptureConceal {
+    holders: usize,
+    /// A Conceal is in effect on the current renderer (Reveal owed).
+    sent: bool,
+    /// The sole Conceal whose acknowledgement may release this hold.
+    outstanding_seq: Option<u64>,
+    /// Whether the current Conceal has been acknowledged.
+    acked: tokio::sync::watch::Sender<bool>,
+    failed: bool,
+}
+
+impl Default for CaptureConceal {
+    fn default() -> Self {
+        Self {
+            holders: 0,
+            sent: false,
+            outstanding_seq: None,
+            acked: tokio::sync::watch::Sender::new(false),
+            failed: false,
+        }
+    }
+}
+
 struct State {
     machine: PresenceMachine<String>,
     hooks: HashMap<String, LeaseHooks>,
     renderers: BTreeMap<PresenceSurface, Box<dyn PresenceRenderer>>,
     acks: HashMap<u64, oneshot::Sender<()>>,
+    captures: BTreeMap<PresenceSurface, CaptureConceal>,
+    /// Outstanding Conceal sequence numbers and their surface.
+    conceal_acks: HashMap<u64, PresenceSurface>,
 }
 
 /// Process-wide presence controller.
@@ -81,6 +112,12 @@ pub(crate) struct CuPresence {
     /// cancellation (zero in production). Models a slow cancel commit so the
     /// Stop-refusal path is observable before the cancellation lands.
     stop_cancel_delay: StdMutex<Duration>,
+    #[cfg(test)]
+    fixture_pointer_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_conceal_ack_timeout: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    fixture_idle_clock: StdMutex<Option<(Instant, tokio::time::Instant)>>,
     me: Weak<CuPresence>,
 }
 
@@ -92,14 +129,36 @@ impl CuPresence {
                 hooks: HashMap::new(),
                 renderers: BTreeMap::new(),
                 acks: HashMap::new(),
+                captures: BTreeMap::new(),
+                conceal_acks: HashMap::new(),
             }),
             factories: StdMutex::new(BTreeMap::new()),
             ticker_running: AtomicBool::new(false),
             tick_interval,
-            next_conceal_seq: std::sync::atomic::AtomicU64::new(1 << 62),
+            next_conceal_seq: std::sync::atomic::AtomicU64::new(CONCEAL_ACK_SEQ_START),
             stop_cancel_delay: StdMutex::new(Duration::ZERO),
+            #[cfg(test)]
+            fixture_pointer_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_conceal_ack_timeout: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_idle_clock: StdMutex::new(None),
             me: me.clone(),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((wall, monotonic)) = *lock(&self.fixture_idle_clock) {
+            return wall + tokio::time::Instant::now().saturating_duration_since(monotonic);
+        }
+        Instant::now()
+    }
+
+    /// Pair the presence machine's standard clock with paused Tokio timers.
+    #[cfg(test)]
+    pub(crate) fn set_idle_clock_for_test(&self) {
+        *lock(&self.fixture_idle_clock) = Some((Instant::now(), tokio::time::Instant::now()));
     }
 
     /// Delays every Stop hook's turn cancellation (tests only).
@@ -114,6 +173,18 @@ impl CuPresence {
         lock(&self.factories).insert(surface, factory);
     }
 
+    /// Real-store fixtures that press Stop must own the parked-ack window.
+    /// Production and the virtual-clock policy probes retain the 250 ms bound.
+    #[cfg(test)]
+    pub(crate) fn set_pointer_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_pointer_ack_timeout) = Some(timeout);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_conceal_ack_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.fixture_conceal_ack_timeout) = Some(timeout);
+    }
+
     fn event_sink(&self, surface: PresenceSurface) -> EventSink {
         let me = self.me.clone();
         Arc::new(move |event| {
@@ -125,6 +196,7 @@ impl CuPresence {
 
     /// Starts one CU action. On success returns an optional acknowledgement
     /// the caller should await (bounded) before posting pointer input.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         &self,
         key: &str,
@@ -133,12 +205,17 @@ impl CuPresence {
         point: Option<PresencePoint>,
         stop: StopHook,
         in_flight: StopHook,
+        actor: Option<haider_tools::presence::PresenceActor>,
     ) -> Result<Option<oneshot::Receiver<()>>, PresenceRefusal> {
         let mut state = lock(&self.state);
-        let (seq, commands) =
-            state
-                .machine
-                .begin_action(key.to_owned(), surface, mark, point, Instant::now())?;
+        let (seq, commands) = state.machine.begin_action_as(
+            key.to_owned(),
+            surface,
+            mark,
+            point,
+            self.now(),
+            actor,
+        )?;
         state.hooks.insert(
             key.to_owned(),
             LeaseHooks {
@@ -167,7 +244,7 @@ impl CuPresence {
     /// The action begun for `key` finished; its idle window starts now.
     pub(crate) fn finish(&self, key: &str) {
         let mut state = lock(&self.state);
-        state.machine.finish_action(&key.to_owned(), Instant::now());
+        state.machine.finish_action(&key.to_owned(), self.now());
         if let Some(hooks) = state.hooks.get_mut(key) {
             hooks.in_flight = None;
         }
@@ -208,37 +285,135 @@ impl CuPresence {
         keys.len()
     }
 
-    /// Asks a capturable renderer on `surface` to take its UI off screen
-    /// before a model-facing capture. `None` when nothing needs concealing.
-    pub(crate) fn conceal(&self, surface: PresenceSurface) -> Option<oneshot::Receiver<()>> {
-        let mut state = lock(&self.state);
-        if !state
+    /// Sends Conceal to `surface`'s renderer if it is capturable, and marks
+    /// the Conceal as owed a Reveal. Returns false if a capturable renderer
+    /// rejected it, so a recreated renderer is retired before any Show.
+    /// Caller holds the state lock.
+    fn send_conceal(&self, state: &mut State, surface: PresenceSurface) -> bool {
+        let capturable = state
             .renderers
             .get(&surface)
-            .is_some_and(|renderer| renderer.capturable())
-        {
-            return None;
+            .is_some_and(|renderer| renderer.capturable());
+        if !capturable {
+            return true;
         }
-        let seq = self.next_conceal_seq.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
-        state.acks.insert(seq, sender);
+        // Stay in the Conceal sequence range even at u64 rollover. A pointer
+        // acknowledgement must never alias a Conceal acknowledgement.
+        let seq = self
+            .next_conceal_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current == u64::MAX {
+                    CONCEAL_ACK_SEQ_START
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(CONCEAL_ACK_SEQ_START);
         let sent = state
             .renderers
             .get_mut(&surface)
             .is_some_and(|renderer| renderer.send(&PresenceCommand::Conceal { surface, seq }));
-        if !sent {
-            state.acks.remove(&seq);
-            return None;
+        if sent {
+            state.conceal_acks.retain(|_, pending| *pending != surface);
+            state.conceal_acks.insert(seq, surface);
+            let capture = state.captures.entry(surface).or_default();
+            capture.sent = true;
+            capture.outstanding_seq = Some(seq);
+            capture.failed = false;
+            capture.acked.send_replace(false);
         }
-        Some(receiver)
+        sent
     }
 
-    /// Restores what [`Self::conceal`] removed.
-    pub(crate) fn reveal(&self, surface: PresenceSurface) {
+    /// Takes one capture hold on `surface`, synchronously (so a caller that
+    /// is cancelled right afterwards still releases it). The first holder
+    /// conceals. Returns a receiver to await the Conceal's ack, if one is
+    /// outstanding.
+    pub(crate) fn begin_capture(
+        &self,
+        surface: PresenceSurface,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
         let mut state = lock(&self.state);
-        if let Some(renderer) = state.renderers.get_mut(&surface) {
+        let first = {
+            let capture = state.captures.entry(surface).or_default();
+            capture.holders += 1;
+            if capture.holders == 1 {
+                capture.failed = false;
+            }
+            capture.holders == 1
+        };
+        if first && !self.send_conceal(&mut state, surface) {
+            // A renderer that cannot accept Conceal must not remain on
+            // screen while the capture proceeds without an ack.
+            if let Some(mut renderer) = state.renderers.remove(&surface) {
+                renderer.close();
+            }
+            state.conceal_acks.retain(|_, pending| *pending != surface);
+            let capture = state.captures.entry(surface).or_default();
+            capture.failed = true;
+            capture.acked.send_replace(true);
+        }
+        let capture = state.captures.entry(surface).or_default();
+        (capture.sent && !*capture.acked.borrow()).then(|| capture.acked.subscribe())
+    }
+
+    /// Releases one capture hold; the last holder reveals.
+    pub(crate) fn end_capture(&self, surface: PresenceSurface) {
+        let mut state = lock(&self.state);
+        let reveal = {
+            let Some(capture) = state.captures.get_mut(&surface) else {
+                return;
+            };
+            capture.holders = capture.holders.saturating_sub(1);
+            if capture.holders == 0 {
+                capture.outstanding_seq = None;
+            }
+            capture.holders == 0 && std::mem::take(&mut capture.sent)
+        };
+        if reveal && let Some(renderer) = state.renderers.get_mut(&surface) {
             let _ = renderer.send(&PresenceCommand::Reveal { surface });
         }
+    }
+
+    fn capture_verified(&self, surface: PresenceSurface) -> bool {
+        let state = lock(&self.state);
+        state
+            .captures
+            .get(&surface)
+            .is_some_and(|capture| !capture.failed && (!capture.sent || *capture.acked.borrow()))
+    }
+
+    fn fail_capture_seq(&self, surface: PresenceSurface, seq: u64) {
+        let mut state = lock(&self.state);
+        if state.conceal_acks.get(&seq) != Some(&surface)
+            || state
+                .captures
+                .get(&surface)
+                .is_none_or(|capture| capture.outstanding_seq != Some(seq))
+        {
+            return;
+        }
+        if let Some(capture) = state.captures.get_mut(&surface) {
+            capture.failed = true;
+            capture.acked.send_replace(true);
+        }
+    }
+
+    fn fail_capture_wait(&self, surface: PresenceSurface) {
+        let mut state = lock(&self.state);
+        if let Some(capture) = state.captures.get_mut(&surface) {
+            capture.failed = true;
+            capture.acked.send_replace(true);
+        }
+    }
+
+    /// Number of capture holds on `surface` (tests).
+    #[cfg(test)]
+    pub(crate) fn capture_holders(&self, surface: PresenceSurface) -> usize {
+        lock(&self.state)
+            .captures
+            .get(&surface)
+            .map_or(0, |capture| capture.holders)
     }
 
     pub(crate) fn is_stopped(&self, key: &str) -> bool {
@@ -256,9 +431,25 @@ impl CuPresence {
                 self.stop(surface);
             }
             PresenceEvent::Ack { seq } => {
-                if let Some(sender) = lock(&self.state).acks.remove(&seq) {
+                let mut state = lock(&self.state);
+                if let Some(sender) = state.acks.remove(&seq) {
                     let _ = sender.send(());
+                } else if state.conceal_acks.get(&seq) == Some(&surface)
+                    && state
+                        .captures
+                        .get(&surface)
+                        .is_some_and(|capture| capture.sent && capture.outstanding_seq == Some(seq))
+                {
+                    state.conceal_acks.remove(&seq);
+                    if let Some(capture) = state.captures.get_mut(&surface) {
+                        capture.outstanding_seq = None;
+                        capture.acked.send_replace(true);
+                    }
                 }
+            }
+            PresenceEvent::ConcealFailed { seq, message } => {
+                tracing::warn!(%message, surface = ?surface, seq, "presence conceal verification failed");
+                self.fail_capture_seq(surface, seq);
             }
             PresenceEvent::Ready {
                 platform,
@@ -274,7 +465,7 @@ impl CuPresence {
 
     fn tick(&self) -> bool {
         let mut state = lock(&self.state);
-        let commands = state.machine.tick(Instant::now());
+        let commands = state.machine.tick(self.now());
         self.dispatch(&mut state, commands);
         let live = state.machine.has_leases();
         if !live {
@@ -312,6 +503,7 @@ impl CuPresence {
     fn dispatch(&self, state: &mut State, commands: Vec<PresenceCommand>) {
         for command in commands {
             let surface = command.surface();
+            let mut initialized = true;
             if let std::collections::btree_map::Entry::Vacant(slot) = state.renderers.entry(surface)
             {
                 // Only a Show or a Pointer on a surface that should be
@@ -328,7 +520,12 @@ impl CuPresence {
                 else {
                     continue;
                 };
-                if matches!(command, PresenceCommand::Pointer { .. })
+                let held = state
+                    .captures
+                    .get(&surface)
+                    .is_some_and(|capture| capture.holders > 0);
+                if !held
+                    && matches!(command, PresenceCommand::Pointer { .. })
                     && !renderer.send(&PresenceCommand::Show {
                         surface,
                         label: surface.badge_label().to_owned(),
@@ -337,17 +534,40 @@ impl CuPresence {
                     continue;
                 }
                 slot.insert(renderer);
+                // A renderer recreated during a capture must be concealed
+                // BEFORE its first Show/Pointer, so it cannot flash in the
+                // in-flight screenshot even for one frame.
+                if held {
+                    initialized = self.send_conceal(state, surface);
+                    if initialized && matches!(command, PresenceCommand::Pointer { .. }) {
+                        initialized = state.renderers.get_mut(&surface).is_some_and(|renderer| {
+                            renderer.send(&PresenceCommand::Show {
+                                surface,
+                                label: surface.badge_label().to_owned(),
+                            })
+                        });
+                    }
+                }
             }
-            let alive = state
-                .renderers
-                .get_mut(&surface)
-                .is_some_and(|renderer| renderer.send(&command));
+            let alive = initialized
+                && state
+                    .renderers
+                    .get_mut(&surface)
+                    .is_some_and(|renderer| renderer.send(&command));
             if !alive || matches!(command, PresenceCommand::Hide { .. }) {
                 if let Some(mut renderer) = state.renderers.remove(&surface) {
                     renderer.close();
                 }
-                // Pending acknowledgements can no longer arrive.
+                // Pending acknowledgements can no longer arrive; release any
+                // capture waiting on this renderer's Conceal ack.
                 state.acks.clear();
+                state.conceal_acks.retain(|_, pending| *pending != surface);
+                if let Some(capture) = state.captures.get_mut(&surface) {
+                    capture.sent = false;
+                    capture.outstanding_seq = None;
+                    capture.failed = true;
+                    capture.acked.send_replace(true);
+                }
             }
         }
     }
@@ -395,6 +615,10 @@ pub(crate) struct PresenceLease {
     presence: Arc<CuPresence>,
     stop: StopHook,
     ended: AtomicBool,
+    /// 973-activity-icons: the subagent driving this run, named on the
+    /// overlay badge (`🖥️ Ammar is using your screen`). `None` for the main
+    /// thread, which keeps the generic badge.
+    actor: Option<haider_tools::presence::PresenceActor>,
 }
 
 /// Finishes the action when dropped, including on cancellation.
@@ -408,6 +632,13 @@ impl Drop for ActionGuard<'_> {
     }
 }
 
+/// Whether an overlay badge leads with the activity emoji (see
+/// [`PresenceLease::with_actor`]).
+pub(crate) fn overlay_emoji(override_value: Option<&str>, no_color: bool) -> bool {
+    haider_protocol::activity::ActivityDisplay::resolve(override_value, None, no_color, None)
+        == haider_protocol::activity::ActivityDisplay::Emoji
+}
+
 impl PresenceLease {
     pub(crate) fn new(presence: Arc<CuPresence>, key: String, stop: StopHook) -> Self {
         Self {
@@ -415,7 +646,28 @@ impl PresenceLease {
             presence,
             stop,
             ended: AtomicBool::new(false),
+            actor: None,
         }
+    }
+
+    /// Name the subagent driving this run on any badge it raises.
+    ///
+    /// Emoji rule (973-activity-icons, F4 — documented choice): the overlay
+    /// is a DAEMON surface shared by every client, so it cannot follow one
+    /// TUI's `/icons` preference. It uses the daemon's own environment with
+    /// the client resolution order minus the terminal heuristics:
+    /// `HAIDER_ACTIVITY_ICONS` (`emoji`/`text`/`off`) wins, else `NO_COLOR`
+    /// selects the plain label, else emoji. An auto-spawned daemon inherits
+    /// both from the client that launched it.
+    #[must_use]
+    pub(crate) fn with_actor(mut self, name: Option<String>) -> Self {
+        let override_value = std::env::var(haider_client::fleet::ACTIVITY_ICONS_ENV).ok();
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let emoji = overlay_emoji(override_value.as_deref(), no_color);
+        self.actor = name
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| haider_tools::presence::PresenceActor { name, emoji });
+        self
     }
 
     /// Lease on `presence` (the daemon-wide [`global`] in production) whose Stop cancels `run_id`
@@ -446,11 +698,15 @@ impl PresenceLease {
             point,
             Arc::clone(&self.stop),
             in_flight,
+            self.actor.clone(),
         )?;
         let guard = ActionGuard { lease: self };
         if let Some(ack) = ack {
             // Bounded: a slow or dead overlay never blocks control.
-            let _ = tokio::time::timeout(POINTER_ACK_TIMEOUT, ack).await;
+            let timeout = POINTER_ACK_TIMEOUT;
+            #[cfg(test)]
+            let timeout = lock(&self.presence.fixture_pointer_ack_timeout).unwrap_or(timeout);
+            let _ = tokio::time::timeout(timeout, ack).await;
             // Stop may have landed while we waited (it also releases the
             // ack): re-check so a stopped run's click is never posted.
             if self.presence.is_stopped(&self.key) {
@@ -498,14 +754,37 @@ impl PresenceLease {
         .map(Some)
     }
 
-    /// Conceals capturable presence UI (Linux notification popup) for the
-    /// duration of one model-facing screenshot; the guard reveals it again.
-    pub(crate) async fn conceal_for_capture(&self) -> Option<RevealGuard> {
-        let ack = self.presence.conceal(PresenceSurface::Screen)?;
-        let _ = tokio::time::timeout(CONCEAL_ACK_TIMEOUT, ack).await;
-        Some(RevealGuard {
+    /// Conceals capturable presence UI (Linux notification popup, refused
+    /// Windows exclusion, or macOS evidence panels) for one model-facing
+    /// screenshot. Failed or missing verification refuses the capture.
+    ///
+    /// The capture hold — and the guard that releases it — is taken
+    /// synchronously, BEFORE the first await: if the caller is cancelled
+    /// while waiting for the helper's ack (Esc, Stop), dropping this future
+    /// drops the guard and the indicator is revealed (unless another capture
+    /// still holds the surface).
+    pub(crate) async fn conceal_for_capture(&self) -> Result<RevealGuard, String> {
+        let ack = self.presence.begin_capture(PresenceSurface::Screen);
+        let guard = RevealGuard {
             presence: Arc::clone(&self.presence),
-        })
+            surface: PresenceSurface::Screen,
+        };
+        let timeout = CONCEAL_ACK_TIMEOUT;
+        #[cfg(test)]
+        let timeout = lock(&self.presence.fixture_conceal_ack_timeout).unwrap_or(timeout);
+        if let Some(mut ack) = ack
+            && !matches!(
+                tokio::time::timeout(timeout, ack.wait_for(|acked| *acked)).await,
+                Ok(Ok(_))
+            )
+        {
+            self.presence.fail_capture_wait(PresenceSurface::Screen);
+        }
+        if self.presence.capture_verified(PresenceSurface::Screen) {
+            Ok(guard)
+        } else {
+            Err("presence panels could not be verified absent from the capture".into())
+        }
     }
 
     /// Whether the human already stopped this run. Checked right after
@@ -528,14 +807,15 @@ impl PresenceLease {
     }
 }
 
-/// Reveals concealed presence UI when the capture is over.
+/// One capture hold; releasing the last hold reveals the surface.
 pub(crate) struct RevealGuard {
     presence: Arc<CuPresence>,
+    surface: PresenceSurface,
 }
 
 impl Drop for RevealGuard {
     fn drop(&mut self) {
-        self.presence.reveal(PresenceSurface::Screen);
+        self.presence.end_capture(self.surface);
     }
 }
 

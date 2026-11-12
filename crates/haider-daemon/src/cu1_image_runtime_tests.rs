@@ -514,12 +514,14 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-cu1-compactor".into(),
         request_digest: "create-cu1-compactor-digest".into(),
         request_json: r#"{"session":"cu1-compactor"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -584,6 +586,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         },
     ]));
     let compactor = super::DaemonContextCompactor {
+        selection_epoch: None,
         store: lease,
         provider: Arc::clone(&provider) as Arc<dyn Provider>,
         model: "fake-model".into(),
@@ -683,12 +686,14 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-cu1-compactor-fallback".into(),
         request_digest: "create-cu1-compactor-fallback-digest".into(),
         request_json: r#"{"session":"cu1-compactor-fallback"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -736,6 +741,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
     }];
     let provider = Arc::new(RejectFirstReplayProvider::new());
     let compactor = super::DaemonContextCompactor {
+        selection_epoch: None,
         store: lease,
         provider: Arc::clone(&provider) as Arc<dyn Provider>,
         model: "fake-model".into(),
@@ -894,12 +900,14 @@ async fn image_tool_ref_reaches_provider_request_without_journal_bytes() {
         .to_string_lossy()
         .into_owned();
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-cu1-image".into(),
         request_digest: "create-cu1-image-digest".into(),
         request_json: r#"{"session":"cu1-image"}"#.into(),
         session_id: session_id.clone(),
         cwd,
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

@@ -490,6 +490,9 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
         &mut model,
         LiveReply::Listed {
             sessions: vec![SessionSummary {
+                owner_agent_id: None,
+                launch_origin: None,
+                latest_context_footprint: None,
                 session_id: sid(),
                 head_seq: 0,
                 worker_generation: 7,

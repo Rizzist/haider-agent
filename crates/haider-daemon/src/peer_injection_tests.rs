@@ -11,12 +11,14 @@ use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};
 
 fn create_command(session: &SessionId) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: format!("create-{session}"),
         request_digest: format!("create-digest-{session}"),
         request_json: "{}".into(),
         session_id: session.clone(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 1_024,
         max_tokens_source: None,

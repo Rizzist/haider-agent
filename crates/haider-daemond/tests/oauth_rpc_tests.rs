@@ -1087,6 +1087,25 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
     let server = FakeServer::start().await;
     let vault = Arc::new(BlockingRotationVault::new());
+    // The injected OAuth registration supplies transport, not a configured
+    // provider. Seed its synthetic adapter before exercising shutdown; OAuth
+    // adapters without a listing API retain configured, unverified models.
+    std::fs::create_dir_all(&config.store_dir).expect("provider fixture directory");
+    std::fs::write(
+        config.store_dir.join("providers.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "providers": [{
+                "provider_id": "fake-oauth", "display_name": "Fake OAuth",
+                "api_family": "anthropic_messages",
+                "base_url": format!("http://{}", server.address),
+                "enabled": true, "auth_requirement": "oauth",
+                "configured_models": ["fake-model"], "default_model": "fake-model",
+                "provenance": "custom"
+            }]
+        }))
+        .expect("encode synthetic provider"),
+    )
+    .expect("seed synthetic provider");
     let builder = Arc::new(OAuthTurnBuilder {
         fake: Arc::new(FakeProvider::new(vec![FakeStep::Finish {
             reason: haider_protocol::provider::FinishReason::EndTurn,
@@ -1360,15 +1379,15 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         },
     )
     .await;
-    let (successor_session, successor_generation) = match successor_created {
-        ResponseBody::SessionCreate {
-            session_id,
-            worker_generation,
-            ..
-        } => (session_id, worker_generation),
-        other => panic!("unexpected successor session.create: {other:?}"),
-    };
-    let _ = request(
+    assert!(
+        matches!(successor_created, ResponseBody::Error { ref code, retryable: false, .. }
+            if code == haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE),
+        "the tombstoned credential cannot admit a new session: {successor_created:?}"
+    );
+    // A persisted session must still fail its next physical turn without
+    // reviving the predecessor's credential. Exercise that boundary too.
+    let successor_session = session_id;
+    let attached = request(
         &mut after_restart,
         "barrier-successor-attach",
         RequestBody::SessionAttach {
@@ -1379,6 +1398,10 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         },
     )
     .await;
+    let successor_generation = match attached {
+        ResponseBody::SessionAttach { attach_state, .. } => attach_state.worker_generation,
+        other => panic!("successor persisted session attach: {other:?}"),
+    };
     after_restart
         .send(
             &WireFrame::Request {
@@ -1396,18 +1419,37 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         )
         .await;
     tokio::time::timeout(DEADLINE, async {
+        let mut successor_run = None;
+        let mut terminal_runs = Vec::new();
         loop {
-            if let WireFrame::Event { envelope, .. } = after_restart.receive().await
-                && let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.into())
-                && state.is_terminal()
+            match after_restart.receive().await {
+                WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::TurnSubmit { run_id, .. },
+                } if request_id.as_str() == "barrier-successor-submit" => {
+                    successor_run = Some(run_id);
+                }
+                WireFrame::Event { envelope, .. } => {
+                    if let Ok(EventPayload::RunState(state)) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.into())
+                        && state.is_terminal()
+                        && let Some(run_id) = envelope.run_id
+                    {
+                        terminal_runs.push(run_id);
+                    }
+                }
+                _ => {}
+            }
+            if successor_run
+                .as_ref()
+                .is_some_and(|run| terminal_runs.contains(run))
             {
                 break;
             }
         }
     })
     .await
-    .expect("successor turn terminal");
+    .expect("the newly submitted successor turn, not replayed history, becomes terminal");
     assert_eq!(
         server.refresh_calls.load(Ordering::SeqCst),
         1,

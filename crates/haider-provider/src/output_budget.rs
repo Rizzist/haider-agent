@@ -31,34 +31,63 @@ pub fn model_output_limit(
     below_context_window(max_output_tokens, context_window)
 }
 
-/// The largest EXPLICIT per-response budget admitted for one row whose
-/// projected maximum is `projected_max` (from [`model_output_limit`]).
-///
-/// A catalog declaration or a sourced table row is exact, so it is also the
-/// explicit ceiling. When the projection is only the unverified
-/// [`crate::UNKNOWN_OUTPUT_LIMIT`] guess (custom endpoints, older Claude,
-/// unlisted Gemini, unknown IDs), that guess must not forbid a larger request
-/// the provider may well accept: an explicit budget may go up to
-/// [`MAX_OUTPUT_LIMIT`], still strictly below a known context window. The
-/// provider-stated one-shot retry ([`provider_stated_output_limit`]) is the
-/// backstop when the provider's real maximum is lower.
-///
-/// Daemon projections carry the projected value, not the raw declaration, so a
-/// catalog that declares exactly the fallback value for an unsourced row is
-/// treated as the guess; the retry covers that case too.
+/// Where one row's projected output maximum came from. Tracked separately
+/// from the value (numeric equality is not provenance) and from the context
+/// window's origin (a published window does not publish an output limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputLimitProvenance {
+    /// The provider's own model catalog declared this maximum.
+    Declared,
+    /// The pinned table's value, which the provider publishes.
+    Static,
+    /// A local value the provider does not publish: the unverified
+    /// [`crate::UNKNOWN_OUTPUT_LIMIT`] guess, or the conservative shared
+    /// default used for rows with a published window but no published output
+    /// maximum.
+    Fallback,
+}
+
+/// The provenance of [`model_output_limit`]'s value for the same inputs: a
+/// catalog declaration wins, otherwise the pinned row says whether its output
+/// maximum is published.
 #[must_use]
-pub fn explicit_output_ceiling(
+pub fn output_limit_provenance(
     provider: &str,
     model: &str,
+    declared: Option<u64>,
+) -> OutputLimitProvenance {
+    if declared.is_some() {
+        OutputLimitProvenance::Declared
+    } else if static_model_limits(provider, model).output_limit_sourced {
+        OutputLimitProvenance::Static
+    } else {
+        OutputLimitProvenance::Fallback
+    }
+}
+
+/// The largest EXPLICIT per-response budget admitted for one row whose
+/// projected maximum is `projected_max` (from [`model_output_limit`]) with
+/// the given `provenance`.
+///
+/// A catalog declaration or a published table row is exact, so it is also the
+/// explicit ceiling — whatever its value, including one equal to the local
+/// fallback. When the maximum is unpublished ([`OutputLimitProvenance::Fallback`]),
+/// that local value must not forbid a larger request the provider may well
+/// accept: an explicit budget may go up to [`MAX_OUTPUT_LIMIT`], still
+/// strictly below a known context window. The provider-stated one-shot retry
+/// ([`provider_stated_output_limit`]) is the backstop when the provider's real
+/// maximum is lower.
+#[must_use]
+pub fn explicit_output_ceiling(
+    provenance: OutputLimitProvenance,
     projected_max: u64,
     context_window: Option<u64>,
 ) -> u64 {
-    let unsourced_guess = !static_model_limits(provider, model).output_limit_sourced
-        && projected_max == model_output_limit(provider, model, None, context_window);
-    if unsourced_guess {
-        below_context_window(MAX_OUTPUT_LIMIT, context_window).max(projected_max)
-    } else {
-        projected_max
+    match provenance {
+        OutputLimitProvenance::Declared | OutputLimitProvenance::Static => projected_max,
+        OutputLimitProvenance::Fallback => {
+            below_context_window(MAX_OUTPUT_LIMIT, context_window).max(projected_max)
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 
 use crate::catalog::{
     CatalogError, CatalogSource, apply_catalog_credential, discover_models,
-    discover_models_with_resolver,
+    discover_models_with_resolver, read_catalog_response,
 };
 
 struct OneAddressResolver(SocketAddr);
@@ -212,7 +212,7 @@ async fn unpinned_compatible_catalog_still_discovers() {
         socket.write_all(body).await.expect("write catalog body");
     });
 
-    let deadline = std::time::Duration::from_secs(2);
+    let deadline = haider_platform::TEST_WAIT_TIMEOUT;
     let catalog = tokio::time::timeout(
         deadline,
         discover_models(CatalogSource::OpenAiCompatible { origin }, None, None),
@@ -309,11 +309,11 @@ async fn recording_models_server_returns_403_for_the_models_get() {
     assert!(matches!(result, Err(CatalogError::Unavailable { reason }) if reason.contains("403")));
 }
 
-/// The daemon maps these three discovery errors to the public Q probe
+/// The daemon maps discovery errors to the public Q probe
 /// taxonomy; pin the transport/parser source classifications at the mocked
 /// `/v1/models` boundary.
 #[tokio::test]
-async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
+async fn custom_catalog_distinguishes_errors_from_successful_empty_lists() {
     for (status, body, expected) in [
         (
             "401 Unauthorized",
@@ -323,7 +323,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
         (
             "404 Not Found",
             br#"{"error":"no models endpoint"}"#.as_slice(),
-            "unavailable",
+            "unsupported",
         ),
         ("200 OK", b"not-json".as_slice(), "invalid_body"),
         (
@@ -331,7 +331,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
             br#"{"models":[{"id":"wrong-shape"}]}"#.as_slice(),
             "invalid_body",
         ),
-        ("200 OK", br#"{"data":[]}"#.as_slice(), "empty"),
+        ("200 OK", br#"{"data":[]}"#.as_slice(), "empty_success"),
         (
             "200 OK",
             br#"{"data":[{"id":""},{"id":"  "},{"name":"missing-id"}]}"#.as_slice(),
@@ -339,16 +339,24 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
         ),
     ] {
         let (origin, fixture) = one_shot_catalog(status, body).await;
-        let error = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None)
-            .await
-            .expect_err("scripted catalog failure");
+        let result = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None).await;
         fixture.await.expect("catalog fixture");
+        if expected == "empty_success" {
+            assert!(
+                result
+                    .expect("empty list is successful fetch evidence")
+                    .models
+                    .is_empty()
+            );
+            continue;
+        }
+        let error = result.expect_err("scripted catalog failure");
         assert!(matches!(
             (expected, error),
             ("unauthorized", CatalogError::Unauthorized)
                 | ("invalid_body", CatalogError::InvalidBody { .. })
                 | ("empty", CatalogError::Empty)
-                | ("unavailable", CatalogError::Unavailable { .. })
+                | ("unsupported", CatalogError::Unsupported { .. })
         ));
     }
 }
@@ -514,5 +522,205 @@ async fn customprov_catalog_rejects_control_obfuscated_key_ids() {
             error.to_string(),
             "model catalog id contains characters that cannot be displayed safely"
         );
+    }
+}
+
+#[tokio::test]
+async fn listing_unsupported_is_distinct_from_retryable_server_failure() {
+    for (status, unsupported) in [
+        ("404 Not Found", true),
+        ("405 Method Not Allowed", true),
+        ("503 Service Unavailable", false),
+        ("500 Internal Server Error", false),
+    ] {
+        for anthropic in [false, true] {
+            let (origin, fixture) = one_shot_catalog(status, b"synthetic-error").await;
+            let source = if anthropic {
+                CatalogSource::AnthropicCompatible { origin }
+            } else {
+                CatalogSource::OpenAiCompatible { origin }
+            };
+            let error = discover_models(source, Some("synthetic-key"), None)
+                .await
+                .expect_err("listing failure");
+            fixture.await.expect("loopback fixture");
+            assert_eq!(
+                matches!(error, CatalogError::Unsupported { .. }),
+                unsupported
+            );
+            assert_eq!(
+                matches!(error, CatalogError::Transport { .. }),
+                !unsupported
+            );
+            assert!(error.to_string().contains(&status[..3]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_listing_not_supported_is_selectable_but_transient_and_other_errors_are_not() {
+    for (status, body, unsupported, transient) in [
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "200 OK",
+            br#"{"error":{"type":"not_supported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "503 Service Unavailable",
+            br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+            false,
+            true,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"UnsupportedModel"}}"#.as_slice(),
+            false,
+            false,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"code":"invalid_request_error","type":"not_supported"}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "200 OK",
+            br#"{"error":{"code":"  operationnotsupported  "}}"#.as_slice(),
+            true,
+            false,
+        ),
+        (
+            "400 Bad Request",
+            br#"{"error":{"message":"listing not supported","code":"UnsupportedModel"}}"#
+                .as_slice(),
+            false,
+            false,
+        ),
+    ] {
+        let (origin, fixture) = one_shot_catalog(status, body).await;
+        let error = discover_models(
+            CatalogSource::OpenAiCompatible { origin },
+            Some("synthetic-key"),
+            None,
+        )
+        .await
+        .expect_err("listing error");
+        fixture.await.expect("fixture");
+        assert_eq!(
+            matches!(error, CatalogError::Unsupported { .. }),
+            unsupported
+        );
+        assert_eq!(matches!(error, CatalogError::Transport { .. }), transient);
+        assert!(error.to_string().contains(&status[..3]));
+        if unsupported {
+            assert!(error.to_string().to_ascii_lowercase().contains("supported"));
+        }
+    }
+}
+
+/// The actual bounded HTTP response reader must preserve the same evidence
+/// for public, authenticated and compatible listing transports. Request
+/// origin/auth fencing remains covered independently by the source tests.
+#[tokio::test]
+async fn listing_evidence_is_shared_across_all_discovery_transports() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("loopback catalog client");
+    for source in [
+        CatalogSource::HaiderCodeApi,
+        CatalogSource::DeepSeekApi,
+        CatalogSource::XaiApi,
+        CatalogSource::GeminiApiKey,
+        CatalogSource::OpenAiSubscription,
+        CatalogSource::AnthropicSubscription,
+        CatalogSource::KimiOAuth,
+        CatalogSource::GrokOAuth,
+        CatalogSource::OpenAiCompatible {
+            origin: "http://127.0.0.1/v1".into(),
+        },
+        CatalogSource::AnthropicCompatible {
+            origin: "http://127.0.0.1/v1".into(),
+        },
+    ] {
+        for (status, body, expected) in [
+            ("404 Not Found", b"no endpoint".as_slice(), "unsupported"),
+            (
+                "405 Method Not Allowed",
+                b"no method".as_slice(),
+                "unsupported",
+            ),
+            (
+                "400 Bad Request",
+                br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+                "unsupported",
+            ),
+            (
+                "200 OK",
+                br#"{"error":{"type":"not_supported"}}"#.as_slice(),
+                "unsupported",
+            ),
+            (
+                "503 Service Unavailable",
+                br#"{"error":{"code":"OperationNotSupported"}}"#.as_slice(),
+                "transport",
+            ),
+            (
+                "401 Unauthorized",
+                b"invalid credential".as_slice(),
+                "unauthorized",
+            ),
+            (
+                "400 Bad Request",
+                br#"{"error":{"code":"UnsupportedModel"}}"#.as_slice(),
+                "unavailable",
+            ),
+        ] {
+            let (origin, fixture) = one_shot_catalog(status, body).await;
+            let response = client.get(origin).send().await.expect("loopback response");
+            let error = read_catalog_response(source.clone(), response, None)
+                .await
+                .expect_err("scripted model-list failure");
+            fixture.await.expect("model-list fixture");
+            assert!(
+                matches!(
+                    (expected, &error),
+                    ("unsupported", CatalogError::Unsupported { .. })
+                        | ("transport", CatalogError::Transport { .. })
+                        | ("unauthorized", CatalogError::Unauthorized)
+                        | ("unavailable", CatalogError::Unavailable { .. })
+                ),
+                "{source:?} {status}: {error:?}"
+            );
+        }
+    }
+
+    // The subscription 403 remains informational; unsupported discovery
+    // does not turn a client-version rejection into a selectable catalog.
+    for (source, status) in [
+        (CatalogSource::OpenAiSubscription, "403 Forbidden"),
+        (CatalogSource::GrokOAuth, "402 Payment Required"),
+        (CatalogSource::GrokOAuth, "426 Upgrade Required"),
+    ] {
+        let (origin, fixture) = one_shot_catalog(status, b"refused").await;
+        let response = client.get(origin).send().await.expect("control response");
+        let error = read_catalog_response(source, response, None)
+            .await
+            .expect_err("negative control");
+        fixture.await.expect("control fixture");
+        assert!(matches!(error, CatalogError::Unavailable { .. }));
+        if status.starts_with("403") {
+            assert!(crate::model_list_forbidden(&error.to_string()));
+        } else {
+            assert!(error.to_string().contains("update the harness"));
+        }
     }
 }

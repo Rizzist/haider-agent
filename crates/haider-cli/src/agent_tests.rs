@@ -1,4 +1,81 @@
+#![allow(clippy::expect_used)]
+
 use super::*;
+#[test]
+fn helper_stop_remedy_respects_parsed_cancel_mode() {
+    for target in [vec!["parent", "child"], vec!["parent", "--all"]] {
+        for no_spawn in [false, true] {
+            for json in [false, true] {
+                for flags_first in [false, true] {
+                    let flags: Vec<_> =
+                        [no_spawn.then_some("--no-spawn"), json.then_some("--json")]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                    let args: Vec<_> = if flags_first {
+                        flags.iter().chain(&target)
+                    } else {
+                        target.iter().chain(&flags)
+                    }
+                    .map(|arg| (*arg).to_owned())
+                    .collect();
+                    let mut argv = vec!["cancel".to_owned()];
+                    argv.extend(args);
+                    let options = Options::parse("agent", &argv)
+                        .unwrap_or_else(|_| panic!("cancel argv: {argv:?}"));
+                    assert_eq!(options.no_spawn, no_spawn);
+                    let message = helper_stop_remedy(options.no_spawn);
+                    assert!(message.contains("`haider daemon stop`"));
+                    if no_spawn {
+                        assert!(
+                            message
+                                .ends_with("without --no-spawn so the current daemon can start.")
+                        );
+                    } else {
+                        assert!(message.ends_with("the current daemon starts automatically."));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn blocking_wait_requires_parent_report_even_after_child_terminal() {
+    let agent = AgentId::new("agent-race");
+    let terminal = RunState::Errored;
+    // Inject the journal ordering: the child is terminal, but the parent
+    // has not committed ChildResult yet. No clock or process race needed.
+    assert!(select_wait_report(&agent, Some(&terminal), "", None, true, false).is_none());
+    let durable = ChildReport {
+        agent: agent.clone(),
+        summary: "failed".into(),
+        verified: ReportVerification::Red,
+        workspace_revision: None,
+    };
+    assert_eq!(
+        select_wait_report(
+            &agent,
+            Some(&terminal),
+            "",
+            Some(&(durable.clone(), 17)),
+            true,
+            false
+        ),
+        Some((durable, Some(17)))
+    );
+}
+
+#[test]
+fn journal_wait_marks_failed_and_cancelled_children_red() {
+    let agent = AgentId::new("agent-journal");
+    for state in [RunState::Errored, RunState::Cancelled] {
+        let (report, seq) = select_wait_report(&agent, Some(&state), "failed", None, true, true)
+            .expect("background journal report");
+        assert_eq!(report.verified, ReportVerification::Red);
+        assert_eq!(seq, None);
+    }
+}
 
 #[test]
 fn agent_spawn_derives_output_budget_for_a_small_limit_model() {
@@ -14,6 +91,7 @@ fn agent_spawn_derives_output_budget_for_a_small_limit_model() {
     let request = agent_session_create_request("agent-test", "/tmp".into(), &spec);
     assert!(
         matches!(request, RequestBody::SessionCreateWithPermissionOverrides {
+        expected_catalog_key: None,
         max_tokens: 0, provider, model, ..
     } if provider == "openai" && model == "gpt-4o")
     );
@@ -34,4 +112,47 @@ fn workflow_run_uses_the_same_derived_budget() {
         agent_session_create_request("workflow-test", "/tmp".into(), &spec),
         RequestBody::SessionCreateWithPermissionOverrides { max_tokens: 0, .. }
     ));
+}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn agent_list_human_output_is_the_fleet_tree_with_activity() {
+    let snapshot = serde_json::json!({
+        "session_id": "parent",
+        "generated_at_ms": 10,
+        "node_limit": 512,
+        "depth_limit": 32,
+        "roots": [{
+            "agent_id": "agent-a",
+            "session_id": "child-a",
+            "callsign": "Amina",
+            "task": "patch the parser",
+            "depth": 1,
+            "parent_session_id": "parent",
+            "state": "live",
+            "activity": "edit",
+            "activities": ["edit", "read"]
+        }],
+        "rollup": {
+            "node_count": 1,
+            "states": {"queued": 0, "live": 1, "waiting": 0, "done": 0, "failed": 0, "cancelled": 0},
+            "max_depth": 1,
+            "metrics": {"elapsed_ms": 0, "tool_attempts": 0},
+            "metrics_complete": false,
+            "complete": true
+        },
+        "truncated": false
+    });
+    let document = serde_json::json!({"schema": "haider.agent.list.v1", "ok": true, "result": snapshot, "error": null});
+    let text = agent_list_human_text("agent", "list", &document).expect("human fleet text");
+    assert!(text.starts_with("fleet of 1"), "{text}");
+    assert!(text.contains("Amina — patch the parser"), "{text}");
+    assert!(
+        text.contains("\u{270F}\u{FE0F} Amina") || text.contains("[edit] Amina"),
+        "{text}"
+    );
+    // Other verbs, errors and undecodable results keep the JSON fallback.
+    assert!(agent_list_human_text("agent", "wait", &document).is_none());
+    let failed = serde_json::json!({"ok": false, "result": null, "error": {"code": "x"}});
+    assert!(agent_list_human_text("agent", "list", &failed).is_none());
 }

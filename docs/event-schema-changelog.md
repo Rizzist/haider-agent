@@ -21,6 +21,243 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.973 — subagent handles and stop semantics
+
+Owner decision 2026-09-25 (973-LANES.md, "subagent stop semantics"). All
+changes are additive; `schema_version` remains 1.
+
+- `spawn_subagent` gains optional `background` (return a durable handle at
+  once; the immediate result preview carries `status: "child_spawned"`, the
+  ids and `collect`/`list`/`cancel`/`cancel_all` CLI commands) and `wait_ms`
+  (bounds only the parent's observation, at most 86 400 000; never the child's
+  life). Both are omitted from recorded arguments when absent.
+- `tool_result.result.child_observation` is optional metadata with kind
+  `child_still_running` (fields `agent`, `parent_session_id`, `child_session_id`,
+  `child_run_id`, `progress`, `latest_progress_at_ms`, `wait_limit_ms`,
+  `collect`), returned when a `wait_ms` observation ends before the child; the
+  child keeps running and is collected with `haider agent wait`. It is outside
+  the strict legacy `data` enum so old readers retain the result preview and
+  history. Current readers also accept the earlier lane's `data` encoding;
+  existing `data` variants such as `tools_discovered` keep their wire shape.
+- Monitor sources gain `task` (`task_id`) and `agent` (`agent_id`), and
+  monitor events gain `task`/`agent` (`payload`, a completion digest), in the
+  tool vocabulary and on the wire (`MonitorSourceWire`,
+  `MonitorEventPayloadWire`; old clients decode them as `unknown`). Durable
+  Task/Agent registrations and pending reports with unsupported source/payload
+  variants use an old-readable `monitor_removed` fence (`reason: "removed"`)
+  with the complete replacement event in additive `monitor_v2` metadata in the
+  same envelope. Current readers restore that event; old readers safely omit
+  the unsupported watch and dismiss its obsolete completion actions, including
+  prior pending/coalesced revisions.
+- Stopping the main thread stops ONLY the main thread (TUI Esc,
+  `turn.cancel`, `haider run --stop-main`). Its subagents keep running; a
+  foreground subagent the stopped turn was waiting on continues in the
+  background. New extension item kinds on the parent session:
+  - `subagents_still_running_v1` — journalled by such a stop when subagents
+    live on: `parent_session_id`, `stopped_run_id`, `still_running` (live
+    subagents in the tree), bounded `agents` (`agent`, `task`,
+    `result_pending`) and `agents_truncated`; rendered to the next prompt as a
+    bounded user note.
+  - `detached_child_result_v1` — the detached waited-on child's result when it
+    finishes: `agent`, `task`, `stopped_run_id`, `state`
+    (`done`/`errored`/`cancelled`), `verified`, bounded `summary`,
+    `summary_truncated`. It is accompanied by the ordinary `agent_report`,
+    `agent_chip_state` and `child_result` item. It is steered into an active
+    parent run when one exists (the extension then has prompt=omit); otherwise
+    it is a prompt-visible note. Delivery never starts provider work. Optional
+    `reason` (`observation_ended`) marks a result delivered because a
+    `wait_ms` observation ended before the child; it is omitted for the
+    default `main_stopped`.
+  - `detached_delivery_v1` — the durable delivery obligation, one fact per
+    owed child and never truncated (`agent`, `phase` `owed`/`settled`,
+    optional `reason`); `render.ui` false, prompt=omit. A main-only stop
+    journals `owed` for every foreground child whose result the parent has
+    not recorded (whatever the child's state), as does an ended `wait_ms`
+    observation; startup recovery re-arms every `owed` child without a later
+    `detached_child_result_v1` or `settled` fact. `subagents_still_running_v1`
+    is a display list only.
+- RPC: `headless.run.stop` gains optional request `scope`
+  (`all` default and omitted, `main`, `subagents`); the response gains
+  optional `scope` (echo of a non-default scope) and `subagents`
+  (`cancelled_runs`, `sessions`, `monitors_removed`, `still_running`).
+  `haider run --stop` = `all`: the run plus every subagent in its tree,
+  however deep, found by session so children started in later child runs
+  (messaged `run-child-message-*` or monitor-woken) are included; their
+  monitors are removed. `--stop-main` = `main`; `--stop-subagents` =
+  `subagents`. An older daemon ignores `scope` (historical behaviour).
+- RPC: new method `agent.cancel_all` (`command_id`, `session_id`,
+  `worker_generation`) → `{session_id, stopped}`; `haider agent cancel
+  <session> --all`. It stops every subagent in the session's tree and removes
+  their monitors; the session's own runs are untouched. It is receipt-backed
+  (method `agent.cancel_all`): a committed command replays its response, a
+  stale `worker_generation` or a command id reused with other semantics is
+  refused before any monitor removal or cancel. `agent.cancel` likewise
+  validates generation and command identity before any side effect.
+- While a stop is in progress, monitor registration from the stopped
+  subagent's runs is refused (tool result status `subagent_stopping`) and its
+  monitor wakes are dismissed; a final monitor drain runs after the cancelled
+  runs settle.
+  Tool registrations retain their original task in additive
+  `monitor_owner_run_id` fact metadata. Older readers ignore this field.
+  Stops recover older tool registrations through their
+  deterministic tool-call identity, including helpers discovered during
+  settlement and expired sources with pending reports. Updates retain the
+  original ownership; independent client and later-task watches remain
+  separate. This changes no journal tag or schema version.
+- `agent.cancel` now stops only the named subagent (its original run, any
+  later live run, and its own monitors). Its children keep running; this
+  replaces the former recursive descendant sweep.
+- Welcome feature `run_stop_scope_v1` advertises scoped stops and
+  `agent.cancel_all`. Stops converge to terminal (never-launched children are
+  finalized as cancelled) and the `subagents` summary counts confirmed
+  cancellations; an auto-spawned daemon's idle linger is extended while any
+  run or owed delivery is live.
+
+### v0.0.973 — autonomy limits become explicit opt-ins
+
+Owner rule (2026-09-23): no DEFAULT cap stops productive automated work;
+limits exist only as explicit opt-ins, alongside cancellation and real
+no-progress detection. This part adds or removes no field or kind;
+`schema_version` remains 1.
+
+- `tool_script` `limits` (`OrchestrationLimitsV1`): `child_attempts`,
+  `script_wall_ms`, `child_wall_ms` and `no_progress_ms` are absent by default
+  (previously 64 / 120 000 / 30 000 / 30 000) and omitted from admitted
+  records when absent. Explicit values keep their meaning and have no ceiling
+  beyond "positive" (previously 256 / 300 000 / 120 000 / 60 000).
+  `no_progress_ms` now stops a child only when the window passes without the
+  session journal advancing (output, child updates, results); it is no longer
+  folded into the child wall. An ask's `wait_ms` bounds only the permission
+  answer window, not the permitted child's execution. New terminal
+  `reason_code` value `child_no_progress` (status `timed_out`). Activation
+  evidence records `deadline_ms`/`script_deadline_ms` =
+  18446744073709551615 (`u64::MAX`) when no explicit wall applies.
+- Graph templates: built-in and compiled Loom node `max_attempts` default to
+  4294967295 (`u32::MAX`, effectively unbounded; previously 8, Loom 4/3) and
+  validators accept any positive explicit value (previously at most 8). The
+  global 24-conditional-hop runtime bound is removed; only a pinned template's
+  explicit per-node `max_attempts` yields `rounds_exhausted`. The
+  repeated-red-fingerprint `no_progress` block is unchanged. Workflow
+  activation ASTs default `max_back_edge_activations` to 4294967295 and accept
+  any positive explicit value (previously at most 24). Legacy pinned values
+  (for example `max_attempts: 8`) are honoured as explicit bounds.
+- `GraphBrief` prompt text and CLI/TUI graph views print `attempt N` without
+  the former fixed `/8` denominator.
+- Subagent depth is unbounded by default. The `recursion_depth_limit` tool
+  rejection appears only when the operator sets `HAIDER_SUBAGENT_MAX_DEPTH`
+  to a positive integer; its `limit` field reports that configured value.
+### v0.0.973 — durable run output pair
+
+Additive, UI-hidden and prompt-omitted extension `run_output_pair_pinned_v1` records
+`provider`, `model`, `max_tokens` and `source` once per run. Headless admission
+pins its spec; native worker pickup pins the selection under the selection
+fence. The equally hidden `run_worker_pickup_v1` marks pickup before provider resolution, so a
+rebind during startup can see the active run. Rebind, recovery and delegated
+children reduce the pin together with later pair-switch and rebind facts.
+The optional `route_snapshot` field retains the complete boundary: rebind id,
+endpoint, account selector, resolved alias/seen state, selection epoch and reset
+epoch. A present snapshot with null selectors records an unselected route;
+a missing snapshot requires historical reconstruction. `provider_route` remains
+the explicit-rebind compatibility projection. These contain no credentials.
+The hidden, prompt-omitted `run_output_route_snapshot_v1` records owned route
+observations even without a rebind id; `run_output_route_resolved_v1` retains
+the older explicit-rebind shape. These update only the run's route. They never
+borrow later session selectors or epochs. Legacy history that cannot prove the
+boundary fails with `StoreCorrupt` and `run-route-history-unavailable` rather
+than borrowing the current session. Later turns resolve their own selections.
+These remain existing Extension items with additive JSON fields, decodable
+by the schema-33 wave base.
+
+### v0.0.973 — subagent activity on fleet nodes
+
+`FleetNodeWire` (`session.fleet`, `haider agent list --json`) gains two
+additive, absence-preserving fields: `activity` (one of `computer`, `mobile`,
+`web`, `remote`, `edit`, `run`, `read`, `orchestrate`) — what the child is
+DOING at `generated_at_ms`, distinct from its `state` — and `activities`, every
+activity used so far in priority order. Both are derived by
+`haider_protocol::activity::ActivityTracker` from typed journal facts only
+(`ToolCall.activity`, `FileChange`, `ChildSpawn`,
+`RunState`), never from free text. Priority (highest first) is the order
+above. Timing: an open call is active until it completes; a finished call
+stays hot for 8 s (hot kinds compete on priority); a quiet agent then shows
+its most recent activity until 60 s of quiet, then none; a node with live
+children is orchestrating; terminal nodes carry no current activity. The
+enum is `#[serde(other)]`-tolerant (`unknown`). Completed `ToolCall` items
+gain an optional `activity` discriminator; old journals without it do not
+infer activity from the display name. An ACP agent's typed `ToolKind` maps
+read/search to read, edit/delete/move to edit, execute to run, fetch to web,
+and think/switch_mode/other to none. Anthropic web_search/web_fetch and the
+hard-coded OpenAI/Gemini web_search carry web; unknown provider names and
+orphan results carry none. Local calls use only a daemon-registered route.
+Effectless registered `web_search`, `session_transcript`, `list_models`
+and `peer_list` also put typed `activity_kind` and `activity_call_id`
+metadata on their existing `running_tool` state event. This opens a live
+icon at the accepted dispatch boundary; only successful completion enters
+history. Legacy peers receive the original state event without those keys.
+Provider admission recovery uses `provider_transport`, which never counts as
+agent activity. This is an additive event shape change, and a
+peer that did not negotiate `session_activity_v1` receives the exact
+pre-activity payload on fleet, metrics and Event frames. Clients render emoji (`🖥️ 📱 🌐 🔌 ✏️ ⚙️ 🔍 🧭`, VS16 where
+the base defaults to text presentation, two columns each) or the text
+fallbacks `[screen] [phone] [web] [remote] [edit] [run] [read] [orch]`;
+`HAIDER_ACTIVITY_ICONS=emoji|text|off`, the TUI `/icons` setting, `NO_COLOR`
+and limited `TERM` values select the form. `AgentMetricsSnapshot` (session
+summaries, observe digests and fleet node metrics) gains an additive
+`activity` object — the time-independent tracker state (`open`, `touched`,
+`latest`, `terminal`) clients evaluate on their own clock; it is likewise
+withheld from peers without `session_activity_v1`. Only work that
+really ran counts: live activity opens on a `Dispatched` effect (by its
+typed `EffectClass`) or an accepted typed effectless route and closes at
+its outcome/settlement; a completed `ToolCall`
+counts only with status `completed` and a typed activity. A tool name the model merely
+requested (unadvertised, ungranted, malformed or refused) sets no icon and
+adds no history. The computer-use overlay names an acting subagent
+(`🖥️ <callsign> is using your screen`), re-labels when a different actor
+takes over a shown surface (relabels debounce for 150 ms to coalesce rapid
+alternation), and follows the daemon's `HAIDER_ACTIVITY_ICONS`
+then `NO_COLOR` (it is a shared daemon surface, so a single TUI's `/icons`
+choice does not apply to it).
+
+**Effect-class downgrade policy:** operator undo, redo and rollback retain
+`CheckpointRestore` provenance in memory; provider recovery retains
+`ProviderTransport` provenance. New journal writes use only released 0.0.972
+class values: `fs_write` plus additive `effect_origin: "checkpoint_restore"`,
+or `network { host: "provider-request" }` plus
+`effect_origin: "provider_transport"`. The released intent structs ignore
+unknown fields. The previous wave-base daemon at the same database schema
+version can start, list and operate on the profile without an unknown-enum
+startup error. It treats restores as ordinary file effects and provider
+recovery as historical transport bookkeeping. Its typed
+projections may omit the additive origin; raw journal records retain it.
+On re-upgrade the current reader prefers the typed additive origin, validates
+its carrier, and restores the distinct mutation admission, graph provenance
+and activity semantics. Ordinary file/network effects have no origin field
+and keep their exact historical shape; names and summaries never supply
+origin. Unknown future origin values retain the released carrier's meaning;
+they never gain restore or transport authority through aliases or text.
+Known origins with mismatched carriers are rejected. Current readers also
+accept direct class values written by earlier
+lane candidates, but normalize all new writes to the released carriers.
+Those unreleased experimental records remain immutable: a profile already
+containing direct new enum values still needs the current daemon. This fix
+protects journals upgraded to the new writer from strict effect-enum
+decoding failures; it does not make pre-fix experimental profiles
+downgrade-safe by rewriting history. Database schema downgrade policy is
+separate: released 0.0.972 uses schema 31 and refuses a newer schema 33
+profile. The real downgrade probes use the schema-33 wave base; compatible
+effect records do not bypass the released daemon's schema-version check.
+Peers without `session_activity_v1` receive the historical intent with the
+origin removed. The frozen enum and complete old-intent decoder tests pin
+both compatible writes and strict rejection of direct new enum values;
+real wave-base daemon probes cover startup, operations and re-upgrade.
+
+**Release note (CLI behaviour change):** `haider agent list` without
+`--json` now prints a human fleet tree (state glyph, activity glyph, name,
+task, metrics) instead of pretty-printed JSON. Scripts must use `--json`,
+whose document is the standard `{schema, ok, result, error}` envelope — the
+fleet is at `.result.roots` (previously the bare default output exposed
+`.roots`).
+
 ### v0.0.973 — provider-request budgets become opt-in
 
 Omitting `RunBudgetV1.request_budget` or a delegated child's request policy now
@@ -305,6 +542,11 @@ version from journal replay; an already admitted request retains its captured
 adapter. Legacy metadata omits the additive `provider_base_url` and
 `provider_rebind_id` fields. Raw readers preserve this additive kind without
 changing schema version 1.
+The optional `output_budget` describes the queued next-turn pair after a
+rebind. When a run is active, optional `active_output_budget` records its run
+ID, model, resolved budget source and any clamp against the destination
+provider. The same active record appears in the rebind receipt and RPC
+response. Older readers ignore it; older records decode with the field absent.
 
 ### v0.0.970 — recoverable invalid tool calls
 
@@ -753,12 +995,73 @@ forward-compatibility behavior.
   `previous_resets`; unavailable meters add optional `retry_at_ms`. Provider
   reset history and exact device-journal observations have explicit source
   labels. Missing fields remain absent.
-- New effect class `usage_reset_apply` and menu kind `deferred_approval` park a
+- Internal effect class `usage_reset_apply` and menu kind `deferred_approval` park a
   finite-resource action without changing the run to a blocked state. The
   menu answer remains the human authorization fact; terminal provider status
   rides the existing `item:extension` carrier as
   `usage_reset_apply_result_v1`.
+- New reset intents write the released `credential_access` class plus additive
+  `effect_origin: usage_reset_apply`. Deferred menus write the released `choice`
+  kind plus additive `deferred_approval` coordinates in the kind object. Current
+  readers restore the dedicated types; same-schema older recovery readers can
+  decode both carriers. Earlier native reset/menu records remain readable by
+  current readers. Ordinary effects and menus retain their existing encoding.
+- Direct tool inventory effects and remembered-grant class objects use the
+  same released-class mapping with additive origin metadata, so older strict
+  inventory readers can decode them while current readers retain typed classes.
 - Additive feature `usage_reset_apply_v1` gates RPC `usage.reset_apply`.
   Initial RPC and agent-tool results are typed `approval_pending` receipts.
-  `schema_version` remains 1; unknown menu/effect values retain existing
-  tolerance rules.
+  `schema_version` remains 1.
+
+### v0.0.973 — client-requested session activity
+
+`session_activity_v1` is an explicit client opt-in. New clients add the optional
+`Hello.features_requested` string list; released daemons ignore that unknown
+field and complete the existing handshake. A new daemon grants the token in
+`Welcome.features` only when it was requested and the Welcome fits the peer's
+receive ceiling. It withholds this newest token before the older fallback
+tokens. The token name ties the activity state and effect class to the session
+wire surface; it is separate from `session_fleet_identity_v1`, which predates
+activity.
+
+Peers without fleet identity keep the pre-identity fleet shape. Peers with
+fleet identity but without activity keep model/provider identity, while all
+activity fields in events, history, observation, lists, roster and recursive
+fleet are omitted. The internal `provider_transport` effect is presented as
+the historical `network { host: "provider-request" }` shape to both older peer
+classes. Operator checkpoint undo/redo/rollback journal the historical `fs_write`
+class with additive `effect_origin: "checkpoint_restore"`; the current
+reader restores the typed class, and older peers omit the origin. Neither operator shell `CommandExecution` nor a
+checkpoint restore counts as agent activity. Old user-shell journals are
+excluded by the typed item kind and the typed `user_typed` authorization
+source on their `process_exec` effect. The typed `CommandExecution` admission
+also identifies its operator run, preserving the preceding agent terminal
+state across shell run states and recovery instead of reviving an older icon.
+This uses existing journal provenance and introduces no additional wire field.
+An untyped `running_tool` fact alone cannot revive a terminal activity icon;
+the accepted typed dispatch or activity metadata opens the next agent tool.
+Old checkpoint journals are excluded after
+their typed `checkpoint_recorded` fact identifies the contiguous, same-run
+and same-effect atomic transaction during replay, with or without child-agent
+attribution. This restores the preceding
+activity state without erasing prior or intervening agent work; tool-origin
+checkpoints remain agent edits. Agent-authored typed tool calls and effects
+retain their activity. Overlay relabels retain the first pending timestamp for
+an unchanged actor label, so a steady actor faster than the 150 ms debounce
+still gets named on the next presence tick.
+
+The TUI requires the granted activity token for chip, fleet and history
+badges, including inferred orchestration. Its attached, background and
+parked-branch reducers preserve raw envelope provenance and effectless
+running-tool metadata, so operator run states obey the same rules as the
+daemon. Demo mode continues to use its locally fabricated typed activity.
+
+Catalog provenance at a run boundary: `run_output_pair_pinned_v1` optionally
+records `resolved_model` and `model_catalog_key` alongside the admitted model.
+Recovery keeps these with the run's route and budget, independently of a pending
+next-turn selection. Both fields are additive and omitted when absent; older
+schema-33 readers continue to decode the enclosing extension and session data.
+The automatic selection fact also carries an optional `automatic_output_budget`
+when its target has an effective budget. Run recovery consumes it at the prepared
+switch boundary, before the later Core completion fact, under the same route
+ownership fence. Older readers ignore the additive key.

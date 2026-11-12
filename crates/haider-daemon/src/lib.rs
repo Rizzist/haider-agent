@@ -71,6 +71,8 @@ mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;
+#[cfg(all(test, unix))]
+mod checkpoint_test_support;
 mod completion;
 mod config;
 mod connection;
@@ -117,6 +119,7 @@ mod manual_retry_tests;
 mod mobile_transport;
 mod model_select;
 mod monitor;
+mod monitor_stop_fence;
 mod native_process;
 mod oauth;
 mod orchestration;
@@ -142,6 +145,8 @@ mod subagent_core_tests;
 mod tasks;
 #[cfg(all(test, unix))]
 mod tasks_runtime_tests;
+#[cfg(test)]
+mod test_clock;
 mod turn_recovery;
 mod typed_agent_executor;
 mod typed_agent_installer;

@@ -270,6 +270,7 @@ fn chip_display_states_follow_the_same_law() {
         ChipDisplayState::InputRequired,
         ChipDisplayState::Waiting,
         ChipDisplayState::Done,
+        ChipDisplayState::Cancelled,
         ChipDisplayState::Error,
     ] {
         let expected = match state {
@@ -281,6 +282,7 @@ fn chip_display_states_follow_the_same_law() {
             | ChipDisplayState::InputRequired
             | ChipDisplayState::Waiting
             | ChipDisplayState::Done
+            | ChipDisplayState::Cancelled
             | ChipDisplayState::Error => false,
         };
         assert_eq!(

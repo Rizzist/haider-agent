@@ -16,6 +16,9 @@
 //!   open while the exclusive profile lock is held, fencing actor identities
 //!   across process restarts even when the wall clock repeats.
 
+mod create_receipt_compat;
+mod run_output_history;
+
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
@@ -49,7 +52,7 @@ use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
     ChildTemplatePromoted, ComputerObservationKind, EvidenceAuthority, EvidenceRecorded,
     EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
-    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_CONDITIONAL_HOPS, GRAPH_MAX_TODO_CHILDREN,
+    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
     GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
     GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
     GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
@@ -782,6 +785,8 @@ pub enum GraphSwitchOutcome {
 /// Secret-free, stable coordinates for an atomic `session.create`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCreateCommand {
+    /// Separately admitted coordinate when the public creation spelling differs.
+    pub resolved_model: Option<String>,
     pub command_id: String,
     pub request_digest: String,
     pub request_json: String,
@@ -789,6 +794,7 @@ pub struct SessionCreateCommand {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     pub max_tokens: u64,
     /// Whether `max_tokens` was derived or user-set; `None` leaves legacy
     /// classification to readers (`SessionOutputBudgetSourceV1::classify`).
@@ -1093,12 +1099,21 @@ pub struct SessionSelectModelCommand {
     pub worker_generation: u64,
     pub provider: String,
     pub model: String,
+    pub model_catalog_key: Option<String>,
     /// rev933b finding 7: an AUTOMATIC mid-turn switch is only valid
     /// against the pair it observed (compare-and-swap). `Some` refuses the
     /// commit with RevisionConflict when the durable pair moved underneath
     /// it (a concurrent explicit selection wins). Explicit selections pass
-    /// `None` — the user's latest word is unconditional.
+    /// `None` — the user's latest word is unconditional. Active-run switches
+    /// also provide `automatic_run`, which fences explicit route generations.
     pub expected_pair: Option<(String, String)>,
+    /// An automatic selection belongs to an active run. The journal generation
+    /// is checked inside the selection transaction, independently of next-turn
+    /// settings. Its prepared fact owns the later Core switch observation.
+    pub automatic_run: Option<AutomaticRunSelection>,
+    /// Resolved account binding for this selection. An absent value keeps
+    /// a same-provider binding; a provider change clears the old binding.
+    pub account_alias: Option<String>,
     /// Output budget resolved by the daemon for the selected model. `None`
     /// (the automatic pair-switch path, which has no validated model row)
     /// keeps the stored budget unchanged.
@@ -1107,17 +1122,35 @@ pub struct SessionSelectModelCommand {
     pub device_id: DeviceId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticRunSelection {
+    pub run_id: RunId,
+    pub branch_id: Option<BranchId>,
+    pub rebind_seq: u64,
+    pub resolved_alias: String,
+    pub selection_epoch: Option<u64>,
+}
+
 /// Stable response stored in the committed `session.select_model` receipt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SelectedModel {
     pub session_id: SessionId,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_key: Option<String>,
     pub selected_seq: u64,
     pub worker_generation: u64,
     /// Budget committed with this selection; absent in pre-973 receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
+    /// Explicit pin removed because this selection changed providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_account_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_provider_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_snapshot: Option<haider_protocol::session::RunOutputRouteSnapshotV1>,
 }
 
 /// Result of the atomic metadata-update/event/receipt transaction.
@@ -1421,8 +1454,24 @@ pub struct SessionProviderRebindCommand {
     pub provider: String,
     pub base_url: Option<String>,
     pub account: Option<String>,
+    pub max_tokens: u64,
+    pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
+    pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
+    pub active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
     pub event_id: EventId,
     pub device_id: DeviceId,
+}
+
+/// Committed session selection at a journal boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOutputPairSnapshot {
+    pub resolved_model: Option<String>,
+    pub model_catalog_key: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub source: Option<haider_protocol::output_budget::SessionOutputBudgetSourceV1>,
+    pub route: crate::RunOutputRouteHistory,
 }
 
 /// Stable response stored in the `session.provider.rebind` receipt.
@@ -1436,6 +1485,14 @@ pub struct ReboundSessionProvider {
     pub account: Option<String>,
     pub selected_seq: u64,
     pub worker_generation: u64,
+    #[serde(default)]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub max_tokens_source: haider_protocol::output_budget::SessionOutputBudgetSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clamped: Option<haider_protocol::output_budget::OutputBudgetClampV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_output_budget: Option<haider_protocol::session::ActiveRunOutputBudgetV1>,
 }
 
 /// Atomic metadata/event/receipt outcome for one session provider rebind.
@@ -1757,6 +1814,28 @@ pub enum MonitorControlClaim {
     Committed(serde_json::Value),
 }
 
+/// Durable command method of an explicit whole-tree subagent stop.
+pub const AGENT_CANCEL_ALL_METHOD: &str = "agent.cancel_all";
+
+/// Outcome of claiming one `agent.cancel_all` command receipt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubagentStopClaim {
+    /// First execution of this command.
+    Fresh,
+    /// An earlier execution claimed the command and did not finish; the
+    /// idempotent stop runs again and finalizes it.
+    ResumePending,
+    /// The command already committed; replay this response.
+    Committed(serde_json::Value),
+}
+
+/// An immutable public stop claim, including the exact run incarnations it owns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopOperationClaim {
+    Pending(serde_json::Value),
+    Committed(serde_json::Value),
+}
+
 /// Secret-free coordinates for atomically accepting a direct user shell
 /// command. The command bytes themselves live in the ordinary started item
 /// and in the canonical receipt request JSON, never in this response.
@@ -1979,6 +2058,7 @@ pub enum TurnCancelOutcome {
     Committed {
         cancelled: CancelledTurn,
         envelope: Option<Box<RawEnvelope>>,
+        delivery_obligations: Vec<RawEnvelope>,
     },
     IdempotentReplay {
         cancelled: CancelledTurn,
@@ -2123,6 +2203,7 @@ pub enum JournalCommitBatch {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -5045,10 +5126,181 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error)?;
-        match metadata {
-            Some(json) => decode_session_metadata(session_id, &json),
-            None => Ok(None),
+        let Some(json) = metadata else {
+            return Ok(None);
+        };
+        let Some(mut metadata) = decode_session_metadata(session_id, &json)? else {
+            return Ok(None);
+        };
+        metadata.launch_origin = recovered_launch_origin(&connection, session_id, Some(&metadata))?;
+        if metadata.selection_epoch.is_some() {
+            return Ok(Some(metadata));
         }
+        drop(connection);
+        // The rare pre-epoch migration takes a write transaction and
+        // re-reads under its lock so a concurrent selection cannot be lost.
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.selection_epoch.is_none() {
+            metadata.selection_epoch = Some(latest_seq_in_connection(&transaction, session_id)?);
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        metadata.launch_origin =
+            recovered_launch_origin(&transaction, session_id, Some(&metadata))?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(Some(metadata))
+    }
+
+    /// Record this session's serving route. The first route keeps the request
+    /// selection epoch; account rotation advances it. Both produce a durable
+    /// route-only fact without changing the selected model or output budget.
+    pub fn commit_resolved_route(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<u64> {
+        self.commit_resolved_route_fact(
+            session_id,
+            expected_provider,
+            expected_model,
+            expected_epoch,
+            resolved_alias,
+            device_id,
+        )
+        .map(|(epoch, _)| epoch.unwrap_or(expected_epoch))
+    }
+
+    /// Return committed route facts for the session actor to publish in order.
+    /// `None` means the epoch guard refused the commit. An accepted no-op
+    /// returns `Some(epoch)` with no facts; refusal cannot masquerade as one.
+    pub fn commit_resolved_route_fact(
+        &self,
+        session_id: &SessionId,
+        expected_provider: &str,
+        expected_model: &str,
+        expected_epoch: u64,
+        resolved_alias: Option<&str>,
+        device_id: &DeviceId,
+    ) -> StoreResult<(Option<u64>, Vec<RawEnvelope>)> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if metadata.provider != expected_provider
+            || metadata.model_coordinate() != expected_model
+            || metadata.selection_epoch.unwrap_or(0) != expected_epoch
+        {
+            // A selection committed after this request captured metadata.
+            // Its request keeps the old epoch and cannot acquire the new one.
+            return Ok((None, Vec::new()));
+        }
+        let current = metadata
+            .selection_epoch
+            .unwrap_or(latest_seq_in_connection(&transaction, session_id)?);
+        let first_route = !metadata.resolved_route_seen;
+        let unreported_clamp = match (
+            metadata.budget_clamp_notice_epoch,
+            metadata.max_tokens_source,
+        ) {
+            (
+                None,
+                Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                    requested,
+                }),
+            ) if requested > metadata.max_tokens => {
+                Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                    requested,
+                    max_output_tokens: metadata.max_tokens,
+                })
+            }
+            _ => None,
+        };
+        let changed = metadata.resolved_route_seen
+            && metadata.resolved_route_alias.as_deref() != resolved_alias;
+        let epoch = if changed {
+            current
+                .max(latest_seq_in_connection(&transaction, session_id)?)
+                .checked_add(1)
+                .ok_or_else(|| corrupt("session selection epoch space is exhausted"))?
+        } else {
+            current
+        };
+        if !metadata.resolved_route_seen
+            || metadata.selection_epoch != Some(epoch)
+            || metadata.resolved_route_alias.as_deref() != resolved_alias
+            || unreported_clamp.is_some()
+        {
+            if unreported_clamp.is_some() {
+                metadata.budget_clamp_notice_epoch = Some(epoch);
+            }
+            metadata.selection_epoch = Some(epoch);
+            metadata.resolved_route_alias = resolved_alias.map(str::to_owned);
+            metadata.resolved_route_seen = true;
+            transaction
+                .execute(
+                    "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                    params![
+                        session_id.as_str(),
+                        serde_json::to_string(&metadata).map_err(|error| {
+                            store_error(ErrorCode::StoreCorrupt, error.to_string(), false)
+                        })?
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        let mut envelopes = Vec::new();
+        if first_route || changed || unreported_clamp.is_some() {
+            let fact_seq = latest_seq_in_connection(&transaction, session_id)?
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            envelopes = vec![unstamped_raw_command_envelope(
+                EventId::new(format!(
+                    "route-selection-{}-{epoch}-{fact_seq}",
+                    session_id.as_str()
+                )),
+                session_id,
+                None,
+                None,
+                device_id.clone(),
+                self.worker_generation,
+                ModelSelected {
+                    selection_epoch: Some(epoch),
+                    provider: metadata.provider.clone(),
+                    model: metadata.model_coordinate().to_owned(),
+                    // A route-only fact keeps the selected pair, so it keeps
+                    // the catalog owner that pair was admitted under.
+                    model_catalog_key: metadata.model_catalog_key.clone(),
+                    route_only: true,
+                    cleared_account_pin: None,
+                    cleared_provider_endpoint: None,
+                    output_budget_clamp: unreported_clamp,
+                }
+                .to_payload_value_with_route(&metadata)
+                .map_err(|error| store_error(ErrorCode::StoreCorrupt, error.to_string(), false))?,
+                PromptRender::Omit,
+            )?];
+            append_transaction_envelopes(&transaction, session_id, now_ms()?, &mut envelopes)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok((Some(epoch), envelopes))
     }
 
     /// Monotonically persists conversation-level savings after the matching
@@ -7620,16 +7872,15 @@ impl Store {
                             false,
                         )
                     })?;
+                // Only the pinned template's per-node `max_attempts` bounds
+                // the loop (unbounded by default; an explicit template value
+                // is an opt-in). A stuck loop is stopped above by the
+                // repeated-red-fingerprint NoProgress guard.
                 let source_attempts_exhausted =
                     node_status.attempts_opened >= node_spec.max_attempts;
                 let target_attempts_exhausted = declared_target.is_some()
                     && target_status.attempts_opened >= target_spec.max_attempts;
-                let conditional_hops_exhausted = declared_target.is_some()
-                    && status.attempt.saturating_sub(1) >= GRAPH_MAX_CONDITIONAL_HOPS;
-                if source_attempts_exhausted
-                    || target_attempts_exhausted
-                    || conditional_hops_exhausted
-                {
+                if source_attempts_exhausted || target_attempts_exhausted {
                     payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                         graph_id: graph_id.clone(),
                         node: current_node.clone(),
@@ -7749,6 +8000,19 @@ impl Store {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(DelegationCreateOutcome::IdempotentReplay(existing));
         }
+        if latest_run_state(
+            &transaction,
+            &record.parent_session_id,
+            &record.parent_run_id,
+        )?
+        .is_some_and(|(state, _, _)| matches!(state, RunState::Cancelling | RunState::Cancelled))
+        {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                "the delegating run has already been stopped",
+                false,
+            ));
+        }
         let live_count = live_delegation_count(&transaction)?;
         if live_count >= SUBAGENT_LIVE_LIMIT {
             let detail = format!(
@@ -7850,6 +8114,18 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
         rows.into_iter().map(decode_delegation).collect()
+    }
+
+    /// Every delegation whose parent is `session_id`, across ALL of that
+    /// session's runs (its original run, messaged `run-child-message-*` runs
+    /// and monitor-woken subturns). Stop-all walks descendants through this
+    /// session relation so later-run children are never missed.
+    pub fn delegations_for_parent_session(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Vec<DelegationRecord>> {
+        let connection = self.connection()?;
+        delegations_for_parent_session_limited(&connection, session_id, usize::MAX)
     }
 
     /// Returns a deterministic, bounded breadth-first subtree rooted at a
@@ -8267,12 +8543,14 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_with_workspace_configuration(
                     command,
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8311,6 +8589,7 @@ impl Store {
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
             } => self
                 .create_session_in_transaction(
                     transaction,
@@ -8318,6 +8597,7 @@ impl Store {
                     *interaction_mode,
                     account_alias.clone(),
                     workspace_allocation.clone(),
+                    inherited_route.clone(),
                 )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
@@ -8518,6 +8798,242 @@ impl Store {
         Ok(())
     }
 
+    /// Looks up a committed `agent.cancel_all` response before generation
+    /// validation (R2 response-loss replay: receipt lookups are unfenced).
+    /// Same command id with a different method or body is
+    /// `invalid_argument`.
+    pub fn subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<serde_json::Value>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )
+    }
+
+    /// Claims one `agent.cancel_all` command before any stop side effect:
+    /// identity conflicts and a stale generation are refused here, inside
+    /// one immediate transaction, so a refused request changes nothing.
+    pub fn claim_subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        worker_generation: u64,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<SubagentStopClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<serde_json::Value>(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SubagentStopClaim::Committed(response));
+        }
+        if worker_generation != self.worker_generation {
+            return Err(stale_generation(worker_generation, self.worker_generation));
+        }
+        let pending = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(if pending {
+            SubagentStopClaim::ResumePending
+        } else {
+            SubagentStopClaim::Fresh
+        })
+    }
+
+    /// Commits the response of a claimed `agent.cancel_all` command and
+    /// returns the authoritative response: a concurrent execution of the
+    /// same command that committed first wins, and this one replays it.
+    pub fn finalize_subagent_stop_receipt(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        request_digest: &str,
+        request_json: &str,
+        response: &serde_json::Value,
+    ) -> StoreResult<serde_json::Value> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(committed) = lookup_command_response::<serde_json::Value>(
+            &transaction,
+            command_id,
+            AGENT_CANCEL_ALL_METHOD,
+            request_digest,
+            request_json,
+            "agent-cancel-all",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(committed);
+        }
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            session_id.as_str(),
+            None,
+            None,
+            response,
+            now_ms()?,
+            "agent-cancel-all",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(response.clone())
+    }
+
+    /// Public helper-stop receipt. Transport generations fence fresh claims,
+    /// but are not semantic identity: a completed retry survives a restart.
+    pub fn stop_operation_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<serde_json::Value>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )
+    }
+
+    /// Claims the complete public operation and its immutable run IDs before
+    /// any removal/cancellation. Pending retries retain the first intent.
+    pub fn claim_stop_operation(
+        &self,
+        command_id: &str,
+        generation: u64,
+        request_digest: &str,
+        request_json: &str,
+        intent: &serde_json::Value,
+    ) -> StoreResult<StopOperationClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(StopOperationClaim::Committed(response));
+        }
+        let pending: Option<String> = transaction
+            .query_row(
+                "SELECT recovery_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if let Some(pending) = pending {
+            let intent = serde_json::from_str(&pending)
+                .map_err(|e| corrupt(format!("helper-stop intent is invalid: {e}")))?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(StopOperationClaim::Pending(intent));
+        }
+        if generation != self.worker_generation {
+            return Err(stale_generation(generation, self.worker_generation));
+        }
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        let intent_json = serde_json::to_string(intent)
+            .map_err(|e| corrupt(format!("cannot encode helper-stop intent: {e}")))?;
+        transaction
+            .execute(
+                "UPDATE command_receipts SET recovery_json = ?2 WHERE command_id = ?1",
+                params![command_id, intent_json],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(StopOperationClaim::Pending(intent.clone()))
+    }
+
+    pub fn finalize_stop_operation(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        request_digest: &str,
+        request_json: &str,
+        response: &serde_json::Value,
+    ) -> StoreResult<serde_json::Value> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response(
+            &transaction,
+            command_id,
+            "helper.stop.v1",
+            request_digest,
+            request_json,
+            "helper-stop",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(response);
+        }
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            session_id.as_str(),
+            None,
+            None,
+            response,
+            now_ms()?,
+            "helper-stop",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(response.clone())
+    }
+
     /// Looks up a committed `session.create` response before filesystem
     /// validation. This ordering is intentional: after a successful create,
     /// a lost-response retry remains recoverable even if the workspace path
@@ -8541,6 +9057,120 @@ impl Store {
         validate_command_identity(command_id, request_digest, request_json)?;
         let connection = self.connection()?;
         lookup_session_create_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Original canonical admission for an already established internal child.
+    /// Callers still submit it through the normal strict receipt comparison;
+    /// this only recovers its historical shape before constructing the retry.
+    pub fn child_create_admission(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        parent_session_id: &SessionId,
+    ) -> StoreResult<Option<(String, SessionMetadataV1)>> {
+        let connection = self.connection()?;
+        let row = connection.query_row(
+            "SELECT method, session_id, state, request_json, response_json FROM command_receipts WHERE command_id = ?1",
+            [command_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                      row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?)),
+        ).optional().map_err(map_sqlite_error)?;
+        match row {
+            None => Ok(None),
+            Some((method, stored_session, state, request_json, response_json))
+                if method == "session.create"
+                    && stored_session.as_deref() == Some(session_id.as_str())
+                    && state == "committed" =>
+            {
+                let response_json = response_json
+                    .ok_or_else(|| corrupt("committed child admission has no response"))?;
+                let created: CreatedSession =
+                    serde_json::from_str(&response_json).map_err(|error| {
+                        corrupt(format!("invalid child admission response: {error}"))
+                    })?;
+                let mut metadata = created.metadata.clone();
+                if let Some([account, endpoint, rebind]) =
+                    create_receipt_compat::legacy_admission_route(
+                        &connection,
+                        &request_json,
+                        &created,
+                        parent_session_id.as_str(),
+                    )?
+                {
+                    metadata.account_alias = account;
+                    metadata.provider_base_url = endpoint;
+                    metadata.provider_rebind_id = rebind;
+                }
+                Ok(Some((request_json, metadata)))
+            }
+            Some(_) => Err(store_error(
+                ErrorCode::InvalidArgument,
+                "child command id was already used with different semantics",
+                false,
+            )),
+        }
+    }
+
+    /// Original canonical turn request for an established child. A replay
+    /// keeps its accepted generation in the receipt even after a restart;
+    /// a child whose turn was never accepted still uses the current fence.
+    pub fn child_turn_admission(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<String>> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT method, session_id, state, request_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        match row {
+            None => Ok(None),
+            Some((method, stored_session, state, request_json))
+                if method == "turn.submit"
+                    && stored_session.as_deref() == Some(session_id.as_str())
+                    && state == "committed" =>
+            {
+                Ok(Some(request_json))
+            }
+            Some(_) => Err(store_error(
+                ErrorCode::InvalidArgument,
+                "child turn command id was already used with different semantics",
+                false,
+            )),
+        }
+    }
+
+    /// Legacy automatic selections already named their run in the receipt.
+    /// Read that provenance once; do not reconstruct history per selection.
+    pub fn automatic_run_switches(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<std::collections::BTreeMap<u64, RunId>> {
+        let connection = self.connection()?;
+        run_output_history::automatic_run_switches(&connection, session_id)
+    }
+
+    /// Committed session pair and budget through a journal boundary. New
+    /// runs use their durable pin; this view reconstructs pre-pin journals.
+    pub fn session_output_pair_at(
+        &self,
+        session_id: &SessionId,
+        through_seq: u64,
+    ) -> StoreResult<Option<SessionOutputPairSnapshot>> {
+        let connection = self.connection()?;
+        run_output_history::at(&connection, session_id, through_seq)
     }
 
     /// Atomically claims/finalizes a command receipt, inserts typed metadata,
@@ -8576,18 +9206,21 @@ impl Store {
             interaction_mode,
             account_alias,
             None,
+            None,
         )
     }
 
-    /// Atomic session creation with an optional resolved dated allocation.
-    /// The allocation is metadata only: this transaction performs no
-    /// filesystem materialisation.
+    /// Atomic session creation with an optional resolved dated allocation and
+    /// explicit route inherited by a delegated child. The route's provider
+    /// must match the child's selected provider. The allocation is metadata
+    /// only: this transaction performs no filesystem materialisation.
     pub fn create_session_with_workspace_configuration(
         &self,
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         let mut connection = self.connection()?;
         let transaction = connection
@@ -8599,6 +9232,7 @@ impl Store {
             interaction_mode,
             account_alias,
             workspace_allocation,
+            inherited_route,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(outcome)
@@ -8611,6 +9245,7 @@ impl Store {
         interaction_mode: SessionInteractionModeV1,
         account_alias: Option<String>,
         workspace_allocation: Option<haider_protocol::session::WorkspaceAllocationV1>,
+        inherited_route: Option<SessionMetadataV1>,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -8648,13 +9283,36 @@ impl Store {
             created_at_ms,
         )?;
 
-        let metadata = SessionMetadataV1 {
-            provider_base_url: None,
-            provider_rebind_id: None,
+        if inherited_route
+            .as_ref()
+            .is_some_and(|parent| parent.provider != command.provider)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "inherited route provider differs from child provider",
+                false,
+            ));
+        }
+        let mut metadata = SessionMetadataV1 {
+            resolved_model: command.resolved_model.clone(),
+            selection_epoch: Some(0),
+            route_reset_epoch: Some(0),
+            budget_clamp_notice_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
+            provider_base_url: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_base_url.clone()),
+            provider_rebind_id: inherited_route
+                .as_ref()
+                .and_then(|parent| parent.provider_rebind_id.clone()),
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
-            account_alias,
+            account_alias: inherited_route
+                .as_ref()
+                .map_or(account_alias, |parent| parent.account_alias.clone()),
             model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
             max_tokens: command.max_tokens,
             max_tokens_source: command.max_tokens_source,
             system_prompt_version: Some(command.system_prompt_version.clone()),
@@ -8680,6 +9338,11 @@ impl Store {
             workspace_allocation,
             created_at_ms,
         };
+        if let Some(parent) = inherited_route.as_ref() {
+            haider_protocol::session::RunOutputRouteSnapshotV1::capture(parent)
+                .restore(&mut metadata);
+        }
+
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -9157,6 +9820,13 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
+        metadata.budget_clamp_notice_epoch = None;
+        // A fork inherits history, not a claim that the parent's TUI opened
+        // the child. The child's first foreground open starts at revision 0.
+        metadata.launch_origin = None;
+        // Explicit account and endpoint choices are part of the copied
+        // session configuration. Unpinned parents still follow the mutable
+        // provider default because their account_alias is already None.
         // A fork inherits prompt history, not the source session's operational
         // savings ledger. Its first model-view reduction starts a fresh total.
         metadata.context_economy = ContextEconomy::default();
@@ -9848,8 +10518,21 @@ impl Store {
                 false,
             ));
         };
-        if let Some((expected_provider, expected_model)) = &command.expected_pair
-            && (&metadata.provider != expected_provider || &metadata.model != expected_model)
+        if let Some(automatic) = &command.automatic_run {
+            let rebind_seq =
+                run_output_history::latest_rebind_seq(&transaction, &command.session_id)?;
+            if rebind_seq != automatic.rebind_seq {
+                return Err(store_error(
+                    ErrorCode::RevisionConflict,
+                    "automatic switch route generation changed",
+                    true,
+                ));
+            }
+        }
+        if command.automatic_run.is_none()
+            && let Some((expected_provider, expected_model)) = &command.expected_pair
+            && (&metadata.provider != expected_provider
+                || metadata.model_coordinate() != expected_model)
         {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -9860,21 +10543,95 @@ impl Store {
                 false,
             ));
         }
-        if metadata.provider != command.provider {
-            // A route override belongs to its selected provider. A later
-            // ordinary model selection must never carry that endpoint or a
-            // rebind-pinned account into a different adapter.
-            if metadata.provider_rebind_id.is_some() {
-                metadata.account_alias = None;
-            }
+        // A later ordinary selection configures the next turn. It cannot
+        // cancel this run's switch, nor may this switch overwrite that choice.
+        // Coordinates govern publication to the next turn; installation of
+        // this run's target was fenced separately by its rebind generation.
+        let publish_pair_matches =
+            command
+                .expected_pair
+                .as_ref()
+                .is_none_or(|(provider, model)| {
+                    &metadata.provider == provider && metadata.model_coordinate() == model
+                });
+        let publish_selection = if let Some(automatic) = &command.automatic_run {
+            publish_pair_matches && (metadata.selection_epoch == automatic.selection_epoch
+                || transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM command_receipts WHERE session_id = ?1
+                     AND method = 'session.select_model' AND state = 'committed'
+                     AND json_extract(response_json, '$.selected_seq') = ?2
+                     AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.automatic') = 1
+                     AND json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.run_id') = ?3)",
+                        params![
+                            command.session_id.as_str(),
+                            metadata.selection_epoch.map(to_sqlite_integer).transpose()?,
+                            automatic.run_id.as_str()
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(map_sqlite_error)?)
+        } else {
+            true
+        };
+        let no_op = command.automatic_run.is_none()
+            && metadata.provider == command.provider
+            && metadata.model == command.model
+            && metadata.model_catalog_key == command.model_catalog_key
+            && metadata.resolved_model.is_none()
+            && command
+                .account_alias
+                .as_ref()
+                .is_none_or(|alias| metadata.account_alias.as_ref() == Some(alias))
+            && command.output_budget.is_none_or(|budget| {
+                metadata.max_tokens == budget.max_tokens
+                    && haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        metadata.max_tokens_source,
+                        metadata.max_tokens,
+                    ) == budget.source
+            });
+        let selection_epoch = if no_op {
+            metadata.selection_epoch.unwrap_or(0)
+        } else {
+            latest_seq_in_connection(&transaction, &command.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?
+        };
+        let cleared_account_pin = if publish_selection && metadata.provider != command.provider {
+            metadata.account_alias.clone()
+        } else {
+            None
+        };
+        let cleared_provider_endpoint = (publish_selection
+            && metadata.provider != command.provider)
+            .then(|| metadata.provider_base_url.clone())
+            .flatten();
+        if publish_selection && metadata.provider != command.provider {
+            // Accounts and route overrides belong to their selected
+            // provider. A cross-provider model choice cannot carry either
+            // into the next adapter.
+            metadata.account_alias = None;
             metadata.provider_base_url = None;
             metadata.provider_rebind_id = None;
+            metadata.resolved_route_alias = None;
+            metadata.resolved_route_seen = false;
+            metadata.route_reset_epoch = Some(selection_epoch);
         }
-        metadata.provider = command.provider.clone();
-        metadata.model = command.model.clone();
-        if let Some(budget) = command.output_budget {
+        if publish_selection {
+            if let Some(alias) = &command.account_alias {
+                metadata.account_alias = Some(alias.clone());
+            }
+            metadata.provider = command.provider.clone();
+            metadata.model = command.model.clone();
+            metadata.resolved_model = None;
+            metadata.model_catalog_key = command.model_catalog_key.clone();
+            metadata.selection_epoch = Some(selection_epoch);
+        }
+        if publish_selection && let Some(budget) = command.output_budget {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
+            metadata.budget_clamp_notice_epoch = budget.clamped.map(|_| selection_epoch);
         }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
@@ -9902,42 +10659,79 @@ impl Store {
         if updated_rows != 1 {
             return Err(corrupt("session row disappeared during model selection"));
         }
+        // A run-only preparation has no authority to advance a client's
+        // next-turn selection. Keep its active boundary epoch while the
+        // envelope and receipt retain their fresh journal identity.
+        let fact_selection_epoch = command
+            .automatic_run
+            .as_ref()
+            .filter(|_| !publish_selection)
+            .map_or(selection_epoch, |automatic| {
+                automatic.selection_epoch.unwrap_or(0)
+            });
+        let mut selected_payload = ModelSelected {
+            selection_epoch: Some(fact_selection_epoch),
+            provider: command.provider.clone(),
+            model: command.model.clone(),
+            model_catalog_key: command.model_catalog_key.clone(),
+            route_only: !publish_selection,
+            cleared_account_pin: cleared_account_pin.clone(),
+            cleared_provider_endpoint: cleared_provider_endpoint.clone(),
+            output_budget_clamp: command.output_budget.and_then(|budget| budget.clamped),
+        }
+        .to_payload_value_with_route(&metadata)
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize model-selected payload: {error}"),
+                false,
+            )
+        })?;
+        if let Some(automatic) = &command.automatic_run {
+            selected_payload["automatic_rebind_seq"] = automatic.rebind_seq.into();
+            selected_payload["automatic_resolved_alias"] = automatic.resolved_alias.clone().into();
+            selected_payload["automatic_only"] = (!publish_selection).into();
+            if let Some(budget) = command.output_budget {
+                selected_payload["automatic_output_budget"] = serde_json::json!(budget);
+            }
+        }
         let mut envelopes = vec![unstamped_raw_command_envelope(
             command.event_id.clone(),
             &command.session_id,
-            None,
-            None,
+            command
+                .automatic_run
+                .as_ref()
+                .and_then(|automatic| automatic.branch_id.clone()),
+            command
+                .automatic_run
+                .as_ref()
+                .map(|automatic| automatic.run_id.clone()),
             command.device_id.clone(),
             self.worker_generation,
-            ModelSelected {
-                provider: command.provider.clone(),
-                model: command.model.clone(),
-            }
-            .to_payload_value()
-            .map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot serialize model-selected payload: {error}"),
-                    false,
-                )
-            })?,
+            selected_payload,
             PromptRender::Omit,
         )?];
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let selected = SelectedModel {
+            route_snapshot: Some(haider_protocol::session::RunOutputRouteSnapshotV1::capture(
+                &metadata,
+            )),
             session_id: command.session_id.clone(),
             provider: command.provider.clone(),
             model: command.model.clone(),
-            selected_seq: envelopes[0].seq,
+            model_catalog_key: command.model_catalog_key.clone(),
+            selected_seq: selection_epoch,
             worker_generation: self.worker_generation,
             output_budget: command.output_budget,
+            cleared_account_pin,
+            cleared_provider_endpoint,
         };
         finalize_command_receipt(
             &transaction,
             &command.command_id,
             command.session_id.as_str(),
             None,
-            Some(selected.selected_seq),
+            Some(envelopes[0].seq),
             &selected,
             now,
             "session-select-model",
@@ -10467,12 +11261,8 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(map_sqlite_error)?;
-        if let Some(metadata) = decode_session_metadata(session_id, &metadata_json)?
-            && metadata.launch_origin.is_some()
-        {
-            return Ok(metadata.launch_origin);
-        }
-        latest_launch_origin_event(&connection, session_id)
+        let metadata = decode_session_metadata(session_id, &metadata_json)?;
+        recovered_launch_origin(&connection, session_id, metadata.as_ref())
     }
 
     /// Atomically applies one launch-origin registration: revision CAS,
@@ -10532,15 +11322,9 @@ impl Store {
             .map_err(map_sqlite_error)?;
         // Legacy `{}` metadata stays `{}`: the event alone carries origin.
         let metadata = decode_session_metadata(&command.session_id, &metadata_json)?;
-        let current_revision = match &metadata {
-            Some(metadata) => match &metadata.launch_origin {
-                Some(origin) => origin.revision,
-                None => latest_launch_origin_event(&transaction, &command.session_id)?
-                    .map_or(0, |origin| origin.revision),
-            },
-            None => latest_launch_origin_event(&transaction, &command.session_id)?
-                .map_or(0, |origin| origin.revision),
-        };
+        let current_revision =
+            recovered_launch_origin(&transaction, &command.session_id, metadata.as_ref())?
+                .map_or(0, |origin| origin.revision);
         if command.expected_revision != current_revision {
             return Err(store_error(
                 ErrorCode::RevisionConflict,
@@ -10930,11 +11714,26 @@ impl Store {
         &self,
         command: &SessionProviderRebindCommand,
     ) -> StoreResult<SessionProviderRebindOutcome> {
+        if command.max_tokens == 0 {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "rebind output budget must be positive",
+                false,
+            ));
+        }
+        let output_budget = haider_protocol::output_budget::SessionOutputBudgetV1 {
+            max_tokens: command.max_tokens,
+            source: command.max_tokens_source,
+            clamped: command.clamped,
+        };
         let rebound = SessionProviderRebound {
+            selection_epoch: None,
             rebind_id: command.command_id.clone(),
             provider: command.provider.clone(),
             base_url: command.base_url.clone(),
             account: command.account.clone(),
+            output_budget: Some(output_budget),
+            active_output_budget: command.active_output_budget.clone(),
         };
         let fact = rebound.to_payload_value().map_err(|error| {
             store_error(
@@ -10967,6 +11766,10 @@ impl Store {
                 account: command.account.clone(),
                 selected_seq,
                 worker_generation: generation,
+                max_tokens: output_budget.max_tokens,
+                max_tokens_source: output_budget.source,
+                clamped: output_budget.clamped,
+                active_output_budget: command.active_output_budget.clone(),
             },
         )?;
         Ok(match outcome {
@@ -10986,7 +11789,7 @@ impl Store {
     fn select_session_config<R: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
         selection: SessionConfigSelection<'_>,
-        fact_payload: serde_json::Value,
+        mut fact_payload: serde_json::Value,
         validate: impl FnOnce(&Connection) -> StoreResult<()>,
         mutate: impl FnOnce(&mut SessionMetadataV1),
         respond: impl FnOnce(u64) -> R,
@@ -11035,7 +11838,36 @@ impl Store {
                 false,
             ));
         };
+        let previous_route = (selection.method == "session.provider.rebind").then(|| {
+            (
+                metadata.provider.clone(),
+                metadata.provider_base_url.clone(),
+                metadata.account_alias.clone(),
+            )
+        });
         mutate(&mut metadata);
+        if selection.method == "session.provider.rebind" {
+            let epoch = latest_seq_in_connection(&transaction, selection.session_id)?
+                .max(metadata.selection_epoch.unwrap_or(0))
+                .checked_add(1)
+                .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+            metadata.selection_epoch = Some(epoch);
+            if previous_route
+                .as_ref()
+                .is_some_and(|(provider, endpoint, account)| {
+                    provider != &metadata.provider
+                        || endpoint != &metadata.provider_base_url
+                        || account != &metadata.account_alias
+                })
+            {
+                metadata.route_reset_epoch = Some(epoch);
+            }
+            fact_payload["selection_epoch"] = serde_json::Value::from(epoch);
+            fact_payload["route_snapshot"] = serde_json::to_value(
+                haider_protocol::session::RunOutputRouteSnapshotV1::capture(&metadata),
+            )
+            .map_err(|error| corrupt(format!("invalid rebind route snapshot: {error}")))?;
+        }
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -12067,6 +12899,45 @@ impl Store {
             )?);
         }
         if let Some(spec) = headless_spec {
+            if !same_run_delivery && spec.provider != metadata.provider {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "headless provider has no matching admission route",
+                    false,
+                ));
+            }
+            if !same_run_delivery {
+                let pin = haider_protocol::session::RunOutputPairPinnedV1 {
+                    resolved_model: spec.resolved_model.clone(),
+                    model_catalog_key: spec.model_catalog_key.clone(),
+                    route_snapshot: Some(
+                        haider_protocol::session::RunOutputRouteSnapshotV1::capture(&metadata),
+                    ),
+                    provider: spec.provider.clone(),
+                    model: spec.model.clone(),
+                    max_tokens: spec.max_output_tokens,
+                    provider_route: haider_protocol::session::RunOutputProviderRouteV1::capture(
+                        &metadata,
+                    ),
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        metadata.max_tokens_source,
+                        spec.max_output_tokens,
+                    ),
+                };
+                let mut pinned = unstamped_command_envelope(
+                    EventId::new(format!("output-pair-{}", command.queued_event_id)),
+                    &command.session_id,
+                    command.branch_id.clone(),
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    pin.to_event(&command.run_id)
+                        .map_err(|error| corrupt(format!("invalid run output pair: {error}")))?,
+                    PromptRender::Omit,
+                )?;
+                pinned.render.ui = false;
+                envelopes.push(pinned);
+            }
             let payload =
                 haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec)
                     .to_payload_value()
@@ -12446,6 +13317,7 @@ impl Store {
             now,
         )?;
 
+        let was_cancelled = state == RunState::Cancelled;
         let (cancelled, envelope) = cancellation_intent_in_transaction(
             &transaction,
             command,
@@ -12454,6 +13326,12 @@ impl Store {
             branch_id,
             now,
         )?;
+        let delivery_obligations =
+            if was_cancelled || cancelled.status == TurnCancellationStatus::Accepted {
+                reserve_cancelled_parent_deliveries(&transaction, command, now)?
+            } else {
+                Vec::new()
+            };
         finalize_command_receipt(
             &transaction,
             &command.command_id,
@@ -12468,6 +13346,7 @@ impl Store {
         Ok(TurnCancelOutcome::Committed {
             cancelled,
             envelope,
+            delivery_obligations,
         })
     }
 
@@ -12638,6 +13517,11 @@ impl Store {
             .map(|envelope| *envelope)
             .collect::<Vec<_>>();
         envelopes.extend(retract_envelopes);
+        envelopes.extend(reserve_cancelled_parent_deliveries(
+            &transaction,
+            cancel,
+            now,
+        )?);
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(TurnRetractOutcome::Committed {
             retracted,
@@ -15012,8 +15896,17 @@ fn lookup_session_create_receipt(
     else {
         return Ok(None);
     };
-    if method != "session.create" || stored_digest != request_digest || stored_json != request_json
-    {
+    let same_request = stored_digest == request_digest && stored_json == request_json;
+    let compatible_legacy = method == "session.create"
+        && !same_request
+        && state == "committed"
+        && create_receipt_compat::legacy_delegated_create_matches(
+            connection,
+            &stored_json,
+            request_json,
+            response_json.as_deref(),
+        )?;
+    if method != "session.create" || (!same_request && !compatible_legacy) {
         return Err(store_error(
             ErrorCode::InvalidArgument,
             "command id was already used with a different method or semantic request body",
@@ -15110,6 +16003,91 @@ fn lookup_run_retry_receipt(
                 })?;
     }
     Ok(accepted)
+}
+
+/// The parent cannot become cancelling without durably owing every
+/// uncollected foreground child's result. No hub admission or display list
+/// participates, so graceful drain and crash recovery cannot lose ownership.
+fn reserve_cancelled_parent_deliveries(
+    transaction: &Connection,
+    command: &TurnCancelCommand,
+    now: u64,
+) -> StoreResult<Vec<RawEnvelope>> {
+    use haider_protocol::subagent_stop::{
+        DetachedDeliveryPhaseV1, DetachedDeliveryV1, DetachedReasonV1,
+    };
+    let records = {
+        let mut statement = transaction.prepare_cached(&format!(
+            "{} WHERE parent_session_id = ?1 AND parent_run_id = ?2 ORDER BY created_at_ms, call_id",
+            delegation_select())).map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![command.session_id.as_str(), command.run_id.as_str()],
+                stored_delegation,
+            )
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        rows.into_iter()
+            .map(decode_delegation)
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let mut envelopes = Vec::new();
+    for record in records {
+        let background = record
+            .manifest
+            .coordinates
+            .as_ref()
+            .and_then(|c| c.get("background"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if background || record.state == DelegationState::Collected {
+            continue;
+        }
+        let id = format!(
+            "detached-delivery-owed-{}",
+            &stable_digest(&[record.parent_session_id.as_str(), record.agent_id.as_str()])[..24]
+        );
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM events WHERE event_id = ?1",
+                [&id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        if exists {
+            continue;
+        }
+        let item = DetachedDeliveryV1 {
+            agent: record.agent_id,
+            phase: DetachedDeliveryPhaseV1::Owed,
+            reason: DetachedReasonV1::MainStopped,
+        }
+        .to_extension_item()
+        .map_err(|e| corrupt(e.to_string()))?;
+        let mut envelope = unstamped_command_envelope(
+            EventId::new(&id),
+            &command.session_id,
+            record.parent_branch_id,
+            Some(command.run_id.clone()),
+            command.device_id.clone(),
+            command.worker_generation,
+            EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new(&id),
+                item,
+            }),
+            PromptRender::Omit,
+        )?;
+        envelope.agent_id = record.parent_agent_id;
+        envelope.render.ui = false;
+        envelopes.push(envelope);
+    }
+    if !envelopes.is_empty() {
+        append_transaction_envelopes(transaction, &command.session_id, now, &mut envelopes)?;
+    }
+    Ok(envelopes)
 }
 
 fn cancellation_intent_in_transaction(
@@ -15499,6 +16477,10 @@ fn validate_headless_turn_admission(
     if metadata.cwd != spec.cwd
         || metadata.provider != spec.provider
         || metadata.model != spec.model
+        || spec
+            .resolved_model
+            .as_ref()
+            .is_some_and(|model| metadata.resolved_model.as_ref() != Some(model))
         || metadata.max_tokens != spec.max_output_tokens
         || metadata.effort != spec.effort
         || metadata.fast != spec.fast
@@ -17233,8 +18215,10 @@ fn load_workspace_mutation(
                 continue;
             };
             if intent.effect == effect {
-                if intent.class != EffectClass::FsWrite
-                    || intent_envelope.run_id.as_ref() != Some(&mutation_ref.run_id)
+                if !matches!(
+                    intent.class,
+                    EffectClass::FsWrite | EffectClass::CheckpointRestore
+                ) || intent_envelope.run_id.as_ref() != Some(&mutation_ref.run_id)
                 {
                     return Err(graph_evidence_error(
                         ErrorCode::InvalidArgument,
@@ -21425,6 +22409,19 @@ fn stale_generation(provided: u64, current: u64) -> HaiderError {
     )
 }
 
+/// The same own-subject snapshot feeds list/observe, attach and revision CAS.
+/// A missing or foreign projection does not erase an own journal fact.
+fn recovered_launch_origin(
+    connection: &Connection,
+    session_id: &SessionId,
+    metadata: Option<&SessionMetadataV1>,
+) -> StoreResult<Option<haider_protocol::session::LaunchOriginV1>> {
+    match metadata.and_then(|metadata| metadata.launch_origin.as_ref()) {
+        Some(origin) => Ok(Some(origin.clone())),
+        None => latest_launch_origin_event(connection, session_id),
+    }
+}
+
 fn decode_session_metadata(
     session_id: &SessionId,
     json: &str,
@@ -21437,11 +22434,23 @@ fn decode_session_metadata(
     if value.as_object().is_some_and(serde_json::Map::is_empty) {
         return Ok(None);
     }
-    serde_json::from_value(value).map(Some).map_err(|error| {
+    let mut metadata: SessionMetadataV1 = serde_json::from_value(value).map_err(|error| {
         corrupt(format!(
             "session {session_id} metadata does not match SessionMetadataV1: {error}"
         ))
-    })
+    })?;
+    // Older fork writers copied this projection along with session config.
+    // Its revision is authority only for its subject, just like origin facts
+    // in the journal. Discard a foreign claim on every metadata read so list,
+    // attach and origin CAS agree for existing children as well as new ones.
+    if metadata
+        .launch_origin
+        .as_ref()
+        .is_some_and(|origin| origin.subject_session_id != session_id.as_str())
+    {
+        metadata.launch_origin = None;
+    }
+    Ok(Some(metadata))
 }
 
 #[derive(Debug)]
@@ -22794,7 +23803,7 @@ fn validate_workspace_mutation_intent(
         if candidate.run_id != envelope.run_id
             || !matches!(
                 intent.class,
-                EffectClass::FsWrite | EffectClass::ProcessExec
+                EffectClass::FsWrite | EffectClass::ProcessExec | EffectClass::CheckpointRestore
             )
         {
             return Err(store_error(
@@ -23959,7 +24968,7 @@ fn inherited_fork_cache_segment(
         let cache_epoch = source_view.get("cache_epoch")?.as_str()?;
         let stable_history_end = source_view.get("stable_history_end")?.as_u64()?;
         if provider != source_metadata.provider
-            || model != source_metadata.model
+            || model != source_metadata.model_coordinate()
             || max_tokens != source_metadata.max_tokens
             || account_scope.is_empty()
             || cache_epoch.is_empty()
@@ -29572,3 +30581,7 @@ mod group_commit_tests;
 #[cfg(test)]
 #[path = "embedded_store_synchronous_tests.rs"]
 mod embedded_store_synchronous_tests;
+
+#[cfg(test)]
+#[path = "event_store/session_recency_tests.rs"]
+mod session_recency_tests;

@@ -15,12 +15,14 @@ use haider_store::{
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"session_id":"{session_id}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -203,6 +205,19 @@ fn branch_create_receipt_event_and_registry_are_one_atomic_fact() {
     };
     assert_eq!(created.branch_id, BranchId::new("branch-a"));
     assert_eq!(created.created_seq, envelope.seq);
+    let pair = store
+        .session_output_pair_at(&session_id, created.created_seq)
+        .expect("branch snapshot")
+        .expect("typed branch origin");
+    assert_eq!(
+        (
+            pair.provider.as_str(),
+            pair.model.as_str(),
+            pair.max_tokens,
+            pair.source
+        ),
+        ("fake", "fake-model", 4096, None)
+    );
     let fact = BranchCreated::from_payload_value(&envelope.payload).expect("branch fact");
     assert_eq!(fact.branch.branch_id, created.branch_id);
     assert_eq!(

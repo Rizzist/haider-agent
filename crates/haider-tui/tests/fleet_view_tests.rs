@@ -124,6 +124,7 @@ fn metrics(agent: &str, usage: Option<AgentUsageMetrics>) -> AgentMetricsSnapsho
         started_at_ms: SPAWN_MS,
         terminal_at_ms: Some(SPAWN_MS + 42_000),
         live: false,
+        activity: None,
         tool_attempts: 3,
         usage,
     }
@@ -149,6 +150,8 @@ fn node(
         parent_agent_id: None,
         state,
         metrics: Some(metrics(agent, Some(oauth_usage(420_000)))),
+        activity: None,
+        activities: Vec::new(),
         folded_children: 0,
         children,
     }
@@ -841,4 +844,50 @@ fn leaf_enter_opens_member_detail_with_workflow_and_esc_backs_out() {
     model.handle(key(KeyCode::Esc));
     assert!(model.fleet.detail.is_none(), "first esc closes the detail");
     assert_eq!(model.screen, Screen::Fleet, "still on the fleet surface");
+}
+
+#[test]
+fn fleet_truth_converges_chips_and_never_rewinds_newer_child_head() {
+    let mut model = launcher_model();
+    model.active_session = Some(sid());
+    let mut child = chip("ag-beta", "beta", ChipDisplayState::Thinking);
+    child.child_session = Some("child-ag-beta".into());
+    model.chips = vec![child];
+    let mut terminal = node(
+        "ag-beta",
+        "beta",
+        "task",
+        1,
+        FleetAgentStateWire::Cancelled,
+        vec![],
+    );
+    terminal.metrics = Some(metrics("ag-beta", None));
+    model.apply_fleet_snapshot(snapshot(vec![terminal.clone()], false));
+    assert_eq!(model.chips[0].state, ChipDisplayState::Cancelled);
+    assert!(!model.chips[0].is_live());
+    assert_eq!(fleet::entry_rollup(&model.chips).cancelled, 1);
+    let mut newer = terminal.clone();
+    newer.state = FleetAgentStateWire::Live;
+    newer.metrics.as_mut().expect("metrics").head_seq += 1;
+    model.apply_fleet_snapshot(snapshot(vec![newer], false));
+    assert!(model.chips[0].is_live());
+    model.apply_fleet_snapshot(snapshot(vec![terminal], false));
+    assert_eq!(model.chips[0].state, ChipDisplayState::Thinking);
+    assert!(
+        model.chips[0].is_live(),
+        "old cancellation cannot paint the later run terminal"
+    );
+    haider_tui::session::apply_agent_payload(
+        &mut model.chips,
+        &haider_protocol::EventPayload::AgentChipState {
+            agent: AgentId::new("ag-beta"),
+            chip: haider_protocol::agent::ChipState::Done,
+        },
+        SPAWN_MS + 70_000,
+    );
+    assert_eq!(
+        model.chips[0].state,
+        ChipDisplayState::Thinking,
+        "an original-run parent event cannot supersede later-run child truth"
+    );
 }

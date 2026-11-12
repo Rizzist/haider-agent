@@ -57,7 +57,10 @@ human clicks Stop (desktop badge | phone chip/notification | Chrome infobar Canc
       3. the run's stop hook submits TurnCancelCommand
          {command_id:"cu-presence-stop-<run>", reason:"cu-presence-stop"}
          via SessionHub::cancel_internal_turn — the same receipt-backed
-         cancellation authority as the TUI's ESC (`turn.cancel`)
+         cancellation authority as the TUI's ESC (`turn.cancel`); it
+         cancels only the run that holds the lease (the main thread's run
+         or one subagent's run), and that run's own subagents keep running
+         (owner decision 2026-09-25)
       4. the surface shows "…" then hides
   → core cancels the turn → dispatcher close_effects(cancelled=true)
       → emergency_stop releases held buttons, broker journals EffectOutcome::Cancelled
@@ -88,6 +91,32 @@ again.
 * The first capture of a run is concealed too: until a helper's `Ready`
   arrives, the daemon treats its UI as capturable (the Conceal is queued on
   stdin after `Show`; an excluded helper just acks it).
+* Capture conceal is owned per surface, not per call: every model-facing
+  capture takes a hold on the surface (synchronously, before it awaits the
+  helper's ack), the first hold sends `conceal` and the last one to retire
+  sends `reveal`. Overlapping captures from different sessions therefore
+  never reveal each other's capture, and a capture cancelled while waiting
+  for the ack (Esc, Stop) still releases its hold, so another session that
+  keeps the surface gets its indicator and Stop back. A renderer recreated
+  while a capture holds the surface receives `Conceal` before its first
+  `Show` or `Pointer`; a renderer that rejects `Conceal` is retired.
+  The capture waits only for the acknowledgement of its current `Conceal`
+  sequence. Late, duplicate, unsent and retired-renderer acknowledgements
+  cannot release a later capture, and old sequences are removed when a new
+  conceal is sent. Conceal sequence rollover stays in its reserved high
+  range, away from pointer acknowledgements. A typed `conceal_failed` event,
+  a helper death, or an ack timeout refuses the capture before backend execute.
+  The hold ends immediately when
+  the screenshot or inspect backend returns, before image admission,
+  journaling and observation work.
+* Helpers keep a concealed state until `reveal`: the Windows fallback (and
+  macOS evidence mode) never re-show the pointer, ring or badge from an
+  animation frame, a `Show`, or a badge relocation while concealed.
+  The Linux helper likewise records Show labels and Pointer bodies without
+  posting notifications during conceal. Reveal posts the latest state once;
+  Hide leaves nothing to restore. Stop actions already queued for a closed
+  notification still reach the daemon during conceal; a Show label refresh
+  does not re-arm a Stop in the same notification generation.
 * Pre-existing turn-cancel race, fixed at the source: when a cancellation
   (Stop *or* Esc) is committed while a just-finished tool's result is being
   settled, the journal refuses the settlement ("durably cancelling; only
@@ -102,7 +131,12 @@ being driven: the macOS badge is a non-activating `NSPanel` owned by an
 accessory (no Dock icon) process; the Windows badge answers
 `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`; the Android chip is
 `FLAG_NOT_FOCUSABLE`; the Chrome infobar is browser chrome. ESC in the TUI
-remains a second Stop.
+is a second Stop only for computer use driven by the main thread: it stops
+the main thread's run, and subagents keep running (owner decision
+2026-09-25). Computer use driven by a subagent is stopped by the overlay
+Stop, `haider agent cancel <parent-session> <agent>`, or `haider agent cancel
+<parent-session> --all`. For configured headless runs,
+`haider run --stop <run-id>` also stops the run and its subagents.
 
 **The agent cannot press its own Stop.** Every mouse event Haider synthesises
 carries `SYNTHETIC_INPUT_TAG` (macOS `kCGEventSourceUserData`, Windows
@@ -136,6 +170,7 @@ Wire (`haider_tools::presence`):
 ```json
 {"event":"ready","platform":"macos","capture_excluded":true}
 {"event":"ack","seq":7}
+{"event":"conceal_failed","seq":7,"message":"…"}
 {"event":"stop"}
 {"event":"error","message":"…"}
 ```
@@ -154,9 +189,9 @@ badge with red live dot and red **Stop** button) is rasterised once in
 | Platform | Mechanism | Deterministic? |
 | --- | --- | --- |
 | macOS | every panel sets `NSWindowSharingNone`; the backend captures with `CGDisplayCreateImage`, which omits sharing-none windows | yes — verified live on macOS 26 (Darwin 25.6): with the overlay on screen (window server lists it at level 1000, sharing state 0) the model-facing CAS image contains neither pointer nor badge, and `screencapture` omits it too |
-| Windows | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on every overlay window (Windows 10 2004+), which Windows documents as excluding the window from capture | by the OS contract on 2004+ — **not runtime-verified here** (cross-compiled and Clippy-checked only); `ready.capture_excluded=false` is reported when the OS refuses |
+| Windows | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on every overlay window (Windows 10 2004+); if refused, `SW_HIDE` on all three, `IsWindowVisible` checks, and a bounded `DwmFlush` before ack | fallback cross-compiled and unit-tested; native Windows capture remains unverified |
 | Linux | no pointer overlay; the notification popup is concealed (closed) around each model-facing capture (below) | no — best effort, see below |
-| any helper reporting `capture_excluded:false` | the daemon sends `conceal` before each `screenshot`/`inspect` and waits ≤ 600 ms for the ack, then `reveal` afterwards | best effort (the helper takes its UI off screen) |
+| any helper reporting `capture_excluded:false` | the daemon sends `conceal` before each `screenshot`/`inspect` and waits ≤ 600 ms for verification; missing or failed verification refuses capture | fail closed on verification failure |
 
 The overlay is click-through everywhere except the badge (`ignoresMouseEvents`
 / `WS_EX_TRANSPARENT`).
@@ -164,11 +199,11 @@ The overlay is click-through everywhere except the badge (`ignoresMouseEvents`
 Because sharing-none also hides the overlay from every screenshot and screen
 recording (that is the point), documenting what the human sees needs
 `HAIDER_CU_PRESENCE_EVIDENCE_CAPTURABLE=1`, an evidence-only switch that uses
-`NSWindowSharingReadOnly` and reports `ready.capture_excluded=false`. Observed
-on this Mac: even in that mode the daemon's own `CGDisplayCreateImage` capture
-still omitted the overlay (only `screencapture` showed it), apparently because
-the helper is the capturing process's own child; production does not rely on
-this and keeps sharing-none.
+`NSWindowSharingReadOnly` and reports `ready.capture_excluded=false`. In this
+mode the helper disables AppKit animations, orders all three panels out,
+flushes the layer transaction, checks their window numbers against the
+window server's on-screen list, and waits for a display refresh before acking.
+Failure is reported as `conceal_failed`; production keeps sharing-none.
 
 ### Linux
 
@@ -187,23 +222,37 @@ this and keeps sharing-none.
   * The helper calls `GetCapabilities` first. Actions are optional in the
     freedesktop spec: only when the server advertises `actions` does the
     notification carry a **Stop** button (wired to the same Stop path). When
-    it does not, the notification body says how to stop instead ("press Esc
-    in the Haider TUI session, or for a headless run use `haider run --stop
-    <run-id>`"), the helper reports `ready.platform =
+    it does not, the notification body says how to stop instead: for a configured
+    headless run, `haider run --stop <run-id>` stops it and all
+    its subagents; in the TUI, press Esc if its main thread controls the
+    screen; for a subagent, use `haider agent cancel <parent-session> <agent>`.
+    The headless stop API requires a configured headless run: an interactive,
+    messaged or monitor-woken run id does not necessarily have that record.
+    Named agent cancellation covers its later runs too. The helper reports `ready.platform =
     "linux-notification-no-actions"` and logs the degraded state. The TUI
-    header's `esc stop` chip is always there.
+    header's `esc stop` chip is shown while the main thread drives the
+    screen; Esc does not stop a subagent.
   * Screenshots: the popup is an ordinary window. The helper reports
     `capture_excluded:false`, so the daemon asks it to `conceal` before every
     model-facing `screenshot`/`inspect`: it closes the notification, waits
     200 ms for the desktop to retire the popup, acks, and re-posts it on
-    `reveal`. This is best effort: a desktop that animates the popup out more
+    `reveal`. A close error or timeout sends `conceal_failed` and refuses the
+    capture. This is best effort: a desktop that animates the popup out more
     slowly, or keeps closed notifications on screen, can still leak it into a
     capture; the model then sees Haider's own notification (not user data).
     The notification is also briefly absent from the list during a capture.
+    Stop still works across that close: the helper keeps every notification
+    id posted since `show` live until `hide`, so a Stop pressed on a popup
+    that was closed for a capture (its `ActionInvoked` still queued on the
+    bus) reaches the run, while an id from an earlier presence never stops a
+    later one (`LinuxStopRouter`).
 * **What Linux guarantees**: a visible "Haider is controlling this screen"
   notification (on a desktop with a notification server), a Stop that reaches
-  the run from the notification when the server supports actions and from
-  the TUI (Esc) or CLI otherwise, and best-effort absence from model
+  the run from the notification when the server supports actions and
+  otherwise from the CLI (`haider agent cancel <parent-session> <agent>` or
+  `--all` for subagents; `haider run --stop <run-id>` for a headless run) or,
+  when the main thread is driving, the TUI (Esc), and
+  best-effort absence from model
   screenshots. There is **no agent pointer** on Linux. Nothing here has run
   on a real Linux desktop; it is compile/Clippy-checked only.
 
@@ -314,9 +363,14 @@ silently.
 While the current run has used `computer`/`mobile` within the idle window the
 session header's top-right shows `[ ◉ controlling screen · esc stop ]` (or
 `phone`), left of the voice chip. It clears at run end and after 30 s idle.
-ESC is the existing turn cancel. The pre-existing transient "◉ controlling
-your screen — esc to stop" banner (in-flight control actions only) is
-unchanged.
+ESC is the existing turn cancel and stops the main thread only (owner
+decision 2026-09-25). The chip and the pre-existing transient "◉ controlling
+your screen — esc to stop" banner (in-flight control actions only) are
+derived from this session's own `computer`/`mobile` calls, so they only
+claim Esc for the main thread's control. A subagent driving the screen keeps
+running after Esc; stop it with the overlay Stop or `haider agent cancel
+<parent-session> <agent>` / `--all`. A configured headless run can also be
+stopped with `haider run --stop <run-id>`.
 
 ## 7. Known limits
 
@@ -339,3 +393,23 @@ unchanged.
   on-device run is not possible in this tree.
 * The macOS "human view" screenshots were taken with the evidence-only
   capturable switch; in production the overlay is invisible to all capture.
+## Native macOS verification gate
+
+Run this local gate from a logged-in macOS desktop session with a window
+server. It uses real AppKit panels on the executable's main thread and
+requires a display refresh after the window list reports all panels absent:
+
+```sh
+HAIDER_HARNESS_ROOT="$(cd ../.. && pwd)" # from a harness worktree
+CARGO_TARGET_DIR="$PWD/target-presence-gate" \
+  "$HAIDER_HARNESS_ROOT/runtime/build-slot.sh" cu-presence-native -- \
+  cargo test -p haider-tools --features native-macos-presence-gate \
+  --test overlay_macos_native_gate
+```
+
+The executable prints `NATIVE_GATE: PASS` when visible panels are refused
+and an actual `orderOut` is acknowledged. It prints `NATIVE_GATE: SKIP` with
+a reason when no window-server session or primary screen exists; a skip is
+not a passing local gate. Run it 20 times under the lane's concurrent test
+load before accepting a macOS presence change. CI runners without an AppKit
+window-server session cannot supply this gate.

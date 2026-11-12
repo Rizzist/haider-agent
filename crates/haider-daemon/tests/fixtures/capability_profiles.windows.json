@@ -2,7 +2,7 @@
   "automation": [
     {
       "name": "list_tools",
-      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -304,7 +304,7 @@
   "coding": [
     {
       "name": "list_tools",
-      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -679,10 +679,14 @@
     },
     {
       "name": "spawn_subagent",
-      "description": "Delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report. Inherits the current model/provider. Call list_tools(filter=\"spawn_subagent\") for optional model/provider, workflow, specialist, and request-budget controls.",
+      "description": "Delegate a child under AgentSpawn policy; waits for its report by default. Set background=true for an immediate handle or wait_ms for a bounded observation that leaves the child running. Use haider agent wait/list/message/cancel on the handle. Call list_tools(filter=\"spawn_subagent\") to expose optional model/provider and workflow controls.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "background": {
+            "description": "Return a durable child handle immediately. Use haider agent wait/list/message/cancel with the returned parent session and child id.",
+            "type": "boolean"
+          },
           "prompt": {
             "description": "Complete task prompt for the child",
             "maxLength": 32768,
@@ -694,6 +698,12 @@
             "maxLength": 80,
             "minLength": 1,
             "type": "string"
+          },
+          "wait_ms": {
+            "description": "Optional time to observe a blocking child. On expiry return child_still_running; the child continues.",
+            "maximum": 86400000,
+            "minimum": 1,
+            "type": "integer"
           }
         },
         "required": [
@@ -707,7 +717,7 @@
   "discovery": [
     {
       "name": "list_tools",
-      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -723,7 +733,7 @@
   "inspection": [
     {
       "name": "list_tools",
-      "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+      "description": "Tools whose schemas are already advertised are callable directly. With no filter, list authorized names; names alone are not enabled. With a name or keyword filter, describe and enable matches for later requests. Does not grant permissions.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {

@@ -26,9 +26,10 @@ use crate::identity::UiGeneration;
 use crate::projection::{Admission, MenuScopeOwner, RawOutcome, SessionProjection};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{AgentId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, SessionId};
 
-/// One previous user prompt recalled by the Esc-Esc chooser.
+/// One previous user prompt recalled by the Esc-Esc chooser, with its
+/// owning agent and source branch retained independently of the displayed branch.
 ///
 /// `seq` is the DURABLE journal coordinate of the source `UserMessage`
 /// envelope — the exclusive cut a `session.fork` resolves. It is `Some` only
@@ -40,6 +41,8 @@ use haider_protocol::ids::{AgentId, SessionId};
 pub struct PromptEntry {
     pub text: String,
     pub seq: Option<u64>,
+    pub agent_id: Option<AgentId>,
+    pub branch_id: Option<BranchId>,
 }
 
 impl PromptEntry {
@@ -49,14 +52,79 @@ impl PromptEntry {
         Self {
             text,
             seq: Some(seq),
+            agent_id: None,
+            branch_id: None,
+        }
+    }
+
+    /// Keep the source lane with its journal cut, even after a branch switch.
+    #[must_use]
+    pub fn from_envelope(text: String, envelope: &RawEnvelope) -> Self {
+        Self {
+            text,
+            seq: Some(envelope.seq),
+            agent_id: envelope.agent_id.clone(),
+            branch_id: envelope.branch_id.clone(),
         }
     }
 
     /// A prompt with no durable coordinate (the local demo twin).
     #[must_use]
     pub const fn local(text: String) -> Self {
-        Self { text, seq: None }
+        Self {
+            text,
+            seq: None,
+            agent_id: None,
+            branch_id: None,
+        }
     }
+}
+
+/// Preserve other scopes until ownership metadata catches up with replay.
+/// Keeping these entries also lets a fresh Root snapshot replace delegation
+/// ownership without re-reading the journal or exposing another agent's turns.
+pub(crate) fn record_scoped_prompt(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    owner: Option<&AgentId>,
+    entry: PromptEntry,
+) {
+    if entry.agent_id.as_ref() == owner {
+        history.push_front(entry);
+    } else {
+        pending.push_front(entry);
+    }
+}
+
+pub(crate) fn rescope_prompts(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    owner: Option<&AgentId>,
+) {
+    let mut entries: Vec<_> = history.drain(..).chain(pending.drain(..)).collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+    for entry in entries {
+        if entry.agent_id.as_ref() == owner {
+            history.push_back(entry);
+        } else {
+            pending.push_back(entry);
+        }
+    }
+}
+
+pub(crate) fn forget_scoped_prompt(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    pending: &mut std::collections::VecDeque<PromptEntry>,
+    envelope: &RawEnvelope,
+    seq: u64,
+) {
+    let keep = |entry: &PromptEntry| {
+        entry.seq != Some(seq)
+            || entry.agent_id != envelope.agent_id
+            || entry.branch_id != envelope.branch_id
+    };
+    history.retain(keep);
+    pending.retain(keep);
 }
 
 /// One session, fully owned — the sim's `sessions[i]` (tui.js:497-579
@@ -89,10 +157,31 @@ pub struct SessionState {
     pub workspace_cwd: Option<String>,
     /// Latest replaceable launch-origin revision and optional sanitised display.
     pub launch_origin: Option<(u64, Option<String>)>,
+    /// This session's context-meter epoch — its committed model pair and
+    /// budget (973-context-meter-fixes B1). Restored with the projection on
+    /// checkout; a parked session's background model change lands here.
+    pub meter_epoch: crate::context_meter::MeterEpoch,
+    /// Explicit credential pin and last served route from this session's
+    /// typed metadata. The global active account is only its initial default.
+    pub account_alias: Option<String>,
+    pub account_provider: Option<String>,
+    /// Endpoint and epoch belong to the same cached account coordinates.
+    pub account_base_url: Option<String>,
+    pub account_metadata_epoch: Option<u64>,
+    pub route_reset_epoch: Option<u64>,
+    pub resolved_route_alias: Option<String>,
+    pub resolved_route_seen: bool,
+    /// A known fresh routing selection can display a future default until a
+    /// request starts. Missing route provenance on old history is insufficient.
+    pub account_default_epoch: Option<u64>,
+    pub account_request_epoch: Option<u64>,
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
     pub prompt_history: std::collections::VecDeque<PromptEntry>,
+    pub(crate) prompt_pending: std::collections::VecDeque<PromptEntry>,
+    /// Durable owning agent from this session's summary, never inferred from ids.
+    pub prompt_owner: Option<AgentId>,
     pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
@@ -154,6 +243,9 @@ pub struct SessionState {
     /// older daemon never sets it and the row degrades to its
     /// projection-derived display (never a fabricated count).
     pub summary_counts: Option<SummaryCounts>,
+    /// A summary can establish that the child exists without reporting
+    /// counts or a selection. Its spawn manifest is no longer authority.
+    pub summary_seen: bool,
     /// W-flow inline identity: the session's bound Loom agent-type id from
     /// its `session.list` summary (`SessionSummary.agent_type`). Hydrated
     /// only from a daemon serving `session_agent_type_select_v1` — absence
@@ -186,9 +278,37 @@ pub struct SummaryCounts {
     /// (`SessionSummary::footprint_truth`) — present exactly when the
     /// token figure is.
     pub footprint_truth: Option<haider_protocol::context::ContextFootprintTruth>,
+    pub latest_context_footprint: Option<haider_protocol::context::ContextFootprint>,
 }
 
 impl SessionState {
+    /// A committed provider change invalidates every cached route coordinate.
+    /// Leaving an old alias here would revive it on A→B→A before the List.
+    pub(crate) fn reset_account_route(&mut self, provider: &str, epoch: Option<u64>) {
+        self.account_alias = None;
+        self.account_provider = Some(provider.to_owned());
+        self.account_base_url = None;
+        self.account_metadata_epoch = epoch;
+        self.resolved_route_alias = None;
+        self.resolved_route_seen = false;
+        self.route_reset_epoch = epoch;
+        self.account_default_epoch = epoch;
+    }
+
+    /// A route fact proves a request was served even before its RunState.
+    /// A newer route epoch invalidates the old account until its List arrives;
+    /// same-epoch metadata may already contain the actual served account.
+    pub(crate) fn observe_route_commit(&mut self, epoch: Option<u64>, previous: Option<u64>) {
+        if epoch != previous {
+            self.account_alias = None;
+            self.account_metadata_epoch = None;
+            self.resolved_route_alias = None;
+            self.resolved_route_seen = false;
+        }
+        self.account_request_epoch = epoch;
+        self.account_default_epoch = None;
+    }
+
     /// A neutral scratch slot — what the model's live fields hold when no
     /// session is attached, and what a checked-out slot holds meanwhile.
     #[must_use]
@@ -203,8 +323,20 @@ impl SessionState {
             dir: String::new(),
             workspace_cwd: None,
             launch_origin: None,
+            meter_epoch: crate::context_meter::MeterEpoch::default(),
+            account_alias: None,
+            account_provider: None,
+            account_base_url: None,
+            account_metadata_epoch: None,
+            route_reset_epoch: None,
+            resolved_route_alias: None,
+            resolved_route_seen: false,
+            account_default_epoch: None,
+            account_request_epoch: None,
             projection: SessionProjection::new(),
             prompt_history: std::collections::VecDeque::new(),
+            prompt_owner: None,
+            prompt_pending: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
@@ -230,6 +362,7 @@ impl SessionState {
             branches_offset: 1,
             turns_offset: 0,
             summary_counts: None,
+            summary_seen: false,
             agent_type: None,
             lockdown_provider: None,
             lockdown_boundary_known: false,
@@ -357,6 +490,21 @@ impl SessionState {
         summary_tokens
     }
 
+    /// Latest own-session durable footprint, preferring the fresher list
+    /// summary until this row has replayed through its head.
+    #[must_use]
+    pub fn latest_context_footprint(&self) -> Option<&haider_protocol::context::ContextFootprint> {
+        let summary = self
+            .summary_counts
+            .as_ref()
+            .and_then(|counts| counts.latest_context_footprint.as_ref());
+        if self.summary_is_fresher() {
+            summary.or_else(|| self.projection.latest_footprint())
+        } else {
+            self.projection.latest_footprint().or(summary)
+        }
+    }
+
     /// Route one RAW envelope into this (non-attached) session — the
     /// background half of the W3c3 router (report R11 cut 2).
     ///
@@ -390,15 +538,20 @@ impl SessionState {
                 // already refused; and a retraction that lands here still has
                 // to drop the prompt from THIS session's chooser, because
                 // nothing re-delivers the fact when the user comes back.
-                if envelope.agent_id.is_none()
-                    && !route_response_boundary(&mut self.projection, envelope)
-                    && let Some(fact) =
-                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
-                            &envelope.payload,
-                        )
+                if envelope.agent_id.as_ref() == self.prompt_owner.as_ref() {
+                    route_response_boundary(&mut self.projection, envelope);
+                }
+                if let Some(fact) =
+                    haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                        &envelope.payload,
+                    )
                 {
-                    self.prompt_history
-                        .retain(|entry| entry.seq != Some(fact.prompt_seq));
+                    forget_scoped_prompt(
+                        &mut self.prompt_history,
+                        &mut self.prompt_pending,
+                        envelope,
+                        fact.prompt_seq,
+                    );
                 }
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The fork this session itself issued: the receipt is
@@ -424,19 +577,16 @@ impl SessionState {
                                     &origin,
                                 );
                             }
-                            if envelope.agent_id.is_none()
-                                && let EventPayload::UserMessage { text, .. } = &payload
-                            {
-                                self.prompt_history
-                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
+                            if let EventPayload::UserMessage { text, .. } = &payload {
+                                record_scoped_prompt(
+                                    &mut self.prompt_history,
+                                    &mut self.prompt_pending,
+                                    self.prompt_owner.as_ref(),
+                                    PromptEntry::from_envelope(text.clone(), envelope),
+                                );
                             }
                             if admission == Admission::Apply {
-                                self.route_admitted(
-                                    &payload,
-                                    envelope.branch_id.as_ref(),
-                                    envelope.agent_id.as_ref(),
-                                    envelope.committed_at_ms,
-                                );
+                                self.route_admitted(&payload, envelope);
                             }
                         }
                         // S3/W-A/L3: additive agent, task, and workflow graph
@@ -471,15 +621,10 @@ impl SessionState {
 
     /// Route one admitted content payload: aggregate session-scope types
     /// FIRST (risk 6), then branch (outer), then agent — the background
-    /// half; `AppModel::route_admitted` is the attached twin. `at_ms` is
-    /// the envelope's `committed_at_ms` — the chip clocks' time base (S4).
-    fn route_admitted(
-        &mut self,
-        payload: &EventPayload,
-        branch: Option<&haider_protocol::ids::BranchId>,
-        agent: Option<&AgentId>,
-        at_ms: u64,
-    ) {
+    /// half; `AppModel::route_admitted` is the attached twin. The raw
+    /// envelope preserves provenance and the chip clocks' time base (S4).
+    fn route_admitted(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let branch = envelope.branch_id.as_ref();
         use crate::branch::BranchScope;
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
@@ -489,17 +634,17 @@ impl SessionState {
                 self.branch_state.apply_aggregate_to_parked(payload);
                 self.absorb_envelope(payload);
             }
-            BranchScope::Active => self.absorb_scoped(payload, agent, at_ms),
+            BranchScope::Active => self.absorb_scoped(payload, envelope),
             BranchScope::ParkedMain => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.parked_main_mut() {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::ParkedNamed(id) => {
                 self.note_parked_turn(payload);
                 if let Some(view) = self.branch_state.view_mut(&id) {
-                    crate::branch::absorb_into_view(view, payload, agent, at_ms);
+                    crate::branch::absorb_into_view(view, payload, envelope);
                 }
             }
             BranchScope::Orphan => self.branch_state.count_orphan(),
@@ -533,12 +678,14 @@ impl SessionState {
     /// One admitted payload, routed by SCOPE (report R11 cut 2) — the
     /// BACKGROUND half. [`classify`] makes the decision so this path and
     /// the attached path in `AppModel` can never diverge.
-    pub fn absorb_scoped(&mut self, payload: &EventPayload, agent: Option<&AgentId>, at_ms: u64) {
+    pub fn absorb_scoped(&mut self, payload: &EventPayload, envelope: &RawEnvelope) {
+        let agent = envelope.agent_id.as_ref();
+        let at_ms = envelope.committed_at_ms;
         match classify(&mut self.projection, &self.chips, payload, agent) {
             Destination::Agent => apply_agent_payload(&mut self.chips, payload, at_ms),
             Destination::Chip(target) => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &target) {
-                    chip_apply(chip, payload, at_ms);
+                    chip_apply(chip, payload, envelope);
                 }
             }
             Destination::Session => self.absorb_envelope(payload),
@@ -642,7 +789,8 @@ fn chip_or_session(chips: &[ChipModel], agent: Option<&AgentId>) -> Destination 
 /// Chip-tree bookkeeping for the three agent payloads (report R11 cut 2).
 ///
 /// `AgentSpawned` creates the chip from its manifest (idempotent under
-/// replay), `AgentChipState` is the SOLE chip-state authority, and
+/// replay), `AgentChipState` supplies state until a sealed child-session
+/// snapshot supersedes it, and
 /// `AgentReport` contributes ONLY summary/verification content — never
 /// state. Shared by the attached and background routes. `at_ms` is the
 /// envelope's `committed_at_ms`: the spawn instant on `AgentSpawned`, an
@@ -681,7 +829,9 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, a
             }
         }
         EventPayload::AgentChipState { agent, chip } => {
-            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str()) {
+            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str())
+                && model.state_child_head_seq.is_none()
+            {
                 // S4: through the shared transition law — a terminal flip
                 // freezes the chip's clock at this envelope's timestamp.
                 model.set_state_at(crate::script::ChipDisplayState::from_protocol(chip), at_ms);
@@ -709,10 +859,51 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload, a
 /// user row. The demo driver's `ChipEmit` beats apply straight to the
 /// chip projection and stay plain: the sim fabricates locally and must
 /// not dress its rows as parent-stream truth.
-pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, at_ms: u64) {
+pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload, envelope: &RawEnvelope) {
     // S4: every child-attributed envelope advances this chip's event
     // clock (the frozen-final measure's far end) before the payload lands.
-    chip.note_event_at(at_ms);
+    chip.note_event_at(envelope.committed_at_ms);
+    // Preserve provenance on attached, background, parked and replay paths.
+    chip.activity.observe_raw(envelope);
+    match payload {
+        EventPayload::MenuOpened(menu) => {
+            chip.question = Some(crate::app::ChipQuestion {
+                recovery: matches!(
+                    menu.kind,
+                    haider_protocol::menu::MenuKind::ErrorRecovery { .. }
+                ),
+                text: menu.title.clone(),
+                options: menu
+                    .options
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect(),
+                resolved: false,
+            });
+        }
+        EventPayload::MenuAnswered(answer)
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|menu| menu.id == answer.menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        EventPayload::MenuClosed { menu, .. }
+            if chip
+                .transcript
+                .open_menu()
+                .is_some_and(|open| open.id == *menu) =>
+        {
+            if let Some(question) = &mut chip.question {
+                question.resolved = true;
+            }
+        }
+        _ => {}
+    }
+
     if let EventPayload::UserMessage {
         text, attachments, ..
     } = payload

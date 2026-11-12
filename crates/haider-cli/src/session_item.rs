@@ -508,7 +508,7 @@ mod tests {
         sender
             .send(test_envelope(4, json!({"type": "irrelevant_kind"})))
             .expect("boundary envelope delivers");
-        let found = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+        let found = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, collector)
             .await
             .expect("early-stop resolves without the channel closing")
             .expect("collector joins");
@@ -540,7 +540,7 @@ mod tests {
                 json!({"type": "user_message", "text": "t"}),
             ))
             .expect("target envelope delivers");
-        let (found, join) = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+        let (found, join) = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, collector)
             .await
             .expect("early-stop resolves without the channel closing")
             .expect("collector joins");
@@ -571,6 +571,7 @@ mod tests {
                     args: json!({"cmd": "true"}),
                     status: haider_protocol::item::ToolStatus::Completed,
                     call_id: "call-join".into(),
+                    activity: None,
                 },
             },
         ))
@@ -596,7 +597,7 @@ mod tests {
         sender
             .send(test_envelope(3, tool_result_payload("call-join", "joined")))
             .expect("binding result delivers");
-        let (found, join) = tokio::time::timeout(std::time::Duration::from_secs(2), collector)
+        let (found, join) = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, collector)
             .await
             .expect("early-stop resolves without the channel closing")
             .expect("collector joins");

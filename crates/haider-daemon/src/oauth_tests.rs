@@ -284,7 +284,7 @@ fn native_store_timeout_is_typed_and_cooled_down_for_discovery() {
         Err(ClaudeNativeCredentialFailure::TimedOut)
     ));
     observed_start
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("raw platform read started");
     assert!(matches!(
         access.read(ClaudeNativeReadEvent::AdoptionDiscovery),
@@ -332,28 +332,35 @@ fn native_platform_read_never_holds_the_access_mutex() {
     });
     let access = Arc::new(ClaudeNativeCredentialAccess::new_with_timeout(
         raw.clone(),
-        Duration::from_secs(1),
+        haider_platform::TEST_WAIT_TIMEOUT,
     ));
     let first_access = Arc::clone(&access);
     let first =
         std::thread::spawn(move || first_access.read(ClaudeNativeReadEvent::AdoptionDiscovery));
     observed_first
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .expect("first raw read started");
 
-    let began = std::time::Instant::now();
-    assert!(matches!(
-        access.read(ClaudeNativeReadEvent::Significant),
-        Err(ClaudeNativeCredentialFailure::Denied)
-    ));
-    assert!(
-        began.elapsed() < Duration::from_millis(250),
-        "the second platform read waited behind the access mutex"
-    );
+    let (second_finished, observed_second) = std::sync::mpsc::sync_channel(1);
+    let second_access = Arc::clone(&access);
+    let second = std::thread::spawn(move || {
+        let result = second_access.read(ClaudeNativeReadEvent::Significant);
+        second_finished
+            .send(result)
+            .expect("second read completion");
+    });
+    // Receipt before the held first read is released proves independence,
+    // without charging scheduler delays against a 250 ms elapsed assertion.
+    let second_result = observed_second.recv_timeout(haider_platform::TEST_WAIT_TIMEOUT);
     let _ = first_release.send(());
     assert!(matches!(
         first.join().expect("join first access call"),
         Err(ClaudeNativeCredentialFailure::Missing)
+    ));
+    second.join().expect("join independent read");
+    assert!(matches!(
+        second_result.expect("second read completes while first is held"),
+        Err(ClaudeNativeCredentialFailure::Denied)
     ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
 }
@@ -1061,10 +1068,13 @@ async fn openai_jwks_chunked_body_stops_at_limit() {
         None,
         "fixture must exercise a response without Content-Length"
     );
-    let error = tokio::time::timeout(Duration::from_secs(2), bounded_jwks_response(response))
-        .await
-        .expect("JWKS reader must stop when the streaming limit is crossed")
-        .expect_err("oversized chunked JWKS must be rejected");
+    let error = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        bounded_jwks_response(response),
+    )
+    .await
+    .expect("JWKS reader must stop when the streaming limit is crossed")
+    .expect_err("oversized chunked JWKS must be rejected");
     assert_eq!(error.code, "identity_keys_malformed");
 }
 
@@ -1163,7 +1173,7 @@ async fn refused_terminal_oauth_response_closes_after_state_advances() {
         )
         .expect("start handoff");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while sink.attempts.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
@@ -1228,7 +1238,7 @@ pub(super) async fn coordinator_for_registration(
 pub(super) async fn started_flow(
     receiver: &mut mpsc::UnboundedReceiver<WireFrame>,
 ) -> (OAuthFlowId, String, u16) {
-    let frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+    let frame = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, receiver.recv())
         .await
         .expect("start timeout")
         .expect("start response");
@@ -1290,7 +1300,7 @@ pub(super) async fn wait_ready(
     coordinator: &OAuthCoordinator,
     flow_id: &OAuthFlowId,
 ) -> OAuthFlowStatusWire {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             let status = coordinator
                 .status("connection-1", flow_id, "attempt-1")
@@ -2995,10 +3005,12 @@ async fn shutdown_and_cancel_interrupt_a_slow_accepted_callback_read() {
         Some(OAuthFlowStatusWire::Cancelled)
     );
     let mut response = Vec::new();
-    let read_result =
-        tokio::time::timeout(Duration::from_millis(250), slow.read_to_end(&mut response))
-            .await
-            .expect("cancel interrupts read");
+    let read_result = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        slow.read_to_end(&mut response),
+    )
+    .await
+    .expect("cancel interrupts read");
     assert!(
         read_result.is_ok()
             || read_result
@@ -3020,10 +3032,12 @@ async fn shutdown_and_cancel_interrupt_a_slow_accepted_callback_read() {
         "shutdown joins the callback listener owner"
     );
     let mut response = Vec::new();
-    let read_result =
-        tokio::time::timeout(Duration::from_millis(250), slow.read_to_end(&mut response))
-            .await
-            .expect("shutdown interrupts read");
+    let read_result = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        slow.read_to_end(&mut response),
+    )
+    .await
+    .expect("shutdown interrupts read");
     assert!(
         read_result.is_ok()
             || read_result
@@ -3036,7 +3050,7 @@ async fn shutdown_and_cancel_interrupt_a_slow_accepted_callback_read() {
     // that extra platform oracle; Windows' pending AcceptEx state makes
     // refusal timing a kernel artifact even after the sole owner task joined.
     #[cfg(unix)]
-    tokio::time::timeout(Duration::from_millis(250), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if TcpStream::connect((Ipv4Addr::LOCALHOST, port))
                 .await
@@ -3064,7 +3078,7 @@ async fn cancel_during_token_exchange_cannot_publish_a_late_ready_bundle() {
         .send()
         .await
         .expect("browser");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while server.state.token_calls.load(Ordering::SeqCst) != 1 {
             tokio::task::yield_now().await;
         }
@@ -3177,7 +3191,7 @@ async fn independent_flows_never_reuse_state_nonce_callback_path_or_pkce_verifie
     for url in urls {
         browser.get(url).send().await.expect("flow");
     }
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while server.state.verifiers.lock().expect("lock").len() < 2 {
             tokio::task::yield_now().await;
         }
@@ -4110,8 +4124,8 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(2))
+        .connect_timeout(haider_platform::TEST_WAIT_TIMEOUT)
+        .timeout(haider_platform::TEST_WAIT_TIMEOUT)
         .build()
         .expect("device fixture client");
 
@@ -4293,7 +4307,7 @@ async fn device_flow_runner_continues_and_honors_slow_down_interval() {
 }
 
 async fn wait_for_refresh_calls(server: &FakeOAuthServer, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while server.state.refresh_calls.load(Ordering::SeqCst) != expected {
             tokio::task::yield_now().await;
         }
@@ -5278,7 +5292,7 @@ async fn cancelled_task_registration_poison_removes_the_unowned_refresh_flight()
         let descriptor = descriptor.clone();
         async move { broker.resolve(&descriptor).await }
     });
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         loop {
             if !broker.inner.flights.lock().expect("flights").is_empty() {
                 break;
@@ -5304,7 +5318,7 @@ async fn cancelled_task_registration_poison_removes_the_unowned_refresh_flight()
     });
     wait_for_refresh_calls(&server, 1).await;
     server.release_refresh();
-    let access = tokio::time::timeout(Duration::from_secs(2), successor)
+    let access = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, successor)
         .await
         .expect("successor must not wait on the cancelled flight")
         .expect("successor join")
@@ -5335,17 +5349,23 @@ async fn refresh_worker_panic_wakes_waiters_and_makes_graceful_shutdown_unclean(
         .expect("seed");
     let (broker, _, descriptor) = broker_for(&server, vault, descriptor);
     broker.panic_next_refresh_worker();
-    let result = tokio::time::timeout(Duration::from_secs(2), broker.resolve(&descriptor))
-        .await
-        .expect("panic must not strand the single-flight waiter");
+    let result = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        broker.resolve(&descriptor),
+    )
+    .await
+    .expect("panic must not strand the single-flight waiter");
     assert!(result.is_err(), "a panicked refresh worker fails closed");
     assert!(
         broker.tasks.sealed.load(Ordering::Acquire),
         "panic cleanup must seal admission before waking the failed flight"
     );
-    let replacement = tokio::time::timeout(Duration::from_secs(2), broker.resolve(&descriptor))
-        .await
-        .expect("sealed admission fails replacement work closed");
+    let replacement = tokio::time::timeout(
+        haider_platform::TEST_WAIT_TIMEOUT,
+        broker.resolve(&descriptor),
+    )
+    .await
+    .expect("sealed admission fails replacement work closed");
     assert!(
         replacement.is_err(),
         "a panic must not admit a replacement refresh worker"
@@ -5446,7 +5466,7 @@ async fn resolver_with_stale_vault_read_adopts_completed_refresh_generation() {
         tokio::spawn(async move { broker.resolve(&descriptor).await })
     };
     tokio::time::timeout(
-        Duration::from_secs(2),
+        haider_platform::TEST_WAIT_TIMEOUT,
         vault.wait_until_stale_read_is_captured(),
     )
     .await
@@ -5458,7 +5478,7 @@ async fn resolver_with_stale_vault_read_adopts_completed_refresh_generation() {
     );
 
     server.release_refresh();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !server.state.durable.load(Ordering::SeqCst)
             || !broker.inner.flights.lock().expect("flights").is_empty()
         {
@@ -5531,7 +5551,7 @@ async fn shutdown_joins_an_open_callback_and_inflight_refresh_before_successor_w
     );
     let mut callback_response = Vec::new();
     let callback_read = tokio::time::timeout(
-        Duration::from_millis(250),
+        haider_platform::TEST_WAIT_TIMEOUT,
         slow_callback.read_to_end(&mut callback_response),
     )
     .await
@@ -5543,7 +5563,7 @@ async fn shutdown_joins_an_open_callback_and_inflight_refresh_before_successor_w
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
     );
     server.release_refresh();
-    tokio::time::timeout(Duration::from_secs(1), shutdown)
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, shutdown)
         .await
         .expect("owned OAuth tasks join")
         .expect("shutdown task");
@@ -6434,5 +6454,116 @@ fn vault_publication_cannot_pair_a_new_principal_with_an_old_account_record() {
     assert!(
         validate_bundle_against(&registration, &descriptor, &refreshed).is_ok(),
         "a token refresh for the same principal retains its binding"
+    );
+}
+
+#[tokio::test]
+async fn api_key_broker_rejects_mismatched_bytes_and_preserves_gcloud_rotation() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(MemoryVault::new());
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.auth_method = AuthMethod::ApiKey;
+    descriptor.credential_digest = Some(blake3::hash(b"SYNTHETIC_KEY_A").to_hex().to_string());
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_B")
+        .expect("different key");
+    let (broker, snapshot, descriptor) = broker_for(&server, vault.clone(), descriptor);
+    assert!(
+        broker.resolve(&descriptor).await.is_err(),
+        "an externally changed vault cannot supply a different account's key"
+    );
+    let mut gcloud = descriptor.clone();
+    gcloud.provider = haider_provider::VERTEX_PROVIDER_NAME.into();
+    gcloud.alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    vault
+        .put(&gcloud.alias, b"SYNTHETIC_ROTATED_GCLOUD_TOKEN")
+        .expect("native token rotation");
+    *snapshot.lock().expect("snapshot") = vec![gcloud.clone()];
+    assert_eq!(
+        broker
+            .resolve(&gcloud)
+            .await
+            .expect("same-account native token")
+            .expose_secret(),
+        b"SYNTHETIC_ROTATED_GCLOUD_TOKEN"
+    );
+}
+
+#[tokio::test]
+async fn api_key_broker_rejects_a_read_that_crosses_a_rollback() {
+    struct HeldReadVault {
+        inner: MemoryVault,
+        entered: Notify,
+        released: (Mutex<bool>, Condvar),
+    }
+    impl Vault for HeldReadVault {
+        fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+            self.inner.put(alias, secret)
+        }
+        fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+            let secret = self.inner.resolve(alias)?;
+            self.entered.notify_one();
+            let (lock, wake) = &self.released;
+            let (released, _) = wake
+                .wait_timeout_while(
+                    lock.lock().expect("release lock"),
+                    Duration::from_secs(30),
+                    |released| !*released,
+                )
+                .expect("held vault read");
+            assert!(*released, "test released vault reader");
+            Ok(secret)
+        }
+        fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+        fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(HeldReadVault {
+        inner: MemoryVault::new(),
+        entered: Notify::new(),
+        released: (Mutex::new(false), Condvar::new()),
+    });
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.auth_method = AuthMethod::ApiKey;
+    descriptor.credential_digest = None;
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_A")
+        .expect("seed A");
+    let (broker, _, descriptor) = broker_for(&server, vault.clone() as Arc<dyn Vault>, descriptor);
+    let read_broker = broker.clone();
+    let read_descriptor = descriptor.clone();
+    let task = tokio::spawn(async move { read_broker.resolve(&read_descriptor).await });
+    let entered = tokio::time::timeout(Duration::from_secs(10), vault.entered.notified()).await;
+    let guard = broker
+        .inner
+        .fences
+        .begin_credential_write(&descriptor.alias)
+        .expect("replacement writer");
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_B")
+        .expect("vault-first write");
+    vault
+        .put(&descriptor.alias, b"SYNTHETIC_KEY_A")
+        .expect("rollback");
+    drop(guard);
+    *vault.released.0.lock().expect("release reader") = true;
+    vault.released.1.notify_all();
+    let read = task.await.expect("reader task");
+    entered.expect("reader entered vault");
+    assert!(
+        read.is_err(),
+        "a rollback cannot hide a replacement that crossed this read"
+    );
+    assert_eq!(
+        broker
+            .resolve(&descriptor)
+            .await
+            .expect("fresh A read after rollback")
+            .expose_secret(),
+        b"SYNTHETIC_KEY_A"
     );
 }

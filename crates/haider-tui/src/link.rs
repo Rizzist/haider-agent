@@ -180,6 +180,52 @@ async fn supervise_link(
     }
 }
 
+/// Child journals can advance without a parent envelope (for example a
+/// monitor starts a later child run). Subscribe once per socket so those
+/// heads reach the same single-flight fleet reconciliation as parent facts.
+async fn watch_roster(client: &Arc<RpcClient>, replies: &mpsc::Sender<LiveReply>) {
+    if !client
+        .welcome()
+        .features
+        .contains(haider_rpc::FEATURE_SESSION_LIST_WATCH_V1)
+    {
+        return;
+    }
+    let pending = match client.begin_request(RequestBody::SessionListWatch {}).await {
+        Ok(pending) => pending,
+        Err(ClientError::Disconnected(_)) => return,
+        Err(error) => {
+            let _ = replies
+                .send(LiveReply::Failed {
+                    command_id: None,
+                    code: "roster_watch_failed".into(),
+                    message: error.to_string(),
+                    retryable: false,
+                    presentation: None,
+                })
+                .await;
+            return;
+        }
+    };
+    let replies = replies.clone();
+    tokio::spawn(async move {
+        match pending.wait().await {
+            Ok(ResponseBody::SessionListWatch { .. }) | Err(ClientError::Disconnected(_)) => {}
+            other => {
+                let _ = replies
+                    .send(LiveReply::Failed {
+                        command_id: None,
+                        code: "roster_watch_failed".into(),
+                        message: format!("session roster watch failed: {other:?}"),
+                        retryable: false,
+                        presentation: None,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
 async fn run_link(
     mut client: Arc<RpcClient>,
     profile: ResolvedProfile,
@@ -212,6 +258,7 @@ async fn run_link(
     // envelope — the one with no later sequence to expose its hole — was
     // pure silence (review W3c3 P1-2).
     let mut lost_baseline = client.lost_events();
+    watch_roster(&client, &replies).await;
     loop {
         let lost = client.lost_events();
         if lost > lost_baseline {
@@ -361,6 +408,7 @@ async fn run_link(
                     if replies.send(handshake).await.is_err() {
                         return;
                     }
+                    watch_roster(&client, &replies).await;
                     if replies.send(LiveReply::Reconnected).await.is_err() {
                         return;
                     }
@@ -509,10 +557,15 @@ async fn issue(
         .copied()
         .find(|feature| !client.welcome().features.contains(*feature));
     if let Some(feature) = missing_feature {
-        let message = format!("connected daemon does not advertise {feature}");
+        let message = if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+            haider_rpc::HELPER_STOP_UNSUPPORTED_MESSAGE.to_owned()
+        } else {
+            format!("connected daemon does not advertise {feature}")
+        };
         if matches!(
             command,
-            LiveCommand::CheckpointList { .. }
+            LiveCommand::Cancel { .. } | LiveCommand::AgentCancel { .. }
+                | LiveCommand::CheckpointList { .. }
                 | LiveCommand::CheckpointUndo { .. }
                 | LiveCommand::CheckpointRedo { .. }
                 | LiveCommand::CheckpointRollbackTurn { .. }
@@ -529,7 +582,12 @@ async fn issue(
             let _ = replies
                 .send(LiveReply::Failed {
                     command_id: context.command_id.clone(),
-                    code: "feature_missing".into(),
+                    code: if feature == haider_rpc::FEATURE_HELPER_STOP_V1 {
+                        "protocol_mismatch"
+                    } else {
+                        "feature_missing"
+                    }
+                    .into(),
                     message,
                     retryable: false,
                     presentation: None,
@@ -647,8 +705,15 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
         }
         LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
-        LiveCommand::AgentCancel { .. } => &[haider_rpc::FEATURE_AGENT_CANCEL_V1],
-        LiveCommand::Retract { .. } => &[haider_rpc::FEATURE_TURN_RETRACT_V1],
+        LiveCommand::AgentCancel { .. } => &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_AGENT_CANCEL_V1,
+        ],
+        LiveCommand::Cancel { .. } => &[haider_rpc::FEATURE_HELPER_STOP_V1],
+        LiveCommand::Retract { .. } => &[
+            haider_rpc::FEATURE_HELPER_STOP_V1,
+            haider_rpc::FEATURE_TURN_RETRACT_V1,
+        ],
         LiveCommand::CheckpointList { .. }
         | LiveCommand::CheckpointUndo { .. }
         | LiveCommand::CheckpointRedo { .. }
@@ -686,6 +751,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
+        LiveCommand::AccountListWatch => &[haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1],
         _ => &[],
     }
 }
@@ -705,6 +771,10 @@ type CheckpointListContext = (
 /// daemon — the workspace forbids inline test modules, and an unmapped
 /// response body is a silently swallowed reply.
 pub struct CommandContext {
+    list: bool,
+    list_epoch: Option<u64>,
+    catalog_epoch: Option<u64>,
+    selection_connection_epoch: Option<u64>,
     /// The OAuth start's attempt id, so the reply is identity-tagged.
     pub oauth_attempt: Option<String>,
     command_id: Option<haider_rpc::CommandId>,
@@ -774,7 +844,7 @@ pub struct CommandContext {
     loom_install_status: Option<(u64, u64, String)>,
     ssh_stage: Option<crate::app::SshProfileMutation>,
     ssh_test: bool,
-    ssh_shell_open: bool,
+    ssh_shell_open: Option<u64>,
 }
 
 impl CommandContext {
@@ -786,6 +856,26 @@ impl CommandContext {
             _ => None,
         };
         Self {
+            list: matches!(
+                command,
+                LiveCommand::List { .. } | LiveCommand::ListAt { .. }
+            ),
+            list_epoch: match command {
+                LiveCommand::ListAt { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
+            catalog_epoch: match command {
+                LiveCommand::AccountListAt { epoch }
+                | LiveCommand::ProviderListAt { epoch }
+                | LiveCommand::RefreshProviderModelsAt { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
+            selection_connection_epoch: match command {
+                LiveCommand::SelectModel {
+                    connection_epoch, ..
+                } => Some(*connection_epoch),
+                _ => None,
+            },
             command_id: command.command_id().cloned(),
             login: match command {
                 LiveCommand::Stage {
@@ -808,7 +898,8 @@ impl CommandContext {
                 _ => None,
             },
             models_provider: match command {
-                LiveCommand::RefreshProviderModels { provider } => Some(provider.clone()),
+                LiveCommand::RefreshProviderModels { provider }
+                | LiveCommand::RefreshProviderModelsAt { provider, .. } => Some(provider.clone()),
                 _ => None,
             },
             attach: match command {
@@ -915,7 +1006,10 @@ impl CommandContext {
                 _ => None,
             },
             ssh_test: matches!(command, LiveCommand::SshTest { .. }),
-            ssh_shell_open: matches!(command, LiveCommand::SshShellOpen { .. }),
+            ssh_shell_open: match command {
+                LiveCommand::SshShellOpen { attempt_id, .. } => Some(*attempt_id),
+                _ => None,
+            },
         }
     }
 }
@@ -946,15 +1040,17 @@ pub fn request_body_for_features(
     match command {
         // Reconnect is consumed by the IO shell before RPC conversion.
         LiveCommand::Reconnect => unreachable!("reconnect retires the socket before RPC mapping"),
-        LiveCommand::List { cursor } => RequestBody::SessionList {
-            cursor,
-            limit: crate::live::LIST_PAGE,
-            order: if daemon_features.contains(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1) {
-                haider_rpc::SessionListOrderWire::RecencyDesc
-            } else {
-                haider_rpc::SessionListOrderWire::IdAsc
-            },
-        },
+        LiveCommand::List { cursor } | LiveCommand::ListAt { cursor, .. } => {
+            RequestBody::SessionList {
+                cursor,
+                limit: crate::live::LIST_PAGE,
+                order: if daemon_features.contains(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1) {
+                    haider_rpc::SessionListOrderWire::RecencyDesc
+                } else {
+                    haider_rpc::SessionListOrderWire::IdAsc
+                },
+            }
+        }
         LiveCommand::Attach { session, after_seq } => RequestBody::SessionAttach {
             session_id: session,
             after_seq,
@@ -1002,15 +1098,19 @@ pub fn request_body_for_features(
             command_id,
             cwd,
             workspace_allocation,
+            account_alias,
             provider,
             model,
             max_tokens,
+            expected_catalog_key,
             ..
         } => RequestBody::SessionCreateWithPermissionOverrides {
             command_id,
             cwd,
             provider,
+            resolve_model: model.is_empty(),
             model,
+            expected_catalog_key,
             max_tokens,
             // OWNER DIRECTIVE: the interactive surface runs in full AUTO-ALLOW
             // mode (the Codex --full-auto analogue) — writes, exec, web fetch,
@@ -1033,9 +1133,8 @@ pub fn request_body_for_features(
             interaction_mode:
                 haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
             ssh_scope: None,
-            account_alias: None,
+            account_alias,
             resolve_provider: false,
-            resolve_model: false,
             effort: None,
             fast: None,
         },
@@ -1337,6 +1436,7 @@ pub fn request_body_for_features(
             profile,
             session,
             size,
+            ..
         } => RequestBody::SshShellOpen {
             name: profile,
             session_id: session,
@@ -1620,7 +1720,10 @@ pub fn request_body_for_features(
             validation_model: None,
             replace_existing: false,
         },
-        LiveCommand::AccountList => RequestBody::AccountList { provider: None },
+        LiveCommand::AccountList | LiveCommand::AccountListAt { .. } => {
+            RequestBody::AccountList { provider: None }
+        }
+        LiveCommand::AccountListWatch => RequestBody::AccountListWatch {},
         // D2: the read carries nothing; the import carries ONLY the opaque
         // candidate id — the daemon re-reads the local store itself, so no
         // credential bytes exist to send.
@@ -1641,8 +1744,11 @@ pub fn request_body_for_features(
             alias,
             confirm_new_epoch,
         },
-        LiveCommand::ProviderList => RequestBody::ProviderList { provider: None },
-        LiveCommand::RefreshProviderModels { provider } => {
+        LiveCommand::ProviderList | LiveCommand::ProviderListAt { .. } => {
+            RequestBody::ProviderList { provider: None }
+        }
+        LiveCommand::RefreshProviderModels { provider }
+        | LiveCommand::RefreshProviderModelsAt { provider, .. } => {
             RequestBody::ProviderModelsRefresh { provider }
         }
         LiveCommand::SetDefaultModel {
@@ -1666,11 +1772,14 @@ pub fn request_body_for_features(
             model,
             provider,
             confirm_new_epoch,
+            expected_catalog_key,
+            ..
         } => RequestBody::SessionSelectModel {
             command_id,
             session_id: session,
             worker_generation,
             model,
+            expected_catalog_key,
             provider: Some(provider),
             confirm_new_epoch,
             max_tokens: None,
@@ -1857,9 +1966,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionList {
             sessions,
             next_cursor,
-        } => vec![LiveReply::Listed {
-            sessions,
-            next_cursor,
+        } => vec![match context.list_epoch {
+            Some(epoch) => LiveReply::ListedAt {
+                sessions,
+                next_cursor,
+                epoch,
+            },
+            None => LiveReply::Listed {
+                sessions,
+                next_cursor,
+            },
         }],
         ResponseBody::SessionAttach {
             attachment_id,
@@ -1910,8 +2026,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 command_id: id,
                 session: session_id,
                 worker_generation,
-                cwd: metadata.cwd,
-                model: metadata.model,
+                cwd: metadata.cwd.clone(),
+                model: metadata.model.clone(),
+                provider: metadata.provider.clone(),
+                model_catalog_key: metadata.model_catalog_key.clone(),
+                metadata: Some(metadata),
             }]
         }),
         // The branch-pinned response shape carries the same driver facts as
@@ -2079,7 +2198,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             vec![LiveReply::SshScopeSet { scope }]
         }
         ResponseBody::SshShell { .. } => Vec::new(),
-        ResponseBody::SshShellOpen { shell } => vec![LiveReply::SshShellOpened { shell }],
+        ResponseBody::SshShellOpen { shell } => vec![LiveReply::SshShellOpened {
+            // Zero is never issued by an AppModel. An uncorrelated success
+            // must still reach the reducer so its orphaned shell is closed.
+            attempt_id: context.ssh_shell_open.unwrap_or(0),
+            shell,
+        }],
         ResponseBody::SshShellInput { shell }
         | ResponseBody::SshShellResize { shell }
         | ResponseBody::SshShellEof { shell } => vec![LiveReply::ShellChanged { shell }],
@@ -2338,15 +2462,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        ResponseBody::AccountListWatch { accepted } => {
+            vec![LiveReply::ManagementWatch { accepted }]
+        }
         ResponseBody::AccountList {
             descriptors,
             revision,
             sources,
             ..
-        } => vec![LiveReply::Accounts {
-            descriptors,
-            revision,
-            sources: sources
+        } => {
+            let sources: Vec<_> = sources
                 .into_iter()
                 .map(|source| crate::app::AccountSourceRow {
                     source_id: source.source_id,
@@ -2363,8 +2488,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     plan: source.plan,
                     masked_identity: source.masked_identity,
                 })
-                .collect(),
-        }],
+                .collect();
+            vec![if let Some(epoch) = context.catalog_epoch {
+                LiveReply::AccountsAt {
+                    descriptors,
+                    revision,
+                    sources,
+                    epoch,
+                }
+            } else {
+                LiveReply::Accounts {
+                    descriptors,
+                    revision,
+                    sources,
+                }
+            }]
+        }
         ResponseBody::AccountDeviceCandidates {
             discovery_disabled,
             candidates,
@@ -2399,12 +2538,28 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             providers,
             revision,
             ..
-        } => vec![LiveReply::Providers {
-            providers,
-            revision,
+        } => vec![if let Some(epoch) = context.catalog_epoch {
+            LiveReply::ProvidersAt {
+                providers,
+                revision,
+                epoch,
+            }
+        } else {
+            LiveReply::Providers {
+                providers,
+                revision,
+            }
         }],
         ResponseBody::ProviderModelsRefresh { provider, revision } => {
-            vec![LiveReply::ProviderModelsRefreshed { provider, revision }]
+            vec![if let Some(epoch) = context.catalog_epoch {
+                LiveReply::ProviderModelsRefreshedAt {
+                    provider,
+                    revision,
+                    epoch,
+                }
+            } else {
+                LiveReply::ProviderModelsRefreshed { provider, revision }
+            }]
         }
         ResponseBody::AccountSetDefaultModel { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
@@ -2421,17 +2576,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session_id,
             provider,
             model,
+            selected_seq,
             worker_generation,
             output_budget,
+            model_catalog_key,
             ..
         } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ModelSelected {
+                connection_epoch: context.selection_connection_epoch,
+                selected_seq,
                 command_id: id,
                 session: session_id,
                 provider,
                 model,
                 worker_generation,
                 output_budget,
+                model_catalog_key,
             }]
         }),
         // G2: the NORMALIZED committed title — the reply reports daemon
@@ -2647,8 +2807,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
-                if context.ssh_shell_open {
+                if let Some(attempt_id) = context.ssh_shell_open {
                     return vec![LiveReply::SshShellFailed {
+                        attempt_id,
                         code: code.clone(),
                         message: message.clone(),
                     }];
@@ -2667,9 +2828,17 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     }];
                 }
                 if let Some(provider) = context.models_provider.clone() {
-                    return vec![LiveReply::ModelsRefreshFailed {
-                        provider,
-                        message: message.clone(),
+                    return vec![if let Some(epoch) = context.catalog_epoch {
+                        LiveReply::ModelsRefreshFailedAt {
+                            provider,
+                            message: message.clone(),
+                            epoch,
+                        }
+                    } else {
+                        LiveReply::ModelsRefreshFailed {
+                            provider,
+                            message: message.clone(),
+                        }
                     }];
                 }
                 // H4: a `hooks.list` error is identity-tagged the same way
@@ -2776,6 +2945,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
+                if context.list {
+                    return vec![context.list_epoch.map_or(LiveReply::ListFailed, |epoch| {
+                        LiveReply::ListFailedAt { epoch }
+                    })];
+                }
                 vec![LiveReply::Failed {
                     command_id: context.command_id.clone(),
                     code: code.clone(),
@@ -2848,6 +3022,9 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             session: session_id,
             op,
         }],
+        WireFrame::SessionRosterDelta { summaries } => vec![LiveReply::RosterUpdated {
+            sessions: summaries,
+        }],
         WireFrame::PeerMessageReceived { message } => vec![LiveReply::PeerReceived { message }],
         WireFrame::PeerDeliveryChanged { receipt } => {
             vec![LiveReply::PeerDeliveryChanged { receipt }]
@@ -2880,6 +3057,11 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.
         WireFrame::ResidentSessionBinding { .. } => Vec::new(),
+        // `account.list_watch` signal: re-read the management snapshot so an
+        // idle terminal follows another client's account or catalog change.
+        WireFrame::AccountsChanged { revision } => {
+            vec![LiveReply::ManagementChanged { revision }]
+        }
         WireFrame::ProtocolError(error)
             if matches!(
                 error.code.as_str(),
@@ -2910,8 +3092,6 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         | WireFrame::Welcome(_)
         | WireFrame::Request { .. }
         | WireFrame::Response { .. }
-        | WireFrame::SessionRosterDelta { .. }
-        | WireFrame::AccountsChanged { .. }
         | WireFrame::HaiderCodePlanStatus { .. }
         | WireFrame::SessionSurfaceDelta { input: None, .. }
         | WireFrame::MenuAnswer { .. }

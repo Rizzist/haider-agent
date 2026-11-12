@@ -217,6 +217,9 @@ pub(crate) struct SessionSummaryView {
     /// lineage, this carries the exact source-prompt sequence selected as the
     /// child's editable draft.
     pub forked_from: Option<SessionForkProvenance>,
+    /// Origin and owning agent from the authoritative roster snapshot.
+    pub owner_agent_id: Option<haider_protocol::ids::AgentId>,
+    pub launch_origin: Option<haider_protocol::session::LaunchOriginV1>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -389,6 +392,12 @@ impl ObserveJson for SessionSummaryView {
         }
         if let Some(needs_input) = &self.needs_input {
             object["needs_input"] = serde_json::to_value(needs_input).unwrap_or(Value::Null);
+        }
+        if let Some(owner) = &self.owner_agent_id {
+            object["owner_agent_id"] = json!(owner);
+        }
+        if let Some(origin) = &self.launch_origin {
+            object["launch_origin"] = json!(origin);
         }
         if let Some(provenance) = &self.forked_from {
             object["forked_from"] = json!({
@@ -989,6 +998,8 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         waiting_why: None,
         needs_input: None,
         forked_from: None,
+        owner_agent_id: None,
+        launch_origin: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
@@ -1091,6 +1102,8 @@ pub(crate) fn merge_roster_summary(
     view.waiting_why = summary.waiting_why.clone();
     view.needs_input = summary.needs_input.clone();
     view.forked_from = summary.forked_from.clone();
+    view.owner_agent_id = summary.owner_agent_id.clone();
+    view.launch_origin = summary.launch_origin.clone();
 }
 
 pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
@@ -1157,6 +1170,19 @@ pub(crate) fn fleet_candidates(
 }
 
 pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
+    fleet_human_text_with(
+        snapshot,
+        haider_client::fleet::activity_display_from_env(None),
+    )
+}
+
+/// Human fleet tree. 973-activity-icons: each live node's current ACTIVITY
+/// glyph sits between its state glyph and its name (emoji, `[text]` label
+/// under NO_COLOR/limited terminals, or nothing when disabled).
+pub(crate) fn fleet_human_text_with(
+    snapshot: &SessionFleetSnapshot,
+    display: haider_client::fleet::ActivityDisplay,
+) -> String {
     use haider_client::fleet;
     let mut text = fleet::header_line(&fleet::rollup(&snapshot.roots));
     text.push('\n');
@@ -1165,6 +1191,10 @@ pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
         text.push_str(&" │ ".repeat(row.rel_depth));
         text.push_str(fleet::state_glyph(row.node.state));
         text.push(' ');
+        if let Some(glyph) = fleet::activity_glyph(row.node, display) {
+            text.push_str(glyph);
+            text.push(' ');
+        }
         text.push_str(fleet::callsign(row.node));
         if let Some(marker) = fleet::child_marker(row.node) {
             text.push(' ');
@@ -1513,18 +1543,7 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
         | ObserveError::StreamTask(_)
         | ObserveError::UnknownSession(_) => EX_SOFTWARE,
         ObserveError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
-        ObserveError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        ObserveError::Rpc { code, .. } if super::run::is_provider_error_code(code) => EX_PROVIDER,
         ObserveError::Rpc { code, .. }
             if matches!(code.as_str(), "permission_denied" | "input_required") =>
         {
@@ -1588,6 +1607,8 @@ mod roster_scalar_tests {
             waiting_why: None,
             needs_input: None,
             forked_from: None,
+            owner_agent_id: None,
+            launch_origin: None,
         }
     }
 
@@ -1658,5 +1679,49 @@ mod roster_scalar_tests {
             json["waiting_why"],
             serde_json::json!({"kind": "permission"})
         );
+    }
+}
+
+#[cfg(test)]
+mod rpc_availability_exit_tests {
+    use super::*;
+
+    #[test]
+    fn provider_availability_refusals_keep_provider_exit_status() {
+        for code in [
+            "provider_error",
+            "provider_timeout",
+            "credential_missing",
+            "credential_limited",
+            "unauthorized",
+            "provider_unavailable",
+        ] {
+            for retryable in [false, true] {
+                let error = ObserveError::Rpc {
+                    code: code.into(),
+                    message: "fixture refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_observe_error(&error), EX_PROVIDER, "{code}");
+            }
+        }
+        for code in [
+            "internal",
+            "busy",
+            "PROVIDER_UNAVAILABLE",
+            " provider_unavailable",
+            "provider_unavailable_extra",
+            "provider_unavailable ",
+            "",
+        ] {
+            for retryable in [false, true] {
+                let error = ObserveError::Rpc {
+                    code: code.into(),
+                    message: "unknown refusal".into(),
+                    retryable,
+                };
+                assert_eq!(exit_code_for_observe_error(&error), EX_SOFTWARE, "{code}");
+            }
+        }
     }
 }

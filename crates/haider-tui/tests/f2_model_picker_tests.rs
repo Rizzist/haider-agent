@@ -55,6 +55,7 @@ fn seeded_session() -> AppModel {
     let mut model = seeded_launcher();
     model.sessions.clear();
     model.upsert_live_session(&sid());
+    model.note_session_metadata_at(&sid(), "anthropic", "fable-5", 30_000, Some(0), None);
     model.open_session(&sid());
     assert_eq!(model.screen, Screen::Session);
     model.requests.clear();
@@ -130,7 +131,40 @@ fn pass(
     model: &mut AppModel,
     reply: Option<LiveReply>,
 ) -> Vec<LiveCommand> {
-    live_pass(driver, model, reply, std::time::Instant::now()).commands
+    let mut commands = live_pass(driver, model, reply, std::time::Instant::now()).commands;
+    // Session selection now waits for that session's control attachment.
+    // Advance the synthetic wire through the attach before looking for the
+    // selection command, exactly as the live link does.
+    let attaching: Vec<_> = commands
+        .iter()
+        .filter_map(|command| match command {
+            LiveCommand::Attach { session, .. } | LiveCommand::AttachWithOrigin { session, .. } => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for session in attaching {
+        commands.extend(
+            live_pass(
+                driver,
+                model,
+                Some(LiveReply::Attached {
+                    attachment: haider_rpc::AttachmentId::new(format!(
+                        "f2-att-{}",
+                        session.as_str()
+                    )),
+                    session,
+                    worker_generation: 7,
+                    replay_through_seq: 0,
+                    launch_origin: None,
+                }),
+                std::time::Instant::now(),
+            )
+            .commands,
+        );
+    }
+    commands
 }
 
 /// MUTATION CHECK (F2a): route bare `/model` back to the old flash list.
@@ -762,9 +796,12 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "openai-oauth".to_owned(),
+            model_catalog_key: None,
             model: "o4-mini".to_owned(),
             worker_generation: 7,
             output_budget: None,
@@ -848,9 +885,12 @@ fn provider_stage_selection_preserves_pending_and_resolved_truth() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "resolved-stage".to_owned(),
+            model_catalog_key: None,
             model: "stage-model-v2".to_owned(),
             worker_generation: 9,
             output_budget: None,
@@ -882,9 +922,12 @@ fn clamped_user_output_budget_shows_a_notice_on_model_switch() {
         &mut driver,
         &mut model,
         Some(LiveReply::ModelSelected {
+            connection_epoch: None,
+            selected_seq: 1,
             command_id,
             session: sid(),
             provider: "openai".to_owned(),
+            model_catalog_key: None,
             model: "gpt-4o".to_owned(),
             worker_generation: 8,
             output_budget: Some(haider_protocol::output_budget::SessionOutputBudgetV1 {
@@ -1052,7 +1095,7 @@ fn launcher_selection_sets_the_default_pair() {
     );
     assert_eq!(model.identity.provider, "local");
     assert_eq!(model.identity.model_short, "qwen3-coder");
-    assert!(model.identity_pinned, "an explicit choice pins");
+    assert!(model.launcher_identity_pinned, "an explicit choice pins");
     assert!(
         !model
             .requests
@@ -1185,4 +1228,114 @@ fn never_fetched_picker_has_no_invented_model_and_enter_fetches() {
             .iter()
             .any(|row| row.model == "deepseek-v4-flash")
     );
+}
+
+#[test]
+fn configured_unverified_deployment_is_selectable_and_reason_fits_both_picker_sizes() {
+    let mut model = seeded_launcher();
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "azure-deploy",
+            model: "my-gpt-deployment",
+            available: true,
+            reason: Some("configured (unverified): server returned 404 for /models"),
+            context_window: None,
+            fetched_at_ms: None,
+            lockdown: false,
+            is_default: true,
+        },
+    );
+    run_slash(&mut model, "/model my-gpt");
+    let row = model
+        .model_picker_filtered("my-gpt")
+        .pop()
+        .expect("deployment");
+    assert!(row.available && row.selectable);
+    for (width, height) in [(118, 36), (80, 24)] {
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(text.contains("configured (unverified)"), "{text}");
+        assert!(text.contains("404"), "{text}");
+    }
+    model.select_model_row(&row);
+    assert_eq!(model.identity.model_short, "my-gpt-deployment");
+    assert!(model.model_picker.is_none());
+}
+
+#[test]
+fn refused_pick_keeps_its_specific_reason_and_provider_visible_after_roster_refresh() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = seeded_launcher();
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider: "azure-deploy",
+                model: "my-gpt-deployment",
+                available: false,
+                reason: Some("server returned 503 for /models; retry discovery"),
+                context_window: None,
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+        let old_pair = (
+            model.identity.provider.clone(),
+            model.identity.model_short.clone(),
+        );
+        run_slash(&mut model, "/model my-gpt");
+        model.handle(key(KeyCode::Enter));
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(
+            text.contains("Unavailable") && text.contains("503"),
+            "{text}"
+        );
+        assert_eq!(
+            (
+                model.identity.provider.clone(),
+                model.identity.model_short.clone()
+            ),
+            old_pair
+        );
+        model.handle(key(KeyCode::Esc));
+        run_slash(&mut model, "/providers");
+        // The actual provider-list reply may insert/reorder providers before
+        // the refused row. Focus follows its ID, never a stale cursor index.
+        let mut refreshed = model.providers.providers.clone();
+        let mut inserted = refreshed[0].clone();
+        inserted.provider = "inserted-provider".into();
+        refreshed.insert(0, inserted);
+        model.providers.apply_snapshot(refreshed, 2);
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(text.contains("azure-deploy"), "{text}");
+        assert_eq!(
+            model.providers.providers[model.providers.cursor].provider,
+            "azure-deploy"
+        );
+    }
+}
+
+#[test]
+fn never_fetched_deployment_reason_is_complete_at_both_picker_sizes() {
+    let mut model = seeded_launcher();
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "azure-deploy",
+            model: "my-gpt-deployment",
+            available: false,
+            reason: Some("model list not fetched — fetch models before selecting"),
+            context_window: None,
+            fetched_at_ms: None,
+            lockdown: false,
+            is_default: true,
+        },
+    );
+    run_slash(&mut model, "/model my-gpt");
+    for (width, height) in [(118, 36), (80, 24)] {
+        let text = draw_rows(&model, width, height).join("\n");
+        assert!(text.contains("model list not fetched"), "{text}");
+        assert!(text.contains("fetch models before selecting"), "{text}");
+        assert!(!text.contains("not fet…"), "{text}");
+    }
 }

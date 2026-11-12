@@ -370,6 +370,52 @@ pub(super) async fn run_session_actor(
             // work behind the close barrier. Dropping its reply reports closure.
             continue;
         }
+        // A run-scoped route epoch is allocated here and committed by the
+        // `WorkerAppend` arm below in this same actor turn. Every session
+        // selection epoch is allocated from the same journal head by a
+        // command this loop serializes, so neither side can reuse the other's
+        // epoch (an allocation read outside the actor could).
+        let command = match command {
+            ActorCommand::WorkerAppendAllocatedEpoch {
+                lease_id,
+                floor,
+                build,
+                allocated,
+                completed,
+            } => {
+                let latest = match StoreHandle::latest_seq(&store, &session_id).await {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                };
+                let Some(epoch) = head.max(latest).max(floor).checked_add(1) else {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "run route epoch exhausted",
+                        false,
+                    )));
+                    continue;
+                };
+                match build(epoch) {
+                    Ok(envelopes) => {
+                        let _ = allocated.send(epoch);
+                        ActorCommand::WorkerAppend {
+                            lease_id,
+                            expected_head: None,
+                            envelopes,
+                            completed,
+                        }
+                    }
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                }
+            }
+            command => command,
+        };
         match command {
             ActorCommand::Append {
                 envelopes,
@@ -466,6 +512,7 @@ pub(super) async fn run_session_actor(
                 interaction_mode,
                 account_alias,
                 workspace_allocation,
+                inherited_route,
                 completed,
             } => {
                 // Same INV-1 shape as ordinary append: the complete metadata +
@@ -477,6 +524,7 @@ pub(super) async fn run_session_actor(
                         interaction_mode,
                         account_alias,
                         workspace_allocation,
+                        inherited_route,
                     )
                     .await;
                 if let Ok(SessionCreateOutcome::Committed { envelope, .. }) = &result {
@@ -551,6 +599,47 @@ pub(super) async fn run_session_actor(
                     });
                 }
                 let _ = completed.send(result);
+            }
+            ActorCommand::ResolvedRoute {
+                provider,
+                model,
+                epoch,
+                alias,
+                device_id,
+                completed,
+            } => {
+                let result = store
+                    .commit_resolved_route_fact(
+                        &session_id,
+                        &provider,
+                        &model,
+                        epoch,
+                        alias.as_deref(),
+                        &device_id,
+                    )
+                    .await;
+                if let Ok((_, envelopes)) = &result
+                    && let Some(last) = envelopes.last()
+                {
+                    head = last.seq;
+                    authority_epoch = last.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result.map(|(epoch, _)| epoch));
             }
             ActorCommand::SelectModel { command, completed } => {
                 // The metadata update, model_selected fact, and R2 receipt
@@ -1308,7 +1397,21 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
-            ActorCommand::CancelTurn { command, completed } => {
+            ActorCommand::CancelTurn {
+                worker_lease,
+                command,
+                completed,
+            } => {
+                if worker_lease.as_ref().is_some_and(|lease_id| {
+                    worker.as_ref().map(|worker| &worker.lease_id) != Some(lease_id)
+                }) {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::SingleWriterViolation,
+                        "worker lease was superseded",
+                        false,
+                    )));
+                    continue;
+                }
                 // PERSIST-BEFORE-WAKE (R5, authoritative statement): the
                 // durable `Cancelling` intent commits and publishes BEFORE the
                 // registered worker's cancellation wake fires below, in this
@@ -1318,34 +1421,41 @@ pub(super) async fn run_session_actor(
                 // states, so a missed wake delays reconciliation, not truth.
                 let result = store.cancel_turn(command).await;
                 if let Ok(TurnCancelOutcome::Committed {
-                    envelope: Some(envelope),
+                    envelope,
+                    delivery_obligations,
                     ..
                 }) = &result
                 {
-                    head = envelope.seq;
-                    authority_epoch = envelope.authority_epoch;
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    publish(
-                        &mut attachments,
-                        std::slice::from_ref(envelope.as_ref()),
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    if let Some(wake) = worker
-                        .as_ref()
-                        .and_then(|worker| worker.cancellation_wake.as_ref())
-                    {
-                        wake.send_modify(|generation| {
-                            *generation = generation.saturating_add(1);
+                    let mut published = Vec::new();
+                    if let Some(envelope) = envelope {
+                        published.push(envelope.as_ref().clone());
+                    }
+                    published.extend(delivery_obligations.iter().cloned());
+                    if let Some(last) = published.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                        observer.observe(HubObservation::Persisted {
+                            session_id: session_id.clone(),
+                            through_seq: head,
                         });
+                        publish(
+                            &mut attachments,
+                            &published,
+                            catch_up_byte_budget,
+                            &metrics,
+                            &hooks,
+                        );
+                        observer.observe(HubObservation::Published {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                    }
+                    if envelope.is_some()
+                        && let Some(wake) = worker
+                            .as_ref()
+                            .and_then(|worker| worker.cancellation_wake.as_ref())
+                    {
+                        wake.send_modify(|generation| *generation = generation.saturating_add(1));
                     }
                 }
                 let _ = completed.send(result);
@@ -1930,6 +2040,14 @@ pub(super) async fn run_session_actor(
                 let _ = completed.send(result);
                 return;
             }
+            ActorCommand::WorkerAppendAllocatedEpoch { completed, .. } => {
+                // Converted into `WorkerAppend` before this match.
+                let _ = completed.send(Err(HaiderError::new(
+                    ErrorCode::Internal,
+                    "run route append reached the actor unallocated",
+                    false,
+                )));
+            }
             ActorCommand::Stop => break,
         }
     }
@@ -2436,12 +2554,14 @@ mod error_wave3_tests {
         let session_id = SessionId::new("e6a-abandon-session");
         store
             .create_session(haider_store::SessionCreateCommand {
+                resolved_model: None,
                 command_id: "create-e6a-abandon".into(),
                 request_digest: "digest-e6a-abandon".into(),
                 request_json: r#"{"session":"e6a-abandon"}"#.into(),
                 session_id: session_id.clone(),
                 cwd: root.path().to_string_lossy().into_owned(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-v1".into(),
                 max_tokens: 1_024,
                 max_tokens_source: None,
