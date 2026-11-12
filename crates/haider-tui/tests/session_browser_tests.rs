@@ -182,6 +182,26 @@ fn rows_order_needs_you_then_unseen_then_recent() {
     assert!(!rows[3].unseen, "activity older than seen is settled");
 }
 
+#[test]
+fn browser_rows_project_real_workspace_paths_for_active_and_inactive_sessions() {
+    let mut model = live_model();
+    let mut row = summary("other", None, None);
+    row.workspace_cwd = Some("/Users/bob/project".to_owned());
+    seed(&mut model, row);
+    assert_eq!(model.session_browser_rows()[0].dir, "/Users/<user>/project");
+
+    model.active_session = Some(SessionId::new("other"));
+    let mut active = summary("other", None, None);
+    active.workspace_cwd = Some("/home/bob/work".to_owned());
+    model.note_summary_counts(&active);
+    assert_eq!(model.session_browser_rows()[0].dir, "/home/<user>/work");
+    assert_eq!(
+        model.session_workspace_cwd.as_deref(),
+        Some("/home/bob/work"),
+        "RPC authority keeps the real path"
+    );
+}
+
 /// The browser is reachable, selects, opens, and returns — the whole
 /// keyboard contract in one pass.
 ///

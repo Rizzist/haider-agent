@@ -201,7 +201,9 @@ async fn front_door_with_options(options: BareTuiOptions) -> ExitCode {
                     "haider {VERSION} — daemon ready ({how}): profile {} at {} \
                      (daemon v{}, generation {})",
                     &profile.profile_id[..12],
-                    profile.endpoint_path.display(),
+                    haider_tui::live::workspace_display_path(
+                        &profile.endpoint_path.to_string_lossy()
+                    ),
                     ensured.welcome.daemon_version,
                     ensured.welcome.daemon_generation,
                 );
@@ -515,24 +517,11 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
         model.sanctum_tier = SanctumTier::Translit;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        // Component-aware: /Users/alice2 must not abbreviate under ~alice.
-        // Seeds the launcher + session working dirs (TUI3b: the shell
-        // builtins' `cd` retargets these; unknown dirs list VFS defaults).
-        let abbreviated = match (!home.is_empty())
-            .then(|| cwd.strip_prefix(&home).ok())
-            .flatten()
-        {
-            Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-            Some(rest) => format!("~/{}", rest.display()),
-            None => cwd.display().to_string(),
-        };
-        model.launcher_dir = abbreviated.clone();
-        model.session_dir = abbreviated;
-        // Tool rows shorten paths under home to `~/…` (973-tui-toolview).
-        model.home_dir = (!home.is_empty()).then_some(home);
-    }
+    seed_display_dirs(
+        &mut model,
+        std::env::current_dir().ok().as_deref(),
+        &haider_client::launch_origin::process_display_homes(),
+    );
     if !interactive {
         // The plain/CI oracle stays deterministic: no demo-store load, no
         // save, no terminal probe — `system` resolves to the dark default.
@@ -680,7 +669,10 @@ fn apply_interactive_workspace(
     let (workspace, allocation) = match selection {
         WorkspaceSelection::LaunchCwd { path, .. } => {
             let canonical = std::fs::canonicalize(&path).map_err(|error| {
-                format!("cannot canonicalize workspace {}: {error}", path.display())
+                format!(
+                    "cannot canonicalize workspace {}: {error}",
+                    haider_tui::live::workspace_display_path(&path.to_string_lossy())
+                )
             })?;
             (canonical, None)
         }
@@ -696,14 +688,14 @@ fn apply_interactive_workspace(
     };
     let workspace_text = workspace
         .to_str()
-        .ok_or_else(|| format!("workspace path is not valid UTF-8: {}", workspace.display()))?
+        .ok_or_else(|| invalid_utf8_workspace_error(&workspace))?
         .to_owned();
     model.cwd = workspace_text;
     model.pending_workspace_allocation = allocation;
     // The SAME producer the live driver uses for renewed allocations
     // (sanitised, home-relative, `/`-normalised, identical fallback), so the
     // first and every later preview spell a path identically everywhere.
-    let display = haider_tui::live::workspace_display_path(&model.cwd);
+    let display = model.display_path(&model.cwd);
     model.pending_workspace_display = model
         .pending_workspace_allocation
         .as_ref()
@@ -713,65 +705,113 @@ fn apply_interactive_workspace(
     Ok(())
 }
 
+fn invalid_utf8_workspace_error(path: &std::path::Path) -> String {
+    format!(
+        "workspace path is not valid UTF-8: {}",
+        haider_client::launch_origin::display_path(path)
+    )
+}
+
 /// Capture the process launch directory independently of workspace selection.
 /// Existing-session opens skip the resolver, but still register this TUI open.
 fn apply_launch_origin(model: &mut AppModel) {
+    apply_launch_origin_with_homes(
+        model,
+        &haider_client::launch_origin::process_display_homes(),
+    );
+}
+
+fn apply_launch_origin_with_homes(model: &mut AppModel, homes: &[PathBuf]) {
+    #[cfg(target_os = "android")]
+    let _ = (model, homes);
     #[cfg(not(target_os = "android"))]
     {
-        let launch_cwd = std::env::current_dir()
-            .ok()
-            .and_then(|path| std::fs::canonicalize(path).ok());
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let sanitized = match haider_client::launch_origin::sanitize_origin_path(
-            launch_cwd.as_deref(),
-            home.as_deref(),
-        ) {
-            Ok(sanitized) => sanitized,
-            Err(error) => {
-                model.flash = Some(format!("· launch origin was not registered — {error}"));
-                return;
-            }
-        };
-        model.launch_origin_path = Some(haider_protocol::session::LaunchOriginPathV1 {
-            kind: match sanitized.kind {
-                haider_client::launch_origin::OriginPathKind::HomeRelative => {
-                    haider_protocol::session::LaunchOriginPathKindV1::HomeRelative
-                }
-                haider_client::launch_origin::OriginPathKind::Absolute => {
-                    haider_protocol::session::LaunchOriginPathKindV1::Absolute
-                }
-                haider_client::launch_origin::OriginPathKind::Redacted => {
-                    haider_protocol::session::LaunchOriginPathKindV1::Redacted
-                }
-                haider_client::launch_origin::OriginPathKind::Unavailable => {
-                    haider_protocol::session::LaunchOriginPathKindV1::Unavailable
-                }
-            },
-            display: sanitized.display,
-        });
+        let launch_cwd = std::env::current_dir().ok();
+        apply_launch_origin_for_path(model, launch_cwd.as_deref(), homes);
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn apply_launch_origin_for_path(
+    model: &mut AppModel,
+    path: Option<&std::path::Path>,
+    homes: &[PathBuf],
+) {
+    let origin = match projected_launch_origin(path, homes) {
+        Ok(origin) => origin,
+        Err(error) => {
+            model.flash = Some(format!("· launch origin was not registered — {error}"));
+            return;
+        }
+    };
+    model.launch_origin_path = Some(origin);
+}
+
+#[cfg(not(target_os = "android"))]
+fn projected_launch_origin(
+    path: Option<&std::path::Path>,
+    homes: &[PathBuf],
+) -> Result<
+    haider_protocol::session::LaunchOriginPathV1,
+    haider_client::launch_origin::OriginSanitizeError,
+> {
+    let sanitized = haider_client::launch_origin::sanitize_origin_path_with_homes(
+        path,
+        &homes.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+    )?;
+    Ok(haider_protocol::session::LaunchOriginPathV1 {
+        kind: match sanitized.kind {
+            haider_client::launch_origin::OriginPathKind::HomeRelative => {
+                haider_protocol::session::LaunchOriginPathKindV1::HomeRelative
+            }
+            haider_client::launch_origin::OriginPathKind::Absolute => {
+                haider_protocol::session::LaunchOriginPathKindV1::Absolute
+            }
+            haider_client::launch_origin::OriginPathKind::Redacted => {
+                haider_protocol::session::LaunchOriginPathKindV1::Redacted
+            }
+            haider_client::launch_origin::OriginPathKind::Unavailable => {
+                haider_protocol::session::LaunchOriginPathKindV1::Unavailable
+            }
+        },
+        display: sanitized.display,
+    })
 }
 
 /// Abbreviate the process cwd into the launcher/session dirs.
 fn apply_cwd(model: &mut AppModel) {
-    let Ok(cwd) = std::env::current_dir() else {
+    apply_cwd_with_homes(
+        model,
+        &haider_client::launch_origin::process_display_homes(),
+    );
+}
+
+fn apply_cwd_with_homes(model: &mut AppModel, homes: &[PathBuf]) {
+    apply_cwd_for_path(model, std::env::current_dir().ok().as_deref(), homes);
+}
+
+fn apply_cwd_for_path(model: &mut AppModel, cwd: Option<&std::path::Path>, homes: &[PathBuf]) {
+    seed_display_dirs(model, cwd, homes);
+    if let Some(cwd) = cwd {
+        model.cwd = cwd.display().to_string();
+    }
+}
+
+fn seed_display_dirs(model: &mut AppModel, cwd: Option<&std::path::Path>, homes: &[PathBuf]) {
+    // A removed launch directory must not discard the independent home snapshot.
+    model.display_homes = homes.to_vec();
+    let Some(cwd) = cwd else {
         return;
     };
-    let home = std::env::var("HOME").unwrap_or_default();
-    let abbreviated = match (!home.is_empty())
-        .then(|| cwd.strip_prefix(&home).ok())
-        .flatten()
-    {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
-        None => cwd.display().to_string(),
-    };
-    model.launcher_dir = abbreviated.clone();
-    model.session_dir = abbreviated;
-    model.cwd = cwd.display().to_string();
-    // Tool rows shorten paths under home to `~/…` (973-tui-toolview).
-    model.home_dir = (!home.is_empty()).then_some(home);
+    let display =
+        haider_tui::live::workspace_display_path_with_homes(&cwd.to_string_lossy(), homes);
+    model.launcher_dir = display.clone();
+    model.session_dir = display;
 }
+
+#[cfg(all(test, not(target_os = "android")))]
+#[path = "display_path_tests.rs"]
+mod display_path_tests;
 
 #[cfg(test)]
 mod policy_tests {

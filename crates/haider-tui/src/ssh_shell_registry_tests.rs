@@ -222,6 +222,199 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
 }
 
 #[test]
+fn ssh_form_shows_remote_paths_exactly_as_typed() {
+    let paths = [
+        ("/Users/bob/.ssh/id", "/home/bob/work", true),
+        (r"C:\Users\o'brien\keys\id", r"C:\Users\o'brien\work", true),
+        ("/Users/bob/Café/ssh key", "/home/bob/Δ backup (v2)", true),
+        (
+            "/Users/bob/a-very-long-directory-name/another-long-directory-name/keys/id_ed25519",
+            "/home/bob/a-very-long-directory-name/another-long-directory-name/project",
+            false,
+        ),
+    ];
+    for (width, height) in [(118, 36), (80, 24)] {
+        for (credential, cwd, fully_visible) in paths {
+            for focus in [0, 6, 7] {
+                for (edit, error) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let mut model = live_session();
+                    let background = ssh_overlay_rows(&model, width, height);
+                    model.ssh_open = true;
+                    let mut form = SshProfileForm::add();
+                    form.name = "prod".into();
+                    form.host = "h".into();
+                    form.user = "u".into();
+                    form.credential = credential.into();
+                    form.cwd = cwd.into();
+                    form.focus = focus;
+                    form.original = edit.then(|| "prod".into());
+                    form.error = error.then(|| "invalid port".into());
+                    assert_eq!(form.credential_display(), credential);
+                    model.ssh_form = Some(form);
+                    let rows = ssh_overlay_rows(&model, width, height);
+                    let start = rows
+                        .iter()
+                        .position(|row| {
+                            row.contains("add SSH profile") || row.contains("edit SSH profile")
+                        })
+                        .expect("form heading");
+                    let end = usize::from(model.status_rect.get().expect("status area").y);
+                    assert!(
+                        rows[start..end].iter().all(|row| !row.contains('X')),
+                        "{}",
+                        rows.join("\n")
+                    );
+                    assert!(rows[end - 1].trim().is_empty());
+                    assert_eq!(
+                        rows[..start],
+                        background[..start],
+                        "the panel must preserve the surrounding context"
+                    );
+                    for (label, value) in [
+                        ("port", "22"),
+                        ("key path / secret", credential),
+                        ("cwd", cwd),
+                    ] {
+                        let row = ssh_field_row(&rows, label);
+                        if label == "port" || fully_visible {
+                            let position = row.find(value).expect("raw field value");
+                            assert!(
+                                row[position + value.len()..].trim().is_empty(),
+                                "field acquired background text: {row}"
+                            );
+                        }
+                    }
+                    let description = ssh_field_row(&rows, "description");
+                    assert!(
+                        description
+                            .split_once("description")
+                            .expect("description row")
+                            .1
+                            .trim()
+                            .is_empty()
+                    );
+                    let form = model.ssh_form.as_ref().expect("form");
+                    assert_eq!(form.credential, credential);
+                    assert_eq!(form.cwd, cwd);
+                }
+            }
+        }
+    }
+}
+
+fn ssh_overlay_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend, text::Line, widgets::Paragraph};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let background = vec![Line::raw("X".repeat(usize::from(width))); usize::from(height)];
+            frame.render_widget(Paragraph::new(background), area);
+            crate::render::render(model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn ssh_field_row<'a>(rows: &'a [String], label: &str) -> &'a str {
+    rows.iter()
+        .find(|row| {
+            let text = row.trim_start();
+            text.strip_prefix("› ")
+                .unwrap_or(text)
+                .starts_with(&format!("{label} "))
+        })
+        .map(String::as_str)
+        .expect("field row")
+}
+
+#[test]
+fn ssh_profile_panels_cover_their_background_at_both_sizes() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        for count in [0, 1, 3, 32] {
+            for remove in [false, true] {
+                let mut model = live_session();
+                let background = ssh_overlay_rows(&model, width, height);
+                model.ssh_open = true;
+                model.ssh_profiles = (0..count)
+                    .map(|index| {
+                        let mut item = profile(&format!("prod-{index}"));
+                        item.host = "h".into();
+                        item.user = "u".into();
+                        item.description = Some(String::new());
+                        item
+                    })
+                    .collect();
+                model.ssh_remove_armed = remove.then(|| "prod-0".into());
+                let rows = ssh_overlay_rows(&model, width, height);
+                let start = rows
+                    .iter()
+                    .position(|row| row.contains("ssh profiles"))
+                    .expect("profile heading");
+                let end = usize::from(model.status_rect.get().expect("status area").y);
+                assert!(
+                    rows[start..end].iter().all(|row| !row.contains('X')),
+                    "{}",
+                    rows.join("\n")
+                );
+                if count <= 3 {
+                    assert!(rows[end - 1].trim().is_empty());
+                }
+                assert_eq!(
+                    rows[..start],
+                    background[..start],
+                    "the panel must preserve the surrounding context"
+                );
+                if count == 0 {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.contains("no SSH profiles"))
+                        .expect("empty list");
+                    assert_eq!(row.trim(), "no SSH profiles");
+                }
+                for row in rows[start..end].iter().filter(|row| row.contains("u@h:22")) {
+                    assert!(
+                        row.trim_end().ends_with("multiplexing"),
+                        "profile acquired background text: {row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shell_registry_projects_cwd_without_changing_wire_value() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut model = live_session();
+    model.shells_open = true;
+    let mut listed = shell("shell-1", haider_rpc::ShellKindWire::Local);
+    listed.cwd_or_host = "/Users/bob/work".into();
+    model.shells.push(listed);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            crate::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("/Users/<user>/work"));
+    assert!(!painted.contains("/Users/bob/work"));
+    assert_eq!(model.shells[0].cwd_or_host, "/Users/bob/work");
+}
+
+#[test]
 fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     let mut model = live_session();
     let mut form = SshProfileForm::add();

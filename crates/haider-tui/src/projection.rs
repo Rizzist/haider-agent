@@ -75,12 +75,14 @@ pub enum TranscriptEntry {
     /// A turn item and its streaming accumulation state.
     Item(ItemBlock),
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
-    /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
+    /// mid-turn echoes. Workspace receipts remain structured until rendering.
     Note {
         text: String,
         /// Stable identity for a selection warning echoed by reply and journal.
         selection_notice_epoch: Option<u64>,
     },
+    /// Keep workspace facts structured until the renderer has session homes.
+    Workspace { event: WorkspaceEventPayload },
     /// A daemon-enforced provider capability refusal. This is deliberately
     /// neither a failed run nor a generic note: the model can adapt and the
     /// turn remains healthy.
@@ -1011,18 +1013,15 @@ impl SessionProjection {
         match payload {
             WorkspaceEventPayload::WorkspaceUnavailable(unavailable) => {
                 self.workspace_unavailable = Some(unavailable.clone());
-                self.push_note(format!(
-                    "⚠ workspace unavailable — {} · {} ({})",
-                    unavailable.path,
-                    unavailable.reason.as_str(),
-                    unavailable.detail
-                ));
             }
-            WorkspaceEventPayload::WorkspaceSelected(selected) => {
+            WorkspaceEventPayload::WorkspaceSelected(_) => {
                 self.workspace_unavailable = None;
-                self.push_note(format!("⇄ workspace → {}", selected.path));
             }
         }
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.entries.push(TranscriptEntry::Workspace {
+            event: payload.clone(),
+        });
     }
 
     #[must_use]
@@ -3051,29 +3050,62 @@ pub(crate) fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option
     }
 }
 
-/// Decode and format the durable image-created fact shared by styled and
-/// plain transcript renderers. Keeping this at the projection boundary makes
-/// the extension payload, rather than a renderer-specific side channel, the
-/// complete UI contract.
+/// Decode the durable image fact without projecting its action path.
 #[must_use]
-pub(crate) fn image_created_fact(
+pub(crate) fn image_created(
     kind: &str,
     data: &serde_json::Value,
-) -> Option<(haider_protocol::image::ImageCreatedV1, String)> {
+) -> Option<haider_protocol::image::ImageCreatedV1> {
     if kind != haider_protocol::image::IMAGE_CREATED_EXTENSION_KIND {
         return None;
     }
-    let image =
-        serde_json::from_value::<haider_protocol::image::ImageCreatedV1>(data.clone()).ok()?;
+    serde_json::from_value(data.clone()).ok()
+}
+
+/// Styled and plain image rows share the session's path projection.
+pub(crate) fn image_created_fact_with_context(
+    kind: &str,
+    data: &serde_json::Value,
+    paths: &crate::toolview::PathContext,
+) -> Option<(haider_protocol::image::ImageCreatedV1, String)> {
+    let image = image_created(kind, data)?;
+    let homes = paths
+        .homes
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect::<Vec<_>>();
+    let protected = haider_client::launch_origin::sanitize_origin_path_with_homes(
+        Some(std::path::Path::new(&image.path)),
+        &homes,
+    )
+    .map(|projection| {
+        matches!(
+            projection.kind,
+            haider_client::launch_origin::OriginPathKind::Redacted
+                | haider_client::launch_origin::OriginPathKind::HomeRelative
+        )
+    })
+    .unwrap_or(true);
+    let in_workspace = paths.workspace.as_deref().is_some_and(|root| {
+        haider_client::launch_origin::workspace_relative_display(
+            std::path::Path::new(&image.path),
+            std::path::Path::new(root),
+        )
+        .is_some()
+    });
+    // A wire-relative label is useful when the client lacks workspace
+    // metadata, but it cannot erase an account mask from a broad root.
+    let display = if protected || in_workspace {
+        paths.shorten(&image.path)
+    } else {
+        paths.shorten(&image.display_path)
+    };
     let dimensions = match (image.width, image.height) {
         (Some(width), Some(height)) => format!(" · {width}×{height}"),
         _ => String::new(),
     };
     let kilobytes = image.byte_len.div_ceil(1024);
-    let label = format!(
-        "🖼 image · {}{dimensions} · {kilobytes} KB",
-        image.display_path
-    );
+    let label = format!("🖼 image · {}{dimensions} · {kilobytes} KB", display);
     Some((image, label))
 }
 

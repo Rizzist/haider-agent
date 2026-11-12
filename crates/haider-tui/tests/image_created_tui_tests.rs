@@ -10,7 +10,7 @@ use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit};
 use haider_tui::browser::reveal_path_command;
 use haider_tui::live::LiveDriver;
 use haider_tui::mock::demo_script;
-use haider_tui::plain::render_plain;
+use haider_tui::plain::render_plain_with_context;
 use haider_tui::render::render;
 use haider_tui::runtime::{ShellRequest, live_pass};
 use ratatui::Terminal;
@@ -21,6 +21,11 @@ fn image_model() -> (AppModel, ImageCreatedV1) {
     for payload in demo_script() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
+    // The displayed path comes from the durable absolute path in the session
+    // workspace. The producer's display_path is only a reported hint.
+    model.cwd = "/workspace".into();
+    model.session_workspace_cwd = Some(model.cwd.clone());
+    model.display_homes = vec!["C:/Users/image-fixture-owner".into()];
     let image = ImageCreatedV1 {
         path: "/workspace/artifacts/chart.png".into(),
         display_path: "artifacts/chart.png".into(),
@@ -75,7 +80,7 @@ fn image_extension_renders_and_registers_its_absolute_reveal_path() {
         "the row hit carries the durable absolute path"
     );
 
-    let plain = render_plain(&model.projection, 0, None);
+    let plain = render_plain_with_context(&model.projection, 0, None, &model.tool_path_context());
     assert!(
         plain.contains("🖼 image · artifacts/chart.png · 640×360 · 3 KB"),
         "plain mode must project the same payload: {plain}"
