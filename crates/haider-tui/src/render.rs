@@ -1393,7 +1393,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if model.ssh_terminal.is_some() {
         render_ssh_terminal(model, theme, frame, body);
         hits.clear();
-    } else if model.model_picker.is_some() {
+    } else if model.model_picker_visible() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {

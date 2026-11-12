@@ -10610,6 +10610,23 @@ impl AppModel {
         }
     }
 
+    /// A blocking answer band parks the model picker, just as it parks
+    /// Theme and Effort. Deferred spend cards yield to the picker instead.
+    pub(crate) fn model_picker_visible(&self) -> bool {
+        self.model_picker.is_some()
+            && match self.screen {
+                Screen::Session => {
+                    self.projection.permission_card().is_none()
+                        && self.projection.open_menu().is_none_or(is_deferred_approval)
+                }
+                Screen::Subagent => self
+                    .viewed_chip()
+                    .and_then(ChipModel::question_menu)
+                    .is_none_or(is_deferred_approval),
+                _ => true,
+            }
+    }
+
     fn primary_input_owner(&self) -> InputOwner {
         if self.lockdown_overlay {
             return InputOwner::Lockdown;
@@ -10639,7 +10656,7 @@ impl AppModel {
         if self.ssh_terminal.is_some() {
             return InputOwner::SshTerminal;
         }
-        if self.model_picker.is_some() {
+        if self.model_picker_visible() {
             return InputOwner::ModelPicker;
         }
         if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
