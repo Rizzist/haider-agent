@@ -4224,13 +4224,6 @@ fn broker_for(
 pub(crate) async fn non_live_issued_broker_for_sendpoint(
     provider: &str,
 ) -> (CredentialBroker, CredentialDescriptor) {
-    let (broker, descriptor, _) = non_live_issued_broker_with_origin_for_sendpoint(provider).await;
-    (broker, descriptor)
-}
-
-pub(crate) async fn non_live_issued_broker_with_origin_for_sendpoint(
-    provider: &str,
-) -> (CredentialBroker, CredentialDescriptor, Url) {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let mut descriptor = oauth_descriptor_for_test();
     descriptor.provider = provider.to_owned();
@@ -4283,8 +4276,7 @@ pub(crate) async fn non_live_issued_broker_with_origin_for_sendpoint(
         sender,
     )
     .expect("broker");
-    let origin = Url::parse(&server.state.issuer).expect("fake issuer origin");
-    (broker, descriptor, origin)
+    (broker, descriptor)
 }
 
 fn serialized_registration(server: &FakeOAuthServer) -> OAuthProviderRegistration {

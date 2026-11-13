@@ -117,50 +117,6 @@ async fn meter_bearer_refuses_non_live_issued_bundle() {
     assert_eq!(error.reason, "credential_unavailable");
 }
 
-#[cfg(debug_assertions)]
-#[tokio::test]
-async fn fake_meter_bearer_requires_its_exact_loopback_origin() {
-    use crate::debug_fake_usage::Mode;
-    let (broker, descriptor, origin) =
-        crate::oauth::non_live_issued_broker_with_origin_for_sendpoint("anthropic-oauth").await;
-    let token = super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Fake(origin.clone()))
-        .await
-        .expect("the explicitly routed fake meter can resolve its fake token");
-    assert!(!token.expose_secret().is_empty());
-    assert!(
-        super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Off)
-            .await
-            .is_err()
-    );
-    let (live_broker, live_descriptor, _) =
-        crate::oauth::live_issued_broker_for_sendpoint("anthropic-oauth");
-    assert!(
-        super::meter_bearer_for_mode(&live_broker, &live_descriptor, &Mode::Fake(origin.clone()))
-            .await
-            .is_err()
-    );
-    assert!(live_broker.shutdown().await);
-    let mut other = origin;
-    other
-        .set_port(Some(if other.port() == Some(1) { 2 } else { 1 }))
-        .expect("different loopback port");
-    assert!(
-        super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Fake(other))
-            .await
-            .is_err()
-    );
-    assert!(
-        super::meter_bearer_for_mode(
-            &broker,
-            &descriptor,
-            &Mode::Refused("test_mode_origin_invalid")
-        )
-        .await
-        .is_err()
-    );
-    assert!(broker.shutdown().await);
-}
-
 #[async_trait::async_trait]
 impl MeterTokenSource for FailingTokens {
     async fn bearer(

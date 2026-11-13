@@ -68,7 +68,7 @@ pub(crate) fn resolve(fake_provider_set: bool, origin: Option<&OsStr>) -> Mode {
     }
 }
 
-pub(crate) fn mode() -> &'static Mode {
+fn mode() -> &'static Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     MODE.get_or_init(|| {
         let mode = resolve(

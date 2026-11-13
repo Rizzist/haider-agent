@@ -7848,6 +7848,3 @@ pub(crate) use tests::{
     isolated_oauth_catalog_for_test, live_issued_broker_for_sendpoint,
     non_live_issued_broker_for_sendpoint,
 };
-
-#[cfg(all(test, debug_assertions))]
-pub(crate) use tests::non_live_issued_broker_with_origin_for_sendpoint;

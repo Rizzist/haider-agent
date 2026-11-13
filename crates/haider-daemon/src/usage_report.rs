@@ -88,12 +88,8 @@ impl MeterTokenSource for CredentialBroker {
         }
         // The broker's own message may name vault/refresh internals; the
         // report carries only the bounded classification.
-        #[cfg(debug_assertions)]
-        let resolved =
-            meter_bearer_for_mode(self, descriptor, crate::debug_fake_usage::mode()).await;
-        #[cfg(not(debug_assertions))]
-        let resolved = self.resolve_remote(descriptor).await;
-        resolved.map_err(|error| {
+        // The meter endpoint is the provider's real one.
+        self.resolve_remote(descriptor).await.map_err(|error| {
             let reason = if error.code == ErrorCode::CredentialMissing {
                 "credential_source_gone"
             } else {
@@ -101,25 +97,6 @@ impl MeterTokenSource for CredentialBroker {
             };
             MeterUnavailable::new(reason)
         })
-    }
-}
-
-// The debug meter transport and broker must agree on the destination. The
-// broker still refuses live-issued tokens at loopback and fake tokens remotely.
-#[cfg(debug_assertions)]
-async fn meter_bearer_for_mode(
-    broker: &CredentialBroker,
-    descriptor: &CredentialDescriptor,
-    mode: &crate::debug_fake_usage::Mode,
-) -> Result<SecretHandle, haider_protocol::error::HaiderError> {
-    match mode {
-        crate::debug_fake_usage::Mode::Off => broker.resolve_remote(descriptor).await,
-        crate::debug_fake_usage::Mode::Fake(origin) => {
-            broker.resolve_to_loopback(descriptor, origin).await
-        }
-        crate::debug_fake_usage::Mode::Refused(reason) => Err(
-            haider_protocol::error::HaiderError::new(ErrorCode::InvalidArgument, *reason, false),
-        ),
     }
 }
 
