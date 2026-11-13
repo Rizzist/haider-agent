@@ -281,6 +281,8 @@ pub enum InputOwner {
     TalkSetup,
     CustomProviderForm,
     AccountsReplace,
+    /// Expanded account notice covering the roster and any pinned form.
+    AccountsNotice,
     SessionMenu,
     /// A visible deferred usage decision, below pickers, Search and History.
     SpendCard,
@@ -392,6 +394,15 @@ impl AccountRow {
             base_url: descriptor.base_url.clone(),
         }
     }
+
+    /// This row's provider-scoped dedupe key, if it captured an identity.
+    #[must_use]
+    pub fn principal(&self) -> Option<haider_protocol::credential::AccountPrincipal<'_>> {
+        haider_protocol::credential::AccountPrincipal::new(
+            &self.provider,
+            self.account_identity.as_ref(),
+        )
+    }
 }
 
 /// Secret-free source metadata paired with an account descriptor by alias.
@@ -454,11 +465,24 @@ pub struct AccountsState {
     pub revision: Option<u64>,
     /// Last account action (sim `acctMsg`), shown under the head line.
     pub message: Option<String>,
+    /// Full notice and its separately pinned action. Expansion owns input.
+    pub message_details: Option<String>,
+    pub message_action: Option<String>,
+    pub message_expanded: bool,
+    /// Opaque incarnation for input captured before a notice changes.
+    pub message_revision: u64,
+    /// Frame authority: expansion is offered only with a visible hint.
+    pub message_expandable: std::cell::Cell<bool>,
+    pub message_scroll: std::cell::Cell<usize>,
+    pub message_scroll_max: std::cell::Cell<usize>,
     /// In-flight `account.set_active` target. While `Some`, the rows do not
     /// move and further selects are refused (one at a time).
     pub pending_select: Option<String>,
     /// W10b: an armed removal awaiting Enter (x armed it; esc disarms).
     pub pending_remove: Option<String>,
+    /// 973: an unusable OAuth row whose in-place re-login the notice offered;
+    /// Enter on that same row again opens the re-login card (↑/↓/esc disarm).
+    pub pending_relogin: Option<String>,
     /// Keyboard highlight over the flattened selectable rows (W5
     /// accessibility extension — separately goldened).
     pub cursor: usize,
@@ -777,6 +801,30 @@ impl AppModel {
 }
 
 impl AccountsState {
+    /// Every new action notice, including a repeated message, reveals the
+    /// focused row against the notice's reduced roster viewport. The renderer
+    /// consumes the latch once so later explicit paging remains possible.
+    pub fn set_message(&mut self, message: Option<String>) {
+        self.message_revision = self.message_revision.wrapping_add(1);
+        if message.is_some() {
+            self.follow_cursor.set(true);
+        }
+        let expanded = self.message_expanded && message.is_some();
+        self.message = message;
+        self.message_details = None;
+        self.message_action = None;
+        self.message_expanded = expanded;
+        self.message_expandable.set(false);
+        self.message_scroll.set(0);
+        self.message_scroll_max.set(0);
+    }
+
+    pub fn set_detailed_message(&mut self, summary: String, details: String, action: String) {
+        self.set_message(Some(summary));
+        self.message_details = Some(details);
+        self.message_action = Some(action);
+    }
+
     /// Applies an `account.list` snapshot, gated on revision monotonicity.
     /// `None` revisions (older daemons) always apply.
     pub fn apply_snapshot(&mut self, rows: Vec<AccountRow>, revision: Option<u64>) -> bool {
@@ -785,14 +833,23 @@ impl AccountsState {
         {
             return false;
         }
-        self.rows = rows
+        let selected_alias = self
+            .rows
+            .get(self.cursor)
+            .map(|row| row.alias.as_str().to_owned());
+        let visible_rows = rows
             .into_iter()
             .filter(|row| !is_probe_account_alias(&row.alias))
             .collect();
+        self.rows = group_account_rows(visible_rows);
         if revision.is_some() {
             self.revision = revision;
         }
-        if self.cursor >= self.rows.len() {
+        if let Some(selected_alias) = selected_alias
+            && let Some(index) = self.rows.iter().position(|row| row.alias == selected_alias)
+        {
+            self.cursor = index;
+        } else if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
@@ -804,6 +861,33 @@ impl AccountsState {
     pub fn apply_sources(&mut self, sources: Vec<AccountSourceRow>) {
         self.sources = sources;
     }
+
+    /// Appends a locally fabricated row (demo/sim flows) and restores the
+    /// grouped display order, so the cursor keeps walking what is drawn.
+    pub fn push_row(&mut self, row: AccountRow) {
+        self.rows.push(row);
+        self.rows = group_account_rows(std::mem::take(&mut self.rows));
+    }
+}
+
+/// OAuth providers whose sign-in can re-login an existing alias in place,
+/// with the card title for that flow.
+fn oauth_relogin_title(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "openai-oauth" => "OpenAI — ChatGPT",
+        "anthropic-oauth" => "Anthropic — Claude",
+        "kimi-oauth" => "Kimi — Moonshot",
+        "grok-oauth" => "Grok — xAI",
+        GOOGLE_ANTIGRAVITY_PROVIDER => "Google Antigravity",
+        _ => return None,
+    })
+}
+
+/// `/accounts` display order: provider groups in first-seen order, snapshot
+/// order within a group. `rows` is ALWAYS stored in this order, so ↑/↓
+/// step through exactly what the renderer (same rule, a no-op here) draws.
+fn group_account_rows(rows: Vec<AccountRow>) -> Vec<AccountRow> {
+    crate::display_order::group_by_first_seen(rows, |row| row.provider.clone())
 }
 
 /// The `/accounts` OAuth add card (sim authFlow, tui.js:3629-3682): a
@@ -8204,6 +8288,12 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
+                if self.input_owner() == InputOwner::AccountsNotice {
+                    if !self.accounts_scroll_gesture(key.code) {
+                        self.handle_accounts_key(key.code);
+                    }
+                    return;
+                }
                 // Clipboard paste is the one shortcut interpreted before
                 // text-field dispatch. Its result still re-enters the
                 // owner's zeroizing Paste route.
@@ -8315,6 +8405,19 @@ impl AppModel {
                 {
                     return;
                 }
+                // Function keys can open a visible notice without becoming
+                // input to an open sign-in form. The notice then owns all input.
+                if self.accounts_surface_visible()
+                    && key.code == KeyCode::F(2)
+                    && self.accounts.message_expandable.get()
+                    && self.accounts.message.is_some()
+                    && self.accounts.pending_replace.is_none()
+                {
+                    self.accounts.message_revision = self.accounts.message_revision.wrapping_add(1);
+                    self.accounts.message_expanded = true;
+                    self.accounts.message_scroll.set(0);
+                    return;
+                }
                 // 971 F1(b): the one-line "replace the pending form?"
                 // confirm OUTRANKS every accounts-card modality below —
                 // it answers a gesture the user just made on that card's
@@ -8377,6 +8480,9 @@ impl AppModel {
                 self.handle_key(key, now, spend_card_at_event.as_ref());
             }
             AppEvent::Paste(text) => {
+                if self.input_owner() == InputOwner::AccountsNotice {
+                    return;
+                }
                 self.dirty = true;
                 // The zeroizing wrapper is borrowed, never unwrapped
                 // (TUI6.3 fix 2): the wrapped copy wipes when `text`
@@ -10659,6 +10765,9 @@ impl AppModel {
         if self.model_picker_visible() {
             return InputOwner::ModelPicker;
         }
+        if self.accounts_surface_visible() && self.accounts.message_expanded {
+            return InputOwner::AccountsNotice;
+        }
         if self.screen == Screen::Accounts && self.accounts.pending_replace.is_some() {
             return InputOwner::AccountsReplace;
         }
@@ -10951,6 +11060,7 @@ impl AppModel {
                     row.map(|row| (row.provider, row.model))
                 )
             }),
+            InputOwner::AccountsNotice => Some(self.accounts.message_revision.to_string()),
             InputOwner::AccountsReplace => self
                 .accounts
                 .pending_replace
@@ -11256,7 +11366,8 @@ impl AppModel {
                 InputOwner::ToolDetail
                 | InputOwner::FleetMemberDetail
                 | InputOwner::SshTerminal
-                | InputOwner::AccountsReplace => owner.instance.clone(),
+                | InputOwner::AccountsReplace
+                | InputOwner::AccountsNotice => owner.instance.clone(),
                 _ => self.decision_identity(),
             };
         owner.instance = self.composer_replacement_identity(owner.owner, owner.instance);
@@ -13313,12 +13424,13 @@ impl AppModel {
         if self.screen == Screen::Accounts {
             return;
         }
-        self.accounts.message = self.accounts.adoption_candidate.as_ref().map(|candidate| {
+        self.accounts
+            .set_message(self.accounts.adoption_candidate.as_ref().map(|candidate| {
             format!(
                 "import {} login? y confirms · n cancels · `haider account import {} --confirm`",
                 candidate.source_label, candidate.source
             )
-        });
+        }));
         // P1 MASK LAW (the U2 owner addendum): every open starts masked —
         // a reveal never survives into a later visit, whichever way the
         // last one ended (esc, ⌃C, a screen switch).
@@ -13328,6 +13440,7 @@ impl AppModel {
         // rows the daemon is about to replace.
         self.accounts.scroll.set(0);
         self.accounts.pending_replace = None;
+        self.accounts.pending_relogin = None;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
         // Local-login detection rides screen entry. The report is
@@ -13366,45 +13479,75 @@ impl AppModel {
         if self.accounts.pending_select.is_some() {
             return;
         }
+        self.accounts.follow_cursor.set(true);
         let Some(row) = self.accounts.rows.iter().find(|row| row.alias == alias) else {
-            self.accounts.message =
-                Some(format!("· no account \"{alias}\" — /accounts to see them"));
+            self.accounts.set_message(Some(format!(
+                "· no account \"{alias}\" — /accounts to see them"
+            )));
             self.dirty = true;
             return;
         };
-        if row.selected {
-            // Sim parity: re-clicking the active row re-emits the message
-            // without a daemon round-trip (useAccount has no early return).
-            self.accounts.message = Some(format!(
-                "✓ {} → {} · {} · active",
-                row.provider,
-                row.alias,
-                auth_label(row.method)
-            ));
-            self.dirty = true;
-            return;
-        }
         // W5 extension (additive status vocabulary): an unusable row is
         // refused locally with an honest reason instead of a doomed RPC.
+        // Status wins even for the selected row: calling an expired default
+        // "active" without a recovery action is exactly the poisoned-default
+        // trap this screen exists to resolve.
         match row.status {
             haider_protocol::credential::CredentialStatus::Expired
             | haider_protocol::credential::CredentialStatus::Revoked
             | haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
-                self.accounts.message = Some(format!(
-                    "· {alias} is not usable — /login to re-authenticate"
-                ));
+                // `/login` always adds a fresh alias (and only OpenAI/Claude
+                // can then match it back by identity), so the honest recovery
+                // for a dead OAuth row is an in-place re-login through ITS
+                // alias: a second Enter opens it. API-key rows have no login.
+                let relogin = row.method == haider_protocol::credential::AuthMethod::OAuth
+                    && oauth_relogin_title(&row.provider).is_some();
+                if relogin && self.accounts.pending_relogin.as_deref() == Some(alias) {
+                    let provider = row.provider.clone();
+                    self.accounts.pending_relogin = None;
+                    self.open_oauth_relogin(&provider, alias.to_owned());
+                    self.dirty = true;
+                    return;
+                }
+                let oauth = row.method == haider_protocol::credential::AuthMethod::OAuth;
+                self.accounts.pending_relogin = relogin.then(|| alias.to_owned());
+                self.accounts.set_message(Some(if relogin {
+                    format!(
+                        "· `{alias}` unusable — enter again re-logs it in place · ↑/↓ choose live"
+                    )
+                } else if oauth {
+                    format!(
+                        "· `{alias}` unusable — ↑/↓ choose live · x removes it; /login adds a new alias"
+                    )
+                } else {
+                    format!(
+                        "· `{alias}` unusable — ↑/↓ choose live · x removes it; /login adds a new key"
+                    )
+                }));
                 self.dirty = true;
                 return;
             }
             haider_protocol::credential::CredentialStatus::Ok
             | haider_protocol::credential::CredentialStatus::Limited { .. } => {}
         }
+        if row.selected {
+            // Sim parity: re-clicking a usable active row re-emits the message
+            // without a daemon round-trip (useAccount has no early return).
+            self.accounts.set_message(Some(format!(
+                "✓ {} → {} · {} · active",
+                row.provider,
+                row.alias,
+                auth_label(row.method)
+            )));
+            self.dirty = true;
+            return;
+        }
         let change = PendingCacheChange::Account {
             alias: alias.to_owned(),
         };
         let confirm_new_epoch = self.pending_cache_change.as_ref() == Some(&change);
         self.accounts.pending_select = Some(alias.to_owned());
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.requests.push(AppRequest::AccountSetActive {
             alias: alias.to_owned(),
             confirm_new_epoch,
@@ -13446,12 +13589,12 @@ impl AppModel {
             }
         }
         self.accounts.revision = Some(revision);
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "✓ {} → {} · {} · active",
             descriptor.provider,
             descriptor.alias,
             auth_label(descriptor.auth_method)
-        ));
+        )));
         self.accounts
             .catalog_incarnations
             .insert(descriptor.alias.as_str().to_owned(), descriptor.incarnation);
@@ -13511,8 +13654,7 @@ impl AppModel {
                 launcher.model_short = model;
             }
             launcher.context_window = self
-                .providers
-                .declared_window(&launcher.provider, &launcher.model_short)
+                .session_declared_window(None, &launcher.provider, &launcher.model_short)
                 .unwrap_or(0);
             self.launcher_pick_scope =
                 self.pick_scope_for(&launcher.provider, &launcher.model_short);
@@ -13546,6 +13688,107 @@ impl AppModel {
         self.park_launcher_pick();
         self.launcher_identity_pinned |= pin;
         self.dirty = true;
+    }
+
+    /// Management catalogs describe active accounts at one revision. Do not
+    /// combine a replacement account with an earlier catalog snapshot.
+    pub(crate) fn provider_inventory_matches_accounts(
+        &self,
+        summary: &haider_rpc::ProviderSummaryWire,
+    ) -> bool {
+        if !summary.catalog_is_account_scoped() || self.mode.fabricates_locally() {
+            return true;
+        }
+        if let Some(scope) = &summary.catalog_scope {
+            return scope
+                .account_alias
+                .as_ref()
+                .zip(scope.account_incarnation)
+                .is_some_and(|(alias, incarnation)| {
+                    self.accounts.catalog_incarnations.get(alias) == Some(&incarnation)
+                        && self.accounts.rows.iter().any(|row| {
+                            row.provider == summary.provider && row.alias == *alias && row.selected
+                        })
+                });
+        }
+        matches!((self.accounts.revision, self.providers.revision),
+            (Some(accounts), Some(providers)) if accounts == providers)
+    }
+
+    fn session_model_detail(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<&haider_rpc::ModelDetailWire> {
+        let summary = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)?;
+        let detail = summary
+            .model_details
+            .iter()
+            .find(|detail| detail.name == model)?;
+        // Maintained and manually configured facts belong to the provider.
+        // Only remote/unknown metadata needs the producing account snapshot.
+        if matches!(
+            detail.source,
+            Some(
+                haider_rpc::ModelDetailSourceWire::Static
+                    | haider_rpc::ModelDetailSourceWire::Configured
+            )
+        ) {
+            return Some(detail);
+        }
+        if session
+            .and_then(|id| self.session_catalog_routes.get(id))
+            .is_some_and(|(base_url, account)| {
+                !summary.catalog_matches_session_route(base_url.as_deref(), account.as_deref())
+            })
+        {
+            return None;
+        }
+        if summary.catalog_is_account_scoped() && !self.mode.fabricates_locally() {
+            if !self.provider_inventory_matches_accounts(summary) {
+                return None;
+            }
+            if let Some(session) = session {
+                let row = self.sessions.iter().find(|row| &row.id == session)?;
+                let account_provider = row.account_provider.as_deref()?;
+                if account_provider == provider
+                    && let Some(pin) = row.account_alias.as_deref()
+                    && !self.accounts.rows.iter().any(|account| {
+                        account.provider == provider && account.selected && account.alias == pin
+                    })
+                {
+                    // The global catalog cannot supply an inactive pin's
+                    // limits. Its own request footprint remains authoritative.
+                    return None;
+                }
+            }
+        }
+        Some(detail)
+    }
+
+    fn session_declared_window(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u64> {
+        self.session_model_detail(session, provider, model)
+            .and_then(|detail| detail.context_window)
+    }
+
+    fn session_declared_output_limit(
+        &self,
+        session: Option<&SessionId>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u64> {
+        self.session_model_detail(session, provider, model)
+            .and_then(|detail| detail.max_output_tokens)
     }
 
     /// The boot restore of the persisted launcher pick (model retention).
@@ -13991,13 +14234,11 @@ impl AppModel {
         if self.active_session.is_none() && self.mode.fabricates_locally() {
             self.meter_epoch.pair = Some(pair);
         }
-        let declared = self
-            .current_catalog_matches_session_route()
-            .then(|| {
-                self.providers
-                    .declared_window(&self.identity.provider, &self.identity.model_short)
-            })
-            .flatten();
+        let declared = self.session_declared_window(
+            self.active_session.as_ref(),
+            &self.identity.provider,
+            &self.identity.model_short,
+        );
         let window = match declared {
             Some(window) => window,
             None if self.mode.fabricates_locally() => return,
@@ -14029,15 +14270,30 @@ impl AppModel {
         } else {
             self.meter_epoch.snapshot_epoch(latest)
         };
+        let account_scoped = self.providers.providers.iter().any(|summary| {
+            summary.provider == identity.provider && summary.catalog_is_account_scoped()
+        });
+        let window = if account_scoped && !self.mode.fabricates_locally() {
+            self.session_declared_window(
+                self.active_session.as_ref(),
+                &identity.provider,
+                &identity.model_short,
+            )
+            .unwrap_or(0)
+        } else {
+            identity.context_window
+        };
         let mut meter = crate::context_meter::ContextMeter::resolve(
             latest,
             self.projection.context_tokens(),
-            identity.context_window,
+            window,
             epoch,
             |window| {
-                let output_limit = self
-                    .current_pair_detail()
-                    .and_then(|detail| detail.max_output_tokens);
+                let output_limit = self.session_declared_output_limit(
+                    self.active_session.as_ref(),
+                    &identity.provider,
+                    &identity.model_short,
+                );
                 crate::context_meter::epoch_reserved_output(
                     self.meter_epoch.projected_output_budget(output_limit),
                     output_limit,
@@ -14076,8 +14332,10 @@ impl AppModel {
                 (tokens > 0).then_some(tokens)
             })
             .or_else(|| footprint.map(|item| item.used_tokens))?;
-        let window = self.providers.declared_window(provider, model).unwrap_or(0);
-        let output_limit = self.providers.declared_output_limit(provider, model);
+        let window = self
+            .session_declared_window(Some(&row.id), provider, model)
+            .unwrap_or(0);
+        let output_limit = self.session_declared_output_limit(Some(&row.id), provider, model);
         let mut meter = crate::context_meter::ContextMeter::resolve(
             footprint,
             fallback,
@@ -14598,7 +14856,8 @@ impl AppModel {
         {
             self.accounts.pending_select = None;
         }
-        self.accounts.message = Some(format!("· {alias}: {message}"));
+        self.accounts
+            .set_message(Some(format!("· {alias}: {message}")));
         self.dirty = true;
     }
 
@@ -15114,7 +15373,7 @@ impl AppModel {
         let alias = smallest_free_alias(provider, &self.accounts.rows);
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.oauth_add = Some(OAuthAddCard {
             provider: provider.to_owned(),
             title,
@@ -15150,7 +15409,7 @@ impl AppModel {
             self.open_oauth_add(AccountAddKind::GoogleAntigravity);
             return;
         }
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.antigravity_consent = Some(AccountAddKind::GoogleAntigravity);
         self.dirty = true;
     }
@@ -15179,7 +15438,8 @@ impl AppModel {
     /// record of an acceptance that never happened.
     fn decline_antigravity_consent(&mut self) {
         if self.antigravity_consent.take().is_some() {
-            self.accounts.message = Some("· Google Antigravity sign-in cancelled".to_owned());
+            self.accounts
+                .set_message(Some("· Google Antigravity sign-in cancelled".to_owned()));
             self.dirty = true;
         }
     }
@@ -15191,22 +15451,15 @@ impl AppModel {
         if self.oauth_add.is_some() || self.custom_add.is_some() {
             return;
         }
-        let title = match provider {
-            "openai-oauth" => "OpenAI — ChatGPT",
-            "anthropic-oauth" => "Anthropic — Claude",
-            "kimi-oauth" => "Kimi — Moonshot",
-            "grok-oauth" => "Grok — xAI",
-            GOOGLE_ANTIGRAVITY_PROVIDER => "Google Antigravity",
-            _ => {
-                self.accounts.message = Some(format!(
-                    "· re-login is not available for {provider}; add it again"
-                ));
-                return;
-            }
+        let Some(title) = oauth_relogin_title(provider) else {
+            self.accounts.set_message(Some(format!(
+                "· re-login is not available for {provider}; add it again"
+            )));
+            return;
         };
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.oauth_add = Some(OAuthAddCard {
             provider: provider.to_owned(),
             title,
@@ -15228,7 +15481,8 @@ impl AppModel {
             self.requests.push(AppRequest::OAuthAddCancel {
                 attempt: card.attempt,
             });
-            self.accounts.message = Some("· authorize cancelled".to_owned());
+            self.accounts
+                .set_message(Some("· authorize cancelled".to_owned()));
             self.dirty = true;
         }
     }
@@ -15271,17 +15525,144 @@ impl AppModel {
             .as_ref()
             .is_some_and(|card| card.attempt == attempt)
         {
-            self.oauth_add = None;
+            let requested = self
+                .oauth_add
+                .take()
+                .map(|card| card.alias)
+                .unwrap_or_default();
             // P1 MASK LAW: the receipt is transient chrome with no key
             // loop of its own, so the identity rides it MASKED-ALWAYS
             // (one authority — `mask_identity`); the durable, revealable
             // surface is the account row itself.
-            self.accounts.message = Some(format!(
+            let mut message = format!(
                 "✓ {} → {} · oauth · {}",
                 descriptor.provider,
                 descriptor.alias,
                 crate::format::mask_identity(&descriptor.identity)
-            ));
+            );
+            // The daemon may save under another alias than the card asked
+            // for: an identity match, or a re-login through `requested` that
+            // authenticated a different account (which never rewrites it).
+            let mut details = None;
+            let saved = descriptor.alias.as_str();
+            if !requested.is_empty() && requested != saved {
+                let existed = self.accounts.rows.iter().any(|row| row.alias == saved);
+                let target = if existed {
+                    format!("updated existing `{saved}`")
+                } else {
+                    format!("saved as new alias `{saved}`")
+                };
+                match self.accounts.rows.iter().find(|row| row.alias == requested) {
+                    Some(row) => {
+                        let attention = !matches!(
+                            row.status,
+                            haider_protocol::credential::CredentialStatus::Ok
+                                | haider_protocol::credential::CredentialStatus::Limited { .. }
+                        );
+                        message.push_str(&format!(
+                            " · a different account than `{requested}`: {target} (now active) · `{requested}` unchanged{}",
+                            if attention {
+                                " and still needs attention"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                    None if existed => {
+                        message.push_str(&format!(" · same account: {target} (now active)"));
+                    }
+                    None => {}
+                }
+            }
+            if descriptor
+                .principal()
+                .is_some_and(haider_protocol::credential::AccountPrincipal::identity_unverified)
+            {
+                message.push_str(
+                    " · identity unverified (profile unavailable); not deduplicated until it verifies",
+                );
+            } else if let Some(principal) = descriptor.principal() {
+                // An email-only row whose email names several stable accounts
+                // is flagged for review, never offered as a removable duplicate.
+                let ambiguous_email = descriptor.account_identity.as_ref().is_some_and(
+                    |identity| {
+                        let Some(email) = identity.email.as_deref() else {
+                            return false;
+                        };
+                        let provider_identities = || {
+                            self.accounts
+                                .rows
+                                .iter()
+                                .filter(|row| row.provider == descriptor.provider)
+                                .filter_map(|row| row.account_identity.as_ref())
+                        };
+                        haider_protocol::credential::AccountIdentity::email_names_several_accounts(
+                            email,
+                            provider_identities().chain(std::iter::once(identity)),
+                        ) && provider_identities().any(|prior| prior.is_email_only_match(email))
+                    },
+                );
+                let duplicates =
+                    self.accounts
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.alias != descriptor.alias.as_str()
+                                && row
+                                    .principal()
+                                    .is_some_and(|prior| prior.same_account(principal))
+                                && (!ambiguous_email
+                                    || row
+                                        .account_identity
+                                        .as_ref()
+                                        .and_then(|prior| prior.account_id.as_deref())
+                                        .zip(
+                                            descriptor.account_identity.as_ref().and_then(
+                                                |identity| identity.account_id.as_deref(),
+                                            ),
+                                        )
+                                        .is_some_and(|(prior, current)| prior == current))
+                        })
+                        .map(|row| row.alias.as_str())
+                        .collect::<Vec<_>>();
+                if !duplicates.is_empty() {
+                    let action = format!("haider account remove {} --confirm", duplicates[0]);
+                    let full = format!(
+                        "{message}\nMatching aliases retained:\n{}",
+                        duplicates.join("\n")
+                    );
+                    let first = duplicates
+                        .iter()
+                        .take(2)
+                        .map(|alias| {
+                            let short = alias.chars().take(24).collect::<String>();
+                            if alias.chars().count() > 24 {
+                                format!("{short}…")
+                            } else {
+                                short
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = duplicates.len().saturating_sub(2);
+                    message.push_str(&format!(" · matching aliases retained: {first}"));
+                    if more > 0 {
+                        message.push_str(&format!(" and {more} more"));
+                    }
+                    details = Some((full, action));
+                } else if ambiguous_email {
+                    message.push_str(" · email matches distinct account IDs; review aliases before removing a duplicate");
+                }
+            } else {
+                message.push_str(
+                    " · provider exposes no stable identity; re-login through this alias to update it",
+                );
+            }
+            if let Some((full, action)) = details {
+                self.accounts.set_detailed_message(message, full, action);
+            } else {
+                self.accounts.set_message(Some(message));
+            }
             self.requests.push(AppRequest::AccountsRefresh);
             self.dirty = true;
         }
@@ -15356,7 +15737,7 @@ impl AppModel {
                                 row.selected = false;
                             }
                         }
-                        self.accounts.rows.push(AccountRow {
+                        self.accounts.push_row(AccountRow {
                             alias: alias.clone(),
                             provider: provider.to_owned(),
                             method: haider_protocol::credential::AuthMethod::OAuth,
@@ -15368,8 +15749,8 @@ impl AppModel {
                             base_url: None,
                         });
                         self.oauth_add = None;
-                        self.accounts.message =
-                            Some(format!("✓ {provider} → {alias} · oauth · active"));
+                        self.accounts
+                            .set_message(Some(format!("✓ {provider} → {alias} · oauth · active")));
                         let _ = attempt;
                         self.dirty = true;
                     } else {
@@ -15397,7 +15778,7 @@ impl AppModel {
         let provider = card.provider.clone();
         let alias = card.alias.clone();
         let attempt = card.attempt;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         self.requests.push(AppRequest::OAuthAddStart {
             provider,
             alias,
@@ -15427,7 +15808,8 @@ impl AppModel {
                 if self.daemon_lists_provider("gemini") {
                     self.open_login_card("gemini", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Gemini accounts")));
                     self.dirty = true;
                 }
             }
@@ -15435,7 +15817,8 @@ impl AppModel {
                 if self.daemon_lists_provider("deepseek") {
                     self.open_login_card("deepseek", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("DeepSeek accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("DeepSeek accounts")));
                     self.dirty = true;
                 }
             }
@@ -15443,7 +15826,8 @@ impl AppModel {
                 if self.daemon_lists_provider("haider-code") {
                     self.open_login_card("haider-code", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Haider Code accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Haider Code accounts")));
                     self.dirty = true;
                 }
             }
@@ -15451,7 +15835,8 @@ impl AppModel {
                 if self.daemon_lists_provider("xai") {
                     self.open_login_card("xai", None);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("xAI accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("xAI accounts")));
                     self.dirty = true;
                 }
             }
@@ -15464,7 +15849,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -15475,7 +15861,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Kimi OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Kimi OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -15483,7 +15870,8 @@ impl AppModel {
                 if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
                     self.open_oauth_add(kind);
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("Grok OAuth sign-in"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Grok OAuth sign-in")));
                     self.dirty = true;
                 }
             }
@@ -15495,8 +15883,8 @@ impl AppModel {
                 if self.daemon_lists_provider(GOOGLE_ANTIGRAVITY_PROVIDER) {
                     self.open_antigravity_add();
                 } else {
-                    self.accounts.message =
-                        Some(self.stale_daemon_note("Google Antigravity accounts"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("Google Antigravity accounts")));
                     self.dirty = true;
                 }
             }
@@ -15509,7 +15897,8 @@ impl AppModel {
                 {
                     self.open_custom_add();
                 } else {
-                    self.accounts.message = Some(self.stale_daemon_note("custom providers"));
+                    self.accounts
+                        .set_message(Some(self.stale_daemon_note("custom providers")));
                     self.dirty = true;
                 }
             }
@@ -15553,15 +15942,30 @@ impl AppModel {
         // `accounts_replace_key` and by nothing else.
         if let Some(pending) = self.pending_account_secret() {
             self.accounts.pending_replace = Some(kind);
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "discard the pending {pending} entry? enter replaces it · esc keeps it"
-            ));
+            )));
             self.dirty = true;
             return false;
         }
         self.accounts.pending_replace = None;
         self.close_pending_account_form();
         true
+    }
+
+    /// Matches the overlays rendered above the account list. Inline sign-in
+    /// forms still leave the notice visible; full-screen overlays cover it.
+    fn accounts_surface_visible(&self) -> bool {
+        self.screen == Screen::Accounts
+            && self.model_picker.is_none()
+            && self.ssh_terminal.is_none()
+            && self.tool_detail.is_none()
+            && !self.inbox_open
+            && !self.help_open
+            && !self.shells_open
+            && !self.ssh_open
+            && !self.monitors_open
+            && !self.lockdown_overlay
     }
 
     /// The `/accounts` paging gestures, routed AHEAD of every add-form's
@@ -15575,8 +15979,20 @@ impl AppModel {
     /// card on screen outranks the page (an invisible card eating keystrokes
     /// is the W5g-5 trap), so the offset the frame chooses wins.
     fn accounts_scroll_gesture(&mut self, code: KeyCode) -> bool {
-        if self.screen != Screen::Accounts {
+        if !self.accounts_surface_visible() {
             return false;
+        }
+        if self.accounts.message_expanded {
+            let current = self.accounts.message_scroll.get();
+            let max = self.accounts.message_scroll_max.get();
+            let next = match code {
+                KeyCode::PageUp => current.saturating_sub(8),
+                KeyCode::PageDown => current.saturating_add(8).min(max),
+                _ => return false,
+            };
+            self.accounts.message_scroll.set(next);
+            self.dirty = true;
+            return true;
         }
         match code {
             KeyCode::PageUp => {
@@ -15629,7 +16045,7 @@ impl AppModel {
             self.cancel_custom_add();
         }
         self.close_login_card();
-        self.accounts.message = None;
+        self.accounts.set_message(None);
     }
 
     /// The keys of the 971 F1(b) replace confirm. It outranks every accounts
@@ -15652,7 +16068,7 @@ impl AppModel {
             }
             KeyCode::Esc => {
                 self.accounts.pending_replace = None;
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 self.dirty = true;
             }
             _ => {}
@@ -15682,7 +16098,7 @@ impl AppModel {
             base_url: None,
         }));
         self.custom_attempt_seq += 1;
-        self.accounts.message = None;
+        self.accounts.set_message(None);
         let name = smallest_free_alias("custom", &taken);
         let cursor = name.chars().count();
         self.custom_add = Some(CustomProviderCard {
@@ -16276,10 +16692,10 @@ impl AppModel {
             return None;
         }
         if credential_staged {
-            self.accounts.message = Some(format!(
+            self.accounts.set_message(Some(format!(
                 "✓ provider {} configured · registering its account…",
                 card.name
-            ));
+            )));
             let login_attempt = self.open_staged_login_card(&card.name, card.name.clone());
             self.dirty = true;
             return Some(login_attempt);
@@ -16291,7 +16707,7 @@ impl AppModel {
         }
         // G4b: every keyed kind chains into the masked key card; the copy
         // names what the "key" actually is on each surface.
-        self.accounts.message = Some(match card.kind {
+        self.accounts.set_message(Some(match card.kind {
             CustomCardKind::Azure => format!(
                 "✓ provider {} configured · Azure OpenAI — now add its api-key",
                 card.name
@@ -16308,7 +16724,7 @@ impl AppModel {
                 "✓ provider {} created · OpenAI-compatible — now add its key",
                 card.name
             ),
-        });
+        }));
         self.open_login_card(&card.name, None);
         self.dirty = true;
         None
@@ -16490,7 +16906,7 @@ impl AppModel {
                 row.selected = false;
             }
         }
-        self.accounts.rows.push(AccountRow {
+        self.accounts.push_row(AccountRow {
             alias: alias.clone(),
             provider: provider.clone(),
             method: haider_protocol::credential::AuthMethod::ApiKey,
@@ -16501,15 +16917,39 @@ impl AppModel {
             selected: true,
             base_url: Some(base_url.to_owned()),
         });
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "✓ added {provider} · {alias} · api key · OpenAI-compatible — now active"
-        ));
+        )));
         self.dirty = true;
     }
 
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
+        if self.accounts.message_expanded {
+            match code {
+                KeyCode::Esc | KeyCode::F(2) => self.accounts.message_expanded = false,
+                KeyCode::Home => self.accounts.message_scroll.set(0),
+                KeyCode::End => self
+                    .accounts
+                    .message_scroll
+                    .set(self.accounts.message_scroll_max.get()),
+                KeyCode::Up => self
+                    .accounts
+                    .message_scroll
+                    .set(self.accounts.message_scroll.get().saturating_sub(1)),
+                KeyCode::Down => self.accounts.message_scroll.set(
+                    self.accounts
+                        .message_scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(self.accounts.message_scroll_max.get()),
+                ),
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
         // 970 — the disclosure card owns the keyboard exactly like the other
         // accounts cards: nothing starts until `[1]`, and `[2]`/esc leaves
         // no record. It closes before `open_oauth_add` runs, so at most one
@@ -16533,7 +16973,8 @@ impl AppModel {
         match code {
             KeyCode::Char('y') if self.accounts.adoption_candidate.is_some() => {
                 if let Some(candidate) = self.accounts.adoption_candidate.take() {
-                    self.accounts.message = Some(format!("importing {} login…", candidate.source));
+                    self.accounts
+                        .set_message(Some(format!("importing {} login…", candidate.source)));
                     self.requests.push(AppRequest::AccountImportDevice {
                         candidate: candidate.candidate,
                         source: candidate.source,
@@ -16543,7 +16984,8 @@ impl AppModel {
             }
             KeyCode::Char('n') if self.accounts.adoption_candidate.is_some() => {
                 self.accounts.adoption_candidate = None;
-                self.accounts.message = Some("local login import cancelled".to_owned());
+                self.accounts
+                    .set_message(Some("local login import cancelled".to_owned()));
                 if self.device_discovery_available() {
                     self.requests.push(AppRequest::DeviceCandidatesRefresh);
                 }
@@ -16551,7 +16993,12 @@ impl AppModel {
             }
             KeyCode::Esc if self.accounts.pending_remove.is_some() => {
                 self.accounts.pending_remove = None;
-                self.accounts.message = None;
+                self.accounts.set_message(None);
+                self.dirty = true;
+            }
+            KeyCode::Esc if self.accounts.pending_relogin.is_some() => {
+                self.accounts.pending_relogin = None;
+                self.accounts.set_message(None);
                 self.dirty = true;
             }
             KeyCode::Esc => self.exit_accounts(),
@@ -16562,9 +17009,9 @@ impl AppModel {
                     .get(self.accounts.cursor)
                     .map(|row| row.alias.clone())
                 {
-                    self.accounts.message = Some(format!(
+                    self.accounts.set_message(Some(format!(
                         "remove account `{alias}`? enter confirms · esc cancels"
-                    ));
+                    )));
                     self.accounts.pending_remove = Some(alias);
                     self.dirty = true;
                 }
@@ -16577,19 +17024,23 @@ impl AppModel {
                         .accounts
                         .cursor
                         .min(self.accounts.rows.len().saturating_sub(1));
-                    self.accounts.message = Some(format!("removed `{alias}` (demo)"));
+                    self.accounts
+                        .set_message(Some(format!("removed `{alias}` (demo)")));
                 } else {
-                    self.accounts.message = Some(format!("removing `{alias}`…"));
+                    self.accounts
+                        .set_message(Some(format!("removing `{alias}`…")));
                     self.requests.push(AppRequest::AccountRemove { alias });
                 }
                 self.dirty = true;
             }
             KeyCode::Up => {
+                self.accounts.pending_relogin = None;
                 self.accounts.cursor = self.accounts.cursor.saturating_sub(1);
                 self.accounts.follow_cursor.set(true);
                 self.dirty = true;
             }
             KeyCode::Down => {
+                self.accounts.pending_relogin = None;
                 let total = self.accounts.rows.len();
                 if total > 0 {
                     self.accounts.cursor = (self.accounts.cursor + 1).min(total - 1);
@@ -16664,10 +17115,10 @@ impl AppModel {
             "· {} login available: {identity} · `{command}`",
             candidate.source_label
         ));
-        self.accounts.message = Some(format!(
+        self.accounts.set_message(Some(format!(
             "import {} login ({identity})? y confirms · n cancels · `{command}`",
             candidate.source_label
-        ));
+        )));
         self.accounts.adoption_candidate = Some(candidate);
         self.dirty = true;
         true
@@ -20611,6 +21062,19 @@ impl AppModel {
     /// rejected, not invented.
     pub fn route_raw(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
         use crate::projection::RawOutcome;
+        let parked_window = self
+            .sessions
+            .iter()
+            .find(|entry| entry.id == envelope.session_id)
+            .and_then(|entry| {
+                entry
+                    .meter_epoch
+                    .pair
+                    .as_ref()
+                    .and_then(|(provider, model)| {
+                        self.session_declared_window(Some(&entry.id), provider, model)
+                    })
+            });
         if self.active_session.as_ref() == Some(&envelope.session_id) {
             let window = self.context_meter().window;
             self.projection.set_compaction_note_window(window);
@@ -20619,11 +21083,7 @@ impl AppModel {
             .iter_mut()
             .find(|entry| entry.id == envelope.session_id)
         {
-            let declared = entry
-                .meter_epoch
-                .pair
-                .as_ref()
-                .and_then(|(provider, model)| self.providers.declared_window(provider, model));
+            let declared = parked_window;
             let footprint = entry.projection.latest_footprint();
             let window = if entry.meter_epoch.snapshot_epoch(footprint)
                 != crate::context_meter::SnapshotEpoch::Previous
@@ -21408,17 +21868,19 @@ impl AppModel {
             ErrorAction::Reimport => {
                 self.enter_accounts();
                 self.requests.push(AppRequest::DeviceCandidatesRefresh);
-                self.accounts.message = Some("· looking for credentials to re-adopt…".into());
+                self.accounts
+                    .set_message(Some("· looking for credentials to re-adopt…".into()));
             }
             ErrorAction::SwitchAccount => {
                 self.enter_accounts();
-                self.accounts.message = Some("· choose another usable account".into());
+                self.accounts
+                    .set_message(Some("· choose another usable account".into()));
             }
             ErrorAction::EditKey => {
                 self.enter_accounts();
-                self.accounts.message = Some(
+                self.accounts.set_message(Some(
                     "· replace this key by removing the rejected account, then add it again".into(),
-                );
+                ));
             }
             ErrorAction::TopUp => self.projection.push_note(format!(
                 "· add credits in the {} billing portal, then retry",
@@ -22688,6 +23150,7 @@ impl AppModel {
         match self.input_owner() {
             InputOwner::Lockdown
             | InputOwner::Help
+            | InputOwner::AccountsNotice
             | InputOwner::SshList
             | InputOwner::SshForm
             | InputOwner::SshTerminal
@@ -22911,6 +23374,12 @@ impl AppModel {
             // tui.js:3604 onClick useAccount). Value-carrying alias, and
             // NEVER an optimistic flip — select_account only requests.
             Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
+                if let Some(cursor) = self.accounts.rows.iter().position(|row| row.alias == alias) {
+                    if cursor != self.accounts.cursor {
+                        self.accounts.pending_relogin = None;
+                    }
+                    self.accounts.cursor = cursor;
+                }
                 self.select_account(&alias);
             }
             Hit::AccountAdd(kind)
@@ -22923,7 +23392,7 @@ impl AppModel {
                 if self.screen == Screen::Providers {
                     self.enter_accounts();
                 }
-                self.accounts.message = None;
+                self.accounts.set_message(None);
                 // 971 F1(b): ONE pending add-form at a time — the choice
                 // REPLACES whatever is open, and only a form already holding
                 // typed secret bytes gets a confirm before the discard.
@@ -23358,6 +23827,18 @@ impl AppModel {
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
         match self.input_owner() {
+            InputOwner::AccountsNotice => {
+                let current = self.accounts.message_scroll.get();
+                self.accounts.message_scroll.set(if up {
+                    current.saturating_sub(3)
+                } else {
+                    current
+                        .saturating_add(3)
+                        .min(self.accounts.message_scroll_max.get())
+                });
+                self.dirty = true;
+                return;
+            }
             InputOwner::ToolDetail => {
                 self.scroll_tool_detail(if up { -3 } else { 3 });
                 return;
@@ -23390,7 +23871,7 @@ impl AppModel {
             owner if owner.scrolls_transcript() || matches!(owner, InputOwner::Screen(_)) => {}
             // Accounts cards are pinned above a still-visible roster. The
             // wheel belongs to that screen's scroll state, as before.
-            InputOwner::Login if self.screen == Screen::Accounts => {}
+            InputOwner::Login | InputOwner::AccountsReplace if self.screen == Screen::Accounts => {}
             InputOwner::CustomProviderForm
                 if matches!(self.screen, Screen::Accounts | Screen::Providers) => {}
             _ => return,
@@ -23807,11 +24288,11 @@ impl AppModel {
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: model.clone(),
                     auth,
-                    context_window: summary
-                        .model_details
-                        .iter()
-                        .find(|detail| detail.name == *model)
-                        .and_then(|detail| detail.context_window),
+                    context_window: self.session_declared_window(
+                        self.selection_surface_session().as_ref(),
+                        &summary.provider,
+                        model,
+                    ),
                     source: summary
                         .model_details
                         .iter()
@@ -24479,8 +24960,9 @@ impl AppModel {
         if viewed_child {
             self.launcher_identity.provider = provider.to_owned();
             self.launcher_identity.model_short = model.to_owned();
-            self.launcher_identity.context_window =
-                self.providers.declared_window(provider, model).unwrap_or(0);
+            self.launcher_identity.context_window = self
+                .session_declared_window(Some(session), provider, model)
+                .unwrap_or(0);
             self.launcher_pick_scope = self.pick_scope_for(provider, model);
             self.launcher_identity_pinned = true;
             self.model_commits += 1;
@@ -24808,6 +25290,9 @@ impl AppModel {
         if let Some((provider, _, _)) = self.session_catalog_keys.get_mut(session) {
             provider.clone_from(&rebound.provider);
         }
+        if self.active_session.as_ref() == Some(session) {
+            self.refresh_context_window();
+        }
         self.dirty = true;
     }
 
@@ -25041,6 +25526,9 @@ impl AppModel {
                         .is_none_or(|request| request < reset))
                 .then_some(epoch.selection_epoch)
                 .flatten();
+            }
+            if self.active_session.as_ref() == Some(session) {
+                self.refresh_context_window();
             }
             self.dirty = true;
         }
@@ -25411,7 +25899,8 @@ impl AppModel {
     /// exact selection is retained so repeating it is an explicit confirm.
     pub fn cache_epoch_confirmation_required(&mut self, change: PendingCacheChange, message: &str) {
         self.pending_cache_change = Some(change);
-        let notice = format!("{message} · repeat this selection to create the new epoch");
+        let action = "repeat this selection to create the new epoch";
+        let notice = format!("{message} · {action}");
         match &mut self.pending_cache_change {
             Some(PendingCacheChange::Model { .. }) => {
                 if let Some(picker) = self.model_picker.as_mut() {
@@ -25427,7 +25916,11 @@ impl AppModel {
             }
             Some(PendingCacheChange::Account { .. }) => {
                 self.accounts.pending_select = None;
-                self.accounts.message = Some(notice.clone());
+                self.accounts.set_detailed_message(
+                    message.to_owned(),
+                    message.to_owned(),
+                    action.to_owned(),
+                );
             }
             Some(PendingCacheChange::Fast { .. }) | None => {}
         }

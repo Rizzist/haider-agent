@@ -88,7 +88,12 @@ impl MeterTokenSource for CredentialBroker {
         }
         // The broker's own message may name vault/refresh internals; the
         // report carries only the bounded classification.
-        self.resolve(descriptor).await.map_err(|error| {
+        #[cfg(debug_assertions)]
+        let resolved =
+            meter_bearer_for_mode(self, descriptor, crate::debug_fake_usage::mode()).await;
+        #[cfg(not(debug_assertions))]
+        let resolved = self.resolve_remote(descriptor).await;
+        resolved.map_err(|error| {
             let reason = if error.code == ErrorCode::CredentialMissing {
                 "credential_source_gone"
             } else {
@@ -96,6 +101,25 @@ impl MeterTokenSource for CredentialBroker {
             };
             MeterUnavailable::new(reason)
         })
+    }
+}
+
+// The debug meter transport and broker must agree on the destination. The
+// broker still refuses live-issued tokens at loopback and fake tokens remotely.
+#[cfg(debug_assertions)]
+async fn meter_bearer_for_mode(
+    broker: &CredentialBroker,
+    descriptor: &CredentialDescriptor,
+    mode: &crate::debug_fake_usage::Mode,
+) -> Result<SecretHandle, haider_protocol::error::HaiderError> {
+    match mode {
+        crate::debug_fake_usage::Mode::Off => broker.resolve_remote(descriptor).await,
+        crate::debug_fake_usage::Mode::Fake(origin) => {
+            broker.resolve_to_loopback(descriptor, origin).await
+        }
+        crate::debug_fake_usage::Mode::Refused(reason) => Err(
+            haider_protocol::error::HaiderError::new(ErrorCode::InvalidArgument, *reason, false),
+        ),
     }
 }
 
@@ -929,11 +953,9 @@ impl UsageReportService {
         } else {
             OpenAiTokenIdentity::default()
         };
-        // OpenAI's WHAM meter is account-scoped. This value is the
-        // `chatgpt_account_id` captured from the OAuth ID token by
-        // `OpenAiOAuthIdentitySource`; an OpenAI organization id is never a
-        // substitute. Refuse early instead of sending an ambiguous request
-        // that fails later as a bare 401/403.
+        // OpenAI's WHAM meter requires the raw workspace id. The descriptor
+        // now stores a user+workspace dedupe coordinate, so extract only the
+        // workspace component for this request header.
         let chatgpt_account_id = if endpoint == UsageMeterEndpoint::OpenAiOauth {
             match descriptor
                 .account_identity
@@ -999,15 +1021,8 @@ impl UsageReportService {
 /// `haider_provider::openai_workspace_from_account_coordinate`; collapse onto
 /// that helper when both lanes land.
 fn openai_workspace_account_id(coordinate: &str) -> Option<&str> {
-    let Some(rest) = coordinate.strip_prefix("user:") else {
-        return (!coordinate.trim().is_empty()).then_some(coordinate);
-    };
-    let (length, rest) = rest.split_once(':')?;
-    let length = length.parse::<usize>().ok()?;
-    let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
-    let (workspace_length, workspace) = suffix.split_once(':')?;
-    let workspace_length = workspace_length.parse::<usize>().ok()?;
-    (workspace_length == workspace.len() && !workspace.trim().is_empty()).then_some(workspace)
+    haider_provider::openai_workspace_from_account_coordinate(coordinate)
+        .filter(|workspace| !workspace.trim().is_empty())
 }
 
 #[cfg(test)]

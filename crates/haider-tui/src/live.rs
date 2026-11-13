@@ -4466,12 +4466,14 @@ impl LiveDriver {
                     }
                 }
                 model.accounts.revision = Some(revision);
-                model.accounts.message = Some(match replacement_active_alias {
-                    Some(active) => {
-                        format!("removed `{removed_alias}` · active → `{active}`")
-                    }
-                    None => format!("removed `{removed_alias}`"),
-                });
+                model
+                    .accounts
+                    .set_message(Some(match replacement_active_alias {
+                        Some(active) => {
+                            format!("removed `{removed_alias}` · active → `{active}`")
+                        }
+                        None => format!("removed `{removed_alias}`"),
+                    }));
                 model.bootstrap_identity_from_daemon();
                 model.refresh_context_window();
                 model.dirty = true;
@@ -4970,6 +4972,7 @@ impl LiveDriver {
                     // Daemon truth landed: an unpinned identity follows the
                     // active account (W5f-2) so the first session can serve.
                     model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
                     model.dirty = true;
                 }
                 // An active OAuth account with no catalog yet needs one
@@ -5024,12 +5027,12 @@ impl LiveDriver {
                 } else {
                     "imported"
                 };
-                model.accounts.message = Some(format!(
+                model.accounts.set_message(Some(format!(
                     "✓ {action} {} → {} · {}",
                     descriptor.provider,
                     descriptor.alias,
                     crate::format::mask_identity(&descriptor.identity)
-                ));
+                )));
                 model.dirty = true;
                 vec![
                     LiveCommand::AccountListAt {
@@ -5100,7 +5103,7 @@ impl LiveDriver {
                     model.refresh_context_window();
                     model.dirty = true;
                 }
-                Vec::new()
+                self.provider_model_refreshes(model)
             }
             LiveReply::ModelSelected {
                 connection_epoch,
@@ -5809,7 +5812,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("`{alias}` not removed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("`{alias}` not removed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -5825,7 +5830,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("✗ import failed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("✗ import failed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -7501,6 +7508,25 @@ impl LiveDriver {
     /// released when the refreshed snapshot lands, so TTL expiry can recur.
     fn provider_model_refreshes(&mut self, model: &AppModel) -> Vec<LiveCommand> {
         let mut commands = Vec::new();
+        if model
+            .providers
+            .providers
+            .iter()
+            .any(|summary| !model.provider_inventory_matches_accounts(summary))
+        {
+            // A refresh changes the management revision too. Fetch the older
+            // half so metadata becomes usable again whichever reply came first.
+            match (model.accounts.revision, model.providers.revision) {
+                (Some(accounts), Some(providers)) if accounts > providers => {
+                    commands.push(LiveCommand::ProviderListAt {
+                        epoch: self.connection_epoch,
+                    });
+                }
+                _ => commands.push(LiveCommand::AccountListAt {
+                    epoch: self.connection_epoch,
+                }),
+            }
+        }
         for row in &model.accounts.rows {
             // Any SELECTED account whose provider has no catalog asks for
             // one — OAuth subscriptions AND api-key accounts alike (W5g-5:
@@ -7514,6 +7540,11 @@ impl LiveDriver {
                 .providers
                 .iter()
                 .find(|summary| summary.provider == row.provider);
+            if summary.is_some_and(|summary| !model.provider_inventory_matches_accounts(summary)) {
+                // Both management snapshots are already requested together.
+                // Wait for their common revision before deciding a cache hit.
+                continue;
+            }
             let needs_refresh = summary.is_none_or(|summary| summary.inventory.needs_refresh());
             if !needs_refresh || self.models_requested.contains(&row.provider) {
                 continue;

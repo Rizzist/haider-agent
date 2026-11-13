@@ -45,6 +45,7 @@ daemon-oauth-single-flight	linux	haider-daemon	lib	concurrent_refresh_is_single_
 daemon-oauth-resolve-commit	linux	haider-daemon	lib	concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_delete	crates/haider-daemon/src/oauth_tests.rs
 daemon-shell-close-race	linux	haider-daemon	lib	close_wins_a_race_with_the_running_transition	crates/haider-daemon/src/shell_registry_tests.rs
 daemon-shell-inventory	linux	haider-daemon	lib	activity_inventory_revision_remains_monotonic_under_concurrent_lifecycle_changes	crates/haider-daemon/src/shell_registry_tests.rs
+daemon-explicit-account-inventory-session-update	linux	haider-daemon	lib	explicit_account_inventory_refresh_retries_after_concurrent_session_update	crates/haider-daemon/src/session_hub_private_tests.rs
 daemon-task-pipe-interleaving	linux	haider-daemon	lib	activity_real_interleaved_pipes_cannot_split_pem_redaction	crates/haider-daemon/src/tasks_runtime_tests.rs
 daemon-observer-rebuild	linux	haider-daemon	lib	concurrent_observers_of_evicted_session_share_one_rebuild	crates/haider-daemon/src/session_hub/rpc.rs
 daemon-budget-stop-race	linux	haider-daemon	lib	a_durable_budget_cause_wins_when_stop_races_the_terminal_batch	crates/haider-daemon/src/run_budget_tests.rs
@@ -82,6 +83,7 @@ daemon-native-close-replay	linux	haider-daemon	lib	native_close_joins_detached_r
 daemon-native-close-publication	linux	haider-daemon	lib	native_close_refuses_monitor_registration_between_commit_and_publication	crates/haider-daemon/src/session_close_tests.rs
 daemon-native-close-process-owner	linux	haider-daemon	lib	native_close_waits_for_cancelled_process_owner_cleanup	crates/haider-daemon/src/session_close_tests.rs
 warm-projection-seed-share	macos	haider-daemon	lib	concurrent_warm_readers_share_one_reducer_seed	crates/haider-daemon/src/worker_warm_journal_projection_tests.rs
+daemon-oauth-flight-issuer	all	haider-daemon	lib	flight_completion_rechecks_the_returned_issuer_for_every_destination	crates/haider-daemon/src/oauth_tests.rs
 catalog-linked-rotation	linux	haider-daemon	lib	same_account_linked_rotation_race_completes_then_reconciles_and_retries	crates/haider-daemon/src/accounts_tests.rs
 daemon-sidecar-committed-coverage	all	haider-daemon	test:session_hub_tests	sidecar_wait_requires_committed_coverage_before_returning	crates/haider-daemon/tests/session_hub_tests.rs
 daemon-stalled-outbox-pressure	all	haider-daemon	test:session_hub_tests	commit_pressure_behind_a_stalled_outbox_laggs_and_detaches	crates/haider-daemon/tests/session_hub_tests.rs
@@ -116,3 +118,8 @@ lock-background-observer-teardown-confirmed	linux	haider-tools	lib	exit_observer
 lock-content-budget-watchdog	linux	haider-tools	lib	observed_length_content_budget_is_explicitly_elided	crates/haider-tools/src/workspace_receipt_tests.rs
 lock-cancellation-receipt-nonblocking-reader	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_waits_for_an_inherited_nonblocking_reader	crates/haider-cli/tests/autospawn_tests.rs
 lock-cancellation-receipt-eof-control	all	haider-cli	test:autospawn_tests	cancellation_gate_receipt_preserves_eof_failure	crates/haider-cli/tests/autospawn_tests.rs
+catalog-owner-paused-account-rebind	linux	haider-daemon	lib	catalog_owner_paused_a_rebind_b	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-inactive-removed-success	linux	haider-daemon	lib	catalog_owner_inactive_removed_success	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-inactive-removed-304	linux	haider-daemon	lib	catalog_owner_inactive_removed_304	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-stale-cache-removal	linux	haider-daemon	lib	catalog_owner_removed_alias_cannot_serve_a_stale_cached_model	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+catalog-owner-active-identity-busy	linux	haider-daemon	lib	catalog_control_active_identity_change_rejects_inflight_a	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs

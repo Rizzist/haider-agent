@@ -127,6 +127,33 @@ results are recorded separately in the lane's evidence directory.
 
 ## Model list lane integration history
 
+Merge of origin/wave-973 at b3aeb633 into lane-973-accounts-ux, round 23.
+
+- accounts_tests.rs: preserve the second discovery release required by the lane's two account discoveries; use upstream's fixture-ready TEST_WAIT_TIMEOUT instead of the two-second load bound.
+- race-stress-cases.tsv: retain both the lane's OAuth returned-issuer case and every upstream file-lock/fixture-readiness case.
+- test-baseline.txt: derived as 6720 by the actual dependency-free xtask test-count --update command on the merged source. Receipt: state/evidence/973-accounts-ux/24-sol-r23-cap3/baseline-only.json (harness-relative). Final integrated source will be counted again after the newest upstream landing.
+- Auto-merged production changes are reviewed together with both P2 repairs and gated on this integrated tree. No push is authorized in this round.
+
+Fresh upstream integration: origin/wave-973 advanced to 56e4a29a3bfa58f422f705302b28b0a15648531b (macOS packaging fixes). Its four packaging/test files merged without source conflicts. The only conflict was test-baseline.txt; actual xtask test-count --update re-derived 6720 on the combined source (baseline-only.json). The original b3aeb633 merge and both account repairs remain in parent 5d62c65e.
+
+Additional recovery repair before the final candidate: reproduced an interrupted sign-in being incorrectly committed when a different saved account had the same saved value. The named regression failed on unchanged production code (staged-before-proof.json), then passed with the repair. Recovery now honors a published target and, when present, the staged stable account coordinate; the existing matching rules stay unchanged. The regression covers 24 Anthropic/OpenAI combinations, including same-identity duplicate rows. The paired profile set adds a thirteenth pending same-value case. The repaired accounts suite passed 181 tests with zero failures and its two existing live-provider ignores (repaired-accounts-audit.json). Actual xtask test-count --update re-derived 6721 on this repaired source; the complete final-candidate gate counts it again.
+
+Further recovery class repair: six named regressions actually failed on unchanged c2db6851 production (five existing A23 functions passed). Fresh interactive claims now protect their original alias in the claim transaction, and every interactive write stages its selected generation. Startup retains a published target, recognizes captured legacy identities, records the saved staged target before finalization, and leaves removal-reserved targets pending. Imports keep their existing coordinates. No schema, enum or stage format changed. The repaired Store library and accounts suites pass, including all eleven A23 functions, 62 recovery variants, six claim/control cases and four real actor failed-write boundaries. Actual xtask baseline: 6727. The paired real-daemon fixture set now has fifteen profiles, including email-only sign-ins and an unstaged fresh claim that must stay pending for both readers. Source/count receipts: state/evidence/973-accounts-ux/24-sol-r23-cap3/legacy-repaired-audit.json. Full exact-candidate verification follows this commit; no push.
+
+Paired-profile fixture correction: the first real 13071bcd comparison passed all four original sign-in cases (21 assertions), but its constructed missing-Y profile was invalid before recovery: it deleted the selected Y and left X inactive. The new AccountStore loader assertion actually reproduced that failure. The checkpoint now represents a valid earlier projection with X selected, and recovery must restore Y while preserving X selection. Every exported profile is loaded and compared through the real AccountStore before the fixture test passes. No production, matching or persisted-format behavior changed. The complete Store/accounts suites and actual xtask baseline were rerun; baseline remains 6727. The real paired probe now preserves text daemon diagnostics, records a failed start separately from daemon-not-running cleanup, and explicitly checks rejection of the invalid no-active snapshot before exercising the valid missing-Y case. Exact fixture before/after evidence is under state/evidence/973-accounts-ux/24-sol-r23-cap3; full final verification is repeated on this new commit. No push.
+
+## Round 24: complete OAuth recovery and placeholder matching
+
+Recovery now recognizes a completed interactive OAuth write only when the saved bundle's entire canonical payload matches the command-owned stage. Stable identity, access value and generation can all recur across writes, so none is sufficient by itself. An incomplete write retains its pending receipt and stage without replacing a newer saved bundle. Published targets, reservations, removal history and separate import recovery retain their existing rules; no persisted format changes.
+
+Account matching now rejects an Anthropic grant-hash placeholder on either side, including a legacy email bridge. This shared rule keeps fresh requested aliases distinct and prevents CLI/TUI duplicate-removal advice from treating a placeholder as a verified match. Explicit same-alias re-login remains allowed. OpenAI user-qualified identities with `verified=false` and ordinary normalized-email migration remain valid.
+
+Durable tests include the real actor's failed-write boundary and completed controls, every accepted bundle field (including same-generation differences), historical/current stages and missing projections, symmetric placeholder/email matching, and CLI/TUI notices. The paired-binary and mutation evidence is recorded under the round-24 harness evidence directory.
+
+---
+
+# Wave 973 integration, Sol round 16
+
 Merged `origin/wave-973` at `a8b218079422dd0a70c6997a56fc6a4f5d4b051f` into the model list fixes lane.
 
 `crates/haider-daemon/src/android_runtime_tests.rs` conflicted because the lane had repaired the recovered-checkpoint fixture's effect history while the wave had extracted that fixture into `checkpoint_test_support.rs`. The shared helper already includes the same ordered Intent → Authorized → Dispatched → Outcome → CheckpointRecorded history, and asserts that the checkpoint is indexed. The resolution uses that shared helper and removes the duplicate local definition. It retains the lane's recovered Android RPC assertions for allowed paths, outside/reserved paths, worker generation, undo, redo, and rollback, along with the wave's general support for creation/write/deletion fixtures and durable postimages.
@@ -166,6 +193,11 @@ The continuation also integrates fresh wave `b3aeb633b9f24c51d07cb901bb532ad907b
 
 The next continuation integrates wave `56e4a29a3bfa58f422f705302b28b0a15648531b`. Its only additions since the prior merged wave are macOS installer identity checks and their Python tests. The sole merge conflict is the shared baseline; xtask re-derived it as **6986 tests** on the integrated tree. All Rust sources, Cargo manifests, Cargo.lock, vendor sources and Rust test drivers remain byte-identical to `6da30807`; source equivalence and evidence reuse are recorded with the continuation receipts.
 
+
+Round 24 integrates fresh wave 6fa2a72d4199b798834cee2d72c5fd2767a6373b with a merge commit. The terminal lane's shared InputOwner and clipboard routes remain authoritative. The expanded accounts notice joins that model as AccountsNotice, with an opaque revision for replacement/reopen input stamps; its existing scroll/close keys and covered-input refusal remain. Pinned account forms and replacement confirmation retain roster paging. Both resolution histories are retained. Actual xtask re-derived the baseline as **7,106 tests** after resolution. Formatting, TUI all-target Clippy and six affected suites pass; full final gates run on the committed integrated candidate. The owner-agreement and covered-input matrices include AccountsNotice. No push.
+
+---
+
 ## Catalog fixes round 17 integration
 
 Merged wave `6fa2a72d4199b798834cee2d72c5fd2767a6373b` after implementing C5. Both lanes' resolution records remain above. The RPC public exports retain the catalog coordinate helpers and the incoming `ShellSetupErrorWire`. The merged baseline is derived by xtask before the merge commit; final gates run on that merge commit.
@@ -175,3 +207,27 @@ The actual merged `xtask test-count --update` derived **7198** source test marke
 The merged all-target clippy gate found two imported input-dwell fixtures missing the catalog fields introduced by this lane. Both now use the existing `metadata_provider` helper, which records their declared Static rows in `static_models`, leaves `configured_models` empty and has no fetched `catalog_scope`. All input assertions remain intact; source marker count stays 7,198.
 
 Round 17 also carries the recorded coordinate into account-switch cache preflight. A raw creation alias otherwise reaches the exact pricing registry and unnecessarily requires an unknown-cost approval. A native wire-request regression covers the recorded alias, an exact-model control and an unlisted-literal control; it also checks that preflight preserves the public model spelling.
+
+## Accounts round 26 integration
+
+Merge wave `7eebe6d09402823ea17b13fc498e5932e7361614` while retaining the producing account on fetched and stale catalogs. The combined code keeps the wave's account incarnations, persisted model coordinates, catalog availability rules and management notifications. Admission and adapter reuse use the actual resolved account, including inactive pins and rotated accounts; the active-account flight guard remains separate from the original producer guard.
+
+An inactive account's failed refresh records its own durable rejection without replacing another account's live inventory. Management publications carry the inventory owner and registry configuration together, so defaults and remote limits can be rebuilt for the requested account. Public and explicitly configured provider facts retain their existing behavior.
+
+Both parents' regression cases remain. Test fixtures use the merged request and discoverer APIs, with their original assertions retained. The actual `cargo run --locked -p xtask -- test-count --update` on the combined source derived **7,654** tests. Final source, runtime and platform checks are recorded against the committed merge in the round 26 continuation evidence.
+
+
+## Accounts round 28 wave merge
+
+Merged wave `65e89efb076dd80fb96dd7caabcbb6f1d05aa4fa` into the accounts lane at
+`8b8ad5cd2fd2a190db92be4252dfaeffc46cce03`, retaining both resolution histories.
+Only this document and the shared test baseline conflicted. Product source
+merged automatically; this round adds no product source changes.
+
+The actual `cargo run --locked -p xtask -- test-count --update` derived **7,794**
+test markers on the merged source. The common base derives 7,472, the accounts
+lane adds 222, and the incoming wave adds 100: 7,472 + 222 + 100 = 7,794.
+Both parents' tests are retained; neither parent's baseline was selected.
+The round 28 evidence contains the update output and per-file count audit.
+TARGETED gates run on the merge commit; Astra owns the subsequent FULL gate.
+No push is authorized in this round.

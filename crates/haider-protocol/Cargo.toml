@@ -13,6 +13,8 @@ rmp-serde.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2.workspace = true
+unicode-casefold = "0.2.0"
+unicode-normalization = "0.1.25"
 
 [lints]
 workspace = true

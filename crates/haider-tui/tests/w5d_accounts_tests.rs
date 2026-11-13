@@ -169,6 +169,46 @@ fn normal_aliases_containing_probe_are_not_hidden() {
     );
 }
 
+/// Account snapshots may arrive interleaved by provider. The renderer groups
+/// them, so the navigation order must use that same grouped sequence rather
+/// than jumping between the original snapshot indices.
+#[test]
+fn arrow_navigation_moves_one_rendered_account_row_at_a_time() {
+    let mut model = accounts_model();
+    let rows = [
+        ("openai-one", "openai-oauth"),
+        ("claude-one", "anthropic-oauth"),
+        ("openai-two", "openai-oauth"),
+        ("claude-two", "anthropic-oauth"),
+    ]
+    .into_iter()
+    .map(|(alias, provider)| {
+        AccountRow::from_descriptor(&descriptor(alias, provider, AuthMethod::OAuth))
+    })
+    .collect();
+    model.accounts.apply_snapshot(rows, Some(3));
+
+    assert_eq!(
+        model
+            .accounts
+            .rows
+            .iter()
+            .map(|row| row.alias.as_str())
+            .collect::<Vec<_>>(),
+        ["openai-one", "openai-two", "claude-one", "claude-two"]
+    );
+    model.handle(key(KeyCode::Down));
+    assert_eq!(
+        model.accounts.rows[model.accounts.cursor].alias,
+        "openai-two"
+    );
+    model.handle(key(KeyCode::Down));
+    assert_eq!(
+        model.accounts.rows[model.accounts.cursor].alias,
+        "claude-one"
+    );
+}
+
 /// Sim hierarchy 1:1: head · provider groups (base URL on the group header,
 /// tui.js:3596-3599) · ●/○ rows with AUTH_LABEL/identity/status/"in use" ·
 /// ONE global add row after ALL groups · hints (tui.js:3684-3686).
@@ -472,7 +512,7 @@ fn expired_and_revoked_rows_refuse_selection_locally() {
     assert!(model.accounts.pending_select.is_none());
     assert_eq!(
         model.accounts.message.as_deref(),
-        Some("· billing-key is not usable — /login to re-authenticate")
+        Some("· `billing-key` unusable — ↑/↓ choose live · x removes it; /login adds a new key")
     );
     // And it renders the additive status vocabulary (identity MASKED —
     // the P1 default).

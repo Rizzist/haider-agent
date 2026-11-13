@@ -598,6 +598,9 @@ fn unpainted_successors_cannot_borrow_a_mature_decision_clock_or_feedback() {
 fn live_child_menu_metadata_is_available_without_demo_beats() {
     let mut chip = super::runtime_pointer_tests::question_chip("child", "old");
     chip.question = None;
+    // This fixture models one live menu, with no older unresolved decision.
+    chip.transcript = crate::projection::SessionProjection::new();
+    assert_eq!(chip.transcript.pending_menu_count(), 0);
     let menu = decision("live");
     super::input_typeahead_tests::apply_child_question(
         &mut chip,
@@ -609,6 +612,7 @@ fn live_child_menu_metadata_is_available_without_demo_beats() {
         Some("live")
     );
     assert!(!chip.question.as_ref().unwrap().resolved);
+    assert_eq!(chip.transcript.pending_menu_count(), 1);
     // Unrelated replies/closures cannot resolve this question.
     super::input_typeahead_tests::apply_child_question(
         &mut chip,
@@ -628,6 +632,7 @@ fn live_child_menu_metadata_is_available_without_demo_beats() {
         30,
     );
     assert!(chip.question_menu().is_none());
+    assert_eq!(chip.transcript.pending_menu_count(), 0);
     assert!(chip.question.as_ref().unwrap().resolved);
     super::input_typeahead_tests::apply_child_question(
         &mut chip,

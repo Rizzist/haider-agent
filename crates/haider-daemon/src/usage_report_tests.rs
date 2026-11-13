@@ -107,6 +107,60 @@ impl MeterTokenSource for StubTokens {
 
 struct FailingTokens;
 
+#[tokio::test]
+async fn meter_bearer_refuses_non_live_issued_bundle() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint("anthropic-oauth").await;
+    let error = MeterTokenSource::bearer(&broker, &descriptor)
+        .await
+        .expect_err("remote meter bearer refused");
+    assert_eq!(error.reason, "credential_unavailable");
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn fake_meter_bearer_requires_its_exact_loopback_origin() {
+    use crate::debug_fake_usage::Mode;
+    let (broker, descriptor, origin) =
+        crate::oauth::non_live_issued_broker_with_origin_for_sendpoint("anthropic-oauth").await;
+    let token = super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Fake(origin.clone()))
+        .await
+        .expect("the explicitly routed fake meter can resolve its fake token");
+    assert!(!token.expose_secret().is_empty());
+    assert!(
+        super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Off)
+            .await
+            .is_err()
+    );
+    let (live_broker, live_descriptor, _) =
+        crate::oauth::live_issued_broker_for_sendpoint("anthropic-oauth");
+    assert!(
+        super::meter_bearer_for_mode(&live_broker, &live_descriptor, &Mode::Fake(origin.clone()))
+            .await
+            .is_err()
+    );
+    assert!(live_broker.shutdown().await);
+    let mut other = origin;
+    other
+        .set_port(Some(if other.port() == Some(1) { 2 } else { 1 }))
+        .expect("different loopback port");
+    assert!(
+        super::meter_bearer_for_mode(&broker, &descriptor, &Mode::Fake(other))
+            .await
+            .is_err()
+    );
+    assert!(
+        super::meter_bearer_for_mode(
+            &broker,
+            &descriptor,
+            &Mode::Refused("test_mode_origin_invalid")
+        )
+        .await
+        .is_err()
+    );
+    assert!(broker.shutdown().await);
+}
+
 #[async_trait::async_trait]
 impl MeterTokenSource for FailingTokens {
     async fn bearer(
@@ -1234,8 +1288,10 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
         haider_provider::OPENAI_OAUTH_USAGE_URL.to_owned(),
         (200, wham.to_vec()),
     )]));
+    let coordinate =
+        haider_provider::openai_user_account_coordinate("person", Some("chatgpt-account-123"));
     let service = service_with_clock(
-        vec![openai_descriptor("work-chatgpt", "chatgpt-account-123")],
+        vec![openai_descriptor("work-chatgpt", &coordinate)],
         Some(Arc::new(StubTokens {
             bytes: jwt_with_claims(&serde_json::json!({
                 "email": "person@example.invalid",

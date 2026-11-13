@@ -2615,6 +2615,10 @@ fn encode_welcome_for_peer(
                     .features
                     .remove(haider_rpc::FEATURE_RUN_STOP_SCOPE_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome
+                    .features
+                    .remove(haider_rpc::FEATURE_USAGE_RESET_APPLY_V1) => {}
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(FEATURE_SESSION_ACTIVITY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(haider_rpc::FEATURE_AGENT_CLI_V1) => {}

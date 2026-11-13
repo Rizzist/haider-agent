@@ -530,6 +530,10 @@ impl DelegationHandle {
                 false,
             )
         })?;
+        let explicit_provider = request
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty());
         let summaries = self
             .hub
             .accounts()
@@ -544,13 +548,19 @@ impl DelegationHandle {
                 facade
                     .management
                     .read()
-                    .map(|view| view.providers)
+                    .map(|mut view| {
+                        view.scope_catalogs_for_session(
+                            &parent.provider,
+                            if explicit_provider {
+                                None
+                            } else {
+                                parent.account_alias.as_deref()
+                            },
+                        );
+                        view.providers
+                    })
                     .unwrap_or_default()
             });
-        let explicit_provider = request
-            .provider
-            .as_deref()
-            .is_some_and(|provider| !provider.trim().is_empty());
         let explicit_model = request
             .model
             .as_deref()

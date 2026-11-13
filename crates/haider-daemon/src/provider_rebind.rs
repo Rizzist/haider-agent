@@ -233,13 +233,14 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         if let Some(budget) = recorded_active {
             metadata.max_tokens = budget.max_tokens;
             metadata.max_tokens_source = Some(budget.source);
-        } else if let Some(view) = self
+        } else if let Some(mut view) = self
             .store
             .hub()
             .accounts()
             .map_err(hub_error)?
             .and_then(|accounts| accounts.management.read())
         {
+            view.scope_catalog_for_account(&metadata.provider, metadata.account_alias.as_deref());
             let selection = crate::model_select::ModelSelectionAuthority::new(
                 self.store.hub().creatable_providers().map_err(hub_error)?,
                 Some(view.providers),

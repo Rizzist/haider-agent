@@ -41,7 +41,7 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawPayload, RenderTargets, SCHEMA_VERSION, write_payload_json,
 };
-use haider_protocol::ids::{AgentId, ItemId, RunId};
+use haider_protocol::ids::{AgentId, CredentialAlias, ItemId, RunId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
@@ -56,6 +56,146 @@ use tokio::time::{MissedTickBehavior, interval_at};
 use zeroize::Zeroizing;
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
+
+pub(super) struct UnavailableProbeBackoff {
+    account_fingerprint: String,
+    next_probe: std::time::Instant,
+    next_delay: Duration,
+}
+
+/// Probe backoff key: `(provider, explicit account alias)`. Keying by the
+/// alias too means alternating pinned and default sessions each keep their
+/// own schedule instead of resetting one shared entry on every switch.
+pub(super) type ProbeBackoffKey = (String, Option<String>);
+
+pub(super) fn probe_backoff_key(provider: &str, account_alias: Option<&str>) -> ProbeBackoffKey {
+    (provider.to_owned(), account_alias.map(str::to_owned))
+}
+
+impl UnavailableProbeBackoff {
+    fn permit(&mut self, account_fingerprint: &str) -> bool {
+        let now = std::time::Instant::now();
+        if self.account_fingerprint != account_fingerprint {
+            self.account_fingerprint = account_fingerprint.to_owned();
+            self.next_probe = now + Duration::from_secs(30);
+            self.next_delay = Duration::from_secs(60);
+            return true;
+        }
+        if now < self.next_probe {
+            return false;
+        }
+        self.next_probe = now + self.next_delay;
+        self.next_delay = (self.next_delay * 2).min(Duration::from_secs(600));
+        true
+    }
+
+    fn new(account_fingerprint: &str) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            account_fingerprint: account_fingerprint.to_owned(),
+            next_probe: now + Duration::from_secs(30),
+            next_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The catalog cache is provider-scoped, so a recovered catalog clears every
+/// alias's backoff for that provider.
+fn retain_backoff_until_catalog_recovers(
+    probes: &mut std::collections::HashMap<ProbeBackoffKey, UnavailableProbeBackoff>,
+    provider: &str,
+    inventory: &haider_rpc::ModelInventoryWire,
+) {
+    if matches!(
+        inventory,
+        haider_rpc::ModelInventoryWire::Fetched { .. }
+            | haider_rpc::ModelInventoryWire::Stale { .. }
+            | haider_rpc::ModelInventoryWire::Static
+            | haider_rpc::ModelInventoryWire::Configured
+    ) {
+        probes.retain(|(probe_provider, _), _| probe_provider != provider);
+    }
+}
+
+#[cfg(test)]
+mod unavailable_probe_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_probe_is_bounded_and_resets_on_account_change() {
+        let mut state = UnavailableProbeBackoff::new("snapshot-1");
+        assert!(!state.permit("snapshot-1"));
+        state.next_probe = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(state.permit("snapshot-1"));
+        assert_eq!(state.next_delay, Duration::from_secs(120));
+        assert!(!state.permit("snapshot-1"));
+        assert!(state.permit("snapshot-2"));
+        assert_eq!(state.next_delay, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn alternating_pinned_and_default_aliases_keep_separate_backoff() {
+        let mut probes = std::collections::HashMap::new();
+        let pinned = probe_backoff_key("openai-oauth", Some("member"));
+        let default = probe_backoff_key("openai-oauth", None);
+        probes.insert(pinned.clone(), UnavailableProbeBackoff::new("snapshot"));
+        probes.insert(default.clone(), UnavailableProbeBackoff::new("snapshot"));
+        // Alternating callers no longer reset each other's schedule.
+        for _ in 0..3 {
+            assert!(
+                probes
+                    .get_mut(&pinned)
+                    .is_some_and(|state| !state.permit("snapshot"))
+            );
+            assert!(
+                probes
+                    .get_mut(&default)
+                    .is_some_and(|state| !state.permit("snapshot"))
+            );
+        }
+    }
+
+    #[test]
+    fn successful_call_with_unavailable_result_keeps_probe_backoff() {
+        let mut probes = std::collections::HashMap::new();
+        let member = probe_backoff_key("openai-oauth", Some("member"));
+        let default = probe_backoff_key("openai-oauth", None);
+        let other = probe_backoff_key("anthropic-oauth", None);
+        for key in [&member, &default, &other] {
+            probes.insert(key.clone(), UnavailableProbeBackoff::new("snapshot"));
+        }
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic outage".to_owned(),
+            },
+        );
+        assert!(probes.contains_key(&member));
+        assert!(
+            probes
+                .get_mut(&member)
+                .is_some_and(|state| !state.permit("snapshot"))
+        );
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::NeverFetched,
+        );
+        assert!(probes.contains_key(&member));
+        retain_backoff_until_catalog_recovers(
+            &mut probes,
+            "openai-oauth",
+            &haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 },
+        );
+        assert!(!probes.contains_key(&member));
+        assert!(!probes.contains_key(&default));
+        assert!(
+            probes.contains_key(&other),
+            "other providers keep their backoff"
+        );
+    }
+}
 
 pub(super) fn status_caching(
     idle_ttl_ms: Option<u64>,
@@ -608,6 +748,17 @@ struct AccountLoginInput {
 enum InventoryRefreshError {
     Hub(SessionHubError),
     Provider(crate::accounts::ProviderModelsRefreshFailure),
+}
+
+impl InventoryRefreshError {
+    fn catalog_owner_changed() -> Self {
+        Self::Provider(crate::accounts::ProviderModelsRefreshFailure {
+            code: ERROR_CODE_BUSY.to_owned(),
+            message: "catalog account changed during model discovery".to_owned(),
+            retryable: true,
+            data: None,
+        })
+    }
 }
 
 /// Profile-vault alias holding the transcription secret (the Deepgram API
@@ -1305,6 +1456,10 @@ pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, mo
         || matches!(summary.inventory, haider_rpc::ModelInventoryWire::Configured)
             && summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory
             && !summary.endpoint.as_deref().is_some_and(haider_provider::azure_openai_origin)
+        || matches!(
+            summary.inventory,
+            haider_rpc::ModelInventoryWire::Unavailable { .. }
+        )
         || matches!(
             summary.inventory,
             haider_rpc::ModelInventoryWire::Fetched { .. }
@@ -8656,16 +8811,24 @@ impl HubConnection {
         session_id: &SessionId,
         provider: &str,
     ) -> Result<Option<(String, Option<String>)>, SessionHubError> {
+        let metadata = self.hub.session_metadata(session_id).await?;
+        let account_alias = metadata
+            .as_ref()
+            .filter(|metadata| metadata.provider == provider)
+            .and_then(|metadata| metadata.account_alias.as_deref());
         let facade = self.hub.accounts()?;
         if let Some(facade) = facade.as_ref() {
-            let view = facade.management.read().ok_or_else(|| {
+            let mut view = facade.management.read().ok_or_else(|| {
                 SessionHubError::Task("account management snapshot is poisoned".into())
             })?;
+            view.scope_catalog_for_account(provider, account_alias);
             if let Some(summary) = view
                 .providers
                 .iter()
                 .find(|summary| summary.provider == provider)
             {
+                // Default projection is read-only. The receipted model
+                // selection below owns discovery after its replay preflight.
                 return Ok(summary
                     .default_model
                     .clone()
@@ -8680,10 +8843,7 @@ impl HubConnection {
                     }));
             }
         }
-        let metadata_model = self
-            .hub
-            .session_metadata(session_id)
-            .await?
+        let metadata_model = metadata
             .filter(|metadata| metadata.provider == provider)
             .map(|metadata| (metadata.model, metadata.model_catalog_key));
         if metadata_model.is_some() || facade.is_some() {
@@ -9031,7 +9191,15 @@ impl HubConnection {
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
+            .map(|mut view| {
+                if let Some(metadata) = metadata.as_ref() {
+                    view.scope_catalogs_for_session(
+                        &metadata.provider,
+                        metadata.account_alias.as_deref(),
+                    );
+                }
+                view.providers
+            })
             .unwrap_or_default();
         let (kind, title, body, options) = match command {
             "rename" => (
@@ -10721,6 +10889,7 @@ impl HubConnection {
             request_id.clone(),
             crate::accounts::AccountCommand::RefreshProviderModels {
                 provider,
+                account_alias: None,
                 completed: crate::accounts::ProviderModelsRefreshCompletion::Wire(
                     crate::accounts::LoginRoute {
                         request_id,
@@ -10733,15 +10902,25 @@ impl HubConnection {
 
     async fn refresh_inventory_if_needed(
         &self,
-        summaries: &mut Vec<ProviderSummaryWire>,
+        view: &mut crate::accounts::ManagementView,
         provider: &str,
         model: &str,
+        account_alias: Option<&str>,
         session_id: Option<&SessionId>,
     ) -> Result<(), InventoryRefreshError> {
+        let requested_account_alias = account_alias;
+        let expected_owner = view.catalog_key_for_account(provider, requested_account_alias);
+        let discovery_alias = view.scope_catalog_for_account(provider, account_alias);
+        let account_alias = discovery_alias.as_ref().map(CredentialAlias::as_str);
+        let summaries = &view.providers;
         let cached_serves_model = summaries
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| summary.models.iter().any(|known| known == model));
+        let has_live_catalog = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| summary.catalog.supports_discovery());
         let advisory_inventory = summaries
             .iter()
             .find(|summary| summary.provider == provider)
@@ -10776,7 +10955,64 @@ impl HubConnection {
                     data: None,
                 })
             })?;
-        let refreshed = match facade.refresh_provider_models(provider.to_owned()).await {
+        let unavailable = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| {
+                matches!(
+                    summary.inventory,
+                    haider_rpc::ModelInventoryWire::Unavailable { .. }
+                )
+            });
+        if unavailable {
+            let descriptors = facade
+                .snapshot
+                .lock()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| row.provider == provider)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let fingerprint = blake3::hash(&serde_json::to_vec(&descriptors).unwrap_or_default())
+                .to_hex()
+                .to_string();
+            if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+                let allowed = match probes.entry(probe_backoff_key(provider, account_alias)) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().permit(&fingerprint)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(UnavailableProbeBackoff::new(&fingerprint));
+                        true
+                    }
+                };
+                if !allowed {
+                    return Ok(());
+                }
+            }
+        } else if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+            probes.retain(|(probe_provider, _), _| probe_provider != provider);
+        }
+        let result = facade
+            .refresh_provider_models(
+                provider.to_owned(),
+                account_alias.map(|alias| CredentialAlias::new(alias.to_owned())),
+            )
+            .await;
+        let mut current = facade
+            .management
+            .read()
+            .ok_or_else(InventoryRefreshError::catalog_owner_changed)?;
+        if current.catalog_key_for_account(provider, requested_account_alias) != expected_owner {
+            return Err(InventoryRefreshError::catalog_owner_changed());
+        }
+        current.scope_catalog_for_account(provider, requested_account_alias);
+        // The refresh may have published a rejection. Every return path,
+        // including advisory/transient errors, must validate the new evidence.
+        *view = current;
+        let refreshed = match result {
             Ok(refreshed) => refreshed,
             // A custom compatible catalog is advisory. Refresh-on-miss still
             // probes exactly once, but discovery failure cannot veto a
@@ -10786,20 +11022,35 @@ impl HubConnection {
             // TTL is a freshness policy, not an availability outage: a
             // transient refresh failure may keep serving a cached requested
             // model. A cache MISS still surfaces the typed discovery failure.
-            Err(error) if cached_serves_model && error.retryable => return Ok(()),
+            Err(error)
+                if cached_serves_model && error.retryable && error.code != ERROR_CODE_BUSY =>
+            {
+                return Ok(());
+            }
             // Seeded/manual inventories have no live catalog. The attempted
             // refresh satisfies refresh-on-miss; validation below then emits
             // ModelUnknown against that unchanged known inventory.
             Err(error)
-                if matches!(
-                    &error.data,
-                    Some(ErrorData::ProviderModelsUnavailable { .. })
-                ) =>
+                if !has_live_catalog
+                    && matches!(
+                        &error.data,
+                        Some(ErrorData::ProviderModelsUnavailable { .. })
+                    ) =>
             {
                 return Ok(());
             }
             Err(error) => return Err(InventoryRefreshError::Provider(error)),
         };
+        if let Ok(mut probes) = self.hub.inner.unavailable_catalog_backoff.lock() {
+            retain_backoff_until_catalog_recovers(&mut probes, provider, &refreshed.inventory);
+        }
+        // A completion cannot acquire an owner merely because this request
+        // expected one. Keep a published owner only for the identical summary;
+        // otherwise the wire scope must prove the producer during projection.
+        if view.providers.iter().find(|row| row.provider == provider) != Some(&refreshed) {
+            view.catalog_owners.remove(provider);
+        }
+        let summaries = &mut view.providers;
         if let Some(summary) = summaries
             .iter_mut()
             .find(|summary| summary.provider == provider)
@@ -10808,6 +11059,7 @@ impl HubConnection {
         } else {
             summaries.push(refreshed);
         }
+        view.scope_catalog_for_account(provider, requested_account_alias);
         Ok(())
     }
 
@@ -10833,7 +11085,7 @@ impl HubConnection {
                 },
             });
         };
-        let Some(view) = facade.management.read() else {
+        let Some(mut view) = facade.management.read() else {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_DRAINING,
@@ -10842,6 +11094,7 @@ impl HubConnection {
                 None,
             );
         };
+        view.scope_catalogs_for_active_accounts();
         let descriptors = view
             .descriptors
             .iter()
@@ -10936,7 +11189,7 @@ impl HubConnection {
                 },
             });
         };
-        let Some(view) = facade.management.read() else {
+        let Some(mut view) = facade.management.read() else {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_DRAINING,
@@ -10945,6 +11198,9 @@ impl HubConnection {
                 None,
             );
         };
+        // The TUI uses this inventory's freshness to decide discovery. Never
+        // let a pinned session's A refresh suppress the active B account's fetch.
+        view.scope_catalogs_for_active_accounts();
         let providers = filter_provider_summaries(view.providers, provider.as_deref());
         self.send(WireFrame::Response {
             request_id,
@@ -12367,24 +12623,26 @@ impl HubConnection {
                     None,
                 );
             };
-            let (mut summaries, descriptors) = self
+            let mut view = self
                 .hub
                 .accounts()?
                 .and_then(|facade| facade.management.read())
-                .map_or_else(
-                    || (Vec::new(), Vec::new()),
-                    |view| (view.providers, view.descriptors),
-                );
+                .unwrap_or_default();
             let selected_provider = provider
                 .as_deref()
                 .map(str::trim)
                 .filter(|provider| !provider.is_empty())
                 .unwrap_or(&before.provider);
+            let selected_account = (selected_provider == before.provider)
+                .then_some(before.account_alias.as_deref())
+                .flatten();
+            let catalog_key = view.catalog_key_for_account(selected_provider, selected_account);
             let refresh = self
                 .refresh_inventory_if_needed(
-                    &mut summaries,
+                    &mut view,
                     selected_provider,
                     model.trim(),
+                    selected_account,
                     Some(&session_id),
                 )
                 .await;
@@ -12401,6 +12659,18 @@ impl HubConnection {
                     None,
                 );
             };
+            let current_catalog_key = self
+                .hub
+                .accounts()?
+                .and_then(|facade| facade.management.read())
+                .and_then(|view| {
+                    view.catalog_key_for_account(
+                        selected_provider,
+                        (selected_provider == current.provider)
+                            .then_some(current.account_alias.as_deref())
+                            .flatten(),
+                    )
+                });
             if (
                 before.provider.as_str(),
                 before.model_coordinate(),
@@ -12425,6 +12695,15 @@ impl HubConnection {
                 drop(selection);
                 continue;
             }
+            if catalog_key != current_catalog_key {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_BUSY,
+                    "catalog account changed while selecting the model",
+                    true,
+                    None,
+                );
+            }
             match refresh {
                 Ok(()) => {}
                 Err(InventoryRefreshError::Hub(error)) => return Err(error),
@@ -12438,7 +12717,7 @@ impl HubConnection {
                     );
                 }
             }
-            break (selection, current, summaries, descriptors);
+            break (selection, current, view.providers, view.descriptors);
         };
         let selected_provider = provider
             .as_deref()
@@ -14820,7 +15099,8 @@ impl HubConnection {
                 None,
             );
         };
-        let authority = self.tuning_authority()?;
+        let authority =
+            self.tuning_authority(&current.provider, current.account_alias.as_deref())?;
         if let Err(refusal) = authority.validate_effort(
             &current.provider,
             current.model_coordinate(),
@@ -15034,7 +15314,8 @@ impl HubConnection {
                 None,
             );
         };
-        let authority = self.tuning_authority()?;
+        let authority =
+            self.tuning_authority(&current.provider, current.account_alias.as_deref())?;
         if let Err(refusal) =
             authority.validate_fast(&current.provider, current.model_coordinate(), enabled)
         {
@@ -15088,12 +15369,17 @@ impl HubConnection {
     /// `session.select_model` consults.
     fn tuning_authority(
         &self,
+        provider: &str,
+        account_alias: Option<&str>,
     ) -> Result<crate::model_select::ModelSelectionAuthority, SessionHubError> {
         let summaries = self.hub.accounts()?.map(|facade| {
             facade
                 .management
                 .read()
-                .map(|view| view.providers)
+                .map(|mut view| {
+                    view.scope_catalog_for_account(provider, account_alias);
+                    view.providers
+                })
                 .unwrap_or_default()
         });
         Ok(crate::model_select::ModelSelectionAuthority::new(
@@ -17340,54 +17626,6 @@ impl HubConnection {
                 None,
             );
         }
-        let mut resolved_catalog_key = None;
-        if resolve_model {
-            if !model.is_empty() {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_INVALID_ARGUMENT,
-                    "session-create model must be empty when daemon resolution is requested",
-                    false,
-                    None,
-                );
-            }
-            let provider_default = match self.hub.accounts()? {
-                Some(facade) => {
-                    let Some(provider_default) = facade.management.inspect(|view| {
-                        view.providers
-                            .iter()
-                            .find(|summary| summary.provider == provider)
-                            .map(|summary| {
-                                (
-                                    summary.default_model.clone(),
-                                    summary
-                                        .catalog_scope
-                                        .as_ref()
-                                        .map(|scope| scope.key.clone()),
-                                )
-                            })
-                    }) else {
-                        return self.respond_error(
-                            request_id,
-                            ERROR_CODE_DRAINING,
-                            "management snapshot is unavailable",
-                            true,
-                            None,
-                        );
-                    };
-                    Some(provider_default)
-                }
-                None => None,
-            };
-            if let Some(Some((Some(default_model), key))) = provider_default {
-                model = default_model;
-                resolved_catalog_key = key;
-            } else if provider_default.is_some() || resolve_provider {
-                let message = format!("provider `{provider}` publishes no default model");
-                return self.respond_error(request_id, "no_default_model", &message, false, None);
-            }
-        }
-
         // D3-5: the dependency configuration is the ONE authority on
         // creatable providers. Production answers the built-in adapter set;
         // "fake" exists only under injected test configurations. Since
@@ -17423,6 +17661,103 @@ impl HubConnection {
                 None,
             );
         }
+        let facade = self.hub.accounts()?;
+        let mut view = match facade.as_ref() {
+            Some(facade) => match facade.management.read() {
+                Some(view) => view,
+                None => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_DRAINING,
+                        "management snapshot is unavailable",
+                        true,
+                        None,
+                    );
+                }
+            },
+            None => crate::accounts::ManagementView::default(),
+        };
+        let mut resolved_catalog_key = None;
+        let mut inventory_prepared = false;
+        if resolve_model {
+            if !model.is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "session-create model must be empty when daemon resolution is requested",
+                    false,
+                    None,
+                );
+            }
+            let provider_default = if facade.is_some() {
+                view.scope_catalog_for_account(
+                    &provider,
+                    account_alias.as_ref().map(CredentialAlias::as_str),
+                );
+                let hint = view
+                    .providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .and_then(|summary| summary.default_model.clone())
+                    .unwrap_or_default();
+                let probe = !hint.is_empty()
+                    || view.providers.iter().any(|summary| {
+                        summary.provider == provider
+                            && (summary.inventory.needs_refresh()
+                                || matches!(
+                                    summary.inventory,
+                                    haider_rpc::ModelInventoryWire::Unavailable { .. }
+                                ))
+                    });
+                if probe {
+                    inventory_prepared = true;
+                    match self
+                        .refresh_inventory_if_needed(
+                            &mut view,
+                            &provider,
+                            &hint,
+                            account_alias.as_ref().map(CredentialAlias::as_str),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                        Err(InventoryRefreshError::Provider(error)) => {
+                            return self.respond_error(
+                                request_id,
+                                &error.code,
+                                &error.message,
+                                error.retryable,
+                                error.data,
+                            );
+                        }
+                    }
+                }
+                view.providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .map(|summary| {
+                        (
+                            summary.default_model.clone(),
+                            summary
+                                .catalog_scope
+                                .as_ref()
+                                .map(|scope| scope.key.clone()),
+                        )
+                    })
+            } else {
+                None
+            };
+            if let Some((Some(default_model), key)) = provider_default {
+                model = default_model;
+                resolved_catalog_key = key;
+            } else if provider_default.is_some() || resolve_provider {
+                let message = format!("provider `{provider}` publishes no default model");
+                return self.respond_error(request_id, "no_default_model", &message, false, None);
+            }
+        }
+
         if model.trim().is_empty() {
             return self.respond_error(
                 request_id,
@@ -17432,30 +17767,33 @@ impl HubConnection {
                 None,
             );
         }
-        let facade = self.hub.accounts()?;
-        let mut summaries = facade
-            .as_ref()
-            .and_then(|facade| facade.management.read())
-            .map_or_else(Vec::new, |view| view.providers);
-        match self
-            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim(), None)
-            .await
-        {
-            Ok(()) => {}
-            Err(InventoryRefreshError::Hub(error)) => return Err(error),
-            Err(InventoryRefreshError::Provider(error)) => {
-                return self.respond_error(
-                    request_id,
-                    &error.code,
-                    &error.message,
-                    error.retryable,
-                    error.data,
-                );
+        if !inventory_prepared {
+            match self
+                .refresh_inventory_if_needed(
+                    &mut view,
+                    &provider,
+                    model.trim(),
+                    account_alias.as_ref().map(CredentialAlias::as_str),
+                    None,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(InventoryRefreshError::Hub(error)) => return Err(error),
+                Err(InventoryRefreshError::Provider(error)) => {
+                    return self.respond_error(
+                        request_id,
+                        &error.code,
+                        &error.message,
+                        error.retryable,
+                        error.data,
+                    );
+                }
             }
         }
         let authority = crate::model_select::ModelSelectionAuthority::new(
             creatable,
-            facade.as_ref().map(|_| summaries),
+            facade.as_ref().map(|_| view.providers),
         );
         if [expected_catalog_key.as_ref(), resolved_catalog_key.as_ref()]
             .into_iter()

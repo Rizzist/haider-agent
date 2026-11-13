@@ -1634,6 +1634,19 @@ pub fn normalize_model_selector(selector: &str) -> String {
 }
 
 impl ProviderSummaryWire {
+    /// Whether fetched rows and their limits belong to one credential account.
+    #[must_use]
+    pub fn catalog_is_account_scoped(&self) -> bool {
+        self.catalog == ProviderCatalogKindWire::Authenticated
+            || (self.catalog == ProviderCatalogKindWire::Custom && !self.auth_methods.is_empty())
+            // Injecting the turn transport does not discard authenticated
+            // discovery's explicit account ownership.
+            || (self.catalog == ProviderCatalogKindWire::Adapter
+                && self.catalog_scope.as_ref().is_some_and(|scope| {
+                    scope.account_alias.is_some() || scope.account_incarnation.is_some()
+                }))
+    }
+
     /// Permanent names come from an unscoped public catalog or offline
     /// configuration. A custom profile or account-owned inventory may use
     /// a public provider namespace without inheriting that meaning.

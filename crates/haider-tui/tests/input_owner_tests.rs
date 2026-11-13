@@ -175,6 +175,16 @@ fn arm(model: &mut AppModel, mode: &str) {
             review_menu(),
         )))),
         "login" => model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1)),
+        "accounts-notice" => {
+            model.screen = Screen::Accounts;
+            model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1));
+            model.accounts.set_detailed_message(
+                "Account notice".into(),
+                "Expanded account notice ".repeat(40),
+                "haider account remove fixture --confirm".into(),
+            );
+            model.accounts.message_expanded = true;
+        }
         "accounts-replace" => {
             model.screen = Screen::Accounts;
             model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1));
@@ -686,9 +696,7 @@ fn e1_stale_allow_click_cannot_answer_a_covered_permission() {
 
 #[test]
 fn e2_stale_hover_never_moves_a_covered_choice() {
-    for cover in [
-        "detail", "inbox", "model", "shells", "ssh", "monitors", "lockdown",
-    ] {
+    for cover in ["detail", "inbox", "shells", "ssh", "monitors", "lockdown"] {
         let mut model = model();
         arm(&mut model, "permission");
         model.menu_selection = 0;
@@ -703,18 +711,36 @@ fn e2_stale_hover_never_moves_a_covered_choice() {
         );
         assert_eq!(model.menu_selection, 0, "{cover}");
     }
-    for choice in ["theme", "effort"] {
+    for choice in ["theme", "effort", "model"] {
         let mut model = model();
         arm(&mut model, choice);
+        let model_row = (choice == "model").then(|| {
+            assert_eq!(model.input_owner(), InputOwner::ModelPicker);
+            model.model_picker_rows().into_iter().last().unwrap()
+        });
         arm(&mut model, "permission");
         if choice == "theme" {
             let before = model.theme_picker.unwrap().selection;
             stale_pointer(&mut model, Hit::ThemeOption(2), MouseEventKind::Moved);
             assert_eq!(model.theme_picker.unwrap().selection, before);
-        } else {
+        } else if choice == "effort" {
             let before = model.effort_picker.as_ref().unwrap().selection;
             stale_pointer(&mut model, Hit::EffortOption(1), MouseEventKind::Moved);
             assert_eq!(model.effort_picker.as_ref().unwrap().selection, before);
+        } else {
+            assert_eq!(model.input_owner(), InputOwner::SessionMenu);
+            let before = model.model_picker.as_ref().unwrap().selection;
+            let row = model_row.unwrap();
+            stale_pointer(
+                &mut model,
+                Hit::ModelPickerRow {
+                    provider: row.provider,
+                    model: row.model,
+                    api_group: row.auth == "api",
+                },
+                MouseEventKind::Moved,
+            );
+            assert_eq!(model.model_picker.as_ref().unwrap().selection, before);
         }
     }
 }
@@ -1824,6 +1850,7 @@ fn owner_label(owner: InputOwner) -> &'static str {
         InputOwner::TalkSetup => "talk setup",
         InputOwner::CustomProviderForm => "custom provider",
         InputOwner::AccountsReplace => "accounts replace",
+        InputOwner::AccountsNotice => "accounts notice",
         InputOwner::SessionMenu => "session menu",
         InputOwner::SpendCard => "spend card",
         InputOwner::SubagentQuestion => "subagent question",
@@ -1860,6 +1887,7 @@ fn expected_owner(mode: &str) -> InputOwner {
         "file-review-doc" => InputOwner::FileReviewDoc,
         "login" => InputOwner::Login,
         "accounts-replace" => InputOwner::AccountsReplace,
+        "accounts-notice" => InputOwner::AccountsNotice,
         "talk-setup" => InputOwner::TalkSetup,
         "custom-form" => InputOwner::CustomProviderForm,
         "fleet-detail" => InputOwner::FleetMemberDetail,
@@ -1905,6 +1933,7 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
         "file-review-doc",
         "login",
         "accounts-replace",
+        "accounts-notice",
         "talk-setup",
         "custom-form",
         "fleet-detail",
@@ -1963,6 +1992,7 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
             "file-review-doc" => Some("EDIT REVIEW"),
             "login" => Some("API key"),
             "accounts-replace" => Some("Replace this form?"),
+            "accounts-notice" => Some("Expanded account notice"),
             "talk-setup" => Some("talk setup"),
             "custom-form" => Some("add a custom provider"),
             "fleet-detail" => Some("Child"),
@@ -2321,8 +2351,14 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
     ];
     for upper in 0..ranked.len() {
         for lower in upper + 1..ranked.len() {
-            let (higher, marker) = ranked[upper];
-            let (lower_name, _) = ranked[lower];
+            let ((higher, marker), (lower_name, _)) =
+                if ranked[upper].0 == "model" && ranked[lower].0 == "permission" {
+                    // A blocking question parks this local picker, while
+                    // Login and Talk retain their independent modal priority.
+                    (ranked[lower], ranked[upper])
+                } else {
+                    (ranked[upper], ranked[lower])
+                };
             let mut model = model();
             arm(&mut model, lower_name);
             arm(&mut model, higher);
@@ -2404,6 +2440,7 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
         "file-review-doc",
         "login",
         "accounts-replace",
+        "accounts-notice",
         "talk-setup",
         "custom-form",
         "fleet-detail",

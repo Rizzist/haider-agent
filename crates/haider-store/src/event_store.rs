@@ -13717,12 +13717,38 @@ impl Store {
             request_json,
             now_ms()?,
         )?;
+        if !existed {
+            let request: serde_json::Value = serde_json::from_str(request_json)
+                .map_err(|error| corrupt(format!("invalid saved account request: {error}")))?;
+            if let Some(alias) = request
+                .get("physical_alias")
+                .and_then(serde_json::Value::as_str)
+            {
+                // Claim and protect an interactive write in one transaction.
+                // The previous reader must not acknowledge an untouched row
+                // while this command is still choosing its saved alias.
+                set_account_add_target(&transaction, command_id, alias, true)?;
+            }
+        }
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(if existed {
             AccountAddClaim::ResumePending
         } else {
             AccountAddClaim::Fresh
         })
+    }
+
+    /// Publish the saved coordinate before staging a retargeted sign-in.
+    /// The previous schema-33 reader sees a command-owned, unwritten alias and
+    /// leaves the operation pending. Only this reader follows recovery_target.
+    /// The original semantic request stays in recovery_json for command replay.
+    pub fn prepare_account_add_target(&self, command_id: &str, alias: &str) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        set_account_add_target(&transaction, command_id, alias, true)?;
+        transaction.commit().map_err(map_sqlite_error)
     }
 
     pub fn finalize_account_add_receipt(
@@ -13734,6 +13760,12 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
+        set_account_add_target(
+            &transaction,
+            command_id,
+            response.descriptor.alias.as_str(),
+            false,
+        )?;
         let revision = finalize_management_command_receipt(
             &transaction,
             command_id,
@@ -13750,8 +13782,49 @@ impl Store {
         Ok(revision)
     }
 
+    /// Load recovery rows, first repairing historical saved-alias coordinates.
+    /// The repair changes neither command identity nor management revision.
     pub fn account_add_receipts(&self) -> StoreResult<Vec<AccountAddReceiptRow>> {
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let committed = {
+            let mut statement = transaction.prepare("SELECT command_id, request_json, response_json FROM command_receipts WHERE method = ?1 AND state = 'committed'").map_err(map_sqlite_error)?;
+            let mapped = statement
+                .query_map([ACCOUNT_ADD_METHOD], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(map_sqlite_error)?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_error)?
+        };
+        for (command_id, request, response) in committed {
+            let response: AccountAddReceiptResponse = serde_json::from_str(&response)
+                .map_err(|error| corrupt(format!("invalid saved account response: {error}")))?;
+            let request: serde_json::Value = serde_json::from_str(&request)
+                .map_err(|error| corrupt(format!("invalid saved account request: {error}")))?;
+            let alias = request
+                .get("physical_alias")
+                .or_else(|| request.get("alias"))
+                .and_then(serde_json::Value::as_str);
+            if alias != Some(response.descriptor.alias.as_str())
+                || request.get("recovery_target").is_some()
+            {
+                set_account_add_target(
+                    &transaction,
+                    &command_id,
+                    response.descriptor.alias.as_str(),
+                    false,
+                )?;
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
         let mut statement = connection
             .prepare(
                 "SELECT command_id, state, request_json, response_json, final_revision
@@ -16289,6 +16362,70 @@ fn lookup_turn_cancel_receipt(
     )
 }
 
+/// Change recovery coordinates without changing semantic command identity or revision.
+fn set_account_add_target(
+    connection: &Connection,
+    command_id: &str,
+    alias: &str,
+    pending: bool,
+) -> StoreResult<()> {
+    let (request, recovery): (String, Option<String>) = connection.query_row(
+        "SELECT request_json, recovery_json FROM command_receipts WHERE command_id = ?1 AND method = ?2",
+        params![command_id, ACCOUNT_ADD_METHOD], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(map_sqlite_error)?;
+    let mut value: serde_json::Value = serde_json::from_str(&request)
+        .map_err(|error| corrupt(format!("invalid saved account request: {error}")))?;
+    if !value.is_object() {
+        return Err(corrupt("saved account request must be an object"));
+    }
+    let interactive = value.get("physical_alias").is_some();
+    let field = if interactive {
+        "physical_alias"
+    } else {
+        "alias"
+    };
+    let pending_target = value
+        .get("recovery_target")
+        .and_then(serde_json::Value::as_str);
+    if pending && interactive {
+        if pending_target == Some(alias) {
+            return Ok(());
+        }
+        // This namespace is rejected by the public alias validator and is
+        // NEVER used as a vault or descriptor coordinate. Older readers cannot
+        // mistake an existing requested row for completion of a staged write.
+        let digest = blake3::hash(command_id.as_bytes()).to_hex();
+        value["physical_alias"] =
+            serde_json::Value::String(format!("__oauth_pending_{}", &digest[..24]));
+        value["recovery_target"] = serde_json::Value::String(alias.to_owned());
+    } else {
+        if value.get(field).and_then(serde_json::Value::as_str) == Some(alias)
+            && pending_target.is_none()
+        {
+            return Ok(());
+        }
+        value[field] = serde_json::Value::String(alias.to_owned());
+        if let Some(object) = value.as_object_mut() {
+            object.remove("recovery_target");
+        }
+    }
+    let mut recovery = recovery
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|error| corrupt(format!("invalid saved account recovery metadata: {error}")))?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let metadata = recovery
+        .as_object_mut()
+        .ok_or_else(|| corrupt("saved account recovery metadata must be an object"))?;
+    metadata
+        .entry("account_add_request")
+        .or_insert(serde_json::Value::String(request));
+    let recovery = recovery.to_string();
+    connection.execute("UPDATE command_receipts SET request_json = ?2, recovery_json = ?3 WHERE command_id = ?1", params![command_id, value.to_string(), recovery]).map_err(map_sqlite_error)?;
+    Ok(())
+}
+
 fn lookup_command_response<T>(
     connection: &Connection,
     command_id: &str,
@@ -16302,7 +16439,7 @@ where
 {
     let row = connection
         .query_row(
-            "SELECT method, request_digest, request_json, state, response_json
+            "SELECT method, request_digest, request_json, state, response_json, recovery_json
              FROM command_receipts WHERE command_id = ?1",
             [command_id],
             |row| {
@@ -16312,14 +16449,30 @@ where
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(map_sqlite_error)?;
-    let Some((method, stored_digest, stored_json, state, response_json)) = row else {
+    let Some((method, stored_digest, stored_json, state, response_json, recovery_json)) = row
+    else {
         return Ok(None);
     };
+    let original_request = if method == ACCOUNT_ADD_METHOD {
+        recovery_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| {
+                value
+                    .get("account_add_request")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    };
+    let stored_json = original_request.as_deref().unwrap_or(&stored_json);
     if method != expected_method || stored_digest != request_digest || stored_json != request_json {
         return Err(store_error(
             ErrorCode::InvalidArgument,

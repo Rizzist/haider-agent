@@ -1604,6 +1604,18 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn prepare_account_add_target(
+        &self,
+        command_id: String,
+        alias: String,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.prepare_account_add_target(&command_id, &alias))
+        })
+        .await
+    }
+
     pub async fn finalize_account_add_receipt(
         &self,
         command_id: String,
