@@ -12,8 +12,8 @@ use serde_json::json;
 
 fn paths() -> PathContext {
     PathContext {
-        workspace: Some("/Users/alice/dev/haider".to_owned()),
-        home: Some("/Users/alice".to_owned()),
+        workspace: Some("C:/Users/alice/dev/haider".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
     }
 }
 
@@ -53,31 +53,620 @@ fn every_tool_family_reads_as_a_human_verb() {
 fn paths_shorten_to_the_workspace_then_home_and_never_across_a_component() {
     let paths = paths();
     assert_eq!(
-        paths.shorten("/Users/alice/dev/haider/state/973-LANES.md"),
+        paths.shorten("C:/Users/alice/dev/haider/state/973-LANES.md"),
         "state/973-LANES.md"
     );
-    assert_eq!(paths.shorten("/Users/alice/dev/haider"), ".");
+    assert_eq!(paths.shorten("C:/Users/alice/dev/haider"), ".");
     assert_eq!(
-        paths.shorten("/Users/alice/Developer/notes.md"),
+        paths.shorten("C:/Users/alice/Developer/notes.md"),
         "~/Developer/notes.md"
     );
-    assert_eq!(paths.shorten("/Users/alice"), "~");
+    assert_eq!(paths.shorten("C:/Users/alice"), "~");
     // Component-aware: a sibling that merely shares a prefix is NOT inside.
-    assert_eq!(paths.shorten("/Users/alice2/x.rs"), "/Users/alice2/x.rs");
     assert_eq!(
-        paths.shorten("/Users/alice/dev/haider-old/x.rs"),
+        paths.shorten("C:/Users/alice2/x.rs"),
+        "C:/Users/<user>/x.rs"
+    );
+    assert_eq!(
+        paths.shorten("C:/Users/alice/dev/haider-old/x.rs"),
         "~/dev/haider-old/x.rs"
     );
     assert_eq!(paths.shorten("/etc/hosts"), "/etc/hosts");
     assert_eq!(paths.shorten("src/app.rs"), "src/app.rs", "relative stays");
+    assert_eq!(
+        paths.shorten("../bob/secret.txt"),
+        "../bob/secret.txt",
+        "relative traversal has no authoritative tool cwd"
+    );
     // A trailing slash on the root changes nothing.
     let slashed = PathContext {
         workspace: Some("/w/".to_owned()),
-        home: None,
+        homes: Vec::new(),
     };
     assert_eq!(slashed.shorten("/w/a.rs"), "a.rs");
     // No context shortens nothing.
     assert_eq!(PathContext::default().shorten("/w/a.rs"), "/w/a.rs");
+}
+
+#[test]
+fn tool_headers_share_the_home_and_other_account_projection() {
+    let context = PathContext {
+        workspace: Some("C:/Users/alice/dev/haider".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for tool in ["fs_read", "fs_write", "fs_edit"] {
+        assert_eq!(
+            tv::header_args(tool, &json!({"path": "/Users/bob/private"}), &context),
+            "/Users/<user>/private",
+            "{tool}"
+        );
+        assert_eq!(
+            tv::header_args(
+                tool,
+                &json!({"path": r"\\?\C:\Users\alice\notes.md"}),
+                &context
+            ),
+            "~/notes.md",
+            "{tool}"
+        );
+    }
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"pattern": "needle", "root": "/Users/bob/repo"}),
+            &context,
+        ),
+        "\"needle\" in /Users/<user>/repo"
+    );
+    assert_eq!(
+        tv::header_args("custom_tool", &json!({"cwd": "/Users/bob/repo"}), &context),
+        "/Users/<user>/repo"
+    );
+    assert_eq!(
+        context.shorten("C:/Users/alice/dev/haider/src/lib.rs"),
+        "src/lib.rs"
+    );
+    assert_eq!(
+        context.shorten("C:/Users/alice/dev/haider/../../../bob/private"),
+        "C:/Users/<user>/private"
+    );
+    assert_eq!(
+        context.shorten(r"\\.\pipe\haider-0123"),
+        r"\\.\pipe\haider-0123"
+    );
+}
+
+#[test]
+fn workspace_root_cannot_shorten_away_another_account_mask() {
+    for workspace in ["/", "/Users", "/Users/"] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert_eq!(
+            context.shorten("/Users/bob/private"),
+            "/Users/<user>/private"
+        );
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": "/Users/bob/private"}), &context),
+            "/Users/<user>/private"
+        );
+        assert_eq!(context.shorten("C:/Users/alice/private"), "~/private");
+    }
+    let windows = PathContext {
+        workspace: Some("C:/Users".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(
+        windows.shorten("C:/Users/bob/private"),
+        "C:/Users/<user>/private"
+    );
+    assert_eq!(windows.shorten("C:/Users/alice/private"), "~/private");
+
+    // A registered home can live outside the standard Users/home layouts.
+    // A broad workspace must keep its home label instead of exposing the
+    // registered profile components as a workspace-relative path.
+    for (workspace, home) in [
+        ("D:/", "D:/Profiles/team/display-fixture-owner"),
+        ("C:/", "C:/storage/team/display-fixture-owner"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec![home.into()],
+        };
+        let path = format!("{home}/notes.txt");
+        assert_eq!(context.shorten(&path), "~/notes.txt", "{workspace}");
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": path}), &context),
+            "~/notes.txt",
+            "{workspace}"
+        );
+    }
+}
+
+fn assert_registered_home_workspace_labels(workspace: &str, home: &str) {
+    let mut context = PathContext {
+        workspace: Some(workspace.to_owned()),
+        homes: vec![home.into()],
+    };
+    let path = format!("{home}/project/notes.txt");
+    assert_eq!(context.shorten(&path), "~/project/notes.txt", "{workspace}");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": path}), &context),
+        "~/project/notes.txt",
+        "{workspace}"
+    );
+    context.workspace = Some(home.to_owned());
+    assert_eq!(context.shorten(home), ".", "home is the workspace");
+    assert_eq!(context.shorten(&path), "project/notes.txt");
+    context.workspace = Some(format!("{home}/project"));
+    assert_eq!(context.shorten(&path), "notes.txt");
+}
+
+#[test]
+fn registered_home_ancestors_keep_home_labels_and_narrow_workspaces_shorten() {
+    for (workspace, home) in [
+        ("D:/Profiles/team", "D:/Profiles/team/display-fixture-owner"),
+        ("d:/profiles/TEAM", "D:/Profiles/team/display-fixture-owner"),
+        (
+            r"\\srv\Profiles\team",
+            r"\\srv\Profiles\team\display-fixture-owner",
+        ),
+    ] {
+        assert_registered_home_workspace_labels(workspace, home);
+    }
+}
+
+#[test]
+fn nested_registered_home_does_not_hide_other_workspace_relative_paths() {
+    let mut context = PathContext {
+        workspace: Some("D:/Profiles/team/display-fixture-owner".to_owned()),
+        homes: vec![
+            "D:/Profiles/team/display-fixture-owner".into(),
+            "D:/Profiles/team/display-fixture-owner/VirtualProfile".into(),
+        ],
+    };
+    let ordinary = "D:/Profiles/team/display-fixture-owner/project/notes.txt";
+    let nested = "D:/Profiles/team/display-fixture-owner/VirtualProfile/notes.txt";
+    assert_eq!(context.shorten(ordinary), "project/notes.txt");
+    assert_eq!(context.shorten(nested), "~/notes.txt");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": ordinary}), &context),
+        "project/notes.txt"
+    );
+    assert_eq!(context.shorten(context.workspace.as_deref().unwrap()), ".");
+    context.workspace = Some("D:/Profiles/team".to_owned());
+    assert_eq!(context.shorten(ordinary), "~/project/notes.txt");
+    assert_eq!(context.shorten(nested), "~/notes.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_registered_home_ancestors_and_aliases_keep_home_labels() {
+    for workspace in ["/srv/profiles", "/srv/profiles/team"] {
+        assert_registered_home_workspace_labels(
+            workspace,
+            "/srv/profiles/team/display-fixture-owner",
+        );
+    }
+    let temp = tempfile::tempdir().expect("registered home fixture");
+    let profiles = temp.path().join("profiles");
+    let home = profiles.join("display-fixture-owner");
+    std::fs::create_dir_all(home.join("project")).expect("home workspace");
+    let alias = temp.path().join("profiles alias");
+    std::os::unix::fs::symlink(&profiles, &alias).expect("profile parent alias");
+    let mut context = PathContext {
+        workspace: Some(alias.display().to_string()),
+        homes: vec![home.clone()],
+    };
+    let path = home.join("project/notes.txt");
+    assert_eq!(
+        context.shorten(&path.to_string_lossy()),
+        "~/project/notes.txt"
+    );
+    context.workspace = Some(
+        alias
+            .join("display-fixture-owner/project")
+            .display()
+            .to_string(),
+    );
+    assert_eq!(context.shorten(&path.to_string_lossy()), "notes.txt");
+}
+
+#[test]
+fn account_shaped_workspace_keeps_safe_relative_labels() {
+    for (workspace, path) in [
+        ("/Users/Shared/proj", "/Users/Shared/proj/src/x.rs"),
+        ("/home/build/repo", "/home/build/repo/src/x.rs"),
+        ("C:/Users/Public/proj", "C:/Users/Public/proj/src/x.rs"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert_eq!(context.shorten(workspace), ".", "{workspace}");
+        assert_eq!(context.shorten(path), "src/x.rs", "{workspace}");
+        assert_eq!(
+            context.shorten(&format!("{workspace}/../bob/private")),
+            if workspace.starts_with("C:") {
+                "C:/Users/<user>/bob/private"
+            } else if workspace.starts_with("/Users") {
+                "/Users/<user>/bob/private"
+            } else {
+                "/home/<user>/bob/private"
+            },
+            "a parent traversal cannot gain a workspace label"
+        );
+    }
+    let shared = PathContext {
+        workspace: Some("/Users/Shared/proj".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(
+        shared.shorten("/Users/Shared/proj-old/src/x.rs"),
+        "/Users/<user>/proj-old/src/x.rs",
+        "a sibling prefix is outside the workspace"
+    );
+}
+
+#[test]
+fn mixed_windows_separators_cannot_escape_workspace_label() {
+    for (workspace, path) in [
+        ("C:/w", r"C:/w/..\Users\bob\x"),
+        ("C:/w", r"C:/w/sub\..\..\Users\bob\x"),
+        ("C:/Users/alice/dev", r"C:/Users/alice/dev/..\..\bob\x"),
+        (r"C:\w", r"C:\w\..\Users\bob\x"),
+        (r"\\?\C:\w", r"\\?\C:\w\..\Users\bob\x"),
+        (r"\\srv\share\w", r"\\srv\share\w\..\Users\bob\x"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        let expected = if path.starts_with(r"\\srv") {
+            "//srv/share/Users/<user>/x"
+        } else {
+            "C:/Users/<user>/x"
+        };
+        assert_eq!(context.shorten(path), expected, "{workspace}: {path}");
+        assert_eq!(
+            tv::header_args("fs_read", &json!({"path": path}), &context),
+            expected,
+            "header: {path}"
+        );
+    }
+}
+
+#[test]
+fn dot_segments_never_become_workspace_labels() {
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [
+        "C:/w/./src/x.rs",
+        r"C:/w/.\src\x.rs",
+        "C:/w/sub/../src/x.rs",
+        r"C:/w/sub\..\src\x.rs",
+    ] {
+        assert_eq!(context.shorten(path), "C:/w/src/x.rs", "{path}");
+    }
+}
+
+#[test]
+fn windows_dot_and_space_segments_never_become_workspace_labels() {
+    use std::path::Path;
+
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [
+        "C:/w/.. /Users/bob/x",
+        "C:/w/sub/.. /.. /Users/bob/x",
+        "C:/w/.. . /Users/bob/x",
+        "C:/w/.../Users/bob/x",
+        r"\\?\C:\w\.. \Users\bob\x",
+    ] {
+        assert_eq!(
+            haider_client::launch_origin::workspace_relative_display(
+                Path::new(path),
+                Path::new("C:/w")
+            ),
+            None,
+            "{path}"
+        );
+        let label = context.shorten(path);
+        assert!(label.contains("<user>"), "{path}: {label}");
+        assert!(!label.contains("bob"), "{path}: {label}");
+        assert!(!label.starts_with(".."), "{path}: {label}");
+    }
+    for path in ["C:/w/. /Users/bob/x", "C:/w/ /Users/bob/x"] {
+        assert_eq!(
+            haider_client::launch_origin::workspace_relative_display(
+                Path::new(path),
+                Path::new("C:/w")
+            ),
+            None,
+            "{path}"
+        );
+        assert_eq!(context.shorten(path), "C:/w/Users/bob/x", "{path}");
+    }
+    // Ordinary leading-dot names still label a file below the workspace.
+    assert_eq!(context.shorten("C:/w/..file/x"), "..file/x");
+    assert_eq!(context.shorten("C:/w/.config/x"), ".config/x");
+}
+
+#[cfg(windows)]
+#[test]
+fn relative_windows_dot_and_space_names_remain_lexical() {
+    let context = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for path in [".../notes", ".. /notes", ". /notes"] {
+        assert_eq!(context.shorten(path), path);
+    }
+}
+
+#[test]
+fn equivalent_windows_spellings_keep_safe_workspace_labels() {
+    for (workspace, path) in [
+        (r"C:\w", r"C:\w\src\x.rs"),
+        ("C:/w", r"C:\w\src\x.rs"),
+        ("C:/w", "c:/W/src/x.rs"),
+        (r"\\?\C:\w", r"C:\w\src\x.rs"),
+        ("C:/w", r"\\?\C:\w\src\x.rs"),
+        (r"\\srv\share\w", r"\\SRV\SHARE\W\src\x.rs"),
+        (r"\\?\UNC\srv\share\w", r"\\srv\share\w\src\x.rs"),
+    ] {
+        let context = PathContext {
+            workspace: Some(workspace.to_owned()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert_eq!(context.shorten(path), "src/x.rs", "{workspace}: {path}");
+    }
+    let own_home = PathContext {
+        workspace: Some("C:/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    assert_eq!(own_home.shorten("C:/Users/alice"), "~");
+    assert_eq!(own_home.shorten("/etc/hosts"), "/etc/hosts");
+    assert_eq!(own_home.shorten("src/x.rs"), "src/x.rs");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn canonical_tmp_alias_keeps_the_workspace_label() {
+    let context = PathContext {
+        workspace: Some("/tmp/winpath-973-alias".to_owned()),
+        homes: Vec::new(),
+    };
+    assert_eq!(
+        context.shorten("/private/tmp/winpath-973-alias/src/x.rs"),
+        "src/x.rs"
+    );
+}
+
+#[test]
+fn absolute_search_patterns_use_the_account_projection() {
+    let context = PathContext {
+        workspace: Some("/w".to_owned()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for args in [
+        json!({"query": "x", "glob": "/Users/bob/**"}),
+        json!({"query": "x", "include": "/Users/bob/**"}),
+    ] {
+        assert_eq!(
+            tv::header_args("fs_search", &args, &context),
+            "\"x\" /Users/<user>/**"
+        );
+    }
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "glob": "src/**"}),
+            &context
+        ),
+        "\"x\" src/**"
+    );
+    assert_eq!(
+        tv::header_args("glob", &json!({"pattern": "/Users/bob/**"}), &context),
+        "\"/Users/<user>/**\""
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": "C:/Users/alice/**"}),
+            &context
+        ),
+        "\"x\" ~/**"
+    );
+    assert_eq!(
+        tv::header_args("glob", &json!({"pattern": "/w/src/**"}), &context),
+        "\"src/**\""
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "glob": r"C:\Users\bob\**"}),
+            &context
+        ),
+        "\"x\" C:/Users/<user>/**"
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": r"\\srv\share\Users\bob\**"}),
+            &context
+        ),
+        "\"x\" //srv/share/Users/<user>/**"
+    );
+    assert_eq!(
+        tv::header_args(
+            "fs_search",
+            &json!({"query": "x", "include": "../src/**"}),
+            &context
+        ),
+        "\"x\" ../src/**"
+    );
+    assert_eq!(
+        tv::header_args("custom_tool", &json!({"cwd": "/Users/bob/repo"}), &context),
+        "/Users/<user>/repo"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn escaped_absolute_glob_roots_share_the_account_and_home_projection() {
+    let context = PathContext {
+        workspace: Some("/opt/work".into()),
+        homes: vec!["/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (r"/U\sers/bob/**", "/Users/<user>/**"),
+        (r"\/Users/bob/**", "/Users/<user>/**"),
+        (r"\/U\sers/bob/**", "/Users/<user>/**"),
+        (r#"'\/Users/o\'brien/**'"#, "'/Users/<user>/**'"),
+        (r"/h\ome/carol/**", "/home/<user>/**"),
+        (r"/Users/b\ob/**", "/Users/<user>/**"),
+        (r"/U\sers/al\ice/a ~b/**", "~/a ~b/**"),
+        (r"\/U\sers/al\ice/a ~b/**", "~/a ~b/**"),
+        (
+            r"{/U\sers/bob/**,/h\ome/carol/**}",
+            "{/Users/<user>/**,/home/<user>/**}",
+        ),
+        (r"**/U\sers/bob/**", r"**/U\sers/bob/**"),
+        (r"/opt/u\sers/bob/**", r"/opt/u\u{005c}sers/bob/**"),
+        (r"/U\sers/bob/f\?o/**", r"/Users/<user>/f\?o/**"),
+        (r"/U\sers/bob/café\?名/**", r"/Users/<user>/café\?名/**"),
+        (
+            r"/Volumes/Café\, 2024/U\sers/bob/**",
+            r"/Volumes/Café\, 2024/Users/<user>/**",
+        ),
+        (
+            r#"/Volumes/Say "hi"/Users/o\'brien/**"#,
+            r#"/Volumes/Say "hi"/Users/<user>/**"#,
+        ),
+        (r"/U\sers/al\ice/Bob\'s notes/**", r"~/Bob\'s notes/**"),
+        (r"/U\sers/al\ice", "~"),
+        (r"C:\Users\bob\**", "C:/Users/<user>/**"),
+    ] {
+        let args = json!({"pattern":pattern});
+        assert_eq!(
+            tv::header_args("glob", &args, &context),
+            format!("\"{expected}\""),
+            "{pattern}"
+        );
+        assert_eq!(
+            args["pattern"], pattern,
+            "raw tool argument must remain unchanged"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_alias_to_multiuser_root_keeps_the_account_mask() {
+    use std::os::unix::fs::symlink;
+    let ancestor = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("temporary workspace alias");
+    let alias = temp.path().join("account-roots");
+    symlink(ancestor, &alias).expect("alias");
+    assert!(haider_client::launch_origin::is_multiuser_workspace_root(
+        &alias
+    ));
+    let narrow = temp.path().join("project");
+    std::fs::create_dir(&narrow).expect("narrow workspace");
+    let narrow_alias = temp.path().join("project-alias");
+    symlink(&narrow, &narrow_alias).expect("narrow alias");
+    assert!(!haider_client::launch_origin::is_multiuser_workspace_root(
+        &narrow_alias
+    ));
+    let context = PathContext {
+        workspace: Some(alias.display().to_string()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    let path = alias.join("bob/private");
+    assert_eq!(
+        context.shorten(&path.to_string_lossy()),
+        format!("{ancestor}/<user>/private")
+    );
+
+    let registered_home = temp.path().join("display-fixture-profile");
+    std::fs::create_dir(&registered_home).expect("registered home");
+    let filesystem_alias = temp.path().join("filesystem-root");
+    symlink("/", &filesystem_alias).expect("filesystem root alias");
+    assert!(haider_client::launch_origin::is_multiuser_workspace_root(
+        &filesystem_alias
+    ));
+    let context = PathContext {
+        workspace: Some(filesystem_alias.display().to_string()),
+        homes: vec![registered_home.clone()],
+    };
+    let path = registered_home.join("notes.txt");
+    assert_eq!(context.shorten(&path.to_string_lossy()), "~/notes.txt");
+    assert_eq!(
+        tv::header_args("fs_read", &json!({"path": path}), &context),
+        "~/notes.txt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interior_workspace_alias_to_accounts_keeps_the_mask_in_all_headers() {
+    use std::os::unix::fs::symlink;
+    let ancestor = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("workspace");
+    let alias = temp.path().join("accounts");
+    symlink(ancestor, &alias).expect("account alias");
+    let paths = [
+        alias.join("display-fixture-other-account/missing/file.rs"),
+        alias
+            .join("..")
+            .join(ancestor.trim_start_matches('/'))
+            .join("display-fixture-other-account/missing/file.rs"),
+    ];
+    for homes in [vec![], vec![temp.path().to_path_buf()]] {
+        let context = PathContext {
+            workspace: Some(temp.path().display().to_string()),
+            homes,
+        };
+        let expected = format!("{ancestor}/<user>/missing/file.rs");
+        for path in &paths {
+            assert_eq!(context.shorten(&path.to_string_lossy()), expected);
+            assert_eq!(
+                tv::header_args("fs_read", &json!({"path":path}), &context),
+                expected
+            );
+            assert_eq!(
+                tv::header_args("fs_glob", &json!({"pattern":path}), &context),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+    // An alias that stays inside the workspace keeps the requested readable spelling.
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).expect("real directory");
+    let internal = temp.path().join("internal");
+    symlink(&real, &internal).expect("internal alias");
+    let context = PathContext {
+        workspace: Some(temp.path().display().to_string()),
+        homes: vec![],
+    };
+    assert_eq!(
+        context.shorten(&internal.join("file.rs").to_string_lossy()),
+        "internal/file.rs"
+    );
 }
 
 #[test]
@@ -111,7 +700,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "fs_write",
-            &json!({"path": "/Users/alice/dev/haider/state/973-LANES.md", "content": "x"}),
+            &json!({"path": "C:/Users/alice/dev/haider/state/973-LANES.md", "content": "x"}),
             &paths
         ),
         "state/973-LANES.md"
@@ -119,7 +708,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "edit",
-            &json!({"file_path": "/Users/alice/notes.md", "old_string": "a", "new_string": "b"}),
+            &json!({"file_path": "C:/Users/alice/notes.md", "old_string": "a", "new_string": "b"}),
             &paths
         ),
         "~/notes.md"
@@ -139,7 +728,7 @@ fn header_arguments_are_short_and_single_line() {
     assert_eq!(
         tv::header_args(
             "fs_search",
-            &json!({"pattern": "todos_collapsed", "path": "/Users/alice/dev/haider/src"}),
+            &json!({"pattern": "todos_collapsed", "path": "C:/Users/alice/dev/haider/src"}),
             &paths
         ),
         "\"todos_collapsed\" in src"
@@ -865,5 +1454,666 @@ fn every_tool_row_text_ink_clears_4_5_on_its_ground_in_every_theme() {
         assert_ne!(theme.diff_added_ground(), theme.bg);
         assert_ne!(theme.diff_removed_ground(), theme.bg);
         assert_ne!(theme.diff_added_ground(), theme.diff_removed_ground());
+    }
+}
+
+#[test]
+fn syntax_prefixed_glob_branches_use_the_shared_projection() {
+    use haider_tui::{toolfold::semantic_summary, toolview::project_absolute_pattern};
+    for (pattern, expected) in [
+        ("!/Users/bob/**", "!/Users/<user>/**"),
+        ("!!/Users/bob/**", "!!/Users/<user>/**"),
+        (
+            "{/Users/bob,/home/carol}/**",
+            "{/Users/<user>,/home/<user>}/**",
+        ),
+        ("{src,/Users/bob}/**", "{src,/Users/<user>}/**"),
+        (" /Users/bob/**", " /Users/<user>/**"),
+        ("\t/Users/bob/**", "\t/Users/<user>/**"),
+        ("~bob/**", "~<user>/**"),
+        ("!~BOB/**", "!~<user>/**"),
+        ("{~bob,~carol}/**", "{~<user>,~<user>}/**"),
+        (r"!C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            r"{C:\Users\bob,D:\temp}\**",
+            r"{C:/Users/<user>,D:/temp}\**",
+        ),
+        (r"!\\server\Users\bob\**", "!//server/Users/<user>/**"),
+        (r"!\\?\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (r"!\\.\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            r"!\\?\Volume{abc}\Users\bob\**",
+            "!//device/Volume{abc}/Users/<user>/**",
+        ),
+        (r"!\??\C:\Users\bob\**", "!C:/Users/<user>/**"),
+        (
+            "{!/Users/bob,{/home/carol,src}}/**",
+            "{!/Users/<user>,{/home/<user>,src}}/**",
+        ),
+        ("**/Users/bob/**", "**/Users/bob/**"),
+        ("src/**", "src/**"),
+        ("../bob/**", "../bob/**"),
+        ("~/**", "~/**"),
+        ("!src/**", "!src/**"),
+        ("{src,tests}/**", "{src,tests}/**"),
+        ("src/~bob/**", "src/~bob/**"),
+        ("src!/Users/bob/**", "src!/Users/bob/**"),
+        ("src/{/Users/bob,lib}/**", "src/{/Users/bob,lib}/**"),
+        ("src,/Users/bob/**", "src,/Users/bob/**"),
+        ("/Users/{bob,carol}/**", "/Users/<user>/**"),
+        ("!/Users/{bob,carol}/**", "!/Users/<user>/**"),
+        ("/Users/bob/{src,tests}/**", "/Users/<user>/{src,tests}/**"),
+        (
+            "@(/Users/bob|/home/carol)/**",
+            "@(/Users/<user>|/home/<user>)/**",
+        ),
+        (
+            "!(/Users/bob|/home/carol)/**",
+            "!(/Users/<user>|/home/<user>)/**",
+        ),
+        (
+            "/Users/bob/** /home/carol/**",
+            "/Users/<user>/** /home/carol/**",
+        ),
+        (
+            "!C:/Documents and Settings/bob/**",
+            "!C:/Documents and Settings/<user>/**",
+        ),
+    ] {
+        assert_eq!(project_absolute_pattern(pattern), expected, "{pattern}");
+        for key in ["glob", "include"] {
+            assert_eq!(
+                haider_tui::toolfold::arg_summary(&json!({key:pattern})),
+                expected
+            );
+        }
+        let paths = PathContext::default();
+        for (name, args) in [
+            ("fs_search", json!({"query":"x", "glob":pattern})),
+            ("fs_search", json!({"query":"x", "include":pattern})),
+            ("glob", json!({"pattern":pattern})),
+            ("fs_glob", json!({"query":pattern})),
+        ] {
+            let header = tv::header_args(name, &args, &paths);
+            let plain = semantic_summary(name, &args);
+            // Tool headers intentionally collapse whitespace onto one line.
+            assert!(
+                header.contains(&haider_tui::toolview::one_line(expected)),
+                "{name} {pattern}: {header}"
+            );
+            assert!(plain.contains(expected), "{name} {pattern}: {plain}");
+        }
+    }
+}
+
+#[test]
+fn expanded_broad_workspace_roots_never_restore_the_account() {
+    for (workspace, path) in [
+        (r"\\srv\share\msys64", r"\\srv\share\msys64\home\bob\x"),
+        (r"\\srv\msys64\home", r"\\srv\msys64\home\bob\x"),
+        (
+            r"\\srv\share\Documents and Settings",
+            r"\\srv\share\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\srv\Documents and Settings",
+            r"\\srv\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\msys64\home\bob\x",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Documents and Settings\bob\x",
+        ),
+        (
+            r"\\?\Volume{abc}\cache\alice",
+            r"\\?\Volume{abc}\cache\alice\Users\bob\x",
+        ),
+        ("C:/msys64", "C:/msys64/home/bob/x"),
+        ("C:/msys64/home", "C:/msys64/home/bob/x"),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+        (
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Users\bob\x",
+        ),
+    ] {
+        let paths = PathContext {
+            workspace: Some(workspace.into()),
+            homes: vec!["C:/Users/alice".into()],
+        };
+        assert!(
+            !paths.shorten(path).to_ascii_lowercase().contains("bob"),
+            "{workspace} {path}"
+        );
+    }
+}
+
+fn assert_pattern_routes(pattern: &str, expected: &str, context: &PathContext) {
+    use haider_protocol::{
+        EventPayload,
+        ids::ItemId,
+        item::{ItemEvent, ToolStatus, TurnItem},
+    };
+    use haider_tui::{plain::render_plain_with_context, projection::SessionProjection};
+    for (name, args, search) in [
+        ("fs_search", json!({"query":"needle", "glob":pattern}), true),
+        (
+            "fs_search",
+            json!({"query":"needle", "include":pattern}),
+            true,
+        ),
+        ("glob", json!({"pattern":pattern}), false),
+        ("fs_glob", json!({"query":pattern}), false),
+    ] {
+        let summary = if search {
+            format!("\"needle\" {expected}")
+        } else {
+            expected.to_owned()
+        };
+        let compact = tv::one_line(expected);
+        let header = if search {
+            format!("\"needle\" {compact}")
+        } else {
+            format!("\"{compact}\"")
+        };
+        assert_eq!(
+            tv::header_args(name, &args, context),
+            header,
+            "{name} {pattern}"
+        );
+        let mut projection = SessionProjection::new();
+        projection.apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("pattern-parity"),
+            item: TurnItem::ToolCall {
+                call_id: "pattern-parity".into(),
+                name: name.into(),
+                args,
+                status: ToolStatus::InProgress,
+                activity: None,
+            },
+        }));
+        let plain = render_plain_with_context(&projection, 0, None, context);
+        assert_eq!(
+            plain.lines().next(),
+            Some(format!("⚒ {name} ◐ · {summary} · status running").as_str()),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
+fn unenclosed_punctuation_and_whitespace_belong_to_the_whole_absolute_pattern() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["/Users/alice".into(), "C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (
+            "/Volumes/Bob's Passport/Users/carol/src/**",
+            "/Volumes/Bob's Passport/Users/<user>/src/**",
+        ),
+        (r"C:\Users\o'brien\src\**", "C:/Users/<user>/src/**"),
+        (
+            r"\\srv\a,b\Users\carol\src\**",
+            "//srv/a,b/Users/<user>/src/**",
+        ),
+        (
+            "/Volumes/Backup, 2024/Users/carol/**",
+            "/Volumes/Backup, 2024/Users/<user>/**",
+        ),
+        (
+            r"\\?\Volume{abc}\a,b\Users\carol\**",
+            "//device/Volume{abc}/a,b/Users/<user>/**",
+        ),
+        ("/Users/al}ice/**", "/Users/<user>/**"),
+        (r"C:\Users\carol)x\**", "C:/Users/<user>/**"),
+        (
+            "/Volumes/A|B/Users/carol/**",
+            "/Volumes/A|B/Users/<user>/**",
+        ),
+        (
+            r#"/Volumes/Say "hi"/Users/carol/**"#,
+            r#"/Volumes/Say "hi"/Users/<user>/**"#,
+        ),
+        (r"\\.\C:\Users\o'brien\**", "C:/Users/<user>/**"),
+        (r"\??\C:\Users\o'brien\**", "C:/Users/<user>/**"),
+        (
+            r"\\?\UNC\srv\a|b\Users\carol\**",
+            "//srv/a|b/Users/<user>/**",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\Mup\srv\a,b\Users\carol\**",
+            "//device/GLOBALROOT/Device/Mup/srv/a,b/Users/<user>/**",
+        ),
+        (
+            "C:/Documents and Settings/o'brien/**",
+            "C:/Documents and Settings/<user>/**",
+        ),
+        ("C:/msys64/home/o'brien/**", "C:/msys64/home/<user>/**"),
+        ("C:/Users/alice/a ~b/x/**", "~/a ~b/x/**"),
+        ("C:/Users/alice/Bob's notes/**", "~/Bob's notes/**"),
+        ("C:/Users/alice/a,b/x/**", "~/a,b/x/**"),
+        ("C:/Users/alice/x (1)/**", "~/x (1)/**"),
+        ("/opt/w/a,b/x/**", "a,b/x/**"),
+        ("/opt/w/src/x (1)/**", "src/x (1)/**"),
+        ("C:/Program Files (x86)/**", "C:/Program Files (x86)/**"),
+    ] {
+        assert_eq!(context.shorten(pattern), expected, "whole path: {pattern}");
+        for prefix in ["", "!", "!!", " ", "! "] {
+            assert_pattern_routes(
+                &format!("{prefix}{pattern}"),
+                &format!("{prefix}{expected}"),
+                &context,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_branch_ends_only_at_its_own_enclosing_syntax() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (
+            "{/Volumes/Bob's Passport/Users/carol/**,/tmp/**}",
+            "{/Volumes/Bob's Passport/Users/<user>/**,/tmp/**}",
+        ),
+        ("{/Users/al)ice/**,/tmp/**}", "{/Users/<user>/**,/tmp/**}"),
+        (
+            "{/Volumes/Backup (old/Users/carol/**,/home/bob/**}",
+            "{/Volumes/Backup (old/Users/<user>/**,/home/<user>/**}",
+        ),
+        (
+            "@(/Volumes/Backup (old/Users/carol/**|/home/bob/**)",
+            "@(/Volumes/Backup (old/Users/<user>/**|/home/<user>/**)",
+        ),
+        (
+            "{/Users/bob/@(src|lib)/**,/home/carol/**}",
+            "{/Users/<user>/@(src|lib)/**,/home/<user>/**}",
+        ),
+        (
+            "@(/Volumes/Backup, 2024/Users/carol/**|/tmp/**)",
+            "@(/Volumes/Backup, 2024/Users/<user>/**|/tmp/**)",
+        ),
+        ("@(/Users/al}ice/**|/tmp/**)", "@(/Users/<user>/**|/tmp/**)"),
+        (
+            "\"/Volumes/Bob's Passport/Users/carol/**\"",
+            "\"/Volumes/Bob's Passport/Users/<user>/**\"",
+        ),
+        (
+            "'/Volumes/Backup, 2024/Users/carol/**'",
+            "'/Volumes/Backup, 2024/Users/<user>/**'",
+        ),
+        (
+            "{C:/Users/alice/a ~b/x/**,/tmp/**}",
+            "{~/a ~b/x/**,/tmp/**}",
+        ),
+        (
+            "{!/Users/bob,{/home/carol,src}}/**",
+            "{!/Users/<user>,{/home/<user>,src}}/**",
+        ),
+        (
+            "@({/Users/bob,/home/carol}|/tmp)/**",
+            "@({/Users/<user>,/home/<user>}|/tmp)/**",
+        ),
+        (
+            "{/Users/{bob,carol}/**,/tmp/**}",
+            "{/Users/<user>/**,/tmp/**}",
+        ),
+        ("src/{/Users/bob,lib}/**", "src/{/Users/bob,lib}/**"),
+        ("src/~bob/**", "src/~bob/**"),
+        (
+            "'/Users/bob/**' /home/carol/**",
+            "'/Users/<user>/**' /home/<user>/**",
+        ),
+        ("'/Users/bob/**' ~carol/**", "'/Users/<user>/**' ~<user>/**"),
+        (
+            "{/Users/bob,/tmp} /home/carol/**",
+            "{/Users/<user>,/tmp} /home/<user>/**",
+        ),
+        (
+            "@(/Users/bob|/tmp) /home/carol/**",
+            "@(/Users/<user>|/tmp) /home/<user>/**",
+        ),
+        ("src,/Users/bob/**", "src,/Users/bob/**"),
+        ("/opt/w/a ~bob/x/**", "a ~bob/x/**"),
+    ] {
+        assert_pattern_routes(pattern, expected, &context);
+    }
+}
+
+#[test]
+fn posix_pattern_routes_match_the_whole_path_projection() {
+    let context = PathContext {
+        workspace: Some("/opt/w".into()),
+        homes: vec!["/Users/alice".into()],
+    };
+    for tail in [
+        "a ~b/x/**",
+        "Bob's notes/**",
+        "Library/Application Support/Code/**",
+        "Developer/my app (v2)/**/*.{rs,toml}",
+    ] {
+        let pattern = format!("/Users/alice/{tail}");
+        // Whether this platform accepts a POSIX home is a separate policy.
+        // Every route must keep the whole-path label and its literal tail.
+        let expected = context.shorten(&pattern);
+        assert!(expected.ends_with(tail), "{expected}");
+        assert_pattern_routes(&pattern, &expected, &context);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_rooted_patterns_use_the_whole_account_projection() {
+    let context = PathContext {
+        workspace: Some("C:/repo".into()),
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for pattern in [
+        r"\Users\o'brien\**",
+        r"\Users\carol)x\**",
+        r"\Users\al}ice\**",
+        r#"\Users\say "hi"\**"#,
+    ] {
+        assert_eq!(context.shorten(pattern), "/Users/<user>/**");
+        assert_pattern_routes(pattern, "/Users/<user>/**", &context);
+    }
+    assert_pattern_routes(r"src\Users\bob\**", r"src\Users\bob\**", &context);
+}
+
+#[cfg(unix)]
+#[test]
+fn escaped_posix_delimiters_do_not_close_a_pattern_branch() {
+    let context = PathContext {
+        workspace: None,
+        homes: vec!["C:/Users/alice".into()],
+    };
+    for (pattern, expected) in [
+        (r"'/Users/o\'brien/**'", "'/Users/<user>/**'"),
+        (r"'~o\'brien/**'", "'~<user>/**'"),
+        (
+            r#""/Volumes/Say \"hi\"/Users/carol/**""#,
+            r#""/Volumes/Say \"hi\"/Users/<user>/**""#,
+        ),
+        (
+            r"{/Volumes/Backup\, 2024/Users/carol/**,/tmp/**}",
+            r"{/Volumes/Backup\, 2024/Users/<user>/**,/tmp/**}",
+        ),
+        (
+            r"@(/Volumes/A\|B/Users/carol/**|/tmp/**)",
+            r"@(/Volumes/A\|B/Users/<user>/**|/tmp/**)",
+        ),
+    ] {
+        assert_pattern_routes(pattern, expected, &context);
+    }
+    assert_pattern_routes(r"'C:\Users\bob\'", "'C:/Users/<user>'", &context);
+}
+
+fn pattern_context_plain(tool: &str, args: &serde_json::Value, paths: &PathContext) -> String {
+    use haider_protocol::{
+        EventPayload,
+        ids::ItemId,
+        item::{ItemEvent, ToolStatus, TurnItem},
+    };
+    use haider_tui::{plain::render_plain_with_context, projection::SessionProjection};
+
+    let mut projection = SessionProjection::new();
+    projection.apply(&EventPayload::Item(ItemEvent::Started {
+        item_id: ItemId::new("sol-r6-exact"),
+        item: TurnItem::ToolCall {
+            call_id: "sol-r6-exact".into(),
+            name: tool.into(),
+            args: args.clone(),
+            status: ToolStatus::InProgress,
+            activity: None,
+        },
+    }));
+    render_plain_with_context(&projection, 0, None, paths)
+}
+
+fn assert_context_pattern(pattern: &str, expected: &str, paths: &PathContext) {
+    use haider_tui::toolfold::arg_summary_with_context;
+    for key in ["glob", "include"] {
+        assert_eq!(
+            arg_summary_with_context(&json!({key: pattern}), paths),
+            expected,
+            "{pattern}"
+        );
+    }
+    for (tool, args) in [
+        ("fs_search", json!({"query":"x", "glob":pattern})),
+        ("fs_search", json!({"query":"x", "include":pattern})),
+        ("glob", json!({"pattern":pattern})),
+        ("fs_glob", json!({"query":pattern})),
+    ] {
+        let header = tv::header_args(tool, &args, paths);
+        let plain = pattern_context_plain(tool, &args, paths);
+        assert!(
+            header.contains(&tv::one_line(expected)),
+            "{tool} {pattern}: {header}"
+        );
+        assert!(plain.contains(expected), "{tool} {pattern}: {plain}");
+        println!(
+            "SOL_GLOB_SCOPE {tool} pattern={pattern:?} expected={expected:?} header={header:?} plain={plain:?}"
+        );
+    }
+}
+
+#[test]
+fn glob_prefixes_with_only_empty_alternatives_keep_rooted_labels() {
+    let paths = PathContext::default();
+    for prefix in [
+        "{}", "{,}", "{{},}", "{,{,}}", "{}{}", "{{},{,}}", "{{}{,}}",
+    ] {
+        for (path, masked) in [
+            ("/Users/bob/src/**", "/Users/<user>/src/**"),
+            ("C:/Users/bob/src/**", "C:/Users/<user>/src/**"),
+            ("//srv/Users/bob/src/**", "//srv/Users/<user>/src/**"),
+        ] {
+            assert_context_pattern(
+                &format!("{prefix}{path}"),
+                &format!("{prefix}{masked}"),
+                &paths,
+            );
+        }
+    }
+    for (pattern, expected) in [
+        ("!!{}/Users/bob/**", "!!{}/Users/<user>/**"),
+        (" {,}/Users/bob/**", " {,}/Users/<user>/**"),
+        ("'{{},}/Users/bob/**'", "'{{},}/Users/<user>/**'"),
+        ("{a,}/Users/bob/**", "{a,}/Users/bob/**"),
+        ("{,a}/Users/bob/**", "{,a}/Users/bob/**"),
+        ("{{},a}/Users/bob/**", "{{},a}/Users/bob/**"),
+        ("src{}/Users/bob/**", "src{}/Users/bob/**"),
+        ("src/{,}/Users/bob/**", "src/{,}/Users/bob/**"),
+        (r"\{\}/Users/bob/**", r"\{\}/Users/bob/**"),
+        (r"{\{\},}/Users/bob/**", r"{\{\},}/Users/bob/**"),
+        ("{''}/Users/bob/**", "{''}/Users/bob/**"),
+        ("{}", "{}"),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn nested_glob_enclosures_preserve_branch_rooting() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        ("{src/{a,b},/Users/bob/**}", "{src/{a,b},/Users/<user>/**}"),
+        (
+            "{{src/{a,b},lib},/home/carol/**}",
+            "{{src/{a,b},lib},/home/<user>/**}",
+        ),
+        (
+            "{src/{/Users/bob,lib},/home/carol/**}",
+            "{src/{/Users/bob,lib},/home/<user>/**}",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+    for operator in ['@', '!', '?', '+', '*'] {
+        assert_context_pattern(
+            &format!("{operator}(src/@(a|b)|/Users/bob/**)"),
+            &format!("{operator}(src/@(a|b)|/Users/<user>/**)"),
+            &paths,
+        );
+        assert_context_pattern(
+            &format!("{operator}(src/@(/Users/bob|lib)|/home/carol/**)"),
+            &format!("{operator}(src/@(/Users/bob|lib)|/home/<user>/**)"),
+            &paths,
+        );
+    }
+}
+
+#[test]
+fn glob_character_classes_own_their_literal_delimiters() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        (
+            "{/Volumes/A[,]B/Users/bob/**,src}",
+            "{/Volumes/A[,]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[}]B/Users/bob/**,src}",
+            "{/Volumes/A[}]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[]},]B/Users/bob/**,src}",
+            "{/Volumes/A[]},]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[!},]B/Users/bob/**,src}",
+            "{/Volumes/A[!},]B/Users/<user>/**,src}",
+        ),
+        (
+            "{/Volumes/A[^},]B/Users/bob/**,src}",
+            "{/Volumes/A[^},]B/Users/<user>/**,src}",
+        ),
+        (
+            "@(/Volumes/A[|)]B/Users/bob/**|src)",
+            "@(/Volumes/A[|)]B/Users/<user>/**|src)",
+        ),
+        (
+            "'/Volumes/Bob[']s/Users/bob/**'",
+            "'/Volumes/Bob[']s/Users/<user>/**'",
+        ),
+        (
+            r#""/Volumes/A["]B/Users/carol/**""#,
+            r#""/Volumes/A["]B/Users/<user>/**""#,
+        ),
+        (r"{C:\Users\bob\a[,]b,src}", "{C:/Users/<user>/a[,]b,src}"),
+        (
+            r"{\\?\Volume{abc}\A[},]B\Users\bob\**,src}",
+            "{//device/Volume{abc}/A[},]B/Users/<user>/**,src}",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn glob_relative_literals_keep_their_enclosures() {
+    let paths = PathContext::default();
+    for (pattern, expected) in [
+        (r"{src/\},/Users/bob/**}", r"{src/\},/Users/<user>/**}"),
+        (r"{src/\{,/Users/bob/**}", r"{src/\{,/Users/<user>/**}"),
+        (r"@(src/\)|/Users/bob/**)", r"@(src/\)|/Users/<user>/**)"),
+        (r"@(src/\(|/Users/bob/**)", r"@(src/\(|/Users/<user>/**)"),
+        (
+            "{src/[}]/lib,/Users/bob/**}",
+            "{src/[}]/lib,/Users/<user>/**}",
+        ),
+        (
+            "{src/[,]/lib,/Users/bob/**}",
+            "{src/[,]/lib,/Users/<user>/**}",
+        ),
+        (
+            "@(src/[)]/lib|/Users/bob/**)",
+            "@(src/[)]/lib|/Users/<user>/**)",
+        ),
+        (r"{src\,/Users/bob/**}", r"{src\,/Users/bob/**}"),
+        (
+            "{src/{a,b},lib}/Users/bob/**",
+            "{src/{a,b},lib}/Users/bob/**",
+        ),
+        ("{a,b}src{c,d} /Users/bob/**", "{a,b}src{c,d} /Users/bob/**"),
+        ("{}src{} /Users/bob/**", "{}src{} /Users/bob/**"),
+        ("{}src{} /home/carol/**", "{}src{} /home/carol/**"),
+        (
+            "@(a|b)src@(c|d) /Users/bob/**",
+            "@(a|b)src@(c|d) /Users/bob/**",
+        ),
+        (
+            "{src,/Users/bob/**} /home/carol/**",
+            "{src,/Users/<user>/**} /home/<user>/**",
+        ),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn empty_glob_prefixes_keep_context_labels() {
+    let paths = paths();
+    for (pattern, expected) in [
+        ("{}C:/Users/alice/dev/haider/src/lib.rs", "{}src/lib.rs"),
+        ("{,{,}}C:/Users/alice/notes.md", "{,{,}}~/notes.md"),
+        ("'{}C:/Users/alice/notes.md'", "'{}~/notes.md'"),
+        ("{}~/notes.md", "{}~/notes.md"),
+        ("{}~bob/notes.md", "{}~<user>/notes.md"),
+    ] {
+        assert_context_pattern(pattern, expected, &paths);
+    }
+}
+
+#[test]
+fn glob_enclosure_labels_do_not_depend_on_hidden_account_names() {
+    let paths = PathContext::default();
+    let outputs = |pattern: &str| {
+        [
+            ("fs_search", json!({"query":"x", "glob":pattern})),
+            ("fs_search", json!({"query":"x", "include":pattern})),
+            ("glob", json!({"pattern":pattern})),
+            ("fs_glob", json!({"query":pattern})),
+        ]
+        .map(|(tool, args)| {
+            (
+                tv::header_args(tool, &args, &paths),
+                pattern_context_plain(tool, &args, &paths),
+            )
+        })
+    };
+    for template in [
+        "{}/Users/{account}/src/**",
+        "{{},}C:/Users/{account}/src/**",
+        "{src/{a,b},/Users/{account}/src/**}",
+        "@(src/@(a|b)|/Users/{account}/src/**)",
+        "{/Volumes/Backup[,]2024/Users/{account}/src/**,src}",
+        "'/Volumes/Bob[']s/Users/{account}/src/**'",
+        "{src/[}]/lib,/Users/{account}/src/**}",
+        r"{src/\},/Users/{account}/src/**}",
+    ] {
+        let reference = template.replace("{account}", "bob");
+        let expected =
+            haider_tui::toolfold::arg_summary_with_context(&json!({"glob": reference}), &paths);
+        assert!(!expected.contains("/bob/"), "{expected}");
+        let reference_outputs = outputs(&reference);
+        for account in ["bob", "robertson", "δοκιμή"] {
+            let pattern = template.replace("{account}", account);
+            assert_context_pattern(&pattern, &expected, &paths);
+            assert_eq!(outputs(&pattern), reference_outputs, "{pattern}");
+        }
     }
 }

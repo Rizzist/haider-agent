@@ -698,9 +698,10 @@ pub use cachemaxxing::{
     plan_inline_breakpoints, validate_provider_view_prefix,
 };
 pub use oauth_identity::{
-    AnthropicOAuthIdentitySource, GrokOAuthIdentitySource, IdentityEndpoint, IdentityError,
-    KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens, OpenAiOAuthIdentitySource,
-    oauth_identity_source,
+    ANTHROPIC_OAUTH_PROFILE_URL, AnthropicOAuthIdentitySource, GrokOAuthIdentitySource,
+    IdentityEndpoint, IdentityError, KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens,
+    OpenAiOAuthIdentitySource, oauth_identity_source, openai_user_account_coordinate,
+    openai_workspace_from_account_coordinate,
 };
 
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
@@ -1239,10 +1240,10 @@ pub use cache::{
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
-    PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
-    compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
-    model_list_forbidden, model_servable_by_endpoint, openai_compatible_catalog_endpoint,
-    parse_catalog, pickable, provider_catalog_definition,
+    MODEL_LIST_REFUSED_FOR_CREDENTIAL, PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition,
+    catalog_request_url, compatible_model_id_is_display_safe, discover_models,
+    discover_models_with_resolver, model_list_forbidden, model_servable_by_endpoint,
+    openai_compatible_catalog_endpoint, parse_catalog, pickable, provider_catalog_definition,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,

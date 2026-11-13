@@ -39,12 +39,19 @@ fn every_macos_keychain_event_is_strictly_no_ui() {
 }
 
 const CODE_SENTINEL: &str = "AUTH_CODE_SENTINEL_51d2";
+
 const ACCESS_SENTINEL: &str = "ACCESS_TOKEN_SENTINEL_834a";
+
 const REFRESH_SENTINEL: &str = "REFRESH_TOKEN_SENTINEL_1c72";
+
 const ID_SENTINEL: &str = "ID_TOKEN_SENTINEL_97e1";
+
 const RAW_ERROR_SENTINEL: &str = "RAW_TOKEN_ERROR_SENTINEL_29af";
+
 const RAW_BODY_SENTINEL: &str = "RAW_TOKEN_BODY_SENTINEL_a83c";
+
 const SCOPES: &str = "openid inference profile";
+
 const AUDIENCE: &str = "fake-resource";
 
 const CLAUDE_SECURE_STORE_FIXTURE: &[u8] = br#"{
@@ -416,6 +423,7 @@ pub(super) struct FakeState {
     issuer: String,
     auth: Mutex<Option<AuthSeen>>,
     pub(super) token_calls: AtomicUsize,
+    profile_calls: AtomicUsize,
     redirect_target_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     saw_client_secret: AtomicBool,
@@ -455,6 +463,7 @@ impl FakeOAuthServer {
             issuer: format!("http://{address}"),
             auth: Mutex::new(None),
             token_calls: AtomicUsize::new(0),
+            profile_calls: AtomicUsize::new(0),
             redirect_target_calls: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
             saw_client_secret: AtomicBool::new(false),
@@ -527,7 +536,7 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
             .msh_headers
             .lock()
             .expect("MSH header lock")
-            .push(headers);
+            .push(headers.clone());
     }
     if target == "/device_authorization" {
         assert_eq!(method, "POST");
@@ -602,6 +611,36 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
     if target == "/token-redirect-target" {
         state.redirect_target_calls.fetch_add(1, Ordering::SeqCst);
         write_http(&mut stream, 500, &[], b"must not follow").await;
+        return;
+    }
+    if target == "/profile" {
+        state.profile_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(method, "GET");
+        assert_eq!(
+            authorization.as_deref(),
+            Some("Bearer ACCESS_TOKEN_SENTINEL_834a")
+        );
+        assert_eq!(
+            headers
+                .get(haider_provider::ANTHROPIC_OAUTH_BETA_HEADER)
+                .map(String::as_str),
+            Some(haider_provider::ANTHROPIC_OAUTH_BETA_VALUE)
+        );
+        let response = serde_json::json!({
+            "account": {
+                "uuid": "account-uuid-973",
+                "email": "owner@example.test",
+                "display_name": "Account Owner",
+                "full_name": "Owner Example"
+            },
+            "organization": {
+                "uuid": "organization-uuid-973",
+                "name": "Personal",
+                "organization_type": "claude_max"
+            }
+        })
+        .to_string();
+        write_http(&mut stream, 200, &[], response.as_bytes()).await;
         return;
     }
     if target == "/resource" {
@@ -1385,6 +1424,12 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         anthropic.token_endpoint,
         "https://console.anthropic.com/v1/oauth/token"
     );
+    assert_eq!(
+        haider_provider::oauth_identity_source(anthropic.provider_id)
+            .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+            .map(|endpoint| endpoint.url),
+        Some("https://api.anthropic.com/api/oauth/profile")
+    );
     assert_eq!(anthropic.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     // Claude Code 2.1.220 parity (W5g-7): the consent page derives its
     // permission items from these, same set, same order.
@@ -1879,8 +1924,8 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
         Some("fake-person@example.invalid")
     );
     assert_eq!(
-        account_identity.account_id.as_deref(),
-        Some("fake-account-id-1")
+        account_identity.account_id, None,
+        "workspace-only JWT has no user dedupe key"
     );
     assert!(!account_identity.verified);
     assert!(bundle.id_token().is_some(), "ID token remains vault-only");
@@ -1930,6 +1975,7 @@ fn grok_cli_import_accepts_bare_and_bundle_auth_json_shapes() {
 }
 
 const GROK_SOURCE_OWNED_REFRESH: &str = "fake-grok-source-owned-refresh-9f21";
+
 const KIMI_SOURCE_OWNED_REFRESH: &str = "fake-kimi-source-owned-refresh-4c07";
 
 fn grok_source_owned_fixture() -> Vec<u8> {
@@ -2289,9 +2335,12 @@ fn denied_or_locked_native_store_never_suppresses_readable_claude_file() {
 }
 
 #[tokio::test]
-async fn anthropic_native_login_gets_a_stable_synthetic_account_identity() {
+async fn anthropic_native_login_gets_verified_profile_identity() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
-    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{}/profile", server.address))
+        .expect("test identity endpoint");
     registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
     registration.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
         display_identity: "Anthropic login".into(),
@@ -2306,21 +2355,171 @@ async fn anthropic_native_login_gets_a_stable_synthetic_account_identity() {
     })
     .to_string();
 
-    let first = token_bundle_from_response(&registration, body.as_bytes(), b"nonce", 1, None)
-        .await
-        .expect("Anthropic grant");
-    let identity = first.account_identity.as_ref().expect("synthetic identity");
-    assert!(
-        identity
-            .account_id
-            .as_deref()
-            .is_some_and(|account_id| account_id.starts_with("anthropic:"))
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let first =
+        token_bundle_from_response(&client, &registration, body.as_bytes(), b"nonce", 1, None)
+            .await
+            .expect("Anthropic grant");
+    let identity = first.account_identity.as_ref().expect("profile identity");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
     );
-    assert_eq!(identity.display_name.as_deref(), Some("Anthropic login"));
+    assert_eq!(identity.email.as_deref(), Some("owner@example.test"));
+    assert_eq!(identity.display_name.as_deref(), Some("Account Owner"));
+    assert_eq!(identity.plan.as_deref(), Some("claude_max"));
+    assert!(identity.verified);
+    assert_eq!(
+        first.identity.display_identity,
+        "owner@example.test · claude_max"
+    );
 
     let refreshed = refresh_bundle_from_response(&registration, body.as_bytes(), &first)
         .expect("refresh bundle");
     assert_eq!(refreshed.account_identity, first.account_identity);
+}
+
+#[tokio::test]
+async fn legacy_anthropic_token_can_upgrade_from_its_own_profile() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{}/profile", server.address))
+        .expect("test profile endpoint");
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let identity = legacy_anthropic_profile_identity_with_registration(
+        ACCESS_SENTINEL.as_bytes(),
+        &registration.issuer,
+        &registration,
+    )
+    .await
+    .expect("verified legacy profile");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
+    );
+    assert_eq!(identity.email.as_deref(), Some("owner@example.test"));
+    assert!(identity.verified);
+}
+
+#[tokio::test]
+async fn legacy_profile_rechecks_the_bundle_issuer_at_the_send_boundary() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{}/profile", server.address))
+        .expect("loopback profile");
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let identity = legacy_anthropic_profile_identity_with_registration(
+        ACCESS_SENTINEL.as_bytes(),
+        "http://127.0.0.1:9",
+        &registration,
+    )
+    .await;
+    assert!(
+        identity.is_none(),
+        "changed issuer must refuse the old token"
+    );
+    assert_eq!(server.state.profile_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        legacy_anthropic_profile_identity_with_registration(
+            ACCESS_SENTINEL.as_bytes(),
+            &registration.issuer,
+            &registration,
+        )
+        .await
+        .is_some(),
+        "same issuer must still reach its own profile"
+    );
+    assert_eq!(server.state.profile_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The restart, refresh and login legacy paths all call this probe. Give a
+/// child process inherited proxies, then prove the bearer reaches its issuer
+/// directly and that a profile redirect never forwards it.
+#[test]
+fn legacy_profile_probe_uses_native_http_builder_and_keeps_redirect_budget() {
+    let source = include_str!("oauth.rs");
+    let client_body = source
+        .split("async fn legacy_anthropic_profile_identity_with_registration(")
+        .nth(1)
+        .expect("legacy probe")
+        .split("async fn token_bundle_from_response(")
+        .next()
+        .expect("probe body");
+    assert!(client_body.contains("haider_platform::native_http_client_builder()"));
+    assert!(client_body.contains("Policy::none()"));
+    assert!(client_body.contains("Duration::from_secs(5)"));
+}
+
+#[tokio::test]
+async fn legacy_anthropic_profile_probe_ignores_inherited_proxy_and_redirects() {
+    const CHILD: &str = "HAIDER_LEGACY_PROFILE_PROXY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let expected_trap = std::env::var("HAIDER_LEGACY_PROFILE_TRAP").expect("trap port");
+        let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+        for (status, headers, expect_identity) in [
+            (200, vec![], true),
+            (
+                302,
+                vec![("Location", format!("{expected_trap}/stolen"))],
+                false,
+            ),
+        ] {
+            let (profile, hits) =
+                scripted_profile_server(vec![(status, headers, email_less_profile())]).await;
+            let mut registration = server
+                .registration(Arc::new(FakeIdentityVerifier))
+                .with_test_identity_endpoint(format!("http://{profile}/profile"))
+                .expect("profile endpoint");
+            registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+            let identity = legacy_anthropic_profile_identity_with_registration(
+                ACCESS_SENTINEL.as_bytes(),
+                &registration.issuer,
+                &registration,
+            )
+            .await;
+            assert_eq!(identity.is_some(), expect_identity);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "probe reached its origin directly"
+            );
+        }
+        return;
+    }
+    let trap = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy trap");
+    let trap_url = format!("http://{}", trap.local_addr().expect("trap port"));
+    let output = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("legacy_anthropic_profile_probe_ignores_inherited_proxy_and_redirects")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env("HAIDER_LEGACY_PROFILE_TRAP", &trap_url)
+        .env("HTTP_PROXY", &trap_url)
+        .env("HTTPS_PROXY", &trap_url)
+        .env("ALL_PROXY", &trap_url)
+        .env("http_proxy", &trap_url)
+        .env("https_proxy", &trap_url)
+        .env("all_proxy", &trap_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .await
+        .expect("child result");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    trap.set_nonblocking(true).expect("nonblocking trap");
+    assert!(
+        matches!(trap.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "proxy or redirect trap received a request"
+    );
 }
 
 /// MUTATION CHECK: force either body builder to ignore the registration's
@@ -4016,6 +4215,66 @@ fn broker_for(
     (broker, snapshot, descriptor)
 }
 
+/// A deliberately non-live-issued OAuth bundle accepted by its fake
+/// registration. Send-point tests must refuse it before invoking transport.
+pub(crate) async fn non_live_issued_broker_for_sendpoint(
+    provider: &str,
+) -> (CredentialBroker, CredentialDescriptor) {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = provider.to_owned();
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = provider.to_owned();
+    let mut bundle = oauth_bundle_for_test(&server, u64::MAX - 1);
+    bundle.provider_id = provider.to_owned();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("bundle encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let (sender, mut receiver) = mpsc::channel(16);
+    let actor_snapshot = snapshot.clone();
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            if let crate::accounts::AccountCommand::ResolveCredential {
+                provider,
+                completed,
+                ..
+            } = command
+            {
+                let selected = actor_snapshot
+                    .lock()
+                    .ok()
+                    .and_then(|rows| rows.iter().find(|row| row.provider == provider).cloned());
+                let result = selected.map_or_else(
+                    || {
+                        Err(HaiderError::new(
+                            ErrorCode::CredentialMissing,
+                            "synthetic account is missing",
+                            false,
+                        ))
+                    },
+                    |descriptor| {
+                        Ok(crate::accounts::ResolvedAccount {
+                            descriptor,
+                            rotation: None,
+                        })
+                    },
+                );
+                let _ = completed.send(result);
+            }
+        }
+    });
+    let broker = CredentialBroker::new(
+        vault.clone(),
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        snapshot.clone(),
+        sender,
+    )
+    .expect("broker");
+    (broker, descriptor)
+}
+
 fn serialized_registration(server: &FakeOAuthServer) -> OAuthProviderRegistration {
     server
         .registration(Arc::new(FakeIdentityVerifier))
@@ -4162,7 +4421,7 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
         panic!("third device poll must produce tokens");
     };
     let before = now_ms().expect("clock");
-    let bundle = token_bundle_from_response(&registration, &bytes, &[], 1, None)
+    let bundle = token_bundle_from_response(&client, &registration, &bytes, &[], 1, None)
         .await
         .expect("Kimi token bundle");
     assert_eq!(bundle.access_token(), ACCESS_SENTINEL.as_bytes());
@@ -5190,7 +5449,11 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
     let mut preadmitted_contender = tokio::spawn({
         let broker = broker.clone();
         let descriptor = descriptor.clone();
-        async move { broker.resolve_oauth(&descriptor, false, None).await }
+        async move {
+            broker
+                .resolve_oauth(&descriptor, false, None, &CredentialDestination::InProcess)
+                .await
+        }
     });
     let mut public_contender = tokio::spawn({
         let broker = broker.clone();
@@ -6039,11 +6302,12 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
             && source
                 .matches("reqwest::header::CONNECTION, \"close\"")
                 .count()
-                // Five key-bearing transports must each close: authorization-code
-                // exchange, refresh, the W5b.2a JWKS fetch, and the B6k Kimi
-                // device-authorization and device-token-poll requests (both feed
-                // bounded_response, so their source chunks join the same scrub).
-                == 5
+                // Six key-bearing transports must each close: authorization-code
+                // exchange, refresh, authenticated identity lookup, the W5b.2a
+                // JWKS fetch, and the B6k Kimi device-authorization and
+                // device-token-poll requests (all bounded responses join the
+                // same source-chunk scrub discipline).
+                == 6
             && source.contains("chunk.as_mut().zeroize();"),
         "token and JWKS transports must close before every source chunk is mutable-owned and scrubbed"
     );
@@ -6385,6 +6649,794 @@ fn registered_redirects_match_provider_clients_and_others_stay_hardened() {
 #[test]
 fn default_flow_ttl_is_at_least_ten_minutes() {
     assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
+}
+
+/// One scripted profile answer: status, extra headers, body.
+type ScriptedProfileResponse = (u16, Vec<(&'static str, String)>, String);
+
+/// A scripted `/api/oauth/profile` stand-in: answers each request with the
+/// next `(status, headers, body)` and counts requests.
+async fn scripted_profile_server(
+    script: Vec<ScriptedProfileResponse>,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind profile");
+    let address = listener.local_addr().expect("profile address");
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        for (status, headers, body) in script {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.starts_with("GET /profile "));
+            assert!(text.contains(&format!("Bearer {ACCESS_SENTINEL}")));
+            counter.fetch_add(1, Ordering::SeqCst);
+            write_http(&mut stream, status, &headers, body.as_bytes()).await;
+        }
+    });
+    (address, hits)
+}
+
+async fn anthropic_login_against_profile(
+    script: Vec<ScriptedProfileResponse>,
+) -> (OAuthTokenBundleV1, usize) {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let (profile, hits) = scripted_profile_server(script).await;
+    let mut registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_identity_endpoint(format!("http://{profile}/profile"))
+        .expect("test identity endpoint");
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    registration.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
+        display_identity: "Claude Max subscription".into(),
+    };
+    registration.scopes = SCOPES.split_ascii_whitespace().map(str::to_owned).collect();
+    let body = serde_json::json!({
+        "access_token": ACCESS_SENTINEL,
+        "refresh_token": REFRESH_SENTINEL,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": SCOPES
+    })
+    .to_string();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let bundle =
+        token_bundle_from_response(&client, &registration, body.as_bytes(), b"nonce", 1, None)
+            .await
+            .expect("a successful token exchange never fails on the profile");
+    (bundle, hits.load(Ordering::SeqCst))
+}
+
+fn email_less_profile() -> String {
+    serde_json::json!({
+        "account": {"uuid": "account-uuid-973", "display_name": "No Email"},
+        "organization": {"uuid": "organization-uuid-973", "organization_type": "claude_max"}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn anthropic_profile_retries_429_and_5xx_and_accepts_missing_email() {
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (503, vec![], "busy".into()),
+        (429, vec![("Retry-After", "0".into())], "slow down".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 3, "two transient failures then success");
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("account=account-uuid-973;organization=organization-uuid-973")
+    );
+    assert_eq!(identity.email, None, "email is informational only");
+    assert!(identity.verified);
+}
+
+#[tokio::test]
+async fn anthropic_profile_outage_saves_unverified_identity_after_bounded_retries() {
+    let started = std::time::Instant::now();
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (503, vec![("Retry-After", "600".into())], "down".into()),
+        (500, vec![], "down".into()),
+        (502, vec![], "down".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 3, "retries are bounded to three attempts");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Retry-After is capped"
+    );
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert!(!identity.verified);
+    assert!(
+        identity
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("anthropic:"))
+    );
+    let principal = haider_protocol::credential::AccountPrincipal::new(
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        Some(identity),
+    )
+    .expect("principal");
+    assert!(principal.identity_unverified());
+    assert_eq!(principal.stable_account_id(), None, "never deduplicated");
+    assert_eq!(bundle.access_token(), ACCESS_SENTINEL.as_bytes());
+}
+
+#[tokio::test]
+async fn anthropic_profile_rejection_is_not_retried_but_login_still_saves() {
+    let (bundle, hits) = anthropic_login_against_profile(vec![
+        (403, vec![], "forbidden".into()),
+        (200, vec![], email_less_profile()),
+    ])
+    .await;
+    assert_eq!(hits, 1, "4xx other than 429 is not retried");
+    let identity = bundle.account_identity.as_ref().expect("identity");
+    assert!(!identity.verified);
+    assert!(
+        haider_protocol::credential::AccountPrincipal::new(
+            haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+            Some(identity)
+        )
+        .is_some_and(haider_protocol::credential::AccountPrincipal::identity_unverified)
+    );
+}
+
+/// The debug-only fake-OAuth hook accepts ONLY an `http://127.x.y.z:<port>`
+/// origin; anything else is refused (and would disable the provider).
+#[cfg(debug_assertions)]
+#[test]
+fn debug_fake_oauth_origin_is_numeric_loopback_only() {
+    use super::debug_fake_oauth::parse_origin;
+    assert!(parse_origin("http://127.0.0.1:43123").is_some());
+    assert!(parse_origin("http://127.0.0.1:43123/").is_some());
+    assert!(parse_origin("http://127.9.8.7:80").is_some());
+    for rejected in [
+        "https://127.0.0.1:43123",
+        "http://localhost:43123",
+        "http://[::1]:43123",
+        "http://10.0.0.1:43123",
+        "http://claude.ai:443",
+        "http://127.0.0.1",
+        "http://127.0.0.1:43123/oauth",
+        "http://127.0.0.1:43123/?x=1",
+        "http://user:pw@127.0.0.1:43123",
+        "http://127.0.0.1:43123/#frag",
+        "not a url",
+    ] {
+        assert!(
+            parse_origin(rejected).is_none(),
+            "{rejected} must be refused"
+        );
+    }
+}
+
+/// The hook rewrites every token-bearing endpoint AND the issuer, so a
+/// live-issued bundle can never validate against the fake registration.
+#[cfg(debug_assertions)]
+#[test]
+fn debug_fake_oauth_rewrites_endpoints_and_issuer() {
+    let live = OAuthProviderCatalog::default()
+        .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+        .expect("anthropic registration");
+    assert_eq!(live.issuer, "https://claude.ai");
+    let origin = super::debug_fake_oauth::parse_origin("http://127.0.0.1:43123").expect("origin");
+    let fake = super::debug_fake_oauth::apply_origin((*live).clone(), &origin).expect("fake");
+    assert_eq!(fake.issuer, "http://127.0.0.1:43123");
+    assert_eq!(
+        fake.authorization_endpoint.as_str(),
+        "http://127.0.0.1:43123/oauth/authorize"
+    );
+    assert_eq!(
+        fake.token_endpoint.as_str(),
+        "http://127.0.0.1:43123/oauth/token"
+    );
+    assert_eq!(
+        fake.identity_endpoint.as_ref().map(Url::as_str),
+        Some("http://127.0.0.1:43123/api/oauth/profile")
+    );
+    assert_ne!(fake.issuer, live.issuer);
+}
+
+/// A bundle issued by another authority (e.g. a live Claude token while the
+/// registration points at a debug fake) never leaves the process on refresh.
+#[tokio::test]
+async fn refresh_never_sends_a_token_to_a_registration_that_did_not_issue_it() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    let descriptor = oauth_descriptor_for_test();
+    let expired = now_ms().expect("clock").saturating_sub(1);
+    let foreign = OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "https://claude.ai".into(),
+        AUDIENCE.into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(b"ACCESS_FOREIGN_SENTINEL_51c0".to_vec()),
+        Some(Zeroizing::new(b"REFRESH_FOREIGN_SENTINEL_77e2".to_vec())),
+        expired,
+        Some(expired.saturating_add(3_600_000)),
+        SCOPES.split_ascii_whitespace().map(str::to_owned).collect(),
+        OAuthIdentityV1 {
+            subject_hash: "foreign-subject".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("foreign bundle");
+    vault
+        .put(&descriptor.alias, &foreign.encode().expect("encode"))
+        .expect("seed");
+    let (broker, _snapshot, descriptor) = broker_for(&server, Arc::clone(&vault), descriptor);
+    let _ = broker.resolve(&descriptor).await;
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Stage-8 depth guard: credential imports stamp the RELEASED issuer from a
+/// catalog the debug hook never rewrites, and the fake-mode gate is open when
+/// the hook is not armed. (Hook-armed refusal runs in an isolated child:
+/// `accounts_tests::v2_fake_oauth_mode_refuses_claude_import_adoption_and_heal`.)
+#[test]
+fn v2_imports_stamp_the_live_issuer_and_the_gate_is_open_without_the_hook() {
+    assert_eq!(
+        OAuthProviderCatalog::live()
+            .registration_issuer(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+            .as_deref(),
+        Some("https://claude.ai")
+    );
+    if std::env::var_os("HAIDER_TEST_FAKE_OAUTH_ORIGIN").is_none() {
+        assert!(
+            require_live_oauth_provider(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME).is_ok()
+        );
+    }
+    let source = include_str!("oauth.rs").replace("\r\n", "\n");
+    let start = source
+        .find("fn load_oauth_import_material_from_input(")
+        .expect("import loader");
+    let body = &source[start..start + 1800];
+    assert!(
+        body.contains("OAuthProviderCatalog::live()"),
+        "imports must use the live catalog"
+    );
+    assert!(!body.contains("OAuthProviderCatalog::default()"));
+    assert!(body.contains("require_live_oauth_provider(spec.provider)?"));
+}
+
+/// Repair 6 data-plane guard (every build): a token whose bundle was minted
+/// by anything other than the provider's LIVE issuer never goes to a
+/// non-loopback endpoint. Only a numeric-loopback destination may receive it.
+#[tokio::test]
+async fn v2_non_live_issued_tokens_only_ever_reach_loopback() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let mut bundle = oauth_bundle_for_test(&server, u64::MAX - 1);
+    bundle.provider_id = descriptor.provider.clone();
+    assert_ne!(
+        Some(bundle.issuer.as_str()),
+        live_issuer(&descriptor.provider)
+    );
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault),
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, Arc::clone(&vault)),
+    )
+    .expect("broker");
+
+    // Real endpoints (inference, usage, catalog): refused, typed, before any send.
+    let error = broker
+        .resolve_remote(&descriptor)
+        .await
+        .expect_err("a non-live-issued token must not reach a real endpoint");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(
+        error
+            .message
+            .contains("never sent to a non-loopback endpoint")
+    );
+    let error = broker
+        .refresh_after_auth_failure_remote(&descriptor, None)
+        .await
+        .expect_err("nor after an auth failure");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    // The loopback data plane may receive it; a live URL may not pose as one.
+    let loopback = Url::parse(&format!("http://{}/v1/models", server.address)).expect("url");
+    assert!(
+        broker
+            .resolve_to_loopback(&descriptor, &loopback)
+            .await
+            .is_ok()
+    );
+    let other_loopback = Url::parse("http://127.0.0.1:9/v1/models").expect("other origin");
+    assert_eq!(
+        broker
+            .resolve_to_loopback(&descriptor, &other_loopback)
+            .await
+            .expect_err("fake bearer belongs to its own origin")
+            .code,
+        ErrorCode::Unauthorized
+    );
+    for fake_loopback in [
+        "https://api.anthropic.com/v1/models",
+        "http://localhost:9/v1/models",
+        "https://127.0.0.1:9/v1/models",
+    ] {
+        let url = Url::parse(fake_loopback).expect("url");
+        assert!(
+            broker.resolve_to_loopback(&descriptor, &url).await.is_err(),
+            "{fake_loopback}"
+        );
+    }
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+
+    // An unknown issuer cannot be approved for a remote destination.
+    let mut test_only = descriptor.clone();
+    test_only.provider = "fake-oauth".to_owned();
+    assert_eq!(
+        ensure_live_issuer_for_remote(&test_only, &bundle)
+            .expect_err("an unknown issuer cannot authorize a remote destination")
+            .code,
+        ErrorCode::Unauthorized
+    );
+    // A live-issued bundle is unaffected (bundles deliberately have no Clone).
+    bundle.issuer = "https://claude.ai".to_owned();
+    assert!(ensure_live_issuer_for_remote(&descriptor, &bundle).is_ok());
+    assert!(broker.shutdown().await);
+}
+
+/// The first read imitates the old preflight guard. Immediately after it,
+/// the vault switches to a fake-issued bundle. The returned token must still
+/// be checked against the remote destination.
+struct IssuerSwapVault {
+    inner: MemoryVault,
+    replacement: Zeroizing<Vec<u8>>,
+    reads: AtomicUsize,
+}
+
+impl Vault for IssuerSwapVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+        self.inner.put(alias, secret)
+    }
+    fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+        let current = self.inner.resolve(alias)?;
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.inner.put(alias, self.replacement.as_slice())?;
+        }
+        Ok(current)
+    }
+    fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+#[tokio::test]
+async fn remote_resolution_checks_the_returned_bundle_after_issuer_swap() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = registration.provider_id.clone();
+    let mut bundle = oauth_bundle_for_test(&server, u64::MAX - 1);
+    bundle.provider_id = descriptor.provider.clone();
+    let replacement = bundle.encode().expect("fake bundle");
+    bundle.issuer = "https://claude.ai".into();
+    let vault = Arc::new(IssuerSwapVault {
+        inner: MemoryVault::new(),
+        replacement,
+        reads: AtomicUsize::new(0),
+    });
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("live bundle"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault) as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, Arc::clone(&vault) as Arc<dyn Vault>),
+    )
+    .expect("broker");
+    let error = broker
+        .resolve_remote(&descriptor)
+        .await
+        .expect_err("foreign or fake token refused");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(
+        vault.reads.load(Ordering::SeqCst) >= 1,
+        "the vault swap must have happened"
+    );
+    let stored = vault
+        .inner
+        .resolve(&descriptor.alias)
+        .expect("replacement is durable");
+    assert_eq!(
+        OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("replacement bundle")
+            .issuer,
+        server.state.issuer
+    );
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+    assert!(broker.shutdown().await);
+}
+
+#[tokio::test]
+async fn loopback_resolution_refuses_a_live_issued_bundle() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    registration.issuer = "https://claude.ai".into();
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = registration.provider_id.clone();
+    let mut bundle = oauth_bundle_for_test(&server, u64::MAX - 1);
+    bundle.provider_id = descriptor.provider.clone();
+    bundle.issuer = registration.issuer.clone();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone(),
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        snapshot.clone(),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("broker");
+    let destination = Url::parse("http://127.0.0.1:9/v1/models").expect("loopback");
+    let error = broker
+        .resolve_to_loopback(&descriptor, &destination)
+        .await
+        .expect_err("live token cannot enter fake plane");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+}
+
+pub(crate) fn live_issued_broker_for_sendpoint(
+    provider: &str,
+) -> (CredentialBroker, CredentialDescriptor, String) {
+    let registration = OAuthProviderCatalog::live()
+        .registration(provider)
+        .expect("live registration");
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = provider.to_owned();
+    let now = now_ms().expect("clock");
+    let token = format!("fake-live-issued-{provider}");
+    let bundle = OAuthTokenBundleV1::new(
+        provider.to_owned(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(token.as_bytes().to_vec()),
+        Some(Zeroizing::new(b"fake-refresh".to_vec())),
+        now + 3_600_000,
+        Some(now + 7_200_000),
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "synthetic-subject".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("live-shaped bundle")
+    .with_refresh_after(now + 3_000_000);
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone(),
+        isolated_oauth_catalog_for_test(),
+        snapshot.clone(),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("broker");
+    (broker, descriptor, token)
+}
+
+#[tokio::test]
+async fn all_sanctioned_live_issued_bundles_still_resolve_remote() {
+    for provider in [
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        haider_provider::GROK_OAUTH_PROVIDER_NAME,
+    ] {
+        let (broker, descriptor, token) = live_issued_broker_for_sendpoint(provider);
+        let resolved = broker
+            .resolve_remote(&descriptor)
+            .await
+            .expect("live issuer accepted");
+        assert_eq!(resolved.expose_secret(), token.as_bytes());
+        assert!(broker.shutdown().await);
+    }
+}
+
+#[tokio::test]
+async fn all_sanctioned_live_issued_bundles_still_refresh_remote() {
+    for provider in [
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        haider_provider::GROK_OAUTH_PROVIDER_NAME,
+    ] {
+        // Only the issuer has the live shape. The minting registration's
+        // token endpoint stays on this synthetic loopback server.
+        let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+        let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+        registration.provider_id = provider.to_owned();
+        registration.issuer = live_issuer(provider).expect("live issuer").to_owned();
+        let mut descriptor = oauth_descriptor_for_test();
+        descriptor.provider = provider.to_owned();
+        let mut bundle = oauth_bundle_for_test(&server, now_ms().expect("clock") - 1);
+        bundle.provider_id = provider.to_owned();
+        bundle.issuer = registration.issuer.clone();
+        let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+        vault
+            .put(&descriptor.alias, &bundle.encode().expect("encode"))
+            .expect("seed live-shaped bundle");
+        let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+        let broker = CredentialBroker::new(
+            Arc::clone(&vault),
+            OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+            Arc::clone(&snapshot),
+            start_status_actor(&snapshot, Arc::clone(&vault)),
+        )
+        .expect("broker");
+
+        let resolved = broker
+            .resolve_remote(&descriptor)
+            .await
+            .expect("expired live-issued bundle refreshes before remote use");
+        assert_eq!(resolved.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+        let retried = broker
+            .refresh_after_auth_failure_remote(&descriptor, None)
+            .await
+            .expect("live-issued bundle refreshes after a remote auth failure");
+        assert_eq!(retried.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+        assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 2);
+        let stored = vault
+            .resolve(&descriptor.alias)
+            .and_then(|secret| OAuthTokenBundleV1::decode(secret.expose_secret()))
+            .expect("durable refreshed bundle");
+        assert_eq!(stored.issuer, live_issuer(provider).expect("live issuer"));
+        assert_eq!(stored.generation, 3);
+        assert!(broker.shutdown().await);
+    }
+}
+
+#[tokio::test]
+async fn remote_resolution_fails_closed_on_missing_and_undecodable_vault_bundles() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = registration.provider_id.clone();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone(),
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        snapshot.clone(),
+        start_status_actor(&snapshot, vault.clone()),
+    )
+    .expect("broker");
+    assert!(
+        broker.resolve_remote(&descriptor).await.is_err(),
+        "missing vault read refused"
+    );
+    vault
+        .put(&descriptor.alias, b"not-an-oauth-bundle")
+        .expect("corrupt bundle");
+    assert!(
+        broker.resolve_remote(&descriptor).await.is_err(),
+        "decode failure refused"
+    );
+    assert!(broker.shutdown().await);
+    let mut valid = oauth_bundle_for_test(&server, u64::MAX - 1);
+    valid.provider_id = descriptor.provider.clone();
+    vault
+        .put(&descriptor.alias, &valid.encode().expect("valid bundle"))
+        .expect("restore bundle");
+    let without_registration = CredentialBroker::new(
+        vault.clone(),
+        OAuthProviderCatalog::with_test_registrations(
+            std::iter::empty::<OAuthProviderRegistration>(),
+        )
+        .expect("empty test catalog"),
+        snapshot.clone(),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("broker without registration");
+    assert_eq!(
+        without_registration
+            .resolve_remote(&descriptor)
+            .await
+            .expect_err("missing registration refused")
+            .code,
+        ErrorCode::Unauthorized
+    );
+}
+
+/// Park a follower on each completion arm, then rotate BOTH the vault and
+/// injected registration before waking it. Validation alone accepts the new
+/// registration: the destination check must reject its different authority.
+/// All registration endpoints stay loopback, even in a guard-removed build.
+#[tokio::test]
+async fn flight_completion_rechecks_the_returned_issuer_for_every_destination() {
+    for imported in [false, true] {
+        for remote in [false, true] {
+            for change_issuer in [false, true] {
+                let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+                let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+                registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.into();
+                let mut descriptor = oauth_descriptor_for_test();
+                descriptor.provider = registration.provider_id.clone();
+                let mut bundle = oauth_bundle_for_test(&server, now_ms().expect("clock") - 1);
+                bundle.provider_id = descriptor.provider.clone();
+                if remote {
+                    bundle.issuer = live_issuer(&descriptor.provider)
+                        .expect("live issuer")
+                        .into();
+                }
+                registration.issuer = bundle.issuer.clone();
+                let catalog = OAuthProviderCatalog::with_test_registrations([registration.clone()])
+                    .expect("injected catalog");
+                let vault: Arc<dyn Vault> = Arc::new(MemoryVault::new());
+                vault
+                    .put(&descriptor.alias, &bundle.encode().expect("initial bundle"))
+                    .expect("seed");
+                let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+                let broker = CredentialBroker::new(
+                    vault.clone(),
+                    catalog.clone(),
+                    snapshot.clone(),
+                    start_status_actor(&snapshot, vault.clone()),
+                )
+                .expect("broker");
+                let flight = Arc::new(RefreshFlight::new());
+                let key = RefreshKey {
+                    provider: descriptor.provider.clone(),
+                    alias: descriptor.alias.as_str().into(),
+                    generation: bundle.generation,
+                    issuer: bundle.issuer.clone(),
+                    subject_hash: bundle.identity.subject_hash.clone(),
+                    fence_epoch: 0,
+                };
+                broker
+                    .inner
+                    .flights
+                    .lock()
+                    .expect("flights")
+                    .insert(key.clone(), flight.clone());
+                let resolving = {
+                    let broker = broker.clone();
+                    let descriptor = descriptor.clone();
+                    let url =
+                        Url::parse(&format!("http://{}/models", server.address)).expect("url");
+                    tokio::spawn(async move {
+                        if remote {
+                            broker.resolve_remote(&descriptor).await
+                        } else {
+                            broker.resolve_to_loopback(&descriptor, &url).await
+                        }
+                    })
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while Arc::strong_count(&flight) < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("follower waiting on flight");
+                if change_issuer {
+                    bundle.issuer = if remote {
+                        server.state.issuer.clone()
+                    } else {
+                        live_issuer(&descriptor.provider)
+                            .expect("live issuer")
+                            .into()
+                    };
+                    registration.issuer = bundle.issuer.clone();
+                    catalog
+                        .test_registrations
+                        .as_ref()
+                        .expect("test catalog")
+                        .lock()
+                        .expect("registrations")
+                        .insert(descriptor.provider.clone(), Arc::new(registration));
+                }
+                bundle = OAuthTokenBundleV1::new(
+                    bundle.provider_id.clone(),
+                    bundle.issuer.clone(),
+                    bundle.audience.clone(),
+                    bundle.resource.clone(),
+                    bundle.token_type.clone(),
+                    Zeroizing::new(b"FLIGHT_ROTATED_SYNTHETIC_ACCESS".to_vec()),
+                    bundle
+                        .refresh_token()
+                        .map(|token| Zeroizing::new(token.to_vec())),
+                    now_ms().expect("clock") + 3_600_000,
+                    bundle.refresh_expires_at_unix_ms,
+                    bundle.granted_scopes.clone(),
+                    bundle.identity.clone(),
+                    bundle.generation + 1,
+                )
+                .expect("rotated bundle");
+                vault
+                    .put(&descriptor.alias, &bundle.encode().expect("replacement"))
+                    .expect("publish");
+                let outcome = if imported {
+                    RefreshFlightOutcome::Imported(refresh_fence(&bundle, 0))
+                } else {
+                    RefreshFlightOutcome::Refreshed
+                };
+                flight.finish(Ok(outcome));
+                let result = resolving.await.expect("resolver joined");
+                if change_issuer {
+                    let error = result
+                        .expect_err("flight must recheck the destination before returning bytes");
+                    assert_eq!(error.code, ErrorCode::Unauthorized);
+                } else {
+                    assert_eq!(
+                        result
+                            .expect("same-issuer completion accepted")
+                            .expose_secret(),
+                        bundle.access_token()
+                    );
+                }
+                assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(server.state.profile_calls.load(Ordering::SeqCst), 0);
+                broker.inner.flights.lock().expect("flights").remove(&key);
+                assert!(broker.shutdown().await);
+            }
+        }
+    }
+}
+
+/// Preserve the sanctioned issuer/claims while isolating every transport URL.
+/// Actors may refresh a synthetic live-shaped row even after a guard mutation.
+pub(crate) fn isolated_oauth_catalog_for_test() -> OAuthProviderCatalog {
+    let origin = debug_fake_oauth::parse_origin("http://127.0.0.1:9").expect("loopback origin");
+    let registrations = SANCTIONED_PROVIDER_REGISTRATIONS.iter().map(|metadata| {
+        let live = OAuthProviderCatalog::live()
+            .registration(metadata.provider_id)
+            .expect("sanctioned");
+        let mut registration =
+            debug_fake_oauth::apply_origin((*live).clone(), &origin).expect("loopback endpoints");
+        registration.issuer = live.issuer.clone();
+        registration
+    });
+    OAuthProviderCatalog::with_test_registrations(registrations).expect("isolated catalog")
 }
 
 #[tokio::test]

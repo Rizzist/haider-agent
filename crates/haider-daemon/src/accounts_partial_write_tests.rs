@@ -14,6 +14,7 @@ impl ProviderModelDiscoverer for UnavailableCatalog {
     async fn discover(
         &self,
         _: CatalogSource,
+        _: CatalogDestination,
         _: Option<&str>,
         _: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
@@ -113,7 +114,12 @@ async fn source_case(kind: CredentialSourceKind, entry: &str, same_account: bool
         Arc::new(CachedProviderModelSource::default()),
     )
     .expect("providers");
-    providers.replace_discovered_models(provider.into(), vec![fetched_model("a-private-only")], 1);
+    providers.replace_owned_discovered_models(
+        provider.into(),
+        vec![fetched_model("a-private-only")],
+        1,
+        Some(ProviderModelCacheKey::for_account(provider, &a)),
+    );
     reconcile_catalog_selection_scope(provider, &accounts, &mut providers);
     providers
         .set_default_model(provider, "a-private-only")
@@ -353,10 +359,16 @@ async fn configuration_case(repoint: bool, overflow: bool, permanent: bool) {
             created_at_ms: None,
         })
         .expect("account A");
-    providers.replace_discovered_models(
+    providers.replace_owned_discovered_models(
         OPENAI_PROVIDER_NAME.into(),
         vec![fetched_model("a-private-only")],
         1,
+        Some(ProviderModelCacheKey::for_account(
+            OPENAI_PROVIDER_NAME,
+            accounts
+                .active_for_provider(OPENAI_PROVIDER_NAME)
+                .expect("account A"),
+        )),
     );
     reconcile_catalog_selection_scope(OPENAI_PROVIDER_NAME, &accounts, &mut providers);
     let chosen = if permanent {

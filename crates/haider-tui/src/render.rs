@@ -1260,7 +1260,7 @@ fn image_reveal_hits(
         let TurnItem::Extension { kind, data } = &block.item else {
             continue;
         };
-        let Some((image, _)) = crate::projection::image_created_fact(kind, data) else {
+        let Some(image) = crate::projection::image_created(kind, data) else {
             continue;
         };
         let start = prefix_rows.saturating_add(cache.row_start(projection, index));
@@ -3245,6 +3245,56 @@ fn derived_antigravity_source(row: &crate::app::AccountRow) -> crate::app::Accou
     }
 }
 
+/// The full notice is a separate paged surface; actions and the exit stay pinned.
+fn render_account_notice(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let width = usize::from(area.width.saturating_sub(1)).max(1);
+    let text = model
+        .accounts
+        .message_details
+        .as_ref()
+        .or(model.accounts.message.as_ref())
+        .map_or("", String::as_str);
+    let lines = text
+        .lines()
+        .flat_map(|line| wrap_words(line, width))
+        .map(Line::raw)
+        .collect::<Vec<_>>();
+    let action = model.accounts.message_action.as_deref().unwrap_or("");
+    let action_lines = wrap_words(action, width)
+        .into_iter()
+        .map(|line| Line::styled(line, theme.gold_style()))
+        .collect::<Vec<_>>();
+    let band = bottom_band(model, theme, frame, area, BandHeights::new(1, 1, 1), hits);
+    let [title, body, command] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(action_lines.len() as u16),
+    ])
+    .areas(band.content);
+    frame.render_widget(Paragraph::new("ACCOUNT NOTICE"), title);
+    let max = lines.len().saturating_sub(usize::from(body.height));
+    model.accounts.message_scroll_max.set(max);
+    let offset = model.accounts.message_scroll.get().min(max);
+    model.accounts.message_scroll.set(offset);
+    let visible = lines
+        .into_iter()
+        .skip(offset)
+        .take(usize::from(body.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), body);
+    frame.render_widget(Paragraph::new(action_lines), command);
+    frame.render_widget(
+        Paragraph::new("↑↓ PgUp/PgDn Home/End scroll · F2 / esc close notice"),
+        band.slot,
+    );
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -3252,6 +3302,10 @@ fn render_accounts(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    if model.accounts.message_expanded {
+        render_account_notice(model, theme, frame, area, hits);
+        return;
+    }
     // Declared BEFORE `lines` so the derived rows outlive the frame that
     // borrows them. A Google account that the daemon DID enrol a source for
     // keeps that source and gets no second badge.
@@ -3284,7 +3338,10 @@ fn render_accounts(
     // The body line the row cursor sits on, for the follow latch.
     let mut cursor_line: Option<usize> = None;
 
-    lines.push(Line::from(vec![
+    // Action feedback is pinned separately from the scrolling roster so it
+    // remains visible even when the selected account is at the bottom.
+    let mut notice_lines = Vec::new();
+    notice_lines.push(Line::from(vec![
         Span::styled(
             "ACCOUNTS",
             theme
@@ -3296,17 +3353,41 @@ fn render_accounts(
             theme.dim_style(),
         ),
     ]));
-    // The action note rides under the head — EXCEPT while the 971 F1(b)
-    // replace confirm is up: that one line belongs beside the form it is
-    // asking about, down in the card block, not at the top of a body the
-    // reader has scrolled away from.
+    model.accounts.message_expandable.set(false);
+    // Replacement confirmation still belongs beside its owning form.
     if let Some(message) = model
         .accounts
         .message
         .as_ref()
         .filter(|_| model.accounts.pending_replace.is_none())
     {
-        lines.push(Line::styled(message.clone(), theme.gold_style()));
+        // Word-wrapped: a re-login/duplicate notice routinely exceeds the
+        // width, and the body paragraph does not wrap (a clipped notice hid
+        // WHICH alias was saved and that the old one still needs attention).
+        // One column stays free for the `⋮` scroll gutter.
+        let width = usize::from(area.width.saturating_sub(1)).max(1);
+        let wrapped = message
+            .lines()
+            .flat_map(|line| wrap_words(line, width))
+            .collect::<Vec<_>>();
+        let bounded = wrapped.len() > 4;
+        for (index, chunk) in wrapped.iter().enumerate() {
+            // Keep the bounded alias summary at the end even when a long
+            // saved-account explanation consumes the opening rows.
+            if !bounded || index < 2 || index >= wrapped.len() - 2 {
+                notice_lines.push(Line::styled(chunk.clone(), theme.gold_style()));
+            }
+        }
+        let expandable = bounded || model.accounts.message_details.is_some();
+        model.accounts.message_expandable.set(expandable);
+        if expandable {
+            notice_lines.push(Line::styled("… · F2 full notice", theme.gold_style()));
+        }
+        if let Some(action) = &model.accounts.message_action {
+            for chunk in wrap_words(action, width) {
+                notice_lines.push(Line::styled(chunk, theme.gold_style()));
+            }
+        }
     }
     // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
     // no policy gate and carries this STANDING disclosure instead — one
@@ -3339,10 +3420,16 @@ fn render_accounts(
     lines.push(Line::raw(""));
 
     // Provider groups in FIRST-SEEN order (sim: Set insertion order over
-    // the account list, tui.js:3593).
+    // the account list, tui.js:3593) — the ONE display-order rule, shared
+    // with the cursor: `AccountsState` stores `rows` in this order, so the
+    // stored index drawn here is the index ↑/↓ step through.
+    let ordered_rows = crate::display_order::group_by_first_seen(
+        model.accounts.rows.iter().enumerate().collect::<Vec<_>>(),
+        |&(_, row)| row.provider.as_str(),
+    );
     let mut providers: Vec<&str> = Vec::new();
-    for row in &model.accounts.rows {
-        if !providers.contains(&row.provider.as_str()) {
+    for (_, row) in &ordered_rows {
+        if providers.last() != Some(&row.provider.as_str()) {
             providers.push(&row.provider);
         }
     }
@@ -3371,11 +3458,8 @@ fn render_accounts(
             header.push(Span::styled(format!(" · {url}"), theme.faint_style()));
         }
         lines.push(Line::from(header));
-        for (index, row) in model
-            .accounts
-            .rows
+        for &(index, row) in ordered_rows
             .iter()
-            .enumerate()
             .filter(|(_, row)| row.provider == provider)
         {
             let selected = row.selected;
@@ -3726,7 +3810,13 @@ fn render_accounts(
         theme.faint_style(),
     );
     let band = bottom_band(model, theme, frame, area, BandHeights::new(1, 1, 1), hits);
-    let inner = band.content;
+    let notice_height = u16::try_from(notice_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(band.content.height.saturating_sub(1));
+    let [notice_area, inner] =
+        Layout::vertical([Constraint::Length(notice_height), Constraint::Min(0)])
+            .areas(band.content);
+    frame.render_widget(Paragraph::new(notice_lines), notice_area);
     // The pin ladder INSIDE the band's content. Everything is pinned while
     // the roster still gets a few rows; under pressure the pending FORM
     // unpins first (the scroll body keeps it in view by itself, below), then
@@ -3737,11 +3827,16 @@ fn render_accounts(
         u16::try_from(pinned).is_ok_and(|height| inner.height.saturating_sub(height) >= BODY_MIN)
     };
     let pin_card = room(card_lines.len() + grid_lines.len());
-    let pin_grid = if pin_card {
-        true
-    } else {
-        room(grid_lines.len())
-    };
+    // Once the form joins the scrolling body, reserve its inked rows before
+    // pinning the provider grid. Pinned feedback already consumed part of
+    // `inner`; BODY_MIN alone can leave the form title above the viewport.
+    let card_height = card_lines
+        .iter()
+        .rposition(|line| line.width() > 0)
+        .map_or(0, |last| last + 1);
+    let body_min = usize::from(BODY_MIN).max(card_height);
+    let pin_grid =
+        pin_card || usize::from(inner.height).saturating_sub(grid_lines.len()) >= body_min;
 
     // Column rects that live in BODY coordinates and therefore scroll.
     let mut body_column_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
@@ -7198,6 +7293,7 @@ fn render_session(
         let max_scroll = render_file_review_document(
             review,
             selected,
+            &model.tool_path_context(),
             theme,
             frame,
             transcript_area,
@@ -9673,6 +9769,42 @@ fn graph_strip_line(theme: &Theme, status: &haider_protocol::graph::GraphStatus)
 /// Round 4 — plain character wrap for /loom detail lines: the screen
 /// scrolls VERTICALLY with exact line math (no Paragraph wrap), so long
 /// job/pipe lines fold here instead of clipping.
+/// Greedy word wrap by terminal cells; a word wider than `width` falls back
+/// to [`wrap_plain`]'s cell folding.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        let needed = if current.is_empty() {
+            word.width()
+        } else {
+            current.width() + 1 + word.width()
+        };
+        if needed <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if word.width() > width {
+            let mut folded = wrap_plain(word, width);
+            current = folded.pop().unwrap_or_default();
+            lines.extend(folded);
+        } else {
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     // Round 5: fold by TERMINAL CELLS, not scalars — CJK/emoji are two
@@ -12418,6 +12550,15 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
+            TranscriptEntry::Workspace { event } => {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        crate::toolview::workspace_event_text(event, &model.tool_path_context()),
+                        theme.dim_style(),
+                    ),
+                ]));
+            }
             TranscriptEntry::Refusal {
                 provider,
                 tool,
@@ -12978,6 +13119,7 @@ fn render_plan_document(
 fn render_file_review_document(
     review: &haider_protocol::file_review::FileReview,
     hunk_index: usize,
+    paths: &crate::toolview::PathContext,
     theme: &Theme,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -12997,7 +13139,7 @@ fn render_file_review_document(
         Span::raw(" "),
         Span::styled(format!("◇ {operation} "), theme.gold_style()),
         Span::styled("· ", theme.dim_style()),
-        Span::styled(review.path.clone(), theme.bright_style()),
+        Span::styled(paths.shorten(&review.path), theme.bright_style()),
         Span::styled(
             format!(
                 " · +{} -{} · hunk {}/{}{}",
@@ -14004,7 +14146,7 @@ fn render_composer(
                     "  "
                 };
                 Line::styled(
-                    format!(" {marker}@{}", candidate),
+                    format!(" {marker}@{}", model.display_path(candidate)),
                     if index == completion.selected {
                         theme.menu_style()
                     } else {
@@ -14179,7 +14321,11 @@ fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
 
 /// T2 — the `/talk` setup card's band lines. Handed STATES, never the
 /// key: the key field renders a capped mask length (the login-card law).
-fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Line<'static>> {
+fn talk_setup_lines(
+    model: &AppModel,
+    card: &crate::talk::TalkSetupCard,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     use crate::talk::{KeyStage, RuntimeRowState, SetupStage, WhisperRowState};
     const MASK_CAP: usize = 32;
     let mut lines = Vec::new();
@@ -14249,7 +14395,9 @@ fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Lin
                 let runtime_selected = card.selection == card.whisper.len();
                 let (runtime_text, runtime_style) = match &card.runtime {
                     RuntimeRowState::Unknown => ("checking…".to_owned(), theme.dim_style()),
-                    RuntimeRowState::Found(path) => (format!("✓ {path}"), theme.ok_style()),
+                    RuntimeRowState::Found(path) => {
+                        (format!("✓ {}", model.display_path(path)), theme.ok_style())
+                    }
                     RuntimeRowState::Missing(hint) => (
                         format!("✗ missing — ⏎ install · {hint}"),
                         theme.warn_style(),
@@ -14501,7 +14649,7 @@ fn composer_lines<'a>(
     // windows, no talk chip (its key field is a secret surface, exactly
     // the login card's reasoning).
     if let Some(card) = model.talk_setup.as_ref() {
-        let mut lines = talk_setup_lines(card, theme);
+        let mut lines = talk_setup_lines(model, card, theme);
         lines.truncate(usize::from(allocated).max(1));
         return (lines, None, Vec::new());
     }
@@ -15057,7 +15205,10 @@ fn render_shells_overlay(
             let line = Line::from(vec![
                 Span::styled(format!("{marker} {kind} · {status} · "), theme.dim_style()),
                 Span::styled(shell.title.clone(), theme.text_style()),
-                Span::styled(format!(" · {}  ", shell.cwd_or_host), theme.dim_style()),
+                Span::styled(
+                    format!(" · {}  ", model.display_path(&shell.cwd_or_host)),
+                    theme.dim_style(),
+                ),
                 Span::styled("[close]", theme.maroon_style()),
             ]);
             close_offsets.push((
@@ -15162,6 +15313,8 @@ fn render_ssh_overlay(
         Constraint::Length(height.min(area.height)),
     ])
     .areas(area);
+    // The saved-profile panel owns blank cells after short metadata too.
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
@@ -15197,6 +15350,7 @@ fn render_ssh_form(
         ("port", form.port.clone()),
         ("auth", form.auth_label().to_owned()),
         ("key path / secret", form.credential_display()),
+        // The cwd belongs to the remote SSH host, not this process's HOME.
         ("cwd", form.cwd.clone()),
     ];
     for (index, (label, value)) in fields.into_iter().enumerate() {
@@ -15221,6 +15375,8 @@ fn render_ssh_form(
         Constraint::Length(height.min(area.height)),
     ])
     .areas(area);
+    // The form owns its panel, including blank cells after field values.
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
@@ -15403,7 +15559,10 @@ fn render_monitors_overlay(
             let state = model.monitor_row_state(monitor);
             let chip = crate::app::monitor_state_chip(state);
             let head = format!(" {marker} {} · ", monitor.monitor_id);
-            let source = crate::app::monitor_source_summary(monitor);
+            let source = crate::app::monitor_source_summary_with_context(
+                monitor,
+                &model.tool_path_context(),
+            );
             let mut spans = vec![
                 Span::styled(head.clone(), theme.dim_style()),
                 Span::styled(source.clone(), theme.text_style()),
@@ -16004,6 +16163,15 @@ fn transcript_lines<'a>(
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(text.as_str(), theme.dim_style()),
+            ]));
+        }
+        TranscriptEntry::Workspace { event } => {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    crate::toolview::workspace_event_text(event, ctx.paths),
+                    theme.dim_style(),
+                ),
             ]));
         }
         TranscriptEntry::Refusal {
@@ -17486,7 +17654,9 @@ fn item_lines<'a>(
                     format!("  ↩ {}", result.summary_line()),
                     theme.gold_style(),
                 ));
-            } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+            } else if let Some((_, label)) =
+                crate::projection::image_created_fact_with_context(kind, data, ctx.paths)
+            {
                 let suffix = label.strip_prefix("🖼 image").unwrap_or(&label);
                 lines.push(Line::from(vec![
                     Span::raw("  "),

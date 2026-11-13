@@ -341,20 +341,44 @@ impl ModelSelectionAuthority {
 
     /// Session overrides cannot inherit the active route's discovery evidence.
     pub(crate) fn scoped_to_session_route(
-        mut self,
+        self,
         current: &haider_protocol::session::SessionMetadataV1,
         provider: &str,
     ) -> Self {
         if current.provider == provider {
-            for summary in &mut self.summaries {
-                if summary.provider == provider
-                    && !summary.catalog_matches_session_route(
-                        current.provider_base_url.as_deref(),
-                        current.account_alias.as_deref(),
-                    )
-                {
-                    summary.retire_fetched_catalog();
-                    summary.catalog_scope = None;
+            return self.scoped_to_route(
+                provider,
+                current.provider_base_url.as_deref(),
+                current.account_alias.as_deref(),
+            );
+        }
+        self
+    }
+
+    pub(crate) fn scoped_to_route(
+        mut self,
+        provider: &str,
+        base_url: Option<&str>,
+        account: Option<&str>,
+    ) -> Self {
+        for summary in &mut self.summaries {
+            if summary.provider == provider
+                && !summary.catalog_matches_session_route(base_url, account)
+            {
+                // A credential-ready advisory route admits explicit literals
+                // without discovery. Discarding another endpoint's metadata
+                // must not turn that existing permission into a refusal.
+                let advisory_passthrough = summary.enabled
+                    && summary.api_family != ProviderApiFamilyWire::Unknown
+                    && summary.endpoint.is_some()
+                    && summary.availability == ProviderAvailabilityWire::Available
+                    && summary.inventory_authority == ModelInventoryAuthorityWire::Advisory
+                    && summary.configured_models.is_empty();
+                summary.retire_fetched_catalog();
+                summary.catalog_scope = None;
+                if advisory_passthrough {
+                    summary.availability = ProviderAvailabilityWire::Available;
+                    summary.availability_reason = None;
                 }
             }
         }

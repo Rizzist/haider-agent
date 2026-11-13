@@ -1075,6 +1075,7 @@ enum RunOutputPairChange {
 
 struct HubInner {
     provider_rebind_revision: Arc<AtomicU64>,
+    unavailable_catalog_backoff: Mutex<HashMap<rpc::ProbeBackoffKey, rpc::UnavailableProbeBackoff>>,
     store: SqliteStoreHandle,
     append_committer: AppendCommitter,
     append_commit_task: Mutex<Option<JoinHandle<()>>>,
@@ -2706,6 +2707,7 @@ impl SessionHub {
         });
         let inner = Arc::new(HubInner {
             provider_rebind_revision: Arc::new(AtomicU64::new(0)),
+            unavailable_catalog_backoff: Mutex::new(HashMap::new()),
             store,
             append_committer,
             append_commit_task: Mutex::new(Some(append_commit_task)),
@@ -7764,13 +7766,17 @@ impl SessionHub {
                             }
                             // Queued headless specs are already pinned even though
                             // they have no active record in this rebind receipt.
-                            if let Some(view) = self
+                            if let Some(mut view) = self
                                 .accounts()
                                 .map_err(|error| {
                                     HaiderError::new(ErrorCode::Internal, error.to_string(), false)
                                 })?
                                 .and_then(|accounts| accounts.management.read())
                             {
+                                view.scope_catalog_for_account(
+                                    &pair.provider,
+                                    rebound.account.as_deref(),
+                                );
                                 let authority = crate::model_select::ModelSelectionAuthority::new(
                                     self.creatable_providers().map_err(|error| {
                                         HaiderError::new(

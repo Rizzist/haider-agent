@@ -1,7 +1,8 @@
 //! W5b OAuth acceptance over the real production UDS and real loopback TCP.
 //!
-//! The only enabled provider is an injected, public-client fake. No live
-//! provider metadata or endpoint is used by this suite.
+//! Providers and credentials are synthetic, with loopback authorization and
+//! token endpoints. Shutdown barriers use a live issuer label so that remote
+//! credential resolution reaches the controlled refresh persistence boundary.
 
 #![allow(clippy::expect_used)]
 
@@ -234,22 +235,57 @@ impl Vault for BlockingRotationVault {
 }
 
 struct OAuthTurnBuilder {
+    provider: &'static str,
     fake: Arc<FakeProvider>,
     builds: AtomicU64,
 }
 
+/// Catalog admission is independent of the injected inference adapter. Keep
+/// every OAuth RPC fixture's model discovery in memory, including when an
+/// issuer refusal is removed or an account-scoped cache has no entry yet.
+struct SyntheticOAuthCatalog;
+
+#[async_trait::async_trait]
+impl haider_daemon::ProviderModelDiscoverer for SyntheticOAuthCatalog {
+    async fn discover(
+        &self,
+        _source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
+        _access_token: Option<&str>,
+        _etag: Option<&str>,
+    ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
+        Ok(haider_provider::DiscoveredCatalog {
+            models: vec![haider_provider::DiscoveredModel {
+                slug: "fake-model".into(),
+                display_name: "Fake barrier model".into(),
+                context_window: Some(4096),
+                max_output_tokens: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+                use_responses_lite: None,
+                extensions: None,
+            }],
+            etag: None,
+        })
+    }
+}
+
 impl AccountProviderBuilder for OAuthTurnBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from(["fake-oauth".to_owned()])
+        std::collections::BTreeSet::from([self.provider.to_owned()])
     }
 
     fn build(
         &self,
-        _provider: &str,
+        provider: &str,
         credential: haider_accounts::SecretHandle,
         _model: &str,
         _alias: &haider_protocol::ids::CredentialAlias,
     ) -> Result<Arc<dyn Provider>, haider_protocol::error::HaiderError> {
+        assert_eq!(provider, self.provider);
         assert_eq!(
             credential.expose_secret(),
             ROTATED_ACCESS.as_bytes(),
@@ -269,6 +305,8 @@ struct SeenAuthorization {
 }
 
 struct FakeServer {
+    provider: &'static str,
+    issuer: String,
     address: SocketAddr,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     verifier: Arc<Mutex<Option<String>>>,
@@ -285,10 +323,17 @@ impl Drop for FakeServer {
 
 impl FakeServer {
     async fn start() -> Self {
+        Self::start_with_registration("fake-oauth", None).await
+    }
+
+    async fn start_with_registration(provider: &'static str, issuer: Option<&str>) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("fake bind");
         let address = listener.local_addr().expect("fake address");
+        let issuer = issuer
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("http://{address}"));
         let seen = Arc::new(Mutex::new(None));
         let verifier = Arc::new(Mutex::new(None));
         let fail_next_token = Arc::new(AtomicBool::new(false));
@@ -297,6 +342,7 @@ impl FakeServer {
         let verifier_for_task = Arc::clone(&verifier);
         let fail_next_for_task = Arc::clone(&fail_next_token);
         let refresh_calls_for_task = Arc::clone(&refresh_calls);
+        let issuer_for_task = issuer.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -306,10 +352,11 @@ impl FakeServer {
                 let verifier = Arc::clone(&verifier_for_task);
                 let fail_next_token = Arc::clone(&fail_next_for_task);
                 let refresh_calls = Arc::clone(&refresh_calls_for_task);
+                let issuer = issuer_for_task.clone();
                 tokio::spawn(async move {
                     serve(
                         stream,
-                        address,
+                        issuer,
                         seen,
                         verifier,
                         fail_next_token,
@@ -320,6 +367,8 @@ impl FakeServer {
             }
         });
         Self {
+            provider,
+            issuer,
             address,
             seen,
             verifier,
@@ -335,8 +384,8 @@ impl FakeServer {
 
     fn catalog(&self) -> OAuthProviderCatalog {
         OAuthProviderCatalog::with_test_registrations([OAuthProviderRegistration::new(
-            "fake-oauth",
-            format!("http://{}", self.address),
+            self.provider,
+            self.issuer.clone(),
             format!("http://{}/authorize", self.address),
             format!("http://{}/token", self.address),
             "haider-public-fake",
@@ -353,7 +402,7 @@ impl FakeServer {
 
 async fn serve(
     mut stream: TcpStream,
-    address: SocketAddr,
+    issuer: String,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     captured_verifier: Arc<Mutex<Option<String>>>,
     fail_next_token: Arc<AtomicBool>,
@@ -456,7 +505,7 @@ async fn serve(
     );
     let identity = serde_json::json!({
         "marker": ID_MARKER,
-        "issuer": format!("http://{address}"),
+        "issuer": issuer,
         "audience": "fake-resource",
         "nonce": authorization.nonce,
         "subject": "fake-subject",
@@ -625,6 +674,7 @@ fn dependencies(server: &FakeServer, vault: Arc<MemoryVault>) -> DaemonDependenc
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault as Arc<dyn Vault>),
             oauth_catalog: server.catalog(),
+            model_discoverer: Some(Arc::new(SyntheticOAuthCatalog)),
             oauth_coordinator: OAuthCoordinatorConfig {
                 max_flows: 8,
                 max_invalid_callbacks: 4,
@@ -638,6 +688,7 @@ fn dependencies(server: &FakeServer, vault: Arc<MemoryVault>) -> DaemonDependenc
 
 async fn start_flow(
     client: &mut UdsClient,
+    provider: &str,
     request_id: &str,
     attempt_id: &str,
     desired_alias: &str,
@@ -646,7 +697,7 @@ async fn start_flow(
         client,
         request_id,
         RequestBody::AccountOAuthStart {
-            provider: "fake-oauth".into(),
+            provider: provider.into(),
             desired_alias: desired_alias.into(),
             attempt_id: attempt_id.into(),
         },
@@ -741,8 +792,14 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     ));
 
     let mut owner = control(&config, "owner-1").await;
-    let (flow_id, authorization_url) =
-        start_flow(&mut owner, "oauth-start", "attempt-1", "work-oauth").await;
+    let (flow_id, authorization_url) = start_flow(
+        &mut owner,
+        server.provider,
+        "oauth-start",
+        "attempt-1",
+        "work-oauth",
+    )
+    .await;
     let formatted_start = format!("{authorization_url:?}");
     for sentinel in [CODE, ACCESS, REFRESH, ID_MARKER, RAW_ERROR] {
         assert!(!formatted_start.contains(sentinel));
@@ -895,6 +952,7 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     server.fail_next_token();
     let (failed_flow, failed_authorization_url) = start_flow(
         &mut owner,
+        server.provider,
         "oauth-fail-start",
         "attempt-fail",
         "failed-oauth",
@@ -945,6 +1003,7 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     // and wipes the unclaimed flow; no later connection can drive it.
     let (_, disconnected_url) = start_flow(
         &mut owner,
+        server.provider,
         "disconnect-start",
         "disconnect-attempt",
         "discarded",
@@ -1085,7 +1144,17 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     config.drain_timeout = Duration::from_millis(100);
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
-    let server = FakeServer::start().await;
+    // The turn factory resolves for a remote destination even though this
+    // injected provider never sends HTTP. Use a sanctioned issuer label so
+    // its guard permits refresh; authorization and token traffic stay local.
+    // Kimi has no token-derived AccountIdentity, preserving the legacy row
+    // shape whose startup backfill must detect a missing vault entry.
+    // discovery_disabled also suppresses automatic remote catalog refresh.
+    let server = FakeServer::start_with_registration(
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        Some("https://auth.kimi.com"),
+    )
+    .await;
     let vault = Arc::new(BlockingRotationVault::new());
     // The injected OAuth registration supplies transport, not a configured
     // provider. Seed its synthetic adapter before exercising shutdown; OAuth
@@ -1107,6 +1176,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     )
     .expect("seed synthetic provider");
     let builder = Arc::new(OAuthTurnBuilder {
+        provider: server.provider,
         fake: Arc::new(FakeProvider::new(vec![FakeStep::Finish {
             reason: haider_protocol::provider::FinishReason::EndTurn,
         }])),
@@ -1117,6 +1187,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         accounts: AccountsDependencies {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             oauth_catalog: server.catalog(),
+            model_discoverer: Some(Arc::new(SyntheticOAuthCatalog)),
             oauth_coordinator: OAuthCoordinatorConfig {
                 max_flows: 8,
                 max_invalid_callbacks: 4,
@@ -1134,6 +1205,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     let mut client = control(&config, "barrier-owner").await;
     let (flow_id, authorization_url) = start_flow(
         &mut client,
+        server.provider,
         "barrier-oauth-start",
         "barrier-attempt",
         "work",
@@ -1154,7 +1226,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         "barrier-account-add",
         RequestBody::AccountAdd {
             command_id: CommandId::new("barrier-account-command"),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             alias: "work".into(),
             auth_method: AccountAddMethod::OAuth,
             flow_id,
@@ -1167,6 +1239,25 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ResponseBody::AccountAdd { descriptor } => descriptor,
         other => panic!("unexpected account.add response: {other:?}"),
     };
+    assert!(
+        descriptor.account_identity.is_none(),
+        "the shutdown fixture retains the legacy identity-free row shape"
+    );
+    // Publish under the actor's active account key while the token is fresh.
+    // A bare provider cache no longer supplies this OAuth account's inventory.
+    let refreshed = request(
+        &mut client,
+        "barrier-models-refresh",
+        RequestBody::ProviderModelsRefresh {
+            provider: server.provider.into(),
+        },
+    )
+    .await;
+    let ResponseBody::ProviderModelsRefresh { provider, .. } = refreshed else {
+        panic!("synthetic catalog refresh failed: {refreshed:?}");
+    };
+    assert!(provider.models.contains(&"fake-model".into()));
+
     let stored = vault
         .resolve(&haider_daemon::scoped_vault_alias(
             profile_id,
@@ -1174,6 +1265,8 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ))
         .expect("initial bundle");
     let initial = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode initial");
+    assert_eq!(initial.provider_id, server.provider);
+    assert_eq!(initial.issuer, server.issuer);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -1211,7 +1304,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         RequestBody::SessionCreate {
             command_id: CommandId::new("barrier-session-command"),
             cwd: workspace.to_string_lossy().into_owned(),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             model: "fake-model".into(),
             max_tokens: 64,
         },
@@ -1362,7 +1455,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
                         }
                     )
             }),
-            "successor migrates the durable descriptor to typed source-gone"
+            "successor migrates the durable descriptor to typed source-gone: {descriptors:?}"
         ),
         other => panic!("unexpected account.list response: {other:?}"),
     }
@@ -1373,7 +1466,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         RequestBody::SessionCreate {
             command_id: CommandId::new("barrier-successor-session-command"),
             cwd: workspace.to_string_lossy().into_owned(),
-            provider: "fake-oauth".into(),
+            provider: server.provider.into(),
             model: "fake-model".into(),
             max_tokens: 64,
         },

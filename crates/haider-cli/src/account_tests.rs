@@ -84,6 +84,139 @@ fn account_list_projection_is_additive_and_preserves_legacy_absence() {
     assert_eq!(projected.created, Some(964));
 }
 
+#[test]
+fn ambiguous_email_bridge_has_review_hint_without_false_removal_advice() {
+    let view = |alias: &str, account_id: Option<&str>| AccountView {
+        alias: alias.to_owned(),
+        provider: "anthropic-oauth".to_owned(),
+        auth_kind: "oauth",
+        identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("OWNER@example.test".to_owned()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created: None,
+        active: false,
+        usable: true,
+    };
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            view("legacy", None),
+            view("member-a", Some("account=a;organization=team")),
+            view("member-b", Some("account=b;organization=team")),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("email matches multiple account IDs"));
+    assert!(!text.contains("remove this duplicate"));
+
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            view("legacy", None),
+            view("member-a", Some("account=a;organization=team")),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("remove this duplicate"));
+}
+
+fn claude_view(alias: &str, account_id: &str, active: bool, usable: bool) -> AccountView {
+    AccountView {
+        alias: alias.to_owned(),
+        provider: "anthropic-oauth".to_owned(),
+        auth_kind: "oauth",
+        identity: Some(haider_protocol::credential::AccountIdentity {
+            email: None,
+            display_name: Some("Claude".to_owned()),
+            account_id: Some(account_id.to_owned()),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created: None,
+        active,
+        usable,
+    }
+}
+
+#[test]
+fn duplicate_hint_keeps_the_active_then_live_row() {
+    let same = "account=a;organization=o";
+    // The first-listed row is dead; the just-signed-in active row is later.
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view("old-dead", same, false, false),
+            claude_view("fresh", same, true, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains(
+        "matching identity already kept as `fresh`; remove this duplicate explicitly with `haider account remove old-dead --confirm`"
+    ));
+    assert!(!text.contains("haider account remove fresh"), "{text}");
+
+    // Without an active row, a usable one is kept over a dead one.
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view("old-dead", same, false, false),
+            claude_view("live", same, false, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains("already kept as `live`"));
+    assert!(!text.contains("haider account remove live"), "{text}");
+    // JSON output stays exactly the documented schema.
+    let json = serde_json::to_value(&document).expect("json");
+    assert!(json["accounts"][0].get("active").is_none());
+    assert!(json["accounts"][0].get("usable").is_none());
+}
+
+#[test]
+fn unverified_claude_rows_are_flagged_as_suspected_duplicates() {
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![
+            claude_view(
+                "anthropic-oauth-2",
+                "anthropic:0123456789abcdef",
+                false,
+                false,
+            ),
+            claude_view("anthropic-oauth-3", "account=a;organization=o", true, true),
+        ],
+    };
+    let text = render_human(&document);
+    assert!(text.contains(
+        "identity unverified; suspected duplicate of `anthropic-oauth-3`; re-login it in place from `/accounts` (enter twice on the row) to verify it, or remove it explicitly with `haider account remove anthropic-oauth-2 --confirm`"
+    ), "{text}");
+    assert!(
+        !text.contains("haider account remove anthropic-oauth-3"),
+        "{text}"
+    );
+    let alone = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![claude_view(
+            "anthropic-oauth",
+            "anthropic:0123456789abcdef",
+            true,
+            true,
+        )],
+    };
+    assert!(
+        render_human(&alone)
+            .contains("identity unverified; it is verified automatically while its token works")
+    );
+}
+
 fn codex_candidate() -> haider_rpc::DeviceCredentialCandidateWire {
     haider_rpc::DeviceCredentialCandidateWire {
         candidate: format!("dc1_{}", "0".repeat(64)),
@@ -271,6 +404,57 @@ async fn account_use_resolves_alias_then_sets_the_profile_default() {
 }
 
 #[tokio::test]
+async fn account_use_cache_warning_names_the_exact_confirmation_command() {
+    let client = FakeAccountClient::new([
+        list_response("work", Some(3)),
+        ResponseBody::Error {
+            code: haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED.to_owned(),
+            message: "cache epoch change: account".to_owned(),
+            retryable: false,
+            data: None,
+        },
+    ]);
+    let error = execute_use(&client, "work".to_owned(), false)
+        .await
+        .expect_err("selection must require confirmation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("run `haider account use work --confirm`")
+    );
+    let hint = error.to_string();
+    let instruction = hint
+        .split('`')
+        .find(|part| part.starts_with("haider account "))
+        .expect("printed command");
+    let words = instruction
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let command = parse_account_command(&words[2..]).expect("literal selection hint");
+    let client = FakeAccountClient::new([
+        list_response("work", Some(3)),
+        ResponseBody::AccountSetActive {
+            descriptor: descriptor("work"),
+            prior_alias: None,
+            revision: 4,
+        },
+    ]);
+    assert!(matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [
+            RequestBody::AccountList { .. },
+            RequestBody::AccountSetActive {
+                confirm_new_epoch: true,
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
 async fn source_add_sends_coordinates_without_credential_material() {
     let source = AccountSourceWire {
         source_id: format!("src1_{}", "1".repeat(64)),
@@ -426,4 +610,163 @@ async fn confirmed_remove_refuses_to_mutate_without_a_snapshot_revision() {
         client.requests().as_slice(),
         [RequestBody::AccountList { provider: None }]
     ));
+}
+
+/// Execute the entire advertised command literally through the CLI parser and
+/// request dispatcher. Unsupported rows must never advertise a confirmation.
+#[tokio::test]
+async fn every_printed_account_suggestion_runs_as_written() {
+    let supported = codex_candidate();
+    let instruction = import_confirmation_instruction(&supported).expect("supported instruction");
+    let words = instruction
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(&words[..2], &["haider", "account"]);
+    let command = parse_account_command(&words[2..]).expect("literal suggestion parses");
+    let client = FakeAccountClient::new([
+        ResponseBody::AccountDeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![supported],
+            adoption_available: Vec::new(),
+        },
+        ResponseBody::AccountImportDevice {
+            descriptor: descriptor("imported"),
+            revision: 2,
+        },
+    ]);
+    assert!(matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [
+            RequestBody::AccountDeviceCandidates,
+            RequestBody::AccountImportDevice { .. }
+        ]
+    ));
+
+    for source in ["codex", "claude-code"] {
+        let mut unsupported = codex_candidate();
+        unsupported.source = source.into();
+        unsupported.import_supported = false;
+        unsupported.unsupported_reason = Some("synthetic unsupported source".into());
+        assert_eq!(import_confirmation_instruction(&unsupported), None);
+        let client = FakeAccountClient::new([ResponseBody::AccountDeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![unsupported],
+            adoption_available: Vec::new(),
+        }]);
+        assert!(
+            matches!(execute(&client, AccountCommand::Import { source: source.into(), confirm: false }).await,
+            Ok(code) if code == ExitCode::from(EX_USAGE))
+        );
+        assert!(matches!(
+            client.requests().as_slice(),
+            [RequestBody::AccountDeviceCandidates]
+        ));
+    }
+    for old_id in ["account=a;organization=o", "anthropic:0123456789abcdef"] {
+        let document = AccountsDocument {
+            schema: ACCOUNTS_SCHEMA,
+            accounts: vec![
+                claude_view("old-dead", old_id, false, false),
+                claude_view("fresh", "account=a;organization=o", true, true),
+            ],
+        };
+        let printed = render_human(&document);
+        let suggestions = printed
+            .split('`')
+            .filter(|part| part.starts_with("haider account "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "each duplicate variant advertises one executable command"
+        );
+        for suggestion in suggestions {
+            let words = suggestion
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let command = parse_account_command(&words[2..]).expect("literal removal hint");
+            let client = FakeAccountClient::new([
+                list_response("old-dead", Some(1)),
+                ResponseBody::AccountRemove {
+                    removed_alias: CredentialAlias::new("old-dead"),
+                    replacement_active_alias: None,
+                    revision: 2,
+                },
+            ]);
+            assert!(
+                matches!(execute(&client, command).await, Ok(code) if code == ExitCode::SUCCESS)
+            );
+            assert!(
+                matches!(client.requests().as_slice(), [RequestBody::AccountList { .. }, RequestBody::AccountRemove { alias, expected_revision: Some(1), .. }] if alias == "old-dead")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_unsupported_claude_import_reaches_live_and_fake_daemon_policy() {
+    for reason in [
+        "owned by the official client",
+        "fake OAuth mode refuses Claude Code import",
+    ] {
+        let mut candidate = codex_candidate();
+        candidate.source = "claude-code".into();
+        candidate.import_supported = false;
+        candidate.unsupported_reason = Some("owned by the official client".into());
+        let client = FakeAccountClient::new([
+            ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: false,
+                candidates: vec![candidate],
+                adoption_available: Vec::new(),
+            },
+            ResponseBody::Error {
+                code: "invalid_argument".into(),
+                message: reason.into(),
+                retryable: false,
+                data: None,
+            },
+        ]);
+        let result = execute(
+            &client,
+            AccountCommand::Import {
+                source: "claude-code".into(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AccountError::Rpc { message, .. }) if message == reason));
+        assert!(matches!(
+            client.requests().as_slice(),
+            [
+                RequestBody::AccountDeviceCandidates,
+                RequestBody::AccountImportDevice { .. }
+            ]
+        ));
+    }
+}
+
+#[test]
+fn a25_legacy_email_row_is_not_ranked_below_an_unverified_placeholder() {
+    let mut legacy = claude_view("legacy", "unused", false, false);
+    let identity = legacy.identity.as_mut().expect("identity");
+    identity.account_id = None;
+    identity.email = Some("same@example.test".into());
+    let mut placeholder = claude_view("placeholder", "anthropic:shared", true, true);
+    placeholder.identity.as_mut().expect("identity").email = Some("SAME@example.test".into());
+    let document = AccountsDocument {
+        schema: ACCOUNTS_SCHEMA,
+        accounts: vec![legacy, placeholder],
+    };
+    assert!(!same_duplicate_group(
+        &document,
+        &document.accounts[0],
+        &document.accounts[1]
+    ));
+    let text = render_human(&document);
+    assert!(!text.contains("matching identity already kept"), "{text}");
+    assert!(!text.contains("haider account remove legacy"), "{text}");
+    assert!(text.contains("identity unverified"), "{text}");
 }

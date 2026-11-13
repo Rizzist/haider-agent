@@ -1143,6 +1143,7 @@ impl haider_daemon::ProviderModelDiscoverer for ForbiddenCatalog {
     async fn discover(
         &self,
         source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         _access_token: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {
@@ -1163,6 +1164,7 @@ impl haider_daemon::ProviderModelDiscoverer for AccountScopedCatalog {
     async fn discover(
         &self,
         source: haider_provider::CatalogSource,
+        _destination: haider_daemon::CatalogDestination,
         access_token: Option<&str>,
         _etag: Option<&str>,
     ) -> Result<haider_provider::DiscoveredCatalog, haider_provider::CatalogError> {

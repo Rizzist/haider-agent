@@ -2844,6 +2844,376 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     store.close().await.expect("store close");
 }
 
+/// A provider-wide failed inventory must be retried through the account named
+/// by session creation. This pins the `haider run --account <live-alias>`
+/// path: admission may not silently substitute the provider default.
+#[tokio::test]
+async fn session_create_refreshes_unavailable_inventory_with_explicit_account() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let live_alias = haider_protocol::ids::CredentialAlias::new("live-openai");
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
+        alias: live_alias.clone(),
+        provider: "openai-oauth".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::OAuth,
+        identity: "live@example.invalid".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: false,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let mut unavailable = provider_summary("openai-oauth");
+    unavailable.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+        reason: "dead default returned 403".into(),
+    };
+    unavailable.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+    unavailable.availability_reason = Some("dead default returned 403".into());
+    let (commands, mut actor_mailbox) = mpsc::channel(2);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(commands),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![descriptor.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![descriptor],
+            vec![unavailable],
+        ),
+        vault_supported: true,
+        discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+        vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
+    })
+    .expect("accounts install");
+    hub.install_creatable_providers(std::collections::BTreeSet::from(
+        ["openai-oauth".to_owned()],
+    ))
+    .expect("creatable providers");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let request = connection.request(
+        RequestId::new("explicit-account-create"),
+        RequestBody::SessionCreateWithPermissionOverrides {
+            expected_catalog_key: None,
+            command_id: haider_rpc::CommandId::new("explicit-account-create-command"),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "openai-oauth".into(),
+            model: "gpt-live".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            workspace_allocation: None,
+            cache_policy: None,
+            interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+            ssh_scope: None,
+            account_alias: Some(live_alias.clone()),
+            resolve_provider: false,
+            resolve_model: false,
+            effort: None,
+            fast: None,
+        },
+    );
+    tokio::pin!(request);
+    let command = tokio::select! {
+        command = actor_mailbox.recv() => command.expect("model refresh command"),
+        result = &mut request => panic!("session admission completed before refresh: {result:?}"),
+    };
+    let crate::accounts::AccountCommand::RefreshProviderModels {
+        provider,
+        account_alias,
+        completed,
+    } = command
+    else {
+        panic!("unexpected account command");
+    };
+    assert_eq!(provider, "openai-oauth");
+    assert_eq!(account_alias.as_ref(), Some(&live_alias));
+    let crate::accounts::ProviderModelsRefreshCompletion::Internal(sender) = completed else {
+        panic!("session admission must use an internal completion");
+    };
+    let mut refreshed = provider_summary("openai-oauth");
+    refreshed.models = vec!["gpt-live".into()];
+    refreshed.default_model = Some("gpt-live".into());
+    refreshed.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    refreshed.availability = haider_rpc::ProviderAvailabilityWire::Available;
+    sender
+        .lock()
+        .expect("completion lock")
+        .take()
+        .expect("completion sender")
+        .send(Ok(refreshed))
+        .expect("refresh completion");
+    request.await.expect("session create completes");
+
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionCreate { metadata, .. },
+        } if request_id.as_str() == "explicit-account-create"
+            && metadata.account_alias.as_deref() == Some("live-openai")
+    )));
+    connection.close().await.expect("connection close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// Refresh uses the explicit account from the speculative session snapshot,
+/// then retries with fresh coordinates if a concurrent writer moves it.
+#[tokio::test]
+async fn explicit_account_inventory_refresh_retries_after_concurrent_session_update() {
+    for (variant, moved_provider, requested_provider, stale_error) in [
+        ("unchanged", "fake", None, false),
+        ("account", "fake", None, false),
+        ("provider", "other", None, false),
+        ("explicit-provider", "other", Some("fake"), false),
+        ("account", "fake", None, true),
+        ("provider", "other", None, true),
+        ("explicit-provider", "other", Some("fake"), true),
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session_id = SessionId::new(format!("inventory-race-{variant}"));
+        hub.create_internal_session(create_command(&session_id, variant))
+            .await
+            .expect("create");
+        let rebind = |suffix: &str, provider: &str, account: &str| {
+            haider_store::SessionProviderRebindCommand {
+                command_id: format!("inventory-{suffix}"),
+                request_digest: format!("inventory-digest-{suffix}"),
+                request_json: format!(r#"{{"fixture":"{suffix}"}}"#),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: provider.into(),
+                base_url: None,
+                account: Some(account.into()),
+                max_tokens: 4096,
+                max_tokens_source:
+                    haider_protocol::output_budget::SessionOutputBudgetSourceV1::Derived,
+                clamped: None,
+                active_output_budget: None,
+                event_id: EventId::new(format!("inventory-{suffix}")),
+                device_id: DeviceId::new("inventory-race-device"),
+            }
+        };
+        hub.rebind_session_provider(rebind("initial", "fake", "old-pin"))
+            .await
+            .expect("initial account pin");
+        let descriptor =
+            |alias: &str, provider: &str| haider_protocol::credential::CredentialDescriptor {
+                incarnation: 0,
+                credential_digest: None,
+
+                alias: haider_protocol::ids::CredentialAlias::new(alias),
+                provider: provider.into(),
+                base_url: None,
+                auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: "synthetic fixture".into(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                active: false,
+                label: None,
+                account_identity: None,
+                created_at_ms: None,
+            };
+        let descriptors = vec![
+            descriptor("old-pin", "fake"),
+            descriptor("new-pin", moved_provider),
+        ];
+        let unavailable = |provider: &str| {
+            let mut summary = provider_summary(provider);
+            summary.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic default failed".into(),
+            };
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            summary
+        };
+        let (commands, mut mailbox) = mpsc::channel(2);
+        hub.install_accounts(crate::accounts::AccountsFacade {
+            login: Some(commands),
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(descriptors.clone())),
+            management: crate::accounts::ManagementSnapshot::new(
+                1,
+                descriptors,
+                vec![unavailable("fake"), unavailable("other")],
+            ),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            sources: Arc::new(Mutex::new(Vec::new())),
+            vault: None,
+        })
+        .expect("accounts");
+        hub.install_creatable_providers(std::collections::BTreeSet::from([
+            "fake".into(),
+            "other".into(),
+        ]))
+        .expect("providers");
+        let sink = Arc::new(CapturingFrameSink::default());
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection");
+        connection
+            .request(
+                RequestId::new("inventory-attach"),
+                RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                    sealed_replay: false,
+                },
+            )
+            .await
+            .expect("attach");
+        let request = connection.request(
+            RequestId::new("inventory-select"),
+            RequestBody::SessionSelectModel {
+                expected_catalog_key: None,
+                command_id: haider_rpc::CommandId::new("inventory-select-command"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                provider: requested_provider.map(str::to_owned),
+                model: "selected-model".into(),
+                confirm_new_epoch: true,
+                max_tokens: None,
+            },
+        );
+        tokio::pin!(request);
+        let attempts = if variant == "unchanged" { 1 } else { 2 };
+        for attempt in 0..attempts {
+            let command = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    command = mailbox.recv() => command.expect("refresh command"),
+                    result = &mut request => panic!("selection completed before fresh account inventory: {variant}/{attempt}: {result:?}"),
+                }
+            })
+            .await
+            .expect("refresh requested");
+            let crate::accounts::AccountCommand::RefreshProviderModels {
+                provider,
+                account_alias,
+                completed,
+            } = command
+            else {
+                panic!("unexpected account command");
+            };
+            let expected_provider = if attempt == 0 || requested_provider.is_some() {
+                "fake"
+            } else {
+                moved_provider
+            };
+            let expected_alias = if attempt == 0 {
+                Some("old-pin")
+            } else if requested_provider.is_some() {
+                None // An alias from the new provider must never leak to the old one.
+            } else {
+                Some("new-pin")
+            };
+            assert_eq!(provider, expected_provider, "{variant}/{attempt}");
+            assert_eq!(
+                account_alias.as_ref().map(|alias| alias.as_str()),
+                expected_alias,
+                "{variant}/{attempt}: catalog must use the explicit account"
+            );
+            if attempt == 0 && variant != "unchanged" {
+                // This is the same fence used by the RPC writer. Network I/O
+                // must leave it available, and the selection must notice the
+                // account change even when the provider/model stay identical.
+                let fence = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    hub.lock_workflow_selection(&session_id),
+                )
+                .await
+                .expect("concurrent update is not blocked by network I/O");
+                hub.rebind_session_provider(rebind("concurrent", moved_provider, "new-pin"))
+                    .await
+                    .expect("concurrent session update");
+                drop(fence);
+            }
+            let mut refreshed = provider_summary(&provider);
+            refreshed.models = vec!["selected-model".into()];
+            refreshed.inventory = haider_rpc::ModelInventoryWire::Static;
+            refreshed.availability = haider_rpc::ProviderAvailabilityWire::Available;
+            let crate::accounts::ProviderModelsRefreshCompletion::Internal(sender) = completed
+            else {
+                panic!("internal completion required");
+            };
+            let result = if stale_error && attempt == 0 {
+                Err(crate::accounts::ProviderModelsRefreshFailure {
+                    code: "synthetic-stale-account".into(),
+                    message: "old account fetch failed after a concurrent update".into(),
+                    retryable: false,
+                    data: None,
+                })
+            } else {
+                Ok(refreshed)
+            };
+            sender
+                .lock()
+                .expect("completion")
+                .take()
+                .expect("sender")
+                .send(result)
+                .expect("refresh result");
+        }
+        request.await.expect("selection");
+        assert!(
+            sink.0.lock().expect("frames").iter().any(|frame| matches!(
+                frame,
+                WireFrame::Response { request_id, body: ResponseBody::SessionSelectModel { .. } }
+                    if request_id.as_str() == "inventory-select"
+            )),
+            "selection succeeds with the fresh catalog: {variant}"
+        );
+        let metadata = hub
+            .session_metadata(&session_id)
+            .await
+            .expect("metadata")
+            .expect("typed");
+        assert_eq!(
+            metadata.provider,
+            requested_provider.unwrap_or(moved_provider)
+        );
+        assert_eq!(metadata.model, "selected-model");
+        assert_eq!(
+            metadata.account_alias.as_deref(),
+            match variant {
+                "unchanged" => Some("old-pin"),
+                "explicit-provider" => None,
+                _ => Some("new-pin"),
+            }
+        );
+        connection.close().await.expect("connection close");
+        hub.shutdown().await.expect("shutdown");
+        store.close().await.expect("close");
+    }
+}
+
 #[tokio::test]
 async fn account_switch_preflight_does_not_pin_archived_or_child_sessions() {
     let root = tempfile::tempdir().expect("profile");
@@ -5920,12 +6290,14 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
     let command = actor_mailbox.recv().await.expect("owned actor job");
     let crate::accounts::AccountCommand::RefreshProviderModels {
         provider,
+        account_alias,
         completed,
     } = command
     else {
         panic!("unexpected actor command");
     };
     assert_eq!(provider, "openai-oauth");
+    assert_eq!(account_alias, None);
     let crate::accounts::ProviderModelsRefreshCompletion::Wire(completed) = completed else {
         panic!("RPC refresh must carry a wire completion");
     };

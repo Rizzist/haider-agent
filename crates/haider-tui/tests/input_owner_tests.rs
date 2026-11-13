@@ -175,6 +175,16 @@ fn arm(model: &mut AppModel, mode: &str) {
             review_menu(),
         )))),
         "login" => model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1)),
+        "accounts-notice" => {
+            model.screen = Screen::Accounts;
+            model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1));
+            model.accounts.set_detailed_message(
+                "Account notice".into(),
+                "Expanded account notice ".repeat(40),
+                "haider account remove fixture --confirm".into(),
+            );
+            model.accounts.message_expanded = true;
+        }
         "accounts-replace" => {
             model.screen = Screen::Accounts;
             model.login = Some(LoginCard::new("fake".into(), "alias".into(), 1));
@@ -1824,6 +1834,7 @@ fn owner_label(owner: InputOwner) -> &'static str {
         InputOwner::TalkSetup => "talk setup",
         InputOwner::CustomProviderForm => "custom provider",
         InputOwner::AccountsReplace => "accounts replace",
+        InputOwner::AccountsNotice => "accounts notice",
         InputOwner::SessionMenu => "session menu",
         InputOwner::SpendCard => "spend card",
         InputOwner::SubagentQuestion => "subagent question",
@@ -1860,6 +1871,7 @@ fn expected_owner(mode: &str) -> InputOwner {
         "file-review-doc" => InputOwner::FileReviewDoc,
         "login" => InputOwner::Login,
         "accounts-replace" => InputOwner::AccountsReplace,
+        "accounts-notice" => InputOwner::AccountsNotice,
         "talk-setup" => InputOwner::TalkSetup,
         "custom-form" => InputOwner::CustomProviderForm,
         "fleet-detail" => InputOwner::FleetMemberDetail,
@@ -1905,6 +1917,7 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
         "file-review-doc",
         "login",
         "accounts-replace",
+        "accounts-notice",
         "talk-setup",
         "custom-form",
         "fleet-detail",
@@ -1963,6 +1976,7 @@ fn i_rendered_hit_map_agrees_with_the_input_owner() {
             "file-review-doc" => Some("EDIT REVIEW"),
             "login" => Some("API key"),
             "accounts-replace" => Some("Replace this form?"),
+            "accounts-notice" => Some("Expanded account notice"),
             "talk-setup" => Some("talk setup"),
             "custom-form" => Some("add a custom provider"),
             "fleet-detail" => Some("Child"),
@@ -2404,6 +2418,7 @@ fn i_owner_by_input_kind_matrix_keeps_parked_drafts_unchanged() {
         "file-review-doc",
         "login",
         "accounts-replace",
+        "accounts-notice",
         "talk-setup",
         "custom-form",
         "fleet-detail",

@@ -8,6 +8,56 @@ use haider_tui::mock::demo_script;
 use haider_tui::plain::{render_plain, status_glyph, status_line, status_word};
 use haider_tui::projection::SessionProjection;
 
+#[cfg(unix)]
+#[test]
+fn file_change_through_an_interior_workspace_account_alias_is_masked() {
+    use haider_tui::app::AppModel;
+    use haider_tui::runtime::run_demo_plain;
+    use std::os::unix::fs::symlink;
+    let accounts = if cfg!(target_os = "macos") {
+        "/Users"
+    } else {
+        "/home"
+    };
+    let temp = tempfile::tempdir().expect("workspace");
+    let alias = temp.path().join("accounts");
+    symlink(accounts, &alias).expect("account alias");
+    let mut model = AppModel::new();
+    model.cwd = temp.path().display().to_string();
+    model.session_workspace_cwd = Some(model.cwd.clone());
+    model.display_homes = vec![temp.path().to_path_buf()];
+    for (index, path) in [
+        alias.join("display-fixture-other-account/missing/file.rs"),
+        alias
+            .join("..")
+            .join(accounts.trim_start_matches('/'))
+            .join("display-fixture-other-account/missing/file.rs"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("alias-file-change-{index}")),
+                item: TurnItem::FileChange {
+                    path: path.display().to_string(),
+                    added: 1,
+                    removed: 0,
+                },
+            }));
+    }
+    let output = run_demo_plain(model);
+    assert!(
+        output.contains(&format!("± {accounts}/<user>/missing/file.rs +1 -0")),
+        "{output}"
+    );
+    assert!(
+        !output.contains("display-fixture-other-account"),
+        "{output}"
+    );
+}
+
 #[test]
 fn demo_script_renders_the_full_plain_story() {
     let mut projection = SessionProjection::new();
@@ -180,6 +230,110 @@ fn semantic_tool_rows_keep_tool_specific_context_compact() {
         semantic_summary("task", &json!({"label":"verify", "state":"running"})),
         "verify · running"
     );
+    assert_eq!(
+        semantic_summary("fs_read", &json!({"path":"/Users/bob/private"})),
+        "/Users/<user>/private"
+    );
+    assert_eq!(
+        semantic_summary("fs_edit", &json!({"path":"/Users/bob/private"})),
+        "/Users/<user>/private"
+    );
+}
+
+#[test]
+fn plain_tool_paths_use_the_shared_account_projection() {
+    use serde_json::json;
+    for (name, args, expected) in [
+        (
+            "fs_list",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        (
+            "glob",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        ("ls", json!({"path": "/home/carol"}), "/home/<user>"),
+        (
+            "fs_search",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        (
+            "custom_tool",
+            json!({"path": "/Users/bob/private"}),
+            "/Users/<user>/private",
+        ),
+        ("fs_list", json!({"path": "src"}), "src"),
+        (
+            "custom_tool",
+            json!({"cwd": "/Users/bob/repo"}),
+            "/Users/<user>/repo",
+        ),
+        (
+            "custom_tool",
+            json!({"file_path": "/Users/bob/repo/x"}),
+            "/Users/<user>/repo/x",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "glob": "/Users/bob/**"}),
+            "\"x\" /Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "/Users/bob/**"}),
+            "\"x\" /Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "src/**"}),
+            "\"x\" src/**",
+        ),
+        (
+            "glob",
+            json!({"pattern": "/Users/bob/**"}),
+            "/Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "glob": r"C:\Users\bob\**"}),
+            "\"x\" C:/Users/<user>/**",
+        ),
+        (
+            "fs_search",
+            json!({"query": "x", "include": "../src/**"}),
+            "\"x\" ../src/**",
+        ),
+        (
+            "fs_read",
+            json!({"path": r"C:/w/..\Users\bob\x"}),
+            "C:/Users/<user>/x",
+        ),
+        (
+            "custom_tool",
+            json!({"cwd": r"C:/w/sub\..\..\Users\bob\x"}),
+            "C:/Users/<user>/x",
+        ),
+    ] {
+        let mut projection = SessionProjection::new();
+        projection.apply(&EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new("path-call"),
+            item: TurnItem::ToolCall {
+                call_id: "path-call".into(),
+                name: name.into(),
+                args,
+                status: ToolStatus::InProgress,
+                activity: None,
+            },
+        }));
+        let plain = render_plain(&projection, 0, None);
+        assert!(
+            plain.contains(&format!("⚒ {name} ◐ · {expected}")),
+            "{plain}"
+        );
+    }
 }
 
 #[test]
@@ -194,4 +348,313 @@ fn reduced_motion_freezes_only_the_spinner_frame() {
 fn status_line_without_window_omits_the_meter() {
     let projection = SessionProjection::new();
     assert_eq!(status_line(&projection, 0), "IDLE · 0 tok");
+}
+
+#[test]
+fn plain_session_paths_keep_workspace_context_for_all_path_keys() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain, toolview::header_args};
+    use serde_json::json;
+    for (workspace, path) in [
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice/project/src/probe.rs",
+        ),
+        (
+            "C:/Users/alice/project",
+            r"c:\users\ALICE\PROJECT\src\probe.rs",
+        ),
+        ("/opt/project", "/opt/project/src/probe.rs"),
+        ("D:/repo", "D:/repo/src/probe.rs"),
+        (r"\\srv\share\repo", r"\\srv\share\repo\src\probe.rs"),
+        (
+            r"\\?\C:\Users\alice\project",
+            r"\\?\C:\Users\alice\project\src\probe.rs",
+        ),
+        (r"\\.\C:\repo", r"\\.\C:\repo\src\probe.rs"),
+    ] {
+        for key in [
+            "path",
+            "file",
+            "file_path",
+            "cwd",
+            "directory",
+            "workspace",
+            "root",
+        ] {
+            for name in ["fs_read", "fs_list", "fs_edit", "custom_tool"] {
+                let mut model = AppModel::new();
+                model.cwd = workspace.into();
+                model.session_workspace_cwd = Some(workspace.into());
+                model.display_homes = vec!["C:/Users/alice".into()];
+                let args = json!({key: path});
+                let expected = header_args(name, &args, &model.tool_path_context());
+                assert_eq!(expected, "src/probe.rs");
+                model
+                    .projection
+                    .apply(&EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new("context-probe"),
+                        item: TurnItem::ToolCall {
+                            call_id: "context-probe".into(),
+                            name: name.into(),
+                            args,
+                            status: ToolStatus::InProgress,
+                            activity: None,
+                        },
+                    }));
+                let plain = run_demo_plain(model);
+                assert!(
+                    plain
+                        .lines()
+                        .any(|line| line.starts_with(&format!("⚒ {name} ◐ · {expected}"))),
+                    "{name} {key} {workspace}: {plain}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_pattern_scope_uses_session_context() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain};
+    use serde_json::json;
+    for (name, args, expected) in [
+        (
+            "fs_read",
+            json!({"file_path":"C:/repo/src/key_probe.rs", "file":"C:/Users/bob/other"}),
+            "src/key_probe.rs",
+        ),
+        (
+            "custom_tool",
+            json!({"cwd":"C:/repo", "root":"C:/repo/src", "description":"inspect"}),
+            ".",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "cwd":"C:/repo", "root":"C:/repo/src"}),
+            "\"needle\" in src",
+        ),
+        (
+            "fs_search",
+            json!({"root":"C:/repo/src", "description":"inspect"}),
+            "src",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "root":"C:/repo/src"}),
+            "\"needle\" in src",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "path":"C:/repo/src", "glob":"C:/repo/src/**"}),
+            "\"needle\" in src src/**",
+        ),
+        (
+            "fs_search",
+            json!({"query":"needle", "include":"C:/repo/src/**"}),
+            "\"needle\" src/**",
+        ),
+        (
+            "glob",
+            json!({"pattern":"C:/repo/src/**", "path":"C:/repo/src"}),
+            "src/** in src",
+        ),
+        ("fs_glob", json!({"query":"!C:/repo/src/**"}), "!src/**"),
+        ("fs_read", json!({"path":"C:/repo"}), "."),
+        (
+            "custom_tool",
+            json!({"cwd":"C:/repo", "description":"inspect workspace", "desc":"inspect", "action":"inspect"}),
+            ".",
+        ),
+        (
+            "agent_spawn",
+            json!({"cwd":"C:/repo", "label":"verify"}),
+            "verify in .",
+        ),
+        (
+            "shell",
+            json!({"cwd":"C:/repo", "description":"inspect workspace"}),
+            ".",
+        ),
+        (
+            "fs_read",
+            json!({"path":"C:/Users/alice/notes.md"}),
+            "~/notes.md",
+        ),
+        (
+            "fs_read",
+            json!({"path":"C:/Users/bob/notes.md"}),
+            "C:/Users/<user>/notes.md",
+        ),
+        (
+            "fs_search",
+            json!({"query":"/Users/bob", "path":"src"}),
+            "\"/Users/bob\" in src",
+        ),
+    ] {
+        let mut model = AppModel::new();
+        model.cwd = "C:/repo".into();
+        model.display_homes = vec!["C:/Users/alice".into()];
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Started {
+                item_id: ItemId::new("scope-probe"),
+                item: TurnItem::ToolCall {
+                    call_id: "scope-probe".into(),
+                    name: name.into(),
+                    args,
+                    status: ToolStatus::InProgress,
+                    activity: None,
+                },
+            }));
+        let plain = run_demo_plain(model);
+        assert!(
+            plain
+                .lines()
+                .any(|line| line.starts_with(&format!("⚒ {name} ◐ · {expected}"))),
+            "{name} {expected}: {plain}"
+        );
+    }
+}
+
+#[test]
+fn file_changes_use_session_workspace_and_home_in_plain_rows() {
+    use haider_tui::{app::AppModel, runtime::run_demo_plain};
+    for (workspace, home, path, expected) in [
+        (
+            "/opt/project",
+            "/Users/alice",
+            "/opt/project/src/lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "/Users/alice/project",
+            "/Users/alice",
+            "/Users/alice/project/src/lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice",
+            "C:/Users/alice/notes.md",
+            "~/notes.md",
+        ),
+        (
+            "/Users/alice/project",
+            "/Users/alice",
+            "/Users/carol/notes.md",
+            "/Users/<user>/notes.md",
+        ),
+        (
+            "C:/Users/alice/project",
+            "C:/Users/alice",
+            r"c:\USERS\ALICE\PROJECT\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            r"\\srv\share\project",
+            "C:/Users/alice",
+            r"\\?\UNC\SRV\SHARE\project\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            r"\\.\C:\project",
+            "C:/Users/alice",
+            r"\\?\C:\project\src\lib.rs",
+            "src/lib.rs",
+        ),
+        (
+            "/Users",
+            "/Users/alice",
+            "/Users/carol/src/lib.rs",
+            "/Users/<user>/src/lib.rs",
+        ),
+        ("/opt/project", "/Users/alice", "src/lib.rs", "src/lib.rs"),
+    ] {
+        let mut model = AppModel::new();
+        model.cwd = workspace.into();
+        model.session_workspace_cwd = Some(workspace.into());
+        model.display_homes = vec![home.into()];
+        assert_eq!(model.tool_path_context().shorten(path), expected);
+        model
+            .projection
+            .apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("file-change-context"),
+                item: TurnItem::FileChange {
+                    path: path.into(),
+                    added: 1,
+                    removed: 0,
+                },
+            }));
+        let plain = run_demo_plain(model);
+        assert_eq!(
+            plain.lines().find(|line| line.starts_with("± ")),
+            Some(format!("± {expected} +1 -0").as_str()),
+            "{workspace}: {path}"
+        );
+    }
+}
+
+#[test]
+fn generic_argument_summaries_project_every_path_key_and_preserve_literals() {
+    use haider_tui::toolfold::{arg_summary, arg_summary_with_context};
+    use haider_tui::toolview::PathContext;
+    use serde_json::json;
+
+    let paths = PathContext {
+        workspace: Some("C:/Users/summary-fixture-alice/project".into()),
+        homes: vec!["C:/Users/summary-fixture-alice".into()],
+    };
+    for key in [
+        "path",
+        "file_path",
+        "file",
+        "cwd",
+        "root",
+        "directory",
+        "workspace",
+    ] {
+        for (path, expected) in [
+            (
+                "C:/Users/summary-fixture-bob/repo/value",
+                "C:/Users/<user>/repo/value",
+            ),
+            (
+                "C:/Users/summary-fixture-alice/project/src/O'Brien, draft.rs",
+                "src/O'Brien, draft.rs",
+            ),
+            ("C:/Users/summary-fixture-alice/a ~b/x", "~/a ~b/x"),
+            (
+                r"C:\Users\display-fixture-o'brien\src\x",
+                "C:/Users/<user>/src/x",
+            ),
+            ("src/Users/bob/a ~b.rs", "src/Users/bob/a ~b.rs"),
+            (
+                "D:/data/Backup, 2024/a ~b.rs",
+                "D:/data/Backup, 2024/a ~b.rs",
+            ),
+        ] {
+            assert_eq!(
+                arg_summary_with_context(&json!({key: path}), &paths),
+                expected,
+                "{key}: {path}"
+            );
+        }
+        for (path, expected) in [
+            (
+                "C:/Users/summary-fixture-bob/repo/value",
+                "C:/Users/<user>/repo/value",
+            ),
+            (
+                r"C:\Users\display-fixture-o'brien\src\x",
+                "C:/Users/<user>/src/x",
+            ),
+            ("src/Users/bob/a ~b.rs", "src/Users/bob/a ~b.rs"),
+            (
+                "D:/data/Backup, 2024/a ~b.rs",
+                "D:/data/Backup, 2024/a ~b.rs",
+            ),
+        ] {
+            assert_eq!(arg_summary(&json!({key: path})), expected, "{key}: {path}");
+        }
+    }
 }

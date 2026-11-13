@@ -192,6 +192,8 @@ fn model_source(
         source.replace(
             provider.to_owned(),
             ProviderInventory::Fetched {
+                owner: None,
+
                 models,
                 fetched_at_ms: u64::MAX,
             },
@@ -263,6 +265,7 @@ fn fresh_subscription_and_failed_catalog_keep_static_rows_selectable() {
     source.replace(
         "anthropic-oauth".into(),
         ProviderInventory::Fetched {
+            owner: None,
             models: vec![
                 discovered_with_context("claude-fable-5-1", true, None, Some(123_456)),
                 discovered("claude-new", true, None),
@@ -536,6 +539,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        catalog_evidence: Default::default(),
         injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
@@ -559,6 +563,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        catalog_evidence: Default::default(),
         injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
@@ -582,6 +587,7 @@ fn compaction_promotion_is_validated_and_scoped_to_the_current_provider() {
         store: MemoryProviderStore::default(),
         profiles: profiles.clone(),
         model_source: model_source([]),
+        catalog_evidence: Default::default(),
         injected_providers: std::collections::BTreeSet::new(),
         resilience: ProviderResilienceConfigV1 {
             fallback_chain: Vec::new(),
@@ -2287,6 +2293,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: Vec::new(),
             fetched_at_ms: 1,
         },
@@ -2322,6 +2329,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: vec![discovered("deepseek-v4-flash", true, None)],
             fetched_at_ms: now,
         },
@@ -2355,6 +2363,7 @@ fn public_inventory_transitions_preserve_provenance_and_validate_defaults() {
     source.replace(
         HAIDER_CODE_PROVIDER_NAME.to_owned(),
         ProviderInventory::Fetched {
+            owner: None,
             models: Vec::new(),
             fetched_at_ms: now,
         },
@@ -2762,6 +2771,8 @@ fn summary_rejects_foreign_default_without_startup_reconciliation() {
     source.replace(
         "work".into(),
         ProviderInventory::Fetched {
+            owner: None,
+
             models: vec![discovered("b-current", true, None)],
             fetched_at_ms: u64::MAX,
         },
@@ -2844,6 +2855,8 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         source.replace(
             "work".into(),
             ProviderInventory::Fetched {
+                owner: None,
+
                 models: vec![discovered("deployment", true, None)],
                 fetched_at_ms: 1,
             },
@@ -2876,6 +2889,8 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         source.replace(
             "work".into(),
             ProviderInventory::Fetched {
+                owner: None,
+
                 models: vec![discovered("other", true, None)],
                 fetched_at_ms: u64::MAX,
             },
@@ -2884,6 +2899,8 @@ fn configured_availability_retains_stale_success_and_rejects_negative_evidence()
         source.replace(
             "work".into(),
             ProviderInventory::Fetched {
+                owner: None,
+
                 models: vec![discovered("other", true, None)],
                 fetched_at_ms: 1,
             },
@@ -3044,6 +3061,8 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
             source.replace(
                 provider.into(),
                 ProviderInventory::Fetched {
+                    owner: None,
+
                     models: vec![discovered(model, true, None)],
                     fetched_at_ms: age,
                 },
@@ -3053,6 +3072,8 @@ fn configured_projection_policy_is_independent_of_provider_catalog_kind() {
         source.replace(
             provider.into(),
             ProviderInventory::Fetched {
+                owner: None,
+
                 models: vec![discovered("deployment", true, None)],
                 fetched_at_ms: u64::MAX,
             },
@@ -3282,6 +3303,8 @@ fn transient_refresh_failure_preserves_successful_empty_inventory() {
                     source.replace(
                         provider.into(),
                         ProviderInventory::Fetched {
+                            owner: None,
+
                             models: listed
                                 .map(|name| vec![discovered(name, true, None)])
                                 .unwrap_or_default(),
@@ -3514,4 +3537,48 @@ fn window_only_catalog_rows_project_an_unpublished_output_maximum() {
         assert_eq!(selection.explicit_max_output_tokens, ceiling, "{provider}");
         assert!(selection.explicit_max_output_tokens >= 60_000);
     }
+}
+
+#[test]
+fn another_owners_rejection_preserves_unsupported_discovery_evidence() {
+    let dir = tempfile::tempdir().expect("synthetic profile");
+    let mut profile = removable_provider_profile_for_catalog_test();
+    profile.configured_models = vec!["deployment".into()];
+    profile.default_model = Some("deployment".into());
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store.save(&[profile]).expect("synthetic provider profile");
+    let registry =
+        ProviderRegistry::new(store.clone(), vec![], model_source([])).expect("registry");
+    registry
+        .record_catalog_rejection("work", "owner-A", "synthetic A rejection".into())
+        .expect("A rejection");
+    registry
+        .record_catalog_unsupported("work", "owner-B", "synthetic B listing unsupported".into())
+        .expect("B listing result");
+    let restarted = ProviderRegistry::new(store, vec![], model_source([])).expect("restart");
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-B")
+            .expect("B evidence"),
+        "A's rejection cannot discard B's independently produced unsupported-listing evidence"
+    );
+    assert!(
+        restarted
+            .summary("work", &|_| true)
+            .expect("B summary")
+            .model_is_selectable("deployment"),
+        "B's own configured deployment remains selectable after its listing refusal"
+    );
+    assert!(
+        restarted
+            .restore_catalog_evidence("work", "owner-A")
+            .expect("A evidence")
+    );
+    assert!(
+        !restarted
+            .summary("work", &|_| true)
+            .expect("A summary")
+            .model_is_selectable("deployment"),
+        "recording B's uncertainty must preserve A's rejection"
+    );
 }

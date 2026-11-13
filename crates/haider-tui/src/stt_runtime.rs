@@ -431,7 +431,8 @@ fn gather_snapshot(store_dir: &std::path::Path) -> TalkSetupSnapshot {
             });
     TalkSetupSnapshot {
         config,
-        whisper_dir: whisper_dir.map(|dir| dir.display().to_string()),
+        whisper_dir: whisper_dir
+            .map(|dir| crate::live::workspace_display_path(&dir.to_string_lossy())),
         installed,
         selected_hint,
         runtime,

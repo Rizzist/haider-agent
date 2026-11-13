@@ -57,7 +57,7 @@ jobs:
       - name: Android release attachment policy regression tests
         run: python3 -m unittest scripts/tests/test_android_release_asset.py
       - name: pipeline reuse, artifact integrity and shard regression tests
-        run: python3 -m unittest scripts/tests/test_find_evidence.py scripts/tests/test_macos_build_artifact.py scripts/tests/test_ci_test_shards.py
+        run: python3 -m unittest scripts/tests/test_find_evidence.py scripts/tests/test_macos_build_artifact.py scripts/tests/test_ci_test_shards.py scripts/tests/test_fake_oauth_server.py
       - name: self-test
         env:
           # The CLI dispatches its offline actor self-test to the daemon and

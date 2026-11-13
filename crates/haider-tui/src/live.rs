@@ -3884,7 +3884,7 @@ impl LiveDriver {
                 model_catalog_key,
                 metadata,
             } => {
-                let cwd_display = workspace_display_path(&cwd);
+                let cwd_display = model.display_path(&cwd);
                 self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
                 self.generations.insert(session.clone(), worker_generation);
@@ -4353,9 +4353,12 @@ impl LiveDriver {
                     },
                 );
                 if model.active_session.as_ref() == Some(&session) {
-                    model.session_dir = workspace_display_path(&path);
+                    model.session_dir = model.display_path(&path);
                     model.session_workspace_cwd = Some(path.clone());
-                    model.flash = Some(format!("· workspace re-rooted → {path}"));
+                    model.flash = Some(format!(
+                        "· workspace re-rooted → {}",
+                        model.display_path(&path)
+                    ));
                     model.dirty = true;
                 }
                 if retry_after {
@@ -4462,12 +4465,14 @@ impl LiveDriver {
                     }
                 }
                 model.accounts.revision = Some(revision);
-                model.accounts.message = Some(match replacement_active_alias {
-                    Some(active) => {
-                        format!("removed `{removed_alias}` · active → `{active}`")
-                    }
-                    None => format!("removed `{removed_alias}`"),
-                });
+                model
+                    .accounts
+                    .set_message(Some(match replacement_active_alias {
+                        Some(active) => {
+                            format!("removed `{removed_alias}` · active → `{active}`")
+                        }
+                        None => format!("removed `{removed_alias}`"),
+                    }));
                 model.bootstrap_identity_from_daemon();
                 model.refresh_context_window();
                 model.dirty = true;
@@ -4966,6 +4971,7 @@ impl LiveDriver {
                     // Daemon truth landed: an unpinned identity follows the
                     // active account (W5f-2) so the first session can serve.
                     model.bootstrap_identity_from_daemon();
+                    model.refresh_context_window();
                     model.dirty = true;
                 }
                 // An active OAuth account with no catalog yet needs one
@@ -5020,12 +5026,12 @@ impl LiveDriver {
                 } else {
                     "imported"
                 };
-                model.accounts.message = Some(format!(
+                model.accounts.set_message(Some(format!(
                     "✓ {action} {} → {} · {}",
                     descriptor.provider,
                     descriptor.alias,
                     crate::format::mask_identity(&descriptor.identity)
-                ));
+                )));
                 model.dirty = true;
                 vec![
                     LiveCommand::AccountListAt {
@@ -5096,7 +5102,7 @@ impl LiveDriver {
                     model.refresh_context_window();
                     model.dirty = true;
                 }
-                Vec::new()
+                self.provider_model_refreshes(model)
             }
             LiveReply::ModelSelected {
                 connection_epoch,
@@ -5805,7 +5811,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("`{alias}` not removed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("`{alias}` not removed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -5821,7 +5829,9 @@ impl LiveDriver {
                     if !retryable {
                         self.retire(id);
                     }
-                    model.accounts.message = Some(format!("✗ import failed — {message}"));
+                    model
+                        .accounts
+                        .set_message(Some(format!("✗ import failed — {message}")));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -6651,7 +6661,7 @@ impl LiveDriver {
                         .as_ref()
                         .map(|metadata| metadata.cwd.as_str())
                 })
-                .map(workspace_display_path);
+                .map(|path| model.display_path(path));
             model.upsert_live_session(&summary.session_id);
             if summary.metadata.is_none()
                 && let Some(row) = model
@@ -7497,6 +7507,25 @@ impl LiveDriver {
     /// released when the refreshed snapshot lands, so TTL expiry can recur.
     fn provider_model_refreshes(&mut self, model: &AppModel) -> Vec<LiveCommand> {
         let mut commands = Vec::new();
+        if model
+            .providers
+            .providers
+            .iter()
+            .any(|summary| !model.provider_inventory_matches_accounts(summary))
+        {
+            // A refresh changes the management revision too. Fetch the older
+            // half so metadata becomes usable again whichever reply came first.
+            match (model.accounts.revision, model.providers.revision) {
+                (Some(accounts), Some(providers)) if accounts > providers => {
+                    commands.push(LiveCommand::ProviderListAt {
+                        epoch: self.connection_epoch,
+                    });
+                }
+                _ => commands.push(LiveCommand::AccountListAt {
+                    epoch: self.connection_epoch,
+                }),
+            }
+        }
         for row in &model.accounts.rows {
             // Any SELECTED account whose provider has no catalog asks for
             // one — OAuth subscriptions AND api-key accounts alike (W5g-5:
@@ -7510,6 +7539,11 @@ impl LiveDriver {
                 .providers
                 .iter()
                 .find(|summary| summary.provider == row.provider);
+            if summary.is_some_and(|summary| !model.provider_inventory_matches_accounts(summary)) {
+                // Both management snapshots are already requested together.
+                // Wait for their common revision before deciding a cache hit.
+                continue;
+            }
             let needs_refresh = summary.is_none_or(|summary| summary.inventory.needs_refresh());
             if !needs_refresh || self.models_requested.contains(&row.provider) {
                 continue;
@@ -7665,8 +7699,7 @@ impl LiveDriver {
                     {
                         Ok(next) => {
                             model.cwd = next.leaf.clone();
-                            model.pending_workspace_display =
-                                Some(workspace_display_path(&next.leaf));
+                            model.pending_workspace_display = Some(model.display_path(&next.leaf));
                             model.pending_workspace_allocation = Some(next);
                         }
                         Err(_) => {
@@ -8921,14 +8954,13 @@ impl LiveDriver {
 /// initial and renewed previews — and their fallback — are identical.
 #[must_use]
 pub fn workspace_display_path(path: &str) -> String {
-    let environment = haider_client::workspace::WorkspaceEnvironment::capture();
-    haider_client::launch_origin::sanitize_origin_path(
-        Some(std::path::Path::new(path)),
-        environment.home.as_deref(),
-    )
-    .ok()
-    .and_then(|sanitized| sanitized.display)
-    .unwrap_or_else(|| "<workspace path unavailable>".to_owned())
+    haider_client::launch_origin::display_path(std::path::Path::new(path))
+}
+
+/// Same projection with an explicit session or launcher home snapshot.
+#[must_use]
+pub fn workspace_display_path_with_homes(path: &str, homes: &[std::path::PathBuf]) -> String {
+    haider_client::launch_origin::display_path_with_homes(std::path::Path::new(path), homes)
 }
 
 /// What to CALL a demo-only request when live mode has to refuse it — the

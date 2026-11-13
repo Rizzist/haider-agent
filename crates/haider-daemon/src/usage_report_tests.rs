@@ -106,6 +106,16 @@ impl MeterTokenSource for StubTokens {
 
 struct FailingTokens;
 
+#[tokio::test]
+async fn meter_bearer_refuses_non_live_issued_bundle() {
+    let (broker, descriptor) =
+        crate::oauth::non_live_issued_broker_for_sendpoint("anthropic-oauth").await;
+    let error = MeterTokenSource::bearer(&broker, &descriptor)
+        .await
+        .expect_err("remote meter bearer refused");
+    assert_eq!(error.reason, "credential_unavailable");
+}
+
 #[async_trait::async_trait]
 impl MeterTokenSource for FailingTokens {
     async fn bearer(
@@ -681,8 +691,10 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
         haider_provider::OPENAI_OAUTH_USAGE_URL.to_owned(),
         (200, wham.to_vec()),
     )]));
+    let coordinate =
+        haider_provider::openai_user_account_coordinate("person", Some("chatgpt-account-123"));
     let service = service_with_clock(
-        vec![openai_descriptor("work-chatgpt", "chatgpt-account-123")],
+        vec![openai_descriptor("work-chatgpt", &coordinate)],
         Some(Arc::new(StubTokens {
             bytes: jwt_with_claims(&serde_json::json!({
                 "email": "person@example.invalid",

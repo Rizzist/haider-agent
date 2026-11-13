@@ -5,7 +5,7 @@
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, OAuthAddPhase};
+use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, Hit, InputOwner, OAuthAddPhase};
 use haider_tui::mock::seed_account_rows;
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -25,6 +25,59 @@ fn accounts_model() -> AppModel {
     model.requests.clear();
     model.accounts.apply_snapshot(seed_account_rows(), None);
     model
+}
+
+#[test]
+fn oauth_receipt_flags_ambiguous_email_without_wrong_removal_hint() {
+    let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
+        alias: CredentialAlias::new(alias),
+        provider: "anthropic-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "owner@example.test".into(),
+        status: CredentialStatus::Ok,
+        active: false,
+        label: None,
+        account_identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("owner@example.test".into()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+        created_at_ms: None,
+    };
+    let mut model = accounts_model();
+    model.accounts.apply_snapshot(
+        vec![
+            AccountRow::from_descriptor(&descriptor("legacy", None)),
+            AccountRow::from_descriptor(&descriptor(
+                "member-a",
+                Some("account=a;organization=team"),
+            )),
+        ],
+        None,
+    );
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::AnthropicOAuth,
+    ));
+    let attempt = model.oauth_add.as_ref().expect("card").attempt;
+    model.oauth_add_completed(
+        attempt,
+        &descriptor("member-b", Some("account=b;organization=team")),
+    );
+    let message = model.accounts.message.as_deref().expect("receipt");
+    assert!(message.contains("email matches distinct account IDs"));
+    assert!(!message.contains("haider account remove legacy"));
+    assert!(model.accounts.message_action.is_none());
+    for (width, height) in [(118, 36), (80, 24)] {
+        assert!(!draw(&model, width, height).contains("haider account remove legacy"));
+    }
 }
 
 fn draw(model: &AppModel, width: u16, height: u16) -> String {
@@ -234,4 +287,310 @@ fn card_renders_waiting_copy_above_the_add_row() {
         .position(|row| row.contains("[+ OpenAI (OAuth)]"))
         .expect("buttons");
     assert!(card_row < button_row, "card sits above the add row");
+}
+
+/// Notice size is bounded independently of alias count, provider and row health.
+/// Completion through the same or another alias shares the paged notice rule.
+#[test]
+fn a23_duplicate_notice_has_a_bounded_summary_and_a_paged_full_list() {
+    for size in [(118, 36), (80, 24)] {
+        for provider in ["anthropic-oauth", "openai-oauth"] {
+            for count in [2, 20, 40] {
+                for long in [false, true] {
+                    for health in [
+                        Some(CredentialStatus::Ok),
+                        Some(CredentialStatus::Expired),
+                        Some(CredentialStatus::Revoked),
+                        None,
+                    ] {
+                        for completion in ["fresh-match", "same-alias", "retarget"] {
+                            check_duplicate_notice(
+                                size,
+                                provider,
+                                count,
+                                long,
+                                health.clone(),
+                                completion,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn check_duplicate_notice(
+    (width, height): (u16, u16),
+    provider: &str,
+    count: usize,
+    long: bool,
+    health: Option<CredentialStatus>,
+    completion: &str,
+) {
+    use haider_protocol::credential::AccountIdentity;
+    use haider_tui::app::AccountAddKind;
+    let aliases = (0..count)
+        .map(|n| {
+            if long {
+                format!("legacy-profile-{n:02}-{}", "a".repeat(40))
+            } else {
+                format!("old-{n:02}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let account_id = if provider == "openai-oauth" {
+        "user:1:a;workspace:4:team"
+    } else {
+        "account=a;organization=team"
+    };
+    let descriptor = |alias: &str, status| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
+        alias: CredentialAlias::new(alias),
+        provider: provider.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same@example.test".into(),
+        status,
+        active: false,
+        label: None,
+        account_identity: Some(AccountIdentity {
+            email: Some("same@example.test".into()),
+            display_name: None,
+            account_id: Some(account_id.into()),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: true,
+        }),
+        created_at_ms: None,
+    };
+    let saved = if long {
+        format!("saved-profile-{}", "s".repeat(44))
+    } else {
+        "saved".into()
+    };
+    let requested = if completion == "same-alias" {
+        saved.clone()
+    } else if long {
+        format!("prior-profile-{}", "x".repeat(44))
+    } else {
+        "requested".into()
+    };
+    let mut rows = vec![AccountRow::from_descriptor(&descriptor(
+        &saved,
+        CredentialStatus::Ok,
+    ))];
+    rows.extend(aliases.iter().enumerate().map(|(n, alias)| {
+        AccountRow::from_descriptor(&descriptor(
+            alias,
+            health.clone().unwrap_or(match n % 3 {
+                0 => CredentialStatus::Ok,
+                1 => CredentialStatus::Expired,
+                _ => CredentialStatus::Revoked,
+            }),
+        ))
+    }));
+    if completion == "retarget" {
+        let mut old = descriptor(&requested, CredentialStatus::Revoked);
+        old.account_identity.as_mut().expect("identity").account_id = Some(
+            if provider == "openai-oauth" {
+                "user:1:b;workspace:4:team"
+            } else {
+                "account=b;organization=team"
+            }
+            .into(),
+        );
+        rows.push(AccountRow::from_descriptor(&old));
+    }
+    let retained = rows.len();
+    let mut model = accounts_model();
+    model.accounts.apply_snapshot(rows, None);
+    model.handle_hit(Hit::AccountAdd(if provider == "openai-oauth" {
+        AccountAddKind::OpenAiOAuth
+    } else {
+        AccountAddKind::AnthropicOAuth
+    }));
+    let card = model.oauth_add.as_mut().expect("card");
+    card.alias = requested;
+    let attempt = card.attempt;
+    model.oauth_add_completed(attempt, &descriptor(&saved, CredentialStatus::Ok));
+    let action = format!("haider account remove {} --confirm", aliases[0]);
+    let normalize = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let frame = normalize(draw(&model, width, height));
+    assert!(
+        frame.contains(&action),
+        "complete action at {width}x{height}/{count}/{long}/{health:?}/{completion}: {frame}"
+    );
+    assert!(frame.contains("F2 full notice"));
+    let message = model.accounts.message.as_ref().expect("summary");
+    if count > 2 {
+        assert!(message.contains(&format!("and {} more", count - 2)));
+        assert!(
+            frame.contains(&format!("and {} more", count - 2)),
+            "remaining count stays visible: {frame}"
+        );
+    }
+    assert!(!message.contains(aliases.last().expect("last")) || count == 2);
+    let cursor = model.accounts.cursor;
+    key(&mut model, KeyCode::F(2));
+    let first = normalize(draw(&model, width, height));
+    assert_eq!(model.input_owner(), InputOwner::AccountsNotice);
+    assert_eq!(
+        model.painted_input().expect("painted").owner,
+        InputOwner::AccountsNotice
+    );
+    assert!(first.contains(&aliases[0]));
+    assert!(first.contains(&action));
+    for _ in 0..10 {
+        key(&mut model, KeyCode::PageDown);
+        draw(&model, width, height);
+    }
+    let last = normalize(draw(&model, width, height));
+    assert!(
+        last.contains(aliases.last().expect("last")),
+        "last alias reachable: {last}"
+    );
+    assert!(last.contains(&action));
+    model.handle_hit(Hit::AccountRow(aliases[1].clone()));
+    assert_eq!(model.accounts.cursor, cursor, "covered list is inert");
+    key(&mut model, KeyCode::Home);
+    assert_eq!(model.accounts.message_scroll.get(), 0);
+    key(&mut model, KeyCode::Esc);
+    assert!(!model.accounts.message_expanded);
+    assert_eq!(
+        model.accounts.rows.len(),
+        retained,
+        "matching and distinct saved accounts are retained"
+    );
+}
+
+#[test]
+fn a25_legacy_email_notice_does_not_offer_placeholder_as_a_duplicate() {
+    let descriptor = |alias: &str, account_id: Option<&str>| CredentialDescriptor {
+        incarnation: 0,
+        credential_digest: None,
+
+        alias: CredentialAlias::new(alias),
+        provider: "anthropic-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "same@example.test".into(),
+        status: CredentialStatus::Ok,
+        active: false,
+        label: None,
+        created_at_ms: None,
+        account_identity: Some(haider_protocol::credential::AccountIdentity {
+            email: Some("same@example.test".into()),
+            display_name: None,
+            account_id: account_id.map(str::to_owned),
+            plan: None,
+            issuer: None,
+            captured_at: 1,
+            verified: false,
+        }),
+    };
+    for incoming_placeholder in [false, true] {
+        let mut model = accounts_model();
+        model.accounts.apply_snapshot(
+            vec![AccountRow::from_descriptor(&descriptor(
+                "neighbor",
+                Some("anthropic:shared"),
+            ))],
+            None,
+        );
+        model.handle_hit(Hit::AccountAdd(
+            haider_tui::app::AccountAddKind::AnthropicOAuth,
+        ));
+        model.oauth_add.as_mut().expect("card").alias = "fresh".into();
+        let attempt = model.oauth_add.as_ref().expect("card").attempt;
+        model.oauth_add_completed(
+            attempt,
+            &descriptor("fresh", incoming_placeholder.then_some("anthropic:shared")),
+        );
+        let message = model.accounts.message.as_deref().expect("notice");
+        assert!(!message.contains("matching aliases retained"), "{message}");
+        assert!(!message.contains("updated existing"), "{message}");
+        assert_eq!(
+            message.contains("not deduplicated until it verifies"),
+            incoming_placeholder
+        );
+        assert!(model.accounts.message_action.is_none());
+        for (width, height) in [(118, 36), (80, 24)] {
+            let text = draw(&model, width, height);
+            assert!(!text.contains("haider account remove neighbor"));
+        }
+    }
+}
+
+#[test]
+fn integrated_account_notice_retires_input_when_replaced_or_reopened() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = accounts_model();
+        let summary = "matching aliases retained ".repeat(50);
+        let details = (0..80)
+            .map(|n| format!("retained alias-{n:02}\n"))
+            .collect::<String>();
+        let action = "haider account remove alias-00 --confirm".to_owned();
+        model
+            .accounts
+            .set_detailed_message(summary.clone(), details.clone(), action.clone());
+        draw(&model, width, height);
+        key(&mut model, KeyCode::F(2));
+        draw(&model, width, height);
+        let opened = model.presented_input();
+        assert_eq!(opened.owner, InputOwner::AccountsNotice);
+        key(&mut model, KeyCode::PageDown);
+        model.handle_wheel(false);
+        assert!(model.accounts.message_scroll.get() > 0);
+        assert_eq!(
+            model.presented_input(),
+            opened,
+            "paging preserves the visible notice"
+        );
+        model.requests.clear();
+        let cursor = model.accounts.cursor;
+        let draft = model.composer.text().to_owned();
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        model.handle(AppEvent::Paste("covered-input".to_owned().into()));
+        model.handle_hit(Hit::AccountRow(model.accounts.rows[0].alias.clone()));
+        assert!(
+            model.requests.is_empty(),
+            "covered input cannot request a clipboard read"
+        );
+        assert_eq!(model.accounts.cursor, cursor);
+        assert_eq!(model.composer.text(), draft);
+        model
+            .accounts
+            .set_detailed_message(summary, details, action);
+        assert!(model.accounts.message_expanded);
+        let replacement = model.presented_input();
+        assert_ne!(
+            replacement, opened,
+            "even a repeated notice retires old input"
+        );
+        model.help_open = true;
+        draw(&model, width, height);
+        assert_eq!(model.input_owner(), InputOwner::Help);
+        key(&mut model, KeyCode::Esc);
+        assert!(!model.help_open);
+        assert_eq!(model.presented_input(), replacement);
+        draw(&model, width, height);
+        key(&mut model, KeyCode::Esc);
+        assert!(!model.accounts.message_expanded);
+        assert_ne!(model.input_owner(), InputOwner::AccountsNotice);
+        draw(&model, width, height);
+        key(&mut model, KeyCode::F(2));
+        assert_eq!(model.input_owner(), InputOwner::AccountsNotice);
+        assert_ne!(
+            model.presented_input(),
+            replacement,
+            "reopened notices reject old input"
+        );
+    }
 }

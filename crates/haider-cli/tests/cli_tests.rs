@@ -6061,6 +6061,42 @@ fn preupgrade_go_session_cli_recovery_reselects_before_any_provider_round() {
         .expect("stop owned upgrade daemon");
 }
 
+#[test]
+fn unsupported_claude_import_reports_reason_without_an_impossible_instruction() {
+    for fake_mode in [false, true] {
+        let mut command = haider();
+        let home = test_home(&command.profile);
+        let claude = home.join(".claude/.credentials.json");
+        std::fs::create_dir_all(claude.parent().expect("parent")).expect("fixture dir");
+        std::fs::write(&claude, r#"{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","expiresAt":4102444800123,"scopes":["user:inference"],"subscriptionType":"max"}}"#).expect("synthetic file");
+        command
+            .env("HAIDER_DISCOVERY_DISABLED", "0")
+            .env("HAIDER_CLAUDE_CREDS_PATH", &claude)
+            .env("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE", "unavailable")
+            .env("HAIDER_CODEX_AUTH_PATH", home.join("no-codex.json"))
+            .env_remove("HAIDER_TEST_FAKE_OAUTH_ORIGIN")
+            .args(["account", "import", "claude-code"]);
+        if fake_mode {
+            command.env("HAIDER_TEST_FAKE_OAUTH_ORIGIN", "http://127.0.0.1:9");
+        }
+        let output = command.output().expect("real CLI");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "unsupported import must refuse");
+        assert!(
+            text.contains("remain owned by the official client"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("--confirm"),
+            "unsupported import must not advertise confirmation: {text}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[path = "catalog/partial_writes.rs"]
 mod catalog_partial_write;

@@ -17,6 +17,7 @@ pub mod composer;
 pub mod context_meter;
 pub mod custom_commands;
 pub mod demo_store;
+pub mod display_order;
 pub mod fleet;
 pub mod format;
 pub mod graph;

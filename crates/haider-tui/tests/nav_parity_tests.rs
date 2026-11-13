@@ -338,6 +338,60 @@ fn mention_completion_handles_empty_query_huge_directory_and_non_utf8_name() {
 }
 
 #[test]
+fn display_label_is_never_used_as_a_file_mention_scan_root() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    fs::write(root.path().join("private-file.txt"), "x").expect("file");
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.session_dir = root.path().to_string_lossy().into_owned();
+    model.session_workspace_cwd = None;
+    model.composer.set_text("@private-file");
+    model.handle(common::key(KeyCode::Char('x')));
+    assert!(model.mention_completion.as_ref().is_none_or(|completion| {
+        !completion
+            .candidates
+            .iter()
+            .any(|item| item == "private-file.txt")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn file_mention_candidate_escapes_control_filename() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    fs::write(root.path().join("bad\nname.txt"), "x").expect("file");
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.session_workspace_cwd = Some(root.path().to_string_lossy().into_owned());
+    model.composer.set_text("@ba");
+    model.handle(common::key(KeyCode::Char('d')));
+    let completion = model.mention_completion.as_ref().expect("completion");
+    assert!(
+        completion
+            .candidates
+            .iter()
+            .any(|name| name == "bad\nname.txt")
+    );
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("@bad\\u{000a}name.txt"));
+}
+
+#[test]
 fn mention_scan_ceiling_is_reported_even_without_matches() {
     let root = tempfile::tempdir().expect("temporary workspace");
     // Pin the safety ceiling separately from the 64-result popup bound.
