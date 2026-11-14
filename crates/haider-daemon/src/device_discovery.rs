@@ -192,8 +192,6 @@ struct CodexClaims {
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
-    sub: Option<String>,
-    #[serde(default)]
     chatgpt_account_id: Option<String>,
     #[serde(default, rename = "https://api.openai.com/auth")]
     openai_auth: Option<CodexAuthClaims>,

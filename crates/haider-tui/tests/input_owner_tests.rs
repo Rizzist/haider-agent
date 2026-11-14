@@ -713,10 +713,20 @@ fn e2_stale_hover_never_moves_a_covered_choice() {
     }
     for choice in ["theme", "effort", "model"] {
         let mut model = model();
+        if choice == "model" {
+            model
+                .providers
+                .apply_snapshot(haider_tui::mock::seed_provider_summaries(), 1);
+            model
+                .accounts
+                .apply_snapshot(haider_tui::mock::seed_account_rows(), Some(1));
+        }
         arm(&mut model, choice);
         let model_row = (choice == "model").then(|| {
             assert_eq!(model.input_owner(), InputOwner::ModelPicker);
-            model.model_picker_rows().into_iter().last().unwrap()
+            let rows = model.model_picker_rows();
+            assert!(rows.len() > 1, "covered hover needs a different target row");
+            rows.into_iter().last().unwrap()
         });
         arm(&mut model, "permission");
         if choice == "theme" {
