@@ -7,12 +7,21 @@ import android.system.ErrnoException
 import android.system.OsConstants
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.io.FileDescriptor
 import java.util.UUID
 
 /** Owner-only files. No credentials or ambient paths are accepted by this API. */
 internal object PrivateDaemonFiles {
+    // Linux O_CLOEXEC works on API 26, but OsConstants exposes it publicly only from API 27.
+    private const val O_CLOEXEC = 0x80000
+
+    // Os.open owns the handle. Android's streams constructed from a FileDescriptor
+    // borrow it, so closing those streams does not close the underlying descriptor.
+    private inline fun <T> withDescriptor(file: File, flags: Int, mode: Int = 0, use: (FileDescriptor) -> T): T {
+        val fd = Os.open(file.path, flags or O_CLOEXEC, mode)
+        return try { use(fd) } finally { Os.close(fd) }
+    }
+
     fun directory(root: File, relative: String): File {
         var current = root.canonicalFile
         relative.split('/').filter(String::isNotEmpty).forEach { part ->
@@ -34,16 +43,15 @@ internal object PrivateDaemonFiles {
     }
 
     fun read(file: File, limit: Int): ByteArray {
-        val fd = Os.open(file.path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
-        return FileInputStream(fd).use { stream ->
+        return withDescriptor(file, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW) { fd ->
             val stat = Os.fstat(fd)
             require(OsConstants.S_ISREG(stat.st_mode) && stat.st_uid == Process.myUid())
             require(stat.st_size in 1..limit.toLong())
             val bytes = ByteArray(limit + 1)
             var count = 0
             while (count < bytes.size) {
-                val read = stream.read(bytes, count, bytes.size - count)
-                if (read < 0) break
+                val read = Os.read(fd, bytes, count, bytes.size - count)
+                if (read == 0) break
                 count += read
             }
             require(count in 1..limit)
@@ -55,16 +63,22 @@ internal object PrivateDaemonFiles {
         val parent = requireNotNull(file.parentFile)
         val temporary = File(parent, ".${file.name}-${UUID.randomUUID()}.tmp")
         try {
-            val fd = Os.open(temporary.path,
-                OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL or OsConstants.O_NOFOLLOW, 384)
-            FileOutputStream(fd).use { it.write(bytes); it.fd.sync() }
+            withDescriptor(temporary,
+                OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL or OsConstants.O_NOFOLLOW, 384) { fd ->
+                var count = 0
+                while (count < bytes.size) {
+                    val written = Os.write(fd, bytes, count, bytes.size - count)
+                    check(written > 0)
+                    count += written
+                }
+                Os.fsync(fd)
+            }
             Os.rename(temporary.path, file.path)
-            val directoryFd = Os.open(parent.path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
-            try {
+            withDescriptor(parent, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW) { directoryFd ->
                 val stat = Os.fstat(directoryFd)
                 require(OsConstants.S_ISDIR(stat.st_mode) && stat.st_uid == Process.myUid())
                 Os.fsync(directoryFd)
-            } finally { Os.close(directoryFd) }
+            }
         } finally {
             temporary.delete()
         }

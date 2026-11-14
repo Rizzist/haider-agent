@@ -161,8 +161,9 @@ impl CuPresence {
         *lock(&self.fixture_idle_clock) = Some((Instant::now(), tokio::time::Instant::now()));
     }
 
-    /// Delays every Stop hook's turn cancellation (tests only).
-    #[cfg(test)]
+    /// Delays every Stop hook's turn cancellation (tests only). Its only caller,
+    /// `cu2_computer_runtime_tests`, is not compiled for Android targets.
+    #[cfg(all(test, not(target_os = "android")))]
     pub(crate) fn set_stop_cancel_delay(&self, delay: Duration) {
         *lock(&self.stop_cancel_delay) = delay;
     }
