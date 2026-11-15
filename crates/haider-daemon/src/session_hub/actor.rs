@@ -1936,13 +1936,19 @@ pub(super) async fn run_session_actor(
             }
             ActorCommand::AcquireWorkerLease {
                 lease_id,
+                settings_save_live,
                 cancellation_wake,
                 completed,
             } => {
+                if let Some(current) = worker.as_ref() {
+                    current.settings_save_live.store(false, Ordering::Release);
+                }
+                hooks.lockdown_saves.fence(Some(&session_id), None);
                 // Replacement revokes the old token in this serialized step
                 // before the successor can append or register a wake target.
                 worker = Some(RegisteredWorker {
                     lease_id,
+                    settings_save_live,
                     harness: None,
                     cancellation_wake,
                 });
@@ -1995,6 +2001,10 @@ pub(super) async fn run_session_actor(
                     .as_ref()
                     .is_some_and(|current| current.lease_id == lease_id)
                 {
+                    if let Some(current) = worker.as_ref() {
+                        current.settings_save_live.store(false, Ordering::Release);
+                    }
+                    hooks.lockdown_saves.fence(Some(&session_id), None);
                     worker = None;
                 }
                 let _ = completed.send(());

@@ -80,6 +80,7 @@ pub(super) fn rebound_turn_lockdown_snapshot(
 
 /// Recovery performs the same frozen-policy check, then publishes the binding
 /// and active boundary with one durable replacement before the turn proceeds.
+#[cfg(test)]
 pub(super) fn rebound_active_turn_lockdown_snapshot(
     hub: &SessionHub,
     session_id: &SessionId,
@@ -87,6 +88,29 @@ pub(super) fn rebound_active_turn_lockdown_snapshot(
     explicitly_rebound: bool,
     provider: &str,
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
+) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
+    let guard = hub
+        .begin_lockdown_save(session_id, run_id)
+        .map_err(hub_error)?;
+    rebound_active_turn_lockdown_snapshot_owned(
+        hub,
+        session_id,
+        run_id,
+        explicitly_rebound,
+        provider,
+        policy,
+        &guard.permit(),
+    )
+}
+
+pub(super) fn rebound_active_turn_lockdown_snapshot_owned(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    explicitly_rebound: bool,
+    provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    save: &crate::session_hub::lockdown_save::SavePermit,
 ) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
     if explicitly_rebound
         && let Some((bound_provider, bound_policy)) = hub
@@ -106,12 +130,12 @@ pub(super) fn rebound_active_turn_lockdown_snapshot(
             // A recovered explicit Full rebind intentionally keeps the
             // accepted run's original authority identity. Its binding is
             // already durable, so only activation remains to persist.
-            hub.activate_lockdown_turn(session_id, run_id)
+            hub.activate_lockdown_turn_owned(session_id, run_id, save)
                 .map_err(hub_error)?;
             return Ok(None);
         }
     }
-    active_lockdown_turn_snapshot(hub, session_id, run_id, provider, policy)
+    active_lockdown_turn_snapshot(hub, session_id, run_id, provider, policy, save)
 }
 
 pub(crate) struct DaemonProviderRebindResolver {
@@ -296,7 +320,8 @@ impl haider_core::ProviderRebindResolver for DaemonProviderRebindResolver {
         let frozen = self
             .store
             .hub()
-            .bound_session_lockdown(self.store.session_id())
+            .bound_session_lockdown_blocking(self.store.session_id())
+            .await
             .map_err(hub_error)?;
         if !frozen.as_ref().is_some_and(|(provider, frozen)| {
             frozen.binding_bits() == policy.binding_bits()

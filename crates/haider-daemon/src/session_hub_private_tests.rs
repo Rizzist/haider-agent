@@ -1033,6 +1033,7 @@ async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
         .commands
         .send(ActorCommand::AcquireWorkerLease {
             lease_id: WorkerLeaseId("delete-barrier-lease".into()),
+            settings_save_live: Arc::new(AtomicBool::new(true)),
             cancellation_wake: None,
             completed: lease_completed,
         })

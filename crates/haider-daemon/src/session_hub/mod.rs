@@ -117,6 +117,7 @@ mod actor;
 mod android_shell;
 mod close;
 mod descendant_stream;
+pub(crate) mod lockdown_save;
 mod replay;
 pub(crate) mod rpc;
 #[cfg(test)]
@@ -129,6 +130,49 @@ pub(crate) async fn open_retention_test_hub(
     let store = SqliteStoreHandle::open(path).await?;
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default())?;
     Ok((store, hub))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+fn lockdown_crash_checkpoint(stage: &str) {
+    if std::env::var("HAIDER_LOCKDOWN_CRASH_STAGE").ok().as_deref() == Some(stage) {
+        if let Some(marker) = std::env::var_os("HAIDER_LOCKDOWN_CRASH_MARKER") {
+            std::fs::write(marker, stage).expect("record injected crash stage");
+        }
+        std::process::abort();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+fn assert_lockdown_durable_before_publish(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
+) {
+    if std::env::var_os("HAIDER_LOCKDOWN_ASSERT_DURABLE_BEFORE_PUBLISH").is_none() {
+        return;
+    }
+    let active = crate::lockdown::global()
+        .expect("lockdown manager")
+        .active_session_binding(
+            hub.inner.store.cached_profile_installation_id(),
+            session_id.as_str(),
+        )
+        .expect("durable active binding");
+    let (lockdown, auto_hermetic) = policy.binding_bits();
+    assert_eq!(
+        active,
+        Some((
+            run_id.as_str().to_owned(),
+            provider.to_owned(),
+            lockdown,
+            auto_hermetic,
+        )),
+        "memory publication must follow the Full-durable binding"
+    );
 }
 
 use crate::DaemonError;
@@ -1201,6 +1245,7 @@ struct HubInner {
     /// acceptance first, but wait on `lockdown_turn_bound` instead of deriving
     /// authority from a mutable management snapshot.
     lockdown_turns: Mutex<HashMap<(SessionId, RunId), LockdownTurnBinding>>,
+    lockdown_saves: Arc<lockdown_save::SaveOwners>,
     /// Wakes hook dispatch after the worker publishes the resolved-account
     /// ceiling. `Notify` is paired with a check-before-wait loop so a binding
     /// committed just before subscription cannot be missed.
@@ -1260,6 +1305,7 @@ struct ResidentBindingState {
 }
 
 pub(super) struct CommitProjection {
+    lockdown_saves: Arc<lockdown_save::SaveOwners>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     warm_journal_projections: Arc<WarmJournalProjectionCache>,
@@ -1270,6 +1316,15 @@ pub(super) struct CommitProjection {
 
 impl CommitProjection {
     pub(super) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
+        for envelope in envelopes {
+            if let Some(run_id) = envelope.run_id.as_ref()
+                && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
+                && (state.is_terminal() || state == RunState::Cancelling)
+            {
+                self.lockdown_saves
+                    .fence(Some(&envelope.session_id), Some(run_id));
+            }
+        }
         self.warm_journal_projections.observe_committed(envelopes);
         self.observe_digests.observe_committed(envelopes);
         if let Ok(installed) = self.hooks.lock()
@@ -1846,10 +1901,17 @@ struct RecoveredMenuCoordinate {
 
 struct RegisteredWorker {
     lease_id: WorkerLeaseId,
+    settings_save_live: Arc<AtomicBool>,
     harness: Option<HarnessHandle>,
     /// Nonblocking notification only; the durable journal is the cancellation
     /// lag buffer. Replacement swaps this sender in actor order.
     cancellation_wake: Option<watch::Sender<u64>>,
+}
+
+impl Drop for RegisteredWorker {
+    fn drop(&mut self) {
+        self.settings_save_live.store(false, Ordering::Release);
+    }
 }
 
 /// Lease-fenced, session-scoped store surface handed to a worker (R1).
@@ -1869,6 +1931,7 @@ pub struct HubStoreHandle {
     session_id: SessionId,
     worker_generation: u64,
     lease_id: WorkerLeaseId,
+    settings_save_live: Arc<AtomicBool>,
 }
 
 /// Hub-level attachment metadata (§5.6): who owns the attachment and with
@@ -2150,6 +2213,7 @@ enum ActorCommand {
     },
     AcquireWorkerLease {
         lease_id: WorkerLeaseId,
+        settings_save_live: Arc<AtomicBool>,
         cancellation_wake: Option<watch::Sender<u64>>,
         completed: oneshot::Sender<()>,
     },
@@ -2337,6 +2401,11 @@ pub enum SessionHubError {
     Delivery,
     Task(String),
     InvalidConfig(String),
+    SettingsSaveSuperseded {
+        session_id: SessionId,
+        run_id: RunId,
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -2367,6 +2436,14 @@ impl fmt::Display for SessionHubError {
             Self::Store(error) => write!(formatter, "session store failed: {error:?}"),
             Self::Delivery => formatter.write_str("connection outbox refused a frame"),
             Self::Task(message) | Self::InvalidConfig(message) => formatter.write_str(message),
+            Self::SettingsSaveSuperseded {
+                session_id,
+                run_id,
+                generation,
+            } => write!(
+                formatter,
+                "settings save {session_id}/{run_id} generation {generation} no longer owns activation"
+            ),
         }
     }
 }
@@ -2618,7 +2695,9 @@ impl SessionHub {
         let hooks = Arc::new(Mutex::new(None));
         let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
         let warm_journal_projections = Arc::new(WarmJournalProjectionCache::default());
+        let lockdown_saves = Arc::new(lockdown_save::SaveOwners::default());
         let commit_projection = Arc::new(CommitProjection {
+            lockdown_saves: Arc::clone(&lockdown_saves),
             hooks: Arc::clone(&hooks),
             observe_digests: Arc::clone(&observe_digests),
             warm_journal_projections: Arc::clone(&warm_journal_projections),
@@ -2695,6 +2774,7 @@ impl SessionHub {
             monitors: crate::monitor::MonitorService::default(),
             web_degrade: Mutex::new(HashMap::new()),
             lockdown_turns: Mutex::new(HashMap::new()),
+            lockdown_saves,
             lockdown_turn_bound: Notify::new(),
             prompt_history: PromptHistoryCache::default(),
             turn_setup_reductions: TurnSetupReductionCache::default(),
@@ -3103,6 +3183,7 @@ impl SessionHub {
     /// replayed child manifests can supply an already-frozen parent ceiling.
     /// A later exact auto-hermetic proposal may only narrow an older ordinary
     /// lockdown binding; no proposal can widen a bound run.
+    #[cfg(test)]
     pub(crate) fn bind_lockdown_turn(
         &self,
         session_id: &SessionId,
@@ -3110,19 +3191,40 @@ impl SessionHub {
         provider: &str,
         proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
     ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        let save = self.begin_lockdown_save(session_id, run_id)?;
+        self.bind_lockdown_turn_owned(
+            session_id,
+            run_id,
+            provider,
+            proposed_policy,
+            &save.permit(),
+        )
+    }
+
+    pub(crate) fn bind_lockdown_turn_owned(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider: &str,
+        proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
+        save: &lockdown_save::SavePermit,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        save.ensure_for(session_id, run_id)?;
+        save.commit(|| {
         let (proposed_lockdown, proposed_auto_hermetic) = proposed_policy.binding_bits();
         let durable = match crate::lockdown::global() {
             Ok(manager) => {
                 let profile_id = self.inner.store.cached_profile_installation_id();
                 Some(
                     manager
-                        .bind_turn(
+                        .bind_turn_if_current(
                             profile_id,
                             session_id.as_str(),
                             run_id.as_str(),
                             provider,
                             proposed_lockdown,
                             proposed_auto_hermetic,
+                            save,
                         )
                         .map_err(|error| SessionHubError::Task(error.to_string()))?,
                 )
@@ -3141,6 +3243,7 @@ impl SessionHub {
         });
         let policy =
             crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic);
+        save.publish(|| {
         let mut turns = lock(&self.inner.lockdown_turns)?;
         let key = (session_id.clone(), run_id.clone());
         if let Some(binding) = turns.get_mut(&key) {
@@ -3159,6 +3262,8 @@ impl SessionHub {
         turns.insert(key, LockdownTurnBinding { provider, policy });
         self.inner.lockdown_turn_bound.notify_waiters();
         Ok(policy)
+        })
+        })
     }
 
     /// Waits for the worker's resolved-account ceiling without allowing the
@@ -3174,11 +3279,17 @@ impl SessionHub {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.inner.lockdown_turn_bound.notified();
-            if let Some(binding) = self.bound_lockdown_run(session_id, run_id)? {
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let binding = self.bound_lockdown_run_blocking(session_id, run_id).await?;
+            if let Some(binding) = binding {
                 return Ok(Some(binding));
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.bound_lockdown_run(session_id, run_id);
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                return self.bound_lockdown_run_blocking(session_id, run_id).await;
             }
         }
     }
@@ -3228,79 +3339,164 @@ impl SessionHub {
         }))
     }
 
+    pub(crate) async fn bound_lockdown_run_blocking(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<(String, crate::auto_hermetic::ProviderLockdownPolicy)>, SessionHubError>
+    {
+        let hub = self.clone();
+        let session_id = session_id.clone();
+        let run_id = run_id.clone();
+        crate::lockdown::on_blocking_pool_result(move || {
+            hub.bound_lockdown_run(&session_id, &run_id)
+        })
+        .await
+        .map_err(|error| SessionHubError::Task(format!("lockdown binding task failed: {error}")))?
+    }
+
     /// Marks the run whose boundary is now executing as the direct-control
     /// ceiling for this session. Durable per-run bindings remain available
     /// for crash recovery, while the live map sheds older completed/queued
     /// snapshots so a later Full boundary can restore Full direct controls.
+    pub(crate) fn begin_lockdown_save(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<lockdown_save::SaveGuard, SessionHubError> {
+        self.inner.lockdown_saves.begin(
+            self.inner.store.cached_profile_installation_id(),
+            session_id,
+            run_id,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn activate_lockdown_turn(
         &self,
         session_id: &SessionId,
         run_id: &RunId,
     ) -> Result<(), SessionHubError> {
-        match crate::lockdown::global() {
-            Ok(manager) => {
-                let profile_id = self.inner.store.cached_profile_installation_id();
-                manager
-                    .activate_turn(profile_id, session_id.as_str(), run_id.as_str())
-                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        let save = self.begin_lockdown_save(session_id, run_id)?;
+        self.activate_lockdown_turn_owned(session_id, run_id, &save.permit())
+    }
+
+    pub(crate) fn activate_lockdown_turn_owned(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        save: &lockdown_save::SavePermit,
+    ) -> Result<(), SessionHubError> {
+        save.ensure_for(session_id, run_id)?;
+        save.commit(|| {
+            match crate::lockdown::global() {
+                Ok(manager) => {
+                    let profile_id = self.inner.store.cached_profile_installation_id();
+                    manager
+                        .activate_turn_if_current(
+                            profile_id,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            save,
+                        )
+                        .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                }
+                #[cfg(test)]
+                Err(_) => {}
+                #[cfg(not(test))]
+                Err(error) => return Err(SessionHubError::Task(error.to_string())),
             }
-            #[cfg(test)]
-            Err(_) => {}
-            #[cfg(not(test))]
-            Err(error) => return Err(SessionHubError::Task(error.to_string())),
-        }
-        let key = (session_id.clone(), run_id.clone());
-        let mut turns = lock(&self.inner.lockdown_turns)?;
-        if !turns.contains_key(&key) {
-            return Err(SessionHubError::Task(format!(
-                "lockdown turn {session_id}/{run_id} was activated before it was bound"
-            )));
-        }
-        turns.retain(|candidate, _| candidate.0 != *session_id || candidate == &key);
-        Ok(())
+            save.ensure_current()?;
+            save.publish(|| {
+                let key = (session_id.clone(), run_id.clone());
+                let mut turns = lock(&self.inner.lockdown_turns)?;
+                if !turns.contains_key(&key) {
+                    return Err(SessionHubError::Task(format!(
+                        "lockdown turn {session_id}/{run_id} was activated before it was bound"
+                    )));
+                }
+                turns.retain(|candidate, _| candidate.0 != *session_id || candidate == &key);
+                Ok(())
+            })
+        })
     }
 
     /// Freezes and activates the turn with one durable ledger replacement.
     /// Publishing the in-memory view happens only after that replacement, so
     /// a worker cannot observe or execute an unenforced active boundary.
+    #[cfg(test)]
     pub(crate) fn bind_activate_lockdown_turn(
         &self,
         session_id: &SessionId,
         run_id: &RunId,
         provider: &str,
-        proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
+        policy: crate::auto_hermetic::ProviderLockdownPolicy,
     ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
-        let (proposed_lockdown, proposed_auto_hermetic) = proposed_policy.binding_bits();
-        let durable = match crate::lockdown::global() {
-            Ok(manager) => {
-                let profile_id = self.inner.store.cached_profile_installation_id();
-                Some(
-                    manager
-                        .bind_and_activate_turn(
-                            profile_id,
-                            session_id.as_str(),
-                            run_id.as_str(),
-                            provider,
-                            proposed_lockdown,
-                            proposed_auto_hermetic,
-                        )
-                        .map_err(|error| SessionHubError::Task(error.to_string()))?,
+        let save = self.begin_lockdown_save(session_id, run_id)?;
+        self.bind_activate_lockdown_turn_owned(session_id, run_id, provider, policy, &save.permit())
+    }
+
+    pub(crate) fn bind_activate_lockdown_turn_owned(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider: &str,
+        proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
+        save: &lockdown_save::SavePermit,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        save.ensure_for(session_id, run_id)?;
+        save.commit(|| {
+            let (proposed_lockdown, proposed_auto_hermetic) = proposed_policy.binding_bits();
+            let durable = match crate::lockdown::global() {
+                Ok(manager) => {
+                    let profile_id = self.inner.store.cached_profile_installation_id();
+                    Some(
+                        manager
+                            .bind_and_activate_turn_if_current(
+                                profile_id,
+                                session_id.as_str(),
+                                run_id.as_str(),
+                                provider,
+                                proposed_lockdown,
+                                proposed_auto_hermetic,
+                                save,
+                            )
+                            .map_err(|error| SessionHubError::Task(error.to_string()))?,
+                    )
+                }
+                #[cfg(test)]
+                Err(_) => None,
+                #[cfg(not(test))]
+                Err(error) => return Err(SessionHubError::Task(error.to_string())),
+            };
+            let (provider, lockdown, auto_hermetic) = durable.unwrap_or_else(|| {
+                (
+                    provider.to_owned(),
+                    proposed_lockdown,
+                    proposed_auto_hermetic,
                 )
-            }
+            });
             #[cfg(test)]
-            Err(_) => None,
-            #[cfg(not(test))]
-            Err(error) => return Err(SessionHubError::Task(error.to_string())),
-        };
-        let (provider, lockdown, auto_hermetic) = durable.unwrap_or_else(|| {
-            (
-                provider.to_owned(),
-                proposed_lockdown,
-                proposed_auto_hermetic,
-            )
-        });
-        let policy =
-            crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic);
+            lockdown_crash_checkpoint("after_durable_before_publish");
+            let policy =
+                crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic);
+            save.ensure_current()?;
+            save.publish(|| {
+                self.publish_active_lockdown_turn(session_id, run_id, provider, policy)
+            })?;
+            #[cfg(test)]
+            lockdown_crash_checkpoint("after_publish_before_execute");
+            Ok(policy)
+        })
+    }
+
+    fn publish_active_lockdown_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider: String,
+        policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    ) -> Result<(), SessionHubError> {
         let key = (session_id.clone(), run_id.clone());
         let mut turns = lock(&self.inner.lockdown_turns)?;
         if let Some(binding) = turns.get(&key)
@@ -3311,10 +3507,12 @@ impl SessionHub {
                 binding.provider
             )));
         }
+        #[cfg(test)]
+        assert_lockdown_durable_before_publish(self, session_id, run_id, &provider, policy);
         turns.retain(|candidate, _| candidate.0 != *session_id || candidate == &key);
         turns.insert(key, LockdownTurnBinding { provider, policy });
         self.inner.lockdown_turn_bound.notify_waiters();
-        Ok(policy)
+        Ok(())
     }
 
     /// Last provider ceiling that actually governed this session. Direct
@@ -3354,6 +3552,20 @@ impl SessionHub {
             #[cfg(not(test))]
             Err(error) => Err(SessionHubError::Task(error.to_string())),
         }
+    }
+
+    pub(crate) async fn bound_session_lockdown_blocking(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(String, crate::auto_hermetic::ProviderLockdownPolicy)>, SessionHubError>
+    {
+        let hub = self.clone();
+        let session_id = session_id.clone();
+        crate::lockdown::on_blocking_pool_result(move || hub.bound_session_lockdown(&session_id))
+            .await
+            .map_err(|error| {
+                SessionHubError::Task(format!("lockdown binding task failed: {error}"))
+            })?
     }
 
     /// W-B: latches "anthropic server web tools 400ed" for this session —
@@ -6434,11 +6646,13 @@ impl SessionHub {
             return Ok(None);
         };
         let lease_id = WorkerLeaseId(random_id("drain-worker-lease")?);
+        let settings_save_live = Arc::new(AtomicBool::new(true));
         let (completed, response) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::AcquireWorkerLease {
                 lease_id: lease_id.clone(),
+                settings_save_live: Arc::clone(&settings_save_live),
                 cancellation_wake: None,
                 completed,
             })
@@ -6450,6 +6664,7 @@ impl SessionHub {
             session_id,
             worker_generation: self.inner.store.worker_generation(),
             lease_id,
+            settings_save_live,
         }))
     }
 
@@ -6636,6 +6851,9 @@ impl SessionHub {
         hooks: Option<&crate::hooks::HookService>,
     ) -> Result<(), HaiderError> {
         let metadata = self.deletion_metadata_if_eligible(session_id).await?;
+        let _deletion_save_guard = self
+            .begin_lockdown_save(session_id, &RunId::new("session-delete"))
+            .map_err(hub_error_as_store)?;
         let actor = lock(&self.inner.actors)
             .map_err(hub_error_as_store)?
             .get(session_id)
@@ -6832,15 +7050,29 @@ impl SessionHub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(candidate, _), _| candidate != session_id);
-        if let Ok(manager) = crate::lockdown::global() {
-            let profile_id = self.inner.store.cached_profile_installation_id();
-            if let Err(error) = manager.remove_session_bindings(profile_id, session_id.as_str()) {
-                tracing::warn!(
-                    session_id = %session_id,
-                    ?error,
-                    "durable session deletion committed but lockdown shell cleanup failed"
-                );
-            }
+        let profile_id = self.inner.store.cached_profile_installation_id().to_owned();
+        let removed_session_id = session_id.as_str().to_owned();
+        let cleanup_guard = self
+            .begin_lockdown_save(session_id, &RunId::new("session-delete"))
+            .map_err(hub_error_as_store)?;
+        let cleanup_save = cleanup_guard.permit();
+        if let Err(error) = crate::lockdown::on_blocking_pool_result(move || {
+            cleanup_save.commit(|| match crate::lockdown::global() {
+                Ok(manager) => manager
+                    .remove_session_bindings(&profile_id, &removed_session_id)
+                    .map_err(|error| SessionHubError::Task(error.to_string())),
+                Err(_) => Ok(()),
+            })
+        })
+        .await
+        .map_err(|error| SessionHubError::Task(error.to_string()))
+        .and_then(|result| result)
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "durable session deletion committed but lockdown shell cleanup failed"
+            );
         }
         if let Some(hooks) = hooks {
             hooks.session_deleted(session_id.clone()).await;
@@ -7744,11 +7976,13 @@ impl SessionHub {
     ) -> Result<HubStoreHandle, SessionHubError> {
         let actor = self.actor_for(session_id.clone()).await?;
         let lease_id = WorkerLeaseId(random_id("worker-lease")?);
+        let settings_save_live = Arc::new(AtomicBool::new(true));
         let (completed, response) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::AcquireWorkerLease {
                 lease_id: lease_id.clone(),
+                settings_save_live: Arc::clone(&settings_save_live),
                 cancellation_wake,
                 completed,
             })
@@ -7760,6 +7994,7 @@ impl SessionHub {
             session_id,
             worker_generation: self.inner.store.worker_generation(),
             lease_id,
+            settings_save_live,
         })
     }
 
@@ -8783,6 +9018,7 @@ impl SessionHub {
     /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
     /// it can never be mistaken for a graceful join.
     pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
+        self.inner.lockdown_saves.close();
         // Serialize task registration with drain admission. Existing close
         // barriers still need the actor and worker registries below.
         let close_tasks = {
@@ -9235,6 +9471,20 @@ fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
 }
 
 impl HubStoreHandle {
+    /// Admission shares the actor's lease lifetime. A delayed metadata read
+    /// cannot let a replaced worker register a new save over its successor.
+    pub(crate) fn begin_lockdown_save(
+        &self,
+        run_id: &RunId,
+    ) -> Result<lockdown_save::SaveGuard, SessionHubError> {
+        self.hub.inner.lockdown_saves.begin_for_worker(
+            self.hub.inner.store.cached_profile_installation_id(),
+            &self.session_id,
+            run_id,
+            Arc::clone(&self.settings_save_live),
+        )
+    }
+
     async fn append_owned_inner(
         &self,
         expected_head: Option<u64>,

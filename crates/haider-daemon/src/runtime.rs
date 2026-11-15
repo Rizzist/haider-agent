@@ -699,6 +699,18 @@ async fn run_owner(
     result
 }
 
+async fn join_lockdown_init(
+    task: tokio::task::JoinHandle<Result<(), crate::lockdown::LockdownError>>,
+) -> Result<(), DaemonError> {
+    task.await
+        .map_err(|error| DaemonError::Lockdown {
+            message: format!("lockdown initialization task failed: {error}"),
+        })?
+        .map_err(|error| DaemonError::Lockdown {
+            message: error.to_string(),
+        })
+}
+
 async fn run_inner(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
@@ -721,14 +733,13 @@ async fn run_inner(
         let request = shutdown.borrow().clone();
         return shutdown_without_store(config, states, request, &shutdown);
     }
-    // The lockdown ceiling is machine-user global, not profile-scoped. Open
-    // and reconcile it before acquiring any per-profile resources so a
-    // typed startup failure cannot strand a lease, store, or actor.
-    crate::lockdown::initialize_global(config.lockdown_root_override.as_deref()).map_err(
-        |error| DaemonError::Lockdown {
-            message: error.to_string(),
-        },
-    )?;
+    // The machine-user-global quota reconcile can overlap profile acquisition
+    // and store open. No listener, hub, or lockdown RPC exists until it has
+    // completed successfully below.
+    let lockdown_root = config.lockdown_root_override.clone();
+    let lockdown_init = tokio::task::spawn_blocking(move || {
+        crate::lockdown::initialize_global(lockdown_root.as_deref()).map(|_| ())
+    });
     let endpoint_path = config.endpoint_path();
     // R1: the profile lifetime lock is acquired before any socket cleanup or
     // store open, and it is the only singleton authority. A held lock means
@@ -736,29 +747,45 @@ async fn run_inner(
     let lease = match SqliteStoreHandle::acquire_profile(&config.store_dir).await {
         Ok(lease) => lease,
         Err(error) if error.code == ErrorCode::StoreLocked => {
+            join_lockdown_init(lockdown_init).await?;
             return Err(DaemonError::AlreadyRunning {
                 diagnostics: incumbent_diagnostics(config, &endpoint_path),
             });
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            join_lockdown_init(lockdown_init).await?;
+            return Err(error.into());
+        }
     };
-    if !crate::android_policy::enabled() {
-        haider_platform::publish_active_daemon_log(&config.store_dir).map_err(|error| {
-            DaemonError::Task {
-                message: format!("cannot publish active daemon log: {error}"),
-            }
-        })?;
+    if !crate::android_policy::enabled()
+        && let Err(error) = haider_platform::publish_active_daemon_log(&config.store_dir)
+    {
+        drop(lease);
+        join_lockdown_init(lockdown_init).await?;
+        return Err(DaemonError::Task {
+            message: format!("cannot publish active daemon log: {error}"),
+        });
     }
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         drop(lease);
+        join_lockdown_init(lockdown_init).await?;
         return shutdown_without_store(config, states, request, &shutdown);
     }
-    let mut runtime_directory = endpoint::RuntimeDirectory::prepare(&config.runtime_dir)?;
+    let mut runtime_directory = match endpoint::RuntimeDirectory::prepare(&config.runtime_dir) {
+        Ok(directory) => directory,
+        Err(error) => {
+            drop(lease);
+            join_lockdown_init(lockdown_init).await?;
+            return Err(error);
+        }
+    };
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
-        runtime_directory.cleanup()?;
+        let cleanup_result = runtime_directory.cleanup();
         drop(lease);
+        join_lockdown_init(lockdown_init).await?;
+        cleanup_result?;
         return shutdown_without_store(config, states, request, &shutdown);
     }
 
@@ -766,13 +793,25 @@ async fn run_inner(
     // reconcile every dispatched-without-terminal effect. Only after all of
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
-    let store = match config.store_synchronous {
+    let store_result = match config.store_synchronous {
         Some(synchronous) => {
-            SqliteStoreHandle::open_locked_with_synchronous(lease, synchronous).await?
+            SqliteStoreHandle::open_locked_with_synchronous(lease, synchronous).await
         }
-        None => SqliteStoreHandle::open_locked(lease).await?,
+        None => SqliteStoreHandle::open_locked(lease).await,
+    };
+    let store = match store_result {
+        Ok(store) => store,
+        Err(error) => {
+            join_lockdown_init(lockdown_init).await?;
+            return Err(error.into());
+        }
     };
     states.mark_store_open();
+    if let Err(error) = join_lockdown_init(lockdown_init).await {
+        let _ = store.close().await;
+        let _ = runtime_directory.cleanup();
+        return Err(error);
+    }
     let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
     if let Err(error) = store.initialize_usage_history().await {
         let _ = store.close().await;

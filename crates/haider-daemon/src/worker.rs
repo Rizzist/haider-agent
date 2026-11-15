@@ -506,7 +506,8 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
         let source_policy = self
             .store
             .hub()
-            .bound_lockdown_run(self.store.session_id(), &switch.run_id)
+            .bound_lockdown_run_blocking(self.store.session_id(), &switch.run_id)
+            .await
             .map_err(hub_error)?
             .map_or(live_source_policy, |(_, policy)| policy);
         let source_lockdown = source_policy.is_lockdown();
@@ -7536,6 +7537,10 @@ pub(crate) async fn perform_manual_compaction(
         |receipt| receipt.run_id.clone(),
     );
 
+    let save_guard = lease
+        .begin_lockdown_save(&boundary_run_id)
+        .map_err(hub_error)?;
+    let save = save_guard.permit();
     let delegation = dependencies.delegation.clone().ok_or_else(|| {
         HaiderError::new(
             ErrorCode::Internal,
@@ -7620,12 +7625,15 @@ pub(crate) async fn perform_manual_compaction(
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
-            if let Err(binding_error) = lease.hub().bind_lockdown_turn(
+            if let Err(binding_error) = bind_unknown_provider_boundary(
+                lease.hub(),
                 lease.session_id(),
                 &boundary_run_id,
                 &metadata.provider,
-                crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
-            ) {
+                &save,
+            )
+            .await
+            {
                 tracing::warn!(
                     target: "haider.lockdown",
                     ?binding_error,
@@ -7636,12 +7644,14 @@ pub(crate) async fn perform_manual_compaction(
         }
     };
     if resolved.provider_name != metadata.provider {
-        let _ = lease.hub().bind_lockdown_turn(
+        let _ = bind_unknown_provider_boundary(
+            lease.hub(),
             lease.session_id(),
             &boundary_run_id,
             &metadata.provider,
-            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
-        );
+            &save,
+        )
+        .await;
         return Err(HaiderError::new(
             ErrorCode::ProviderError,
             "provider factory returned a different provider than the session",
@@ -7652,19 +7662,34 @@ pub(crate) async fn perform_manual_compaction(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = haider_platform::phase_trace::sync(
+    let hub = lease.hub().clone();
+    let session_id = lease.session_id().clone();
+    let run_id = boundary_run_id.clone();
+    let provider = resolved.provider_name.clone();
+    let lockdown = haider_platform::phase_trace::measure(
         haider_platform::phase_trace::Phase::LockdownBindActivate,
-        || {
-            let lockdown = active_lockdown_turn_snapshot(
-                lease.hub(),
-                lease.session_id(),
-                &boundary_run_id,
-                &resolved.provider_name,
-                provider_policy,
-            )?;
-            Ok::<_, HaiderError>(lockdown)
+        async move {
+            crate::lockdown::on_blocking_pool_result(move || {
+                active_lockdown_turn_snapshot(
+                    &hub,
+                    &session_id,
+                    &run_id,
+                    &provider,
+                    provider_policy,
+                    &save,
+                )
+            })
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("lockdown binding task failed: {error}"),
+                    false,
+                )
+            })?
         },
-    )?;
+    )
+    .await?;
     let workspace_pending = crate::workspace::is_pending(metadata);
     let workspace_unavailable = crate::workspace::unavailable_for_metadata(metadata);
     if workspace_unavailable.is_some()
@@ -8911,6 +8936,10 @@ async fn start_turn(
         recovery_ready: _,
         recovering: _,
     } = pending;
+    let save_guard = lease
+        .begin_lockdown_save(&accepted.run_id)
+        .map_err(hub_error)?;
+    let save = save_guard.permit();
     let turn_trace = turn_trace_enabled().then(|| {
         registered_turn_trace(&accepted.session_id, &accepted.run_id).unwrap_or_else(|| {
             // Recovery and lost-response receipt paths can reach the worker
@@ -9355,12 +9384,15 @@ async fn start_turn(
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
-            if let Err(binding_error) = lease.hub().bind_lockdown_turn(
+            if let Err(binding_error) = bind_unknown_provider_boundary(
+                lease.hub(),
                 lease.session_id(),
                 &accepted.run_id,
                 &metadata.provider,
-                crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
-            ) {
+                &save,
+            )
+            .await
+            {
                 tracing::warn!(
                     target: "haider.lockdown",
                     ?binding_error,
@@ -9371,12 +9403,14 @@ async fn start_turn(
         }
     };
     if resolved.provider_name != metadata.provider {
-        let _ = lease.hub().bind_lockdown_turn(
+        let _ = bind_unknown_provider_boundary(
+            lease.hub(),
             lease.session_id(),
             &accepted.run_id,
             &metadata.provider,
-            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
-        );
+            &save,
+        )
+        .await;
         return Err(HaiderError::new(
             ErrorCode::ProviderError,
             "provider factory returned a different provider than the session",
@@ -9387,20 +9421,36 @@ async fn start_turn(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = haider_platform::phase_trace::sync(
+    let hub = lease.hub().clone();
+    let session_id = lease.session_id().clone();
+    let run_id = accepted.run_id.clone();
+    let provider = resolved.provider_name.clone();
+    let explicitly_rebound = metadata.provider_rebind_id.is_some();
+    let lockdown = haider_platform::phase_trace::measure(
         haider_platform::phase_trace::Phase::LockdownBindActivate,
-        || {
-            let lockdown = provider_rebind::rebound_active_turn_lockdown_snapshot(
-                lease.hub(),
-                lease.session_id(),
-                &accepted.run_id,
-                metadata.provider_rebind_id.is_some(),
-                &resolved.provider_name,
-                provider_policy,
-            )?;
-            Ok::<_, HaiderError>(lockdown)
+        async move {
+            crate::lockdown::on_blocking_pool_result(move || {
+                provider_rebind::rebound_active_turn_lockdown_snapshot_owned(
+                    &hub,
+                    &session_id,
+                    &run_id,
+                    explicitly_rebound,
+                    &provider,
+                    provider_policy,
+                    &save,
+                )
+            })
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("lockdown binding task failed: {error}"),
+                    false,
+                )
+            })?
         },
-    )?;
+    )
+    .await?;
     if lockdown.is_some() {
         // A task launched by an earlier Full turn must not remain a process
         // escape after this provider's next Lockdown boundary.
@@ -16919,9 +16969,10 @@ fn active_lockdown_turn_snapshot(
     run_id: &RunId,
     provider: &str,
     policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    save: &crate::session_hub::lockdown_save::SavePermit,
 ) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
     let bound_policy = hub
-        .bind_activate_lockdown_turn(session_id, run_id, provider, policy)
+        .bind_activate_lockdown_turn_owned(session_id, run_id, provider, policy, save)
         .map_err(hub_error)?;
     if !bound_policy.is_lockdown() {
         return Ok(None);
@@ -16931,6 +16982,39 @@ fn active_lockdown_turn_snapshot(
         .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
     crate::auto_hermetic::apply_to_turn(&mut turn, bound_policy);
     Ok(Some(turn))
+}
+
+async fn bind_unknown_provider_boundary(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    provider: &str,
+    save: &crate::session_hub::lockdown_save::SavePermit,
+) -> Result<(), HaiderError> {
+    let hub = hub.clone();
+    let session_id = session_id.clone();
+    let run_id = run_id.clone();
+    let provider = provider.to_owned();
+    let save = save.clone();
+    crate::lockdown::on_blocking_pool_result(move || {
+        hub.bind_lockdown_turn_owned(
+            &session_id,
+            &run_id,
+            &provider,
+            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+            &save,
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("lockdown binding task failed: {error}"),
+            false,
+        )
+    })?
+    .map_err(hub_error)
 }
 
 fn provider_lockdown_snapshot(
@@ -22034,9 +22118,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Err(tool_error(error));
                 }
             }
-            let status = match crate::lockdown::global().and_then(|manager| {
-                manager.write(&lockdown.provider, relative, operation.content.as_bytes())
-            }) {
+            let write_provider = lockdown.provider.clone();
+            let write_relative = relative.to_path_buf();
+            let write_content = operation.content.clone();
+            let status = match crate::lockdown::on_blocking_pool(move || {
+                crate::lockdown::global().and_then(|manager| {
+                    manager.write(&write_provider, &write_relative, write_content.as_bytes())
+                })
+            })
+            .await
+            {
                 Ok(status) => status,
                 Err(crate::lockdown::LockdownError::LockdownQuotaExceeded { used, limit }) => {
                     broker
@@ -22166,8 +22257,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             false,
                         )
                     })?;
-                let bytes = match crate::lockdown::global()
-                    .and_then(|manager| manager.read(&lockdown.provider, relative))
+                let read_provider = lockdown.provider.clone();
+                let read_relative = relative.to_path_buf();
+                let bytes = match crate::lockdown::on_blocking_pool(move || {
+                    crate::lockdown::global()
+                        .and_then(|manager| manager.read(&read_provider, &read_relative))
+                })
+                .await
                 {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -22759,8 +22855,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
             };
-            let child_lockdown_snapshot =
-                provider_lockdown_snapshot(self.output.store.hub(), &child_metadata.provider)?;
+            let hub = self.output.store.hub().clone();
+            let child_provider = child_metadata.provider.clone();
+            let child_lockdown_snapshot = crate::lockdown::on_blocking_pool_result(move || {
+                provider_lockdown_snapshot(&hub, &child_provider)
+            })
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("lockdown binding task failed: {error}"),
+                    false,
+                )
+            })??;
             let child_lockdown = child_lockdown_snapshot.as_ref().map(|(turn, _)| turn);
             if !lockdown_child_provider_allowed(self.lockdown.is_some(), child_lockdown.is_some()) {
                 let Some(lockdown) = self.lockdown.as_ref() else {

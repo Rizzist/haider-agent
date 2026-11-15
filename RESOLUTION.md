@@ -208,6 +208,12 @@ The merged all-target clippy gate found two imported input-dwell fixtures missin
 
 Round 17 also carries the recorded coordinate into account-switch cache preflight. A raw creation alias otherwise reaches the exact pricing registry and unnecessarily requires an unknown-cost approval. A native wire-request regression covers the recorded alias, an exact-model control and an unlisted-literal control; it also checks that preflight preserves the public model spelling.
 
+## Lockdown bindings continuation integration
+
+Merged wave `7eebe6d09402823ea17b13fc498e5932e7361614` into the Lockdown bindings lane after its queued gates had not yet started. The stress catalog retains all eleven Lockdown rows and all four incoming catalog and sidecar-pressure rows, with unique six-column case IDs. The baseline is provisionally derived as **7,495** source test markers using xtask's exact traversal and marker rules; the queued xtask update and count gate must confirm it on the merged candidate.
+
+All seventeen other Rust lane deltas remain identical to their pre-merge deltas against the earlier wave. The worker-retirement regression's session fixture adds `resolved_model: None` and `model_catalog_key: None` for the incoming model-coordinate contract. Its assertions remain intact. Save ownership, cancellation and replacement fencing, durable confirmation, startup joining, and the v1 ledger format retain the lane's behavior.
+
 ## Accounts round 26 integration
 
 Merge wave `7eebe6d09402823ea17b13fc498e5932e7361614` while retaining the producing account on fetched and stale catalogs. The combined code keeps the wave's account incarnations, persisted model coordinates, catalog availability rules and management notifications. Admission and adapter reuse use the actual resolved account, including inactive pins and rotated accounts; the active-account flight guard remains separate from the original producer guard.
@@ -229,5 +235,24 @@ test markers on the merged source. The common base derives 7,472, the accounts
 lane adds 222, and the incoming wave adds 100: 7,472 + 222 + 100 = 7,794.
 Both parents' tests are retained; neither parent's baseline was selected.
 The round 28 evidence contains the update output and per-file count audit.
+TARGETED gates run on the merge commit; Astra owns the subsequent FULL gate.
+No push is authorized in this round.
+
+
+## Lockdown bindings round 5 wave merge
+
+Merged wave `a0335b35fe76fc7381fbd664c9d6502950ced848` into lane
+`a1dc2228f646f8959451c0cdebdef37dfef2a175` with a merge commit.
+Only this document, the shared race catalog and the test baseline conflicted.
+Both resolution histories remain. The catalog retains every row from both
+parents, including the eleven Lockdown settings-save/startup cases and the
+wave's `daemon-oauth-flight-issuer` case: 133 unique IDs, six columns per row.
+Product source merged automatically; this round makes no product source edits.
+
+The actual `cargo run --locked -p xtask -- test-count --update` derived
+**7,817** test markers on the resolved source. The common base has 7,472;
+the lane adds 23 (7,495 total) and the wave adds 322 (7,794 total):
+7,472 + 23 + 322 = 7,817. Neither parent's baseline was selected.
+The round 5 evidence records the update output and per-file count audit.
 TARGETED gates run on the merge commit; Astra owns the subsequent FULL gate.
 No push is authorized in this round.

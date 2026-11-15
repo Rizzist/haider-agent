@@ -151,7 +151,10 @@ impl HubConnection {
             .hub
             .provider_lockdown_policy_for_active(&provider, new_no_auth)?;
         if self.hub.session_has_nonterminal_runs(&session_id).await? {
-            let frozen = self.hub.bound_session_lockdown(&session_id)?;
+            let frozen = self
+                .hub
+                .bound_session_lockdown_blocking(&session_id)
+                .await?;
             if !frozen.as_ref().is_some_and(|(old_provider, old_policy)| {
                 rebind_matches_frozen_policy(old_provider, *old_policy, &provider, new_policy)
             }) {
