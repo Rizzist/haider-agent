@@ -6000,7 +6000,10 @@ async fn handle_refresh_identity(
                 id_token: bundle.id_token(),
                 captured_at: unix_ms_after(Duration::ZERO),
             }) {
-                Ok(Some(identity)) => Some(identity),
+                Ok(Some(identity)) => Some(AccountIdentity {
+                    subject_hash: Some(bundle.identity.subject_hash.clone()),
+                    ..identity
+                }),
                 Ok(None) => bundle
                     .account_identity
                     .clone()
@@ -11353,6 +11356,7 @@ fn api_key_identity(provider: &str, secret: &[u8]) -> AccountIdentity {
         .and_then(|fingerprint| AccountIdentity::sanitized_field(&fingerprint))
         .map(|fingerprint| format!("…{fingerprint}"));
     AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some(last_four.map_or_else(
             || format!("{provider} API key"),

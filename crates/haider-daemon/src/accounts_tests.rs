@@ -405,6 +405,7 @@ fn authenticated_catalog_key_changes_with_same_alias_identity_but_survives_relog
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: Some("a@example.invalid".into()),
             display_name: None,
             account_id: Some("synthetic-a".into()),
@@ -580,6 +581,7 @@ fn confirmed_device_import_is_bound_to_the_reviewed_source_snapshot() {
 #[test]
 fn provider_normalized_subscription_identity_suppresses_repeat_adoption() {
     let candidate = AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some("Claude Pro subscription".into()),
         account_id: None,
@@ -1364,6 +1366,7 @@ fn oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
 
 fn stable_test_identity(email: &str, account_id: Option<&str>) -> AccountIdentity {
     AccountIdentity {
+        subject_hash: None,
         email: Some(email.to_owned()),
         display_name: Some("Account Owner".to_owned()),
         account_id: account_id.map(str::to_owned),
@@ -3800,9 +3803,6 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let primary_alias = CredentialAlias::new("wedged-primary");
     let alternate_alias = CredentialAlias::new("wedged-backup");
     let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
-        // The refusing store cannot perform a legacy-row migration. Seed
-        // already-migrated rows to exercise the intended rotation failure.
-        incarnation: if active { 1 } else { 2 },
         credential_digest: None,
         alias,
         provider: OPENAI_PROVIDER_NAME.into(),
@@ -3813,6 +3813,9 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         active,
         label: None,
         account_identity: None,
+        // The refusing store cannot perform a legacy-row migration. Seed
+        // already-migrated rows to exercise the intended rotation failure.
+        incarnation: if active { 1 } else { 2 },
         created_at_ms: None,
     };
     let descriptors = vec![
@@ -11260,6 +11263,9 @@ fn set_import_bundle_expiry(
         bundle.generation,
     )
     .expect("aged bundle");
+    if let Some(identity) = bundle.account_identity.clone() {
+        aged = aged.with_account_identity(identity);
+    }
     if let Some(fingerprint) = bundle.import_source_access_fingerprint() {
         aged = aged.with_import_source_access_fingerprint(fingerprint);
     }
@@ -18334,6 +18340,7 @@ fn claude_relogin_bundle(
 ) -> haider_accounts::OAuthTokenBundleV1 {
     let identity = if account_id.starts_with("anthropic:") {
         AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some("Claude Max subscription".to_owned()),
             account_id: Some(account_id.to_owned()),
@@ -21900,6 +21907,7 @@ async fn same_source_account_replacement_never_serves_the_previous_accounts_rows
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some("Kimi Code subscription".into()),
             account_id: Some("kimi:0123456789abcdef".into()),

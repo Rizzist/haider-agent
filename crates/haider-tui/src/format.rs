@@ -132,6 +132,9 @@ pub fn fmt_reset(generated_at_ms: u64, resets_at_ms: u64) -> String {
 /// the TUI never discards it behind a generic "meter unavailable" label.
 #[must_use]
 pub fn fmt_meter_reason(reason: &str) -> String {
+    if reason == "credential_identity_incomplete" {
+        return "identity incomplete; refresh account or sign in again".to_owned();
+    }
     reason.strip_prefix("http_status_").map_or_else(
         || reason.replace('_', " "),
         |status| format!("http {status}"),

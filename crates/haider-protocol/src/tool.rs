@@ -43,6 +43,7 @@ pub struct ToolManifest {
     pub name: String,
     pub description: String,
     /// Normalized effects this tool can produce — the permission key.
+    #[serde(with = "crate::effect::compatible_classes")]
     pub effects: Vec<EffectClass>,
     pub dispatch: DispatchMode,
     /// JSON Schema for the input (kept opaque here).
@@ -94,6 +95,7 @@ pub enum RememberedGrantScope {
 /// Sanitized projection of one grant reconstructed from durable menu facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RememberedSessionGrant {
+    #[serde(with = "crate::effect::compatible_class")]
     pub class: EffectClass,
     pub scope: RememberedGrantScope,
 }

@@ -42,6 +42,7 @@ fn oauth_receipt_flags_ambiguous_email_without_wrong_removal_hint() {
         active: false,
         label: None,
         account_identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: Some("owner@example.test".into()),
             display_name: None,
             account_id: account_id.map(str::to_owned),
@@ -357,6 +358,7 @@ fn check_duplicate_notice(
         active: false,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: Some("same@example.test".into()),
             display_name: None,
             account_id: Some(account_id.into()),
@@ -483,6 +485,7 @@ fn a25_legacy_email_notice_does_not_offer_placeholder_as_a_duplicate() {
         label: None,
         created_at_ms: None,
         account_identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: Some("same@example.test".into()),
             display_name: None,
             account_id: account_id.map(str::to_owned),

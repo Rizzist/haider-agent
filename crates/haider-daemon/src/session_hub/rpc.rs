@@ -3590,6 +3590,7 @@ fn observe_menu_kind(kind: &MenuKind) -> &'static str {
         MenuKind::Conflict => "conflict",
         MenuKind::GraphHumanConfirm { .. } => "graph_human_confirm",
         MenuKind::GraphAbandonConfirm { .. } => "graph_abandon_confirm",
+        MenuKind::DeferredApproval { .. } => "deferred_approval",
     }
 }
 
@@ -3896,7 +3897,8 @@ async fn effect_probe_observation(
         | EffectClass::ScreenControl
         | EffectClass::MobileObserve
         | EffectClass::MobileControl
-        | EffectClass::ReadSms => {
+        | EffectClass::ReadSms
+        | EffectClass::UsageResetApply => {
             "inconclusive — no safe automatic probe exists for this effect class".into()
         }
     }
@@ -4428,7 +4430,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_input_inject(request_id, session_id, op)
+                self.session_input_inject(request_id, session_id, op).await
             }
             RequestBody::SessionPipePath { session_id } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -6659,6 +6661,35 @@ impl HubConnection {
                 }
                 self.usage_report(request_id).await
             }
+            RequestBody::UsageResetApply {
+                command_id,
+                session_id,
+                account,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "usage reset requests require a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.usage_reset_apply(request_id, command_id, session_id, account)
+                    .await
+            }
             RequestBody::UsageHistoryDay { date } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -8630,6 +8661,8 @@ impl HubConnection {
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
                 surface_watch: Mutex::new(None),
+                spend_injection_shadow: Mutex::new(std::collections::HashMap::new()),
+                spend_menu_cache: Mutex::new(std::collections::HashMap::new()),
                 monitor_watch: Mutex::new(None),
                 loom_registry_watch: Mutex::new(None),
                 loom_registry_watch_serial: tokio::sync::Mutex::new(()),
@@ -15967,11 +16000,11 @@ impl HubConnection {
             trust_hooks,
             headless_spec,
         } = input;
-        if command_id.as_str().is_empty() || text.trim().is_empty() {
+        if command_id.as_str().is_empty() || (text.trim().is_empty() && attachments.is_empty()) {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "turn command id and text must not be empty",
+                "turn command id and message content must not be empty",
                 false,
                 None,
             );
@@ -18671,7 +18704,7 @@ impl HubConnection {
         Ok(())
     }
 
-    fn session_input_inject(
+    async fn session_input_inject(
         &self,
         request_id: RequestId,
         session_id: SessionId,
@@ -18716,7 +18749,72 @@ impl HubConnection {
                 );
             }
         };
-        let delivered = self.hub.inject_session_input(&session_id, op)?;
+        // An injection ack precedes the owner's next surface publication.
+        // Keep the last acknowledged edit's content state until that
+        // publication advances, so Set(nonempty)→Submit remains a message
+        // even when those requests arrive back-to-back.
+        let input = self
+            .hub
+            .live_surface_snapshot(&session_id)?
+            .and_then(|snapshot| snapshot.input);
+        let shadow = {
+            let mut shadows = lock(&self.spend_injection_shadow)?;
+            let pending = shadows.get(&session_id).cloned();
+            if pending.as_ref().is_some_and(|(owner, revision, _)| {
+                input.as_ref().is_none_or(|input| {
+                    input.owner.as_str() != owner.as_str() || input.revision > *revision
+                })
+            }) {
+                shadows.remove(&session_id);
+                None
+            } else {
+                pending
+            }
+        };
+        let surface_has_text = shadow.as_ref().map_or_else(
+            || input.as_ref().is_some_and(|input| !input.text.is_empty()),
+            |(_, _, has_text)| *has_text,
+        );
+        // The volatile input owner is transport routing, not authority to
+        // press a spending card. Refuse an empty-composer Submit before it
+        // reaches the TUI; the TUI repeats the ownership check at dispatch.
+        let empty_surface = input
+            .as_ref()
+            .is_some_and(|input| !surface_has_text && input.attachments.is_empty());
+        let refused_spend_submit = matches!(op, SurfaceInjectOp::Submit)
+            && empty_surface
+            && self.pending_spend_card_is_latest_menu(&session_id).await?;
+        let delivered = if refused_spend_submit {
+            false
+        } else {
+            let delivered = self.hub.inject_session_input(&session_id, op.clone())?;
+            if delivered {
+                let next_text = match &op {
+                    SurfaceInjectOp::Set { text } => Some(!text.is_empty()),
+                    SurfaceInjectOp::Insert { text } => Some(surface_has_text || !text.is_empty()),
+                    SurfaceInjectOp::Clear => Some(false),
+                    SurfaceInjectOp::Submit => {
+                        lock(&self.spend_injection_shadow)?.remove(&session_id);
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(has_text) = next_text {
+                    let (owner, revision) = shadow.map_or_else(
+                        || {
+                            input.as_ref().map_or_else(
+                                || (String::new(), 0),
+                                |input| (input.owner.clone(), input.revision),
+                            )
+                        },
+                        |(owner, revision, _)| (owner, revision),
+                    );
+                    lock(&self.spend_injection_shadow)?
+                        .insert(session_id.clone(), (owner, revision, has_text));
+                }
+            }
+            delivered
+        };
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionInputInjectAck {
@@ -18724,6 +18822,80 @@ impl HubConnection {
                 delivered,
             },
         })
+    }
+
+    async fn pending_spend_card_is_latest_menu(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, SessionHubError> {
+        let head = self.hub.inner.store.latest_seq(session_id).await?;
+        let cached = lock(&self.spend_menu_cache)?.get(session_id).cloned();
+        let cached = cached
+            .filter(|snapshot| snapshot.head <= head)
+            .unwrap_or_default();
+        let (mut cursor, mut open) = (cached.head, cached.open);
+        loop {
+            if cursor >= head {
+                break;
+            }
+            let page = self
+                .hub
+                .inner
+                .store
+                .read_for(
+                    haider_platform::phase_trace::StoreReadCaller::SessionHubRpc,
+                    session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            let mut reached_future = false;
+            for event in page {
+                if event.seq > head {
+                    reached_future = true;
+                    break;
+                }
+                cursor = event.seq;
+                let Ok(payload) = event.payload.decode_event() else {
+                    continue;
+                };
+                match payload {
+                    EventPayload::MenuOpened(menu) => {
+                        let spend = matches!(
+                            menu.kind,
+                            MenuKind::DeferredApproval {
+                                effect: EffectClass::UsageResetApply,
+                                ..
+                            }
+                        );
+                        open.retain(|(id, _)| *id != menu.id);
+                        open.push((menu.id, spend));
+                    }
+                    EventPayload::MenuAnswered(answer) => {
+                        open.retain(|(id, _)| *id != answer.menu);
+                    }
+                    EventPayload::MenuClosed { menu, .. } => {
+                        open.retain(|(id, _)| *id != menu);
+                    }
+                    _ => {}
+                }
+            }
+            if reached_future || page_len < REPLAY_PAGE_SIZE {
+                break;
+            }
+        }
+        let spend = open.last().is_some_and(|(_, spend)| *spend);
+        // A concurrent append invalidates the just-scanned snapshot. Never
+        // cache under an earlier head when a new menu may already be open.
+        if cursor >= head && self.hub.inner.store.latest_seq(session_id).await? == head {
+            lock(&self.spend_menu_cache)?
+                .insert(session_id.clone(), SpendMenuSnapshot { head, open });
+        }
+        Ok(spend)
     }
 
     fn surface_text_too_large(
@@ -19947,6 +20119,9 @@ impl HubConnection {
         let delegated_menu = self
             .delegated_menu_opening(&session_id, request_seq, &answer.menu)
             .await?;
+        let deferred_menu = self
+            .deferred_approval_opening(&session_id, request_seq, &answer.menu)
+            .await?;
         let command_menu = match self
             .command_menu_lookup(&session_id, request_seq, &answer.menu, &answer)
             .await?
@@ -19975,7 +20150,7 @@ impl HubConnection {
             // checkpoint, a command-door menu has no volatile harness
             // registration to recover after restart, so its exact opening
             // coordinates are the authority for prior-generation recovery.
-            allow_prior_generation: command_menu.is_some() || delegated_menu,
+            allow_prior_generation: command_menu.is_some() || delegated_menu || deferred_menu,
             answer,
             device_id: self.hub.inner.device_id.clone(),
             input_is_secret_reference: secret_reference,
@@ -20027,6 +20202,34 @@ impl HubConnection {
                             None,
                         );
                     }
+                }
+                if let MenuKind::DeferredApproval {
+                    approval_id,
+                    effect: EffectClass::UsageResetApply,
+                    account: Some(account),
+                    binding,
+                } = &menu.kind
+                    && let Err(error) = self
+                        .finish_usage_reset_approval(
+                            envelope,
+                            account,
+                            approval_id,
+                            binding.as_ref(),
+                            &recovery_answer,
+                        )
+                        .await
+                {
+                    // The answer has already committed. A dispatch or
+                    // encode failure must still get a correlated reply;
+                    // the journal remains the authority for a later poll.
+                    tracing::error!(%approval_id, ?error, "usage reset dispatch failed");
+                    return self.menu_error(
+                        request_id,
+                        "usage_reset_dispatch_failed",
+                        "usage reset could not be dispatched; inspect approval status",
+                        false,
+                        None,
+                    );
                 }
                 if let Some(resolved) = command_menu {
                     return self
@@ -22229,5 +22432,7 @@ mod run_identity_tests {
 #[path = "provider_rebind.rs"]
 mod provider_rebind;
 
+#[path = "usage_reset_rpc.rs"]
+mod usage_reset_rpc;
 #[cfg(test)]
 pub(super) use crate::completion::astra22_boundary_hook as stop_boundary_hook;

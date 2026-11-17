@@ -51,7 +51,8 @@ fn intent(class: EffectClass) -> EffectIntent {
     EffectIntent {
         effect: haider_protocol::ids::EffectId::new("synthetic-effect"),
         class,
-        summary: "checkpoint_restore provider_transport are only text here".into(),
+        summary: "checkpoint_restore provider_transport usage_reset_apply are only text here"
+            .into(),
         args_digest: "digest".into(),
         workspace_revision: None,
     }
@@ -97,6 +98,11 @@ fn old_decoder_accepts_new_intents_and_current_reader_restores_origin() {
             },
             "provider_transport",
         ),
+        (
+            EffectClass::UsageResetApply,
+            LegacyEffectClass::CredentialAccess,
+            "usage_reset_apply",
+        ),
     ] {
         for revision in [
             None,
@@ -133,6 +139,7 @@ fn frozen_enum_rejects_direct_new_variants_but_all_released_classes_are_unchange
     for class in [
         EffectClass::CheckpointRestore,
         EffectClass::ProviderTransport,
+        EffectClass::UsageResetApply,
     ] {
         let direct = serde_json::to_value(&class).expect("direct new class");
         assert!(
@@ -195,6 +202,10 @@ fn known_origins_require_matching_carriers_and_unknown_origins_never_gain_author
         " checkpoint_restore",
         "checkpoint_restore ",
         "provider-transport",
+        "UsageResetApply",
+        " usage_reset_apply",
+        "usage_reset_apply ",
+        "usage-reset-apply",
         "",
     ] {
         for class in released_classes() {
@@ -211,6 +222,166 @@ fn known_origins_require_matching_carriers_and_unknown_origins_never_gain_author
                     .class,
                 class
             );
+        }
+    }
+}
+
+#[test]
+fn usage_reset_origin_requires_account_carrier_and_has_no_agent_activity() {
+    assert!(
+        haider_protocol::activity::ActivityKind::for_effect(&EffectClass::UsageResetApply)
+            .is_none()
+    );
+    for class in released_classes() {
+        let mut value = serde_json::to_value(intent(class.clone())).expect("fixture");
+        value["effect_origin"] = serde_json::json!("usage_reset_apply");
+        let read = serde_json::from_value::<EffectIntent>(value);
+        if class == EffectClass::CredentialAccess {
+            assert_eq!(
+                read.expect("account carrier").class,
+                EffectClass::UsageResetApply
+            );
+        } else {
+            assert!(
+                read.is_err(),
+                "a weaker or unrelated carrier cannot confer reset authority: {class:?}"
+            );
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyManifestEffects {
+    effects: Vec<LegacyEffectClass>,
+}
+
+#[derive(Deserialize)]
+struct LegacyInventoryEntry {
+    manifest: LegacyManifestEffects,
+}
+
+#[derive(Deserialize)]
+struct LegacyGrant {
+    class: LegacyEffectClass,
+}
+
+#[derive(Deserialize)]
+struct LegacyInventory {
+    tools: Vec<LegacyInventoryEntry>,
+    remembered_grants: Vec<LegacyGrant>,
+}
+
+fn inventory(classes: Vec<EffectClass>) -> haider_protocol::tool::ToolInventorySnapshot {
+    use haider_protocol::tool::{
+        DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
+        ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    };
+    ToolInventorySnapshot {
+        tools: vec![ToolInventoryEntry {
+            manifest: ToolManifest {
+                name: "synthetic_inventory_only".into(),
+                description: "Read-only serialization fixture; grants no authority".into(),
+                effects: classes.clone(),
+                dispatch: DispatchMode::Deferred,
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            default: ToolPermissionDefault::Ask,
+        }],
+        remembered_grants: classes
+            .into_iter()
+            .map(|class| RememberedSessionGrant {
+                class,
+                scope: RememberedGrantScope::Class,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn frozen_inventory_decoder_accepts_internal_classes_and_current_reader_restores_them() {
+    use haider_protocol::tool::ToolInventorySnapshot;
+    let mut classes = vec![
+        EffectClass::UsageResetApply,
+        EffectClass::CheckpointRestore,
+        EffectClass::ProviderTransport,
+    ];
+    classes.extend(released_classes());
+    let original = inventory(classes.clone());
+    let value = serde_json::to_value(&original).expect("inventory json");
+    assert_eq!(
+        value["tools"][0]["manifest"]["effects"][0]["effect_origin"],
+        "usage_reset_apply"
+    );
+    for (index, class) in classes.iter().enumerate().skip(3) {
+        assert_eq!(
+            value["tools"][0]["manifest"]["effects"][index],
+            serde_json::to_value(class).expect("released class shape")
+        );
+    }
+    let old: LegacyInventory =
+        serde_json::from_value(value.clone()).expect("frozen direct JSON reader");
+    let carriers = [
+        LegacyEffectClass::CredentialAccess,
+        LegacyEffectClass::FsWrite,
+        LegacyEffectClass::Network {
+            host: "provider-request".into(),
+        },
+    ];
+    assert_eq!(old.tools[0].manifest.effects.len(), classes.len());
+    assert_eq!(old.remembered_grants.len(), classes.len());
+    for (index, expected) in carriers.iter().enumerate() {
+        assert_eq!(&old.tools[0].manifest.effects[index], expected);
+        assert_eq!(&old.remembered_grants[index].class, expected);
+    }
+    assert_eq!(
+        serde_json::from_value::<ToolInventorySnapshot>(value).expect("current JSON reader"),
+        original
+    );
+    let bytes = rmp_serde::to_vec_named(&original).expect("inventory MessagePack");
+    let old: LegacyInventory =
+        rmp_serde::from_slice(&bytes).expect("frozen direct MessagePack reader");
+    assert_eq!(
+        old.tools[0].manifest.effects[0],
+        LegacyEffectClass::CredentialAccess
+    );
+    assert_eq!(
+        old.remembered_grants[0].class,
+        LegacyEffectClass::CredentialAccess
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<ToolInventorySnapshot>(&bytes).expect("current MessagePack reader"),
+        original
+    );
+}
+
+#[test]
+fn inventory_origin_requires_its_released_carrier_and_aliases_confer_no_reset_class() {
+    use haider_protocol::tool::ToolInventorySnapshot;
+    let original =
+        serde_json::to_value(inventory(vec![EffectClass::UsageResetApply])).expect("fixture");
+    for path in ["/tools/0/manifest/effects/0", "/remembered_grants/0/class"] {
+        let mut wrong = original.clone();
+        wrong.pointer_mut(path).expect("class")["class"] = serde_json::json!("fs_read");
+        assert!(
+            serde_json::from_value::<ToolInventorySnapshot>(wrong).is_err(),
+            "wrong carrier at {path}"
+        );
+        for origin in [
+            "UsageResetApply",
+            " usage_reset_apply",
+            "usage_reset_apply ",
+            "usage-reset-apply",
+        ] {
+            let mut unknown = original.clone();
+            unknown.pointer_mut(path).expect("class")["effect_origin"] = serde_json::json!(origin);
+            let read: ToolInventorySnapshot =
+                serde_json::from_value(unknown).expect("unknown additive origin");
+            let class = if path.starts_with("/tools/") {
+                &read.tools[0].manifest.effects[0]
+            } else {
+                &read.remembered_grants[0].class
+            };
+            assert_eq!(class, &EffectClass::CredentialAccess);
         }
     }
 }

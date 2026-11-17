@@ -916,7 +916,7 @@ pub fn usage_plain(model: &crate::app::AppModel) -> String {
                         )
                     },
                 ),
-            AccountMeterStateV1::Unavailable { reason } => format!(
+            AccountMeterStateV1::Unavailable { reason, .. } => format!(
                 "meter unavailable — {}",
                 crate::format::fmt_meter_reason(reason)
             ),

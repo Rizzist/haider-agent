@@ -383,7 +383,7 @@ impl Composer {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text.is_empty() && self.attachments.is_empty()
     }
 
     #[must_use]

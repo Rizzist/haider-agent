@@ -8,11 +8,18 @@ use unicode_normalization::UnicodeNormalization as _;
 
 /// Informational, secret-free account facts captured at credential intake.
 ///
-/// These fields are never authentication authority. In particular,
-/// `verified = false` is the only honest value for claims decoded from a JWT
-/// without checking its signature against the issuer.
+/// These fields cannot authenticate on their own. The saved OAuth bundle
+/// must match the subject digest and account coordinate before a token is
+/// handed to a reset action. `verified = false` is the only honest value for
+/// claims decoded from a JWT without checking its signature against the issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountIdentity {
+    /// Stable, non-secret OAuth principal digest. It binds a saved token
+    /// bundle to the account record through a vault-before-record update.
+    /// Older records omit it and cannot authorize a usage reset until the
+    /// account is re-established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +151,7 @@ mod identity_tests {
     #[test]
     fn openai_workspace_id_without_user_sub_never_deduplicates() {
         let mut a = AccountIdentity {
+            subject_hash: None,
             email: Some("one@example.test".into()),
             display_name: None,
             account_id: Some("shared-workspace".into()),
@@ -175,6 +183,7 @@ mod identity_tests {
     #[test]
     fn only_stable_user_coordinates_are_provably_different() {
         let identity = |account_id: Option<&str>| AccountIdentity {
+            subject_hash: None,
             email: Some("member@example.test".into()),
             display_name: None,
             account_id: account_id.map(str::to_owned),
@@ -264,6 +273,17 @@ pub struct CredentialDescriptor {
 
 fn incarnation_is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// Immutable reset target captured when a spending card opens. The alias is
+/// carried separately by the menu for display; this is the dispatch fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResetAccountBinding {
+    pub provider: String,
+    pub account_id: String,
+    pub incarnation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hash: Option<String>,
 }
 
 impl CredentialDescriptor {

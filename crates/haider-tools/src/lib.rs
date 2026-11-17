@@ -44,6 +44,7 @@ mod task_outcome;
 mod tasks;
 mod test_summary;
 mod todo_write;
+mod usage_reset;
 mod webfetch;
 mod workflow_author;
 mod workspace_receipt;
@@ -168,6 +169,7 @@ pub use test_summary::{
     summarize_test_output, test_run_process_bounds,
 };
 pub use todo_write::{MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TodoWrite, todo_write_manifest};
+pub use usage_reset::{UsageResetApply, usage_reset_apply_manifest};
 pub use webfetch::{
     WEB_FETCH_TOOL_OUTPUT_CAP_BYTES, WebFetch, web_fetch_manifest, web_search_manifest,
 };

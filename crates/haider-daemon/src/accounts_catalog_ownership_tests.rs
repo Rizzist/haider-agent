@@ -217,6 +217,7 @@ impl Fixture {
                 .clone();
             let mut replacement = old.clone();
             replacement.account_identity = Some(AccountIdentity {
+                subject_hash: None,
                 email: None,
                 display_name: None,
                 account_id: Some("fixture-replacement-account".into()),
@@ -1633,6 +1634,7 @@ async fn catalog_owner_adapter_cache_uses_canonical_account_identity() {
         .clone();
     let mut other_identity = descriptor.clone();
     other_identity.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: None,
         account_id: Some("fixture-replacement-account".into()),

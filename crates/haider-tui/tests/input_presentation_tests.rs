@@ -331,11 +331,38 @@ fn open(model: &mut AppModel, menu: Menu) {
     model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(menu))));
 }
 
+// Model is covered by a blocking question. Its cover/restoration probes
+// therefore use the deferred card that actually yields to a local picker.
+fn arm_covered_card(model: &mut AppModel, cover: &str) -> InputOwner {
+    if cover != "model" {
+        arm(model, "permission");
+        return InputOwner::SessionMenu;
+    }
+    model.composer.clear();
+    let mut menu = permission();
+    menu.kind = MenuKind::DeferredApproval {
+        approval_id: "presentation-reset".into(),
+        effect: haider_protocol::effect::EffectClass::UsageResetApply,
+        account: None,
+        binding: None,
+    };
+    menu.blocking = false;
+    menu.origin = "deferred_approval_v1".into();
+    menu.options.swap(0, 1);
+    menu.options[1].key = "approve".into();
+    menu.options[1].label = "Apply one reset".into();
+    open(model, menu);
+    InputOwner::SpendCard
+}
+
 /// Close whatever cover is up with the user's own Esc key, as a real user
 /// would while still holding the mouse button.
 fn close_cover(model: &mut AppModel, hits: &[(Rect, Hit)]) {
     for _ in 0..3 {
-        if model.input_owner() == InputOwner::SessionMenu {
+        if matches!(
+            model.input_owner(),
+            InputOwner::SessionMenu | InputOwner::SpendCard
+        ) {
             return;
         }
         dkey(model, hits, KeyCode::Esc);
@@ -486,11 +513,12 @@ fn var_b1d_press_under_a_cover_must_not_answer_the_card_it_reveals() {
     ] {
         for (w, h) in [(118, 36), (80, 24)] {
             let mut m = model();
-            arm(&mut m, "permission");
+            let revealed_owner = arm_covered_card(&mut m, cover);
             let shown = frame(&m, w, h);
-            let (x, y) = option_cell(&shown, 0).unwrap(); // Allow once
+            let (x, y) = option_cell(&shown, 0).unwrap();
             arm(&mut m, cover);
             let covered_owner = m.input_owner();
+            assert_ne!(covered_owner, revealed_owner, "{cover} must cover the card");
             let hidden = frame(&m, w, h);
             let hidden_has_option = hidden
                 .iter()
@@ -504,7 +532,7 @@ fn var_b1d_press_under_a_cover_must_not_answer_the_card_it_reveals() {
             );
             let mut current = hidden.clone();
             for _ in 0..4 {
-                if m.input_owner() == InputOwner::SessionMenu {
+                if m.input_owner() == revealed_owner {
                     break;
                 }
                 dkey(&mut m, &current, KeyCode::Esc);
@@ -512,7 +540,7 @@ fn var_b1d_press_under_a_cover_must_not_answer_the_card_it_reveals() {
             }
             assert_eq!(
                 m.input_owner(),
-                InputOwner::SessionMenu,
+                revealed_owner,
                 "{cover} did not reveal the card at {w}x{h}"
             );
             let revealed = frame(&m, w, h);
@@ -541,10 +569,10 @@ fn var_b1d_press_under_a_cover_must_not_answer_the_card_it_reveals() {
 
 #[test]
 fn session_menu_preempts_local_picker_state_and_remains_actionable() {
-    // These four local surfaces sit below a newly arrived permission card.
+    // These local surfaces sit below a newly arrived permission card.
     // They cannot be used as a cover over that card: the card is already the
     // painted owner, and its visible answer remains a positive control.
-    for picker in ["theme", "effort", "search", "history"] {
+    for picker in ["theme", "effort", "model", "search", "history"] {
         let mut m = model();
         arm(&mut m, "permission");
         arm(&mut m, picker);
@@ -752,8 +780,13 @@ fn var_b2c_queued_keys_after_cover_closes_must_not_answer_unpainted_card() {
     let mut bad = Vec::new();
     for cover in ["detail", "inbox", "help", "model", "ssh-form"] {
         let mut m = model();
-        arm(&mut m, "permission");
+        let revealed_owner = arm_covered_card(&mut m, cover);
         arm(&mut m, cover);
+        assert_ne!(
+            m.input_owner(),
+            revealed_owner,
+            "{cover} must cover the card"
+        );
         let last = frame(&m, 118, 36); // cover painted, card not
         // One burst: close the cover, then the next keys, with no frame between.
         close_cover(&mut m, &last);

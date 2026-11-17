@@ -1329,6 +1329,81 @@ impl TaskFacade {
             .map(|(run_id, (_, branch_id, _))| (run_id, branch_id)))
     }
 
+    /// Delivers a durable typed subsystem notification to an active run
+    /// without starting provider work when the session is idle. The caller's
+    /// separately journaled fact remains the queued/next-turn fallback.
+    pub(crate) async fn deliver_notification(
+        &self,
+        session_id: &SessionId,
+        notification_id: &str,
+        notice: &str,
+    ) -> Result<bool, HaiderError> {
+        let Some((run_id, branch_id)) = self.active_run(session_id).await? else {
+            return Ok(false);
+        };
+        let identity = format!("{notification_id}-{}", run_id.as_str());
+        let request_json = serde_json::to_string(&json!({
+            "session_id": session_id,
+            "run_id": run_id,
+            "notification_id": notification_id,
+            "text": notice,
+            "mode": DeliveryMode::Steer,
+        }))
+        .map_err(internal_serialization)?;
+        let accepted = self
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("notification-steer-{identity}"),
+                request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                branch_id,
+                run_id,
+                agent_id: None,
+                text: notice.to_owned(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new(format!("notification-steer-queued-{identity}")),
+                user_event_id: EventId::new(format!("notification-steer-user-{identity}")),
+                active_event_id: EventId::new(format!("notification-steer-active-{identity}")),
+                device_id: self.hub.device_id(),
+            })
+            .await?;
+        if accepted.disposition != TurnAdmissionDisposition::SteerPending {
+            let request_json = serde_json::to_string(&json!({
+                "session_id": session_id,
+                "run_id": accepted.run_id,
+                "reason": "notification-steer-race",
+            }))
+            .map_err(internal_serialization)?;
+            let cancel = TurnCancelCommand {
+                command_id: format!("notification-steer-race-cancel-{identity}"),
+                request_digest: crate::delegation::digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                run_id: accepted.run_id.clone(),
+                cancelling_event_id: EventId::new(format!(
+                    "notification-steer-race-cancelling-{identity}"
+                )),
+                device_id: self.hub.device_id(),
+            };
+            if let Err(error) = self.hub.cancel_internal_turn(cancel).await {
+                tracing::warn!(%session_id, ?error, "stray notification admission was not cancelled");
+            }
+            return Ok(false);
+        }
+        if let Err(error) = self
+            .hub
+            .submit_internal_nudge(accepted, notice.to_owned())
+            .await
+        {
+            tracing::warn!(%session_id, ?error, "durable notification steer wake was not delivered");
+        }
+        Ok(true)
+    }
+
     /// Durable STEER into the active run + best-effort live wake — exactly
     /// the S1 delivered_steer seam. A disposition race (the run ended
     /// between the scan and the accept) cancels the stray admission and

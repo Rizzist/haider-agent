@@ -370,8 +370,8 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        125,
-        "merged stop and typed SSH capabilities extend the served feature set"
+        126,
+        "usage reset, merged stop and typed SSH capabilities extend the served feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -493,6 +493,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+            haider_rpc::FEATURE_USAGE_RESET_APPLY_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
             haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_PEER_MESSAGING_V1.to_owned(),
@@ -578,6 +579,7 @@ fn activity_token_requires_hello_request_and_follows_newer_withholding() {
     for newer in [
         haider_rpc::FEATURE_HELPER_STOP_V1,
         haider_rpc::FEATURE_RUN_STOP_SCOPE_V1,
+        haider_rpc::FEATURE_USAGE_RESET_APPLY_V1,
     ] {
         let next = encode_welcome_for_peer(welcome.clone(), next_limit)
             .expect("next merged token withheld before activity");
@@ -800,6 +802,7 @@ fn tight_welcome_withholds_new_stop_and_ssh_tokens_before_wave56_features() {
             FEATURE_SSH_TYPED_SETUP_ERRORS_V1,
             haider_rpc::FEATURE_HELPER_STOP_V1,
             haider_rpc::FEATURE_RUN_STOP_SCOPE_V1,
+            haider_rpc::FEATURE_USAGE_RESET_APPLY_V1,
         ] {
             assert!(preceding.features.remove(token));
             let expected = uds_codec::encode(&WireFrame::Welcome(preceding.clone()), usize::MAX)
@@ -912,6 +915,13 @@ async fn tight_welcome_dispatch_preserves_wave56_bytes_with_cold_and_warm_cache(
             );
             let bytes = outbound_bytes(lane.recv().await.expect("Welcome queued").bytes);
             let grant = grant.expect("connection grant");
+            assert_eq!(
+                grant
+                    .features
+                    .contains(haider_rpc::FEATURE_USAGE_RESET_APPLY_V1),
+                ample,
+                "the reset request shape follows the actual Welcome grant"
+            );
             if ample {
                 assert!(grant.features.contains(FEATURE_SSH_TYPED_SETUP_ERRORS_V1));
             } else {

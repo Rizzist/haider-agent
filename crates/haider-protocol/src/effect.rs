@@ -70,6 +70,10 @@ pub enum EffectClass {
     MobileControl,
     /// Read SMS data from an explicitly activated mobile capability.
     ReadSms,
+    /// Spend one provider-issued rate-limit reset credit. This effect is
+    /// deliberately distinct from ordinary network access: it consumes a
+    /// limited account resource and can never be auto-approved.
+    UsageResetApply,
 }
 
 /// Journaled BEFORE dispatch — the durable pre-image of every side effect.
@@ -94,6 +98,7 @@ pub struct EffectIntent {
 enum EffectOrigin {
     CheckpointRestore,
     ProviderTransport,
+    UsageResetApply,
     // A later writer may add an origin while retaining a released carrier.
     // Older readers keep that carrier's meaning instead of bricking replay.
     #[serde(other)]
@@ -112,36 +117,67 @@ struct JournalEffectIntent {
     workspace_revision: Option<WorkspaceRevision>,
 }
 
+fn released_class(class: EffectClass) -> (EffectClass, Option<EffectOrigin>) {
+    match class {
+        EffectClass::CheckpointRestore => {
+            (EffectClass::FsWrite, Some(EffectOrigin::CheckpointRestore))
+        }
+        EffectClass::ProviderTransport => (
+            EffectClass::Network {
+                host: "provider-request".into(),
+            },
+            Some(EffectOrigin::ProviderTransport),
+        ),
+        EffectClass::UsageResetApply => (
+            EffectClass::CredentialAccess,
+            Some(EffectOrigin::UsageResetApply),
+        ),
+        // Keep this exhaustive: adding an internal class must require a
+        // deliberate released-decoder-compatible write representation.
+        class @ (EffectClass::FsRead
+        | EffectClass::FsWrite
+        | EffectClass::ProcessExec
+        | EffectClass::RemoteExecution
+        | EffectClass::Network { .. }
+        | EffectClass::GitOp
+        | EffectClass::AgentSpawn
+        | EffectClass::PeerMessage
+        | EffectClass::CredentialAccess
+        | EffectClass::GuiAct
+        | EffectClass::ScreenObserve
+        | EffectClass::ScreenControl
+        | EffectClass::MobileObserve
+        | EffectClass::MobileControl
+        | EffectClass::ReadSms) => (class, None),
+    }
+}
+
+fn restore_class(
+    class: EffectClass,
+    effect_origin: Option<EffectOrigin>,
+) -> Result<EffectClass, &'static str> {
+    // Prefer explicit provenance, never a tool name or human summary.
+    // Reject a mismatched carrier rather than guessing mutation authority.
+    Ok(match (effect_origin, class) {
+        (Some(EffectOrigin::CheckpointRestore), EffectClass::FsWrite) => {
+            EffectClass::CheckpointRestore
+        }
+        (Some(EffectOrigin::ProviderTransport), EffectClass::Network { host })
+            if host == "provider-request" =>
+        {
+            EffectClass::ProviderTransport
+        }
+        (Some(EffectOrigin::UsageResetApply), EffectClass::CredentialAccess) => {
+            EffectClass::UsageResetApply
+        }
+        (None | Some(EffectOrigin::Unknown), class) => class,
+        (Some(_), _) => return Err("effect origin does not match its released class carrier"),
+    })
+}
+
 impl From<EffectIntent> for JournalEffectIntent {
     fn from(intent: EffectIntent) -> Self {
-        let (class, effect_origin) = match intent.class {
-            EffectClass::CheckpointRestore => {
-                (EffectClass::FsWrite, Some(EffectOrigin::CheckpointRestore))
-            }
-            EffectClass::ProviderTransport => (
-                EffectClass::Network {
-                    host: "provider-request".into(),
-                },
-                Some(EffectOrigin::ProviderTransport),
-            ),
-            // Keep this exhaustive: adding an internal class must require a
-            // deliberate released-decoder-compatible write representation.
-            class @ (EffectClass::FsRead
-            | EffectClass::FsWrite
-            | EffectClass::ProcessExec
-            | EffectClass::RemoteExecution
-            | EffectClass::Network { .. }
-            | EffectClass::GitOp
-            | EffectClass::AgentSpawn
-            | EffectClass::PeerMessage
-            | EffectClass::CredentialAccess
-            | EffectClass::GuiAct
-            | EffectClass::ScreenObserve
-            | EffectClass::ScreenControl
-            | EffectClass::MobileObserve
-            | EffectClass::MobileControl
-            | EffectClass::ReadSms) => (class, None),
-        };
+        let (class, effect_origin) = released_class(intent.class);
         Self {
             effect: intent.effect,
             class,
@@ -157,20 +193,7 @@ impl TryFrom<JournalEffectIntent> for EffectIntent {
     type Error = &'static str;
 
     fn try_from(intent: JournalEffectIntent) -> Result<Self, Self::Error> {
-        // Prefer explicit provenance, never a tool name or human summary.
-        // Reject a mismatched carrier rather than guessing mutation authority.
-        let class = match (intent.effect_origin, intent.class) {
-            (Some(EffectOrigin::CheckpointRestore), EffectClass::FsWrite) => {
-                EffectClass::CheckpointRestore
-            }
-            (Some(EffectOrigin::ProviderTransport), EffectClass::Network { host })
-                if host == "provider-request" =>
-            {
-                EffectClass::ProviderTransport
-            }
-            (None | Some(EffectOrigin::Unknown), class) => class,
-            (Some(_), _) => return Err("effect origin does not match its released class carrier"),
-        };
+        let class = restore_class(intent.class, intent.effect_origin)?;
         Ok(Self {
             effect: intent.effect,
             class,
@@ -178,6 +201,80 @@ impl TryFrom<JournalEffectIntent> for EffectIntent {
             args_digest: intent.args_digest,
             workspace_revision: intent.workspace_revision,
         })
+    }
+}
+
+/// Direct inventory fields use the same authority mapping as journal intents.
+/// The additive origin lives beside the released class tag in these fields.
+pub(crate) mod compatible_class {
+    use super::{EffectClass, EffectOrigin, released_class, restore_class};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Carrier {
+        #[serde(flatten)]
+        class: EffectClass,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect_origin: Option<EffectOrigin>,
+    }
+
+    pub(crate) fn serialize<S: Serializer>(
+        class: &EffectClass,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let (class, effect_origin) = released_class(class.clone());
+        if effect_origin.is_none() {
+            return class.serialize(serializer);
+        }
+        Carrier {
+            class,
+            effect_origin,
+        }
+        .serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<EffectClass, D::Error> {
+        let value = Carrier::deserialize(deserializer)?;
+        restore_class(value.class, value.effect_origin).map_err(serde::de::Error::custom)
+    }
+}
+
+pub(crate) mod compatible_classes {
+    use super::EffectClass;
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    struct ClassRef<'a>(&'a EffectClass);
+
+    impl Serialize for ClassRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            super::compatible_class::serialize(self.0, serializer)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct ClassValue(#[serde(with = "super::compatible_class")] EffectClass);
+
+    pub(crate) fn serialize<S: Serializer>(
+        classes: &[EffectClass],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(classes.len()))?;
+        for class in classes {
+            sequence.serialize_element(&ClassRef(class))?;
+        }
+        sequence.end()
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<EffectClass>, D::Error> {
+        Ok(Vec::<ClassValue>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.0)
+            .collect())
     }
 }
 

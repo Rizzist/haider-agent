@@ -351,7 +351,13 @@ async fn refresh_after_s_drives_the_next_poll() {
         fetched_snapshot(Some(23)),
         fetched_snapshot(Some(23)),
     ]));
-    let (stop, task) = start_fake_poller(accounts, credentials, interest, Arc::clone(&http)).await;
+    let (stop, task) = start_fake_poller(
+        accounts,
+        credentials,
+        Arc::clone(&interest),
+        Arc::clone(&http),
+    )
+    .await;
 
     wait_for(|| http.call_count() == 1).await;
     tokio::time::advance(Duration::from_secs(22)).await;
@@ -689,21 +695,34 @@ async fn poller_follows_an_account_switch_during_a_request() {
     task.await.expect("poller joins");
 }
 
-/// MUTATION CHECK: delete the empty-recipient gate before credential
-/// resolution. Expected runtime failure: an idle daemon performs an HTTP
-/// account request despite having no active Haider Code session.
+/// The usage screen is itself a consumer of the held plan snapshot, so the
+/// poller captures the active account even with no attached provider session.
+/// Publication remains recipient-scoped and therefore stays empty here.
 #[tokio::test(start_paused = true)]
-async fn no_active_provider_session_means_no_network_request() {
+async fn active_account_is_captured_without_a_provider_session() {
     let accounts = Arc::new(FakeAccounts::new(1, descriptor("first")));
     let credentials = Arc::new(FakeCredentials::new(&[("first", b"hk-first")]));
     let interest = Arc::new(FakeInterest::new(Vec::new()));
-    let http = Arc::new(FakeHttp::new([fetched_snapshot(Some(15))]));
-    let (stop, task) = start_fake_poller(accounts, credentials, interest, Arc::clone(&http)).await;
+    let http = Arc::new(FakeHttp::new([
+        fetched_snapshot(Some(15)),
+        fetched_snapshot(Some(15)),
+        fetched_snapshot(Some(15)),
+    ]));
+    let (stop, task) = start_fake_poller(
+        accounts,
+        credentials,
+        Arc::clone(&interest),
+        Arc::clone(&http),
+    )
+    .await;
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(600)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(http.call_count(), 0);
+    wait_for(|| http.call_count() == 1 && interest.captures().len() == 1).await;
+    assert!(interest.publications().is_empty());
+    tokio::time::advance(Duration::from_secs(15)).await;
+    wait_for(|| http.call_count() == 2 && interest.captures().len() == 2).await;
+    tokio::time::advance(Duration::from_secs(15)).await;
+    wait_for(|| http.call_count() == 3 && interest.captures().len() == 3).await;
+    assert!(interest.publications().is_empty());
 
     stop.send_replace(true);
     task.await.expect("poller joins");

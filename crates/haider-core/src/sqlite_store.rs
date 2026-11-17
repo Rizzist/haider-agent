@@ -291,6 +291,18 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn usage_meter_samples_range(
+        &self,
+        through_date: String,
+        days: u16,
+    ) -> Result<Vec<haider_protocol::usage::UsageHistoryMeterSampleV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.usage_meter_samples_range(&through_date, days))
+        })
+        .await
+    }
+
     pub async fn append_usage_meter_sample(
         &self,
         sample: haider_protocol::usage::UsageHistoryMeterSampleV1,

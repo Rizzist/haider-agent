@@ -144,6 +144,8 @@ fn report() -> UsageReportV1 {
                         },
                     ],
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: oauth_stats(),
             },
             AccountUsageReportV1 {
@@ -154,7 +156,10 @@ fn report() -> UsageReportV1 {
                 auth_method: AuthMethod::OAuth,
                 meter: AccountMeterStateV1::Unavailable {
                     reason: "http_status_401".to_owned(),
+                    retry_at_ms: None,
                 },
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: idle_oauth_stats(),
             },
             AccountUsageReportV1 {
@@ -164,6 +169,8 @@ fn report() -> UsageReportV1 {
                 plan: None,
                 auth_method: AuthMethod::ApiKey,
                 meter: AccountMeterStateV1::LocalOnly,
+                reset_credits: None,
+                previous_resets: Vec::new(),
                 local: stats(3, Some(0.57)),
             },
         ],
@@ -330,6 +337,10 @@ fn meter_reason_compaction_preserves_the_typed_mapping() {
     assert_eq!(fmt_meter_reason("http_status_401"), "http 401");
     assert_eq!(fmt_meter_reason("transport_timeout"), "transport timeout");
     assert_eq!(fmt_meter_reason("malformed_response"), "malformed response");
+    assert_eq!(
+        fmt_meter_reason("credential_identity_incomplete"),
+        "identity incomplete; refresh account or sign in again"
+    );
     assert_eq!(
         fmt_meter_reason("credential_unavailable"),
         "credential unavailable"
@@ -881,6 +892,26 @@ fn unavailable_meters_render_the_typed_reason_never_a_bar() {
         body_text(&rows).contains("meter unavailable · http 401"),
         "the compact global row must not swallow the typed reason"
     );
+
+    // Legacy accounts fail closed until refreshed. The recovery action must
+    // remain visible at both gate sizes, rather than a generic unsupported label.
+    let mut usage = report();
+    usage.accounts[1].meter = AccountMeterStateV1::Unavailable {
+        reason: "credential_identity_incomplete".into(),
+        retry_at_ms: None,
+    };
+    model.usage.apply_report(usage);
+    model.usage.scope = UsageScope::Accounts;
+    for (width, height) in [(118, 36), (80, 24)] {
+        let (rows, _) = draw(&model, width, height);
+        let text = body_text(&rows);
+        assert!(
+            text.contains("identity incomplete"),
+            "{width}x{height}: {text}"
+        );
+        assert!(text.contains("refresh account"), "{width}x{height}: {text}");
+        assert!(!text.contains('▰') && !text.contains('▱'));
+    }
 }
 
 /// An API-key account renders tokens + est cost and NEVER a 0–100 meter:

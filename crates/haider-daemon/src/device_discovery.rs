@@ -408,6 +408,7 @@ fn linked_codex_material(
         .as_ref()
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
+    let member_subject = id.sub.clone().and_then(nonempty);
     let email = id.email.and_then(nonempty);
     let user = id.sub.and_then(nonempty);
     let account_id = id
@@ -433,7 +434,12 @@ fn linked_codex_material(
         .or_else(|| account_id.clone())
         .unwrap_or_else(|| "Codex login".to_owned());
     let captured_at = last_refreshed_at_ms.unwrap_or(0);
+    let subject = member_subject
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| blake3::hash(access_token.0.as_slice()).to_hex().to_string());
+    let subject_hash = blake3::hash(subject.as_bytes()).to_hex().to_string();
     let identity = AccountIdentity {
+        subject_hash: Some(subject_hash.clone()),
         email,
         display_name: None,
         account_id: user.map(|user| {
@@ -448,10 +454,6 @@ fn linked_codex_material(
     let expires_at_ms = expires_at_ms.ok_or(LinkedSourceReadFailure::MissingFields)?;
     let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
     let generation = last_refreshed_at_ms.unwrap_or(1).max(1);
-    let subject = identity
-        .account_id
-        .as_deref()
-        .unwrap_or(display_identity.as_str());
     let bundle = OAuthTokenBundleV1::new(
         haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
         "https://auth.openai.com".to_owned(),
@@ -464,7 +466,7 @@ fn linked_codex_material(
         None,
         Vec::new(),
         OAuthIdentityV1 {
-            subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
+            subject_hash,
             display_identity: display_identity.clone(),
         },
         generation,
@@ -481,7 +483,7 @@ fn linked_codex_material(
     };
     Ok(LinkedSourceMaterial {
         credential_digest: None,
-        identity: Some(identity),
+        identity: bundle.account_identity.clone(),
         display_identity,
         last_refreshed_at_ms,
         access_expires_at_ms: Some(expires_at_ms),
@@ -512,6 +514,7 @@ fn linked_claude_metadata(
     Ok(LinkedSourceMaterial {
         credential_digest: None,
         identity: Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some(display_name.to_owned()),
             account_id: Some(synthetic),
@@ -628,6 +631,7 @@ fn linked_grok_material(
             |(issuer, client)| (issuer.to_owned(), client.to_owned()),
         );
     let identity = AccountIdentity {
+        subject_hash: None,
         email,
         display_name: None,
         account_id: Some(account_id.clone()),
@@ -726,6 +730,7 @@ fn linked_kimi_material(
 
 fn kimi_identity(account_id: &str, last_refreshed_at_ms: Option<u64>) -> AccountIdentity {
     AccountIdentity {
+        subject_hash: None,
         email: None,
         display_name: Some("Kimi Code subscription".to_owned()),
         account_id: Some(account_id.to_owned()),
@@ -815,7 +820,7 @@ fn linked_access_material(
         .map_err(|_| LinkedSourceReadFailure::Invalid)?;
     Ok(LinkedSourceMaterial {
         credential_digest: None,
-        identity: Some(identity),
+        identity: bundle.account_identity.clone(),
         display_identity,
         last_refreshed_at_ms,
         access_expires_at_ms: Some(expires_at_ms),
@@ -940,6 +945,7 @@ fn discover_codex() -> Option<DeviceCandidate> {
         })
         .or_else(|| {
             (email.is_some() || account_id.is_some() || user.is_some()).then(|| AccountIdentity {
+                subject_hash: None,
                 email,
                 display_name: None,
                 // The fallback has no stable coordinate without a user sub:
@@ -995,6 +1001,7 @@ fn discover_claude_file_at(path: &Path) -> Option<DeviceCandidate> {
         "Claude Code credential file (read-only)",
         None,
         Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some(display_name.to_owned()),
             account_id: None,

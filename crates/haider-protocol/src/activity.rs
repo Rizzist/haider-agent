@@ -228,7 +228,8 @@ impl ActivityKind {
             EffectClass::ProcessExec => Self::Run,
             EffectClass::FsRead => Self::Read,
             EffectClass::AgentSpawn | EffectClass::PeerMessage => Self::Orchestrate,
-            EffectClass::CredentialAccess => return None,
+            // Account maintenance is not an agent workspace or web activity.
+            EffectClass::CredentialAccess | EffectClass::UsageResetApply => return None,
         })
     }
 

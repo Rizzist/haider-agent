@@ -80,6 +80,7 @@ fn adoption_offer_requires_yes_before_receipted_import() {
     run_slash(&mut model, "/accounts");
     model.requests.clear();
     let identity = haider_protocol::credential::AccountIdentity {
+        subject_hash: None,
         email: Some("owner@example.invalid".into()),
         display_name: None,
         account_id: Some("acct-964".into()),

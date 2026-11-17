@@ -951,6 +951,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "usage.report",
         "usage.history_day",
         "usage.history_range",
+        "usage.reset_apply",
         "vault.stage",
         "workflow.graph.state",
         "workflow.graph.watch",
@@ -963,8 +964,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        137,
-        "133 merged methods plus turn.retract, two peer injection methods and agent.cancel_all"
+        138,
+        "merged methods include usage.reset_apply, turn.retract, peer injection and agent.cancel_all"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -1016,8 +1017,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        69,
-        "the supplemental fixture must contain the 69 methods absent from the union transcript"
+        70,
+        "the supplemental fixture must contain every method absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -5009,6 +5010,49 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
             ..
         }
     ));
+}
+
+#[test]
+fn usage_reset_apply_wire_is_feature_gated_and_returns_pending_coordinates() {
+    use haider_protocol::ids::{CredentialAlias, MenuId, SessionId};
+    use haider_protocol::usage::{UsageResetApplyResultV1, UsageResetApplyStatusV1};
+    use haider_rpc::{CommandId, FEATURE_USAGE_RESET_APPLY_V1, RequestBody, ResponseBody};
+
+    assert_eq!(FEATURE_USAGE_RESET_APPLY_V1, "usage_reset_apply_v1");
+    let request = RequestBody::UsageResetApply {
+        command_id: CommandId::new("reset-command"),
+        session_id: SessionId::new("session-redacted"),
+        account: CredentialAlias::new("openai-oauth"),
+    };
+    assert_eq!(
+        request.additive_shape_feature(),
+        Some(FEATURE_USAGE_RESET_APPLY_V1)
+    );
+    assert_eq!(
+        serde_json::to_value(&request).expect("request json"),
+        serde_json::json!({
+            "method": "usage.reset_apply",
+            "command_id": "reset-command",
+            "session_id": "session-redacted",
+            "account": "openai-oauth"
+        })
+    );
+    let response = ResponseBody::UsageResetApply {
+        result: UsageResetApplyResultV1 {
+            approval_id: "approval-redacted".into(),
+            account: CredentialAlias::new("openai-oauth"),
+            status: UsageResetApplyStatusV1::ApprovalPending,
+            windows_reset: None,
+            reason: None,
+        },
+        menu_id: MenuId::new("menu-redacted"),
+        request_seq: 42,
+        worker_generation: 7,
+    };
+    let encoded = serde_json::to_value(&response).expect("response json");
+    assert_eq!(encoded["method"], "usage.reset_apply");
+    assert_eq!(encoded["result"]["status"], "approval_pending");
+    assert_eq!(encoded["request_seq"], 42);
 }
 
 /// LAW (usage_history_wire_preserves_absence): the two read doors are behind

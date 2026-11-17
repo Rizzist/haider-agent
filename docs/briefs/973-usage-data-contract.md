@@ -1,0 +1,142 @@
+# 973 usage data and deferred reset approval
+
+## Provider facts
+
+Only provider-published fields are meters. Missing windows, balances, counts,
+and timestamps remain absent; cadence is never used to manufacture a reset.
+An OpenAI window without an exact duration keeps its provider name
+(`primary` or `secondary`); it is never relabeled five-hour or weekly.
+
+| Provider | Meter/reset facts | Banked reset operation |
+| --- | --- | --- |
+| `openai-oauth` | `GET /backend-api/wham/usage` publishes rate-limit windows and a reset-credit summary. The current redacted live fixture has one 604800-second weekly window, no 5-hour window, and exact `available_count` / `applicable_available_count`. `GET /backend-api/wham/rate-limit-reset-credits` publishes the detailed available-credit inventory; the confirmed contract does not publish prior-reset history. | OpenAI Codex implements `POST /backend-api/wham/rate-limit-reset-credits/consume` with a caller-supplied `redeem_request_id`; success returns `code: reset` and `windows_reset`. |
+| `anthropic-oauth` | The live `/api/oauth/usage` shape publishes current five-hour/seven-day buckets and optional extra usage. It contains no banked, earned, used, or remaining reset inventory. | None found in the authenticated usage response or provider contract. |
+| `haider-code` | `/v1/account` publishes the current weekly allowance (`percent_remaining`, state, exact reset/grace timestamps), credits, and hold state. It does not publish banked-reset inventory or history. | None published. |
+| `kimi-oauth` | `/coding/v1/usages` publishes current quota counters/windows and reset time. Recorded/verified shapes contain no banked-reset inventory or history. | None published. |
+| `grok-oauth` | The billing response publishes current plan/credit utilization. It contains no banked-reset inventory or history. | None published. |
+| API-key/custom providers and supervised ACP providers | No provider quota/reset surface is available to Haider; local accounting or typed unavailability remains the honest state. | None. |
+
+The OpenAI sources of record are the upstream Codex backend client and
+app-server protocol/tests for `rate-limit-reset-credits` and `consume`. The
+redacted live shape is
+`crates/haider-provider/tests/fixtures/usage/openai_wham_usage_live_redacted.json`;
+every string value was replaced before persistence.
+
+## Additive usage wire
+
+`AccountUsageReportV1` adds optional `reset_credits` and
+`previous_resets`. Reset history carries an explicit `source` of `provider`
+or `device_journal`; the latter is made only from exact reset timestamps that
+this device previously sampled. `AccountMeterStateV1::Unavailable` adds the
+optional exact `retry_at_ms` derived from `Retry-After`.
+
+Haider Code's held account snapshot is now collected for the active account
+even when no provider session is attached. Its weekly window uses
+`utilization` as the used fraction (`1 - percent_remaining / 100`) and carries
+the provider's exact `resets_at_ms`; the remaining fraction is the complement
+of that same published percentage.
+The active-account refresh timer continues without an attached provider
+session, so the held meter is refreshed at the provider cadence.
+
+## Deferred spending approval
+
+`EffectClass::UsageResetApply` is a sensitive finite-resource class. Ordinary
+allow rules, remembered/session grants, autonomous mode, and `auto_allow`
+cannot approve it. A request opens `MenuKind::DeferredApproval` with only
+deny (option 0, the default) and approve-once (option 1) choices. Only an
+answer carrying the explicit `approve` key and matching option index approves;
+a keyless answer is rejected as `invalid_frame` with no durable Deny event.
+The TUI answers a spending card only from a deliberate local gesture while the
+card is visible. Composer text, attachments, paste, newline chords, and remote
+input do not answer it. Enter selects Deny by default; a fresh local Down can
+select Apply. A local theme, effort, or model picker stays above a pending
+spending card. Every card gesture must find that card visible when the event
+begins, even if an overlay closes during dispatch. An attachment alone is
+composer content and submits as a message
+without answering the card. The menu is session-scoped and
+`blocking: false`; the initiating RPC/tool immediately returns
+`approval_pending` and the run continues.
+Both entry points apply the same session policy denial before opening a menu;
+read-only and hard-denied sessions receive a typed refusal.
+
+The card uses the shared toolview input owner, presentation identity, pointer
+binding, 400 ms decision dwell, and local-input queue rebasing. Hidden cards
+leave the composer in charge; pickers, Search and History cover a spending
+card. Same-id menu updates receive a new presentation incarnation. Pending
+decisions remain stacked, with blocking questions first. Answered spending
+cards retire locally at once; their successor starts at Deny and must satisfy
+its own dwell before a pointer can confirm it. The footer shows the pending
+decision count. Local typing survives owner changes caused by earlier queued
+input; outside replacements retire that input, including equal-value clears.
+
+The committed `menu_answer` proves accepted menu coordinates, not human origin.
+Same-UID self-approval remains deferred to lane 975 (registry #165). The card
+captures the provider, provider-issued account id used for the consume header,
+and daemon-minted account incarnation when it opens. Replacement, removal and
+recreation, or missing legacy binding closes the old approval with typed
+`account_changed`, without a consume request. A proven same-account credential
+rotation keeps the incarnation and may complete the pending approval.
+The saved sign-in must also match the account record's principal and workspace.
+Older records without a principal binding require an account refresh or a new
+sign-in before reset apply; RPC errors and tool previews explain this action.
+Journaled reset intents use the released `credential_access` carrier and an
+additive `effect_origin: usage_reset_apply` field. Current readers reconstruct
+the dedicated reset class only with that carrier; incompatible carriers are
+rejected. This follows the shared journal compatibility codec. Reset apply
+does not generate an agent workspace or web activity indicator.
+Direct tool inventory also keeps the released effect-class vocabulary. Its
+effect objects carry additive `effect_origin` metadata, using the same mapping
+as intents; current readers restore the dedicated class. Ordinary inventory
+effects keep their existing encoding, and inventory remains read-only data.
+Within a serialized `Menu`, deferred approval uses the released `choice` kind
+with additive `deferred_approval` coordinates inside the kind object. Current
+readers restore the dedicated menu kind, including its account binding; older
+readers ignore those coordinates. Earlier native deferred-menu records remain
+readable by the current daemon and normalize to this carrier on their next
+write. Other menu kinds keep their existing encoding.
+An import without qualifying provider account proof mints a new incarnation,
+so its earlier approval closes even if the display alias is unchanged.
+On approval the daemon calls the provider with the same opaque approval id as OpenAI's
+idempotency key, then publishes a `usage_reset_apply_result_v1` extension
+(`applied`, `denied`, or `failed`) to the existing session event stream. An
+active run receives the same typed result through the existing durable steer
+notification path; an idle session carries it verbatim into the next prompt.
+The agent can also call `usage_reset_apply` again with `approval_id` to poll
+the durable state. Denial never sends a consume request. A failed or lost
+provider response can leave the spending outcome unknown.
+
+The only consume caller is the hub-owned completion task launched by a committed
+`menu_answer` in `session_hub/usage_reset_rpc.rs`. The RPC persists
+`Dispatched` before handing off the single POST and replies without waiting
+for the provider or steer delivery. Graceful shutdown joins accepted reset
+tasks while their session actors remain open, allowing a completed POST's
+terminal result to commit during drain. If drain wins the task-registration
+fence after `Dispatched` commits, the provider was never called and the claim
+records a terminal `failed` result with reason
+`daemon_draining_provider_not_called`. Forced shutdown can leave its outcome
+unconfirmed. Agent polling in
+`worker_usage_reset.rs::usage_reset_status` reads the
+result and never calls the provider. Shared identifiers, the approval menu
+and the poll-status derivation live in `usage_reset.rs`. If the daemon stops after dispatch but
+before recording a result, polling reports `provider_outcome_unconfirmed` and
+does not reissue the POST. The same approval id is sent as OpenAI's
+`redeem_request_id` for provider-side idempotency. At integration with lane
+973-deferred-approval, replace the local `DeferredApproval` menu opening and
+`finish_usage_reset_approval` callback with that lane's durable pending
+approval mechanism; retain the finite-credit confirmation policy and dispatch-before-POST
+ordering.
+An interrupted approval with no durable dispatch is reported as
+`approval_interrupted_before_dispatch`; it is safe to open a fresh approval.
+
+The notification id for new completions is the already-prefixed approval id
+(`usage-reset-<hex>`). Earlier `usage-reset-usage-reset-<hex>` notification
+ids, and all persisted menu, item, effect, and event ids, remain valid as
+written; no journal migration or replay rewrite is needed.
+
+The active Haider Code account poller fetches `/v1/account` even when no
+provider session is attached. That network behavior is intentional so the
+account meter stays current. It never polls without an active account; a
+provider refresh hint is floored at 15 seconds, and missing hints or
+transient failures use a 60-second fallback. Switching the active account
+starts a fresh request immediately, so the 15-second floor bounds refreshes
+for an unchanged active account rather than user-driven account switches.

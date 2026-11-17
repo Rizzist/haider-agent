@@ -176,6 +176,7 @@ fn oauth_incarnation_fixture(
     row.auth_method = AuthMethod::OAuth;
     row.identity = "same display".into();
     row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
         email: email.map(str::to_owned),
         display_name: Some("same display".into()),
         account_id: Some(account_id.into()),
@@ -455,6 +456,7 @@ fn new_accounts_are_timestamped_while_legacy_rows_stay_unknown() {
         .backfill_identity(
             &CredentialAlias::new("legacy"),
             AccountIdentity {
+                subject_hash: None,
                 email: Some("owner@example.test".into()),
                 display_name: None,
                 account_id: None,
@@ -1023,6 +1025,61 @@ fn labels_are_set_cleared_and_survive_rotation() {
             .set_label(&CredentialAlias::new("nope"), Some("x".into()))
             .is_err()
     );
+}
+
+#[test]
+fn replacement_keeps_only_a_proven_same_account_incarnation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let alias = CredentialAlias::new("synthetic-a");
+    let mut row = descriptor("synthetic-a", "openai-oauth", CredentialStatus::Ok, true);
+    row.auth_method = AuthMethod::OAuth;
+    row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
+        email: Some("a@example.test".into()),
+        display_name: None,
+        account_id: Some("workspace-a".into()),
+        plan: None,
+        issuer: Some("fake-issuer".into()),
+        captured_at: 1,
+        verified: false,
+    });
+    accounts.add(row.clone()).unwrap();
+    let first = accounts.get(&alias).unwrap().incarnation;
+    row.account_identity.as_mut().unwrap().captured_at = 2;
+    accounts.replace(row.clone()).unwrap();
+    assert_eq!(accounts.get(&alias).unwrap().incarnation, first);
+    row.account_identity.as_mut().unwrap().email = Some("b@example.test".into());
+    accounts.replace(row.clone()).unwrap();
+    let second = accounts.get(&alias).unwrap().incarnation;
+    assert!(second > first, "changed user in one workspace must mint");
+    row.account_identity.as_mut().unwrap().account_id = Some("workspace-b".into());
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > second);
+}
+
+#[test]
+fn verified_workspace_without_user_or_email_does_not_prove_continuity() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut accounts = AccountStore::new(JsonFileStore::new(directory.path())).unwrap();
+    let alias = CredentialAlias::new("workspace-only");
+    let mut row = descriptor("workspace-only", "openai-oauth", CredentialStatus::Ok, true);
+    row.auth_method = AuthMethod::OAuth;
+    row.account_identity = Some(AccountIdentity {
+        subject_hash: None,
+        email: None,
+        display_name: None,
+        account_id: Some("shared-workspace".into()),
+        plan: None,
+        issuer: Some("fake-issuer".into()),
+        captured_at: 1,
+        verified: true,
+    });
+    accounts.add(row.clone()).unwrap();
+    let first = accounts.get(&alias).unwrap().incarnation;
+    row.account_identity.as_mut().unwrap().captured_at = 2;
+    accounts.replace(row).unwrap();
+    assert!(accounts.get(&alias).unwrap().incarnation > first);
 }
 
 #[test]

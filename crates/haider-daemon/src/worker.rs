@@ -14758,6 +14758,7 @@ pub(crate) enum RegisteredToolRoute {
     Monitor,
     ListModels,
     SessionTranscript,
+    UsageResetApply,
     PeerList,
     PeerSend,
     SshList,
@@ -14796,6 +14797,7 @@ impl RegisteredToolRoute {
             | Self::TodoWrite
             | Self::TaskOutcome
             | Self::GraphEvidence
+            | Self::UsageResetApply
             | Self::Monitor => return None,
         })
     }
@@ -15275,6 +15277,13 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::SessionTranscript,
         ),
         registered_manifest(
+            haider_tools::usage_reset_apply_manifest(),
+            // This remains Ask even in autonomous/auto-allow mode; the
+            // effective-default projection has an explicit exception too.
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::UsageResetApply,
+        ),
+        registered_manifest(
             peer_list_manifest(),
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::PeerList,
@@ -15338,6 +15347,7 @@ fn orchestration_route_name(route: RegisteredToolRoute) -> &'static str {
         RegisteredToolRoute::Monitor => "monitor",
         RegisteredToolRoute::ListModels => "list_models",
         RegisteredToolRoute::SessionTranscript => "session_transcript",
+        RegisteredToolRoute::UsageResetApply => "usage_reset_apply",
         RegisteredToolRoute::PeerList => "peer_list",
         RegisteredToolRoute::PeerSend => "peer_send",
         RegisteredToolRoute::SshList => "ssh_list",
@@ -15356,6 +15366,7 @@ fn orchestration_repeat_safe(route: RegisteredToolRoute) -> bool {
             | RegisteredToolRoute::WebSearch
             | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::UsageResetApply
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::SshList
     )
@@ -15747,6 +15758,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                         | RegisteredToolRoute::Mobile
+                        | RegisteredToolRoute::UsageResetApply
                 )
             })
             .map(|entry| entry.manifest.name.clone())
@@ -15763,6 +15775,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
                         | RegisteredToolRoute::Mobile
+                        | RegisteredToolRoute::UsageResetApply
                 )
             })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
@@ -17547,47 +17560,12 @@ async fn create_broker_tool_dispatcher(
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
-    let mut policy = PermissionPolicy::default();
-    for (class, default) in effective_permission_defaults(&context.metadata) {
-        match default {
-            ToolPermissionDefault::Allow => policy.allow(class),
-            ToolPermissionDefault::Ask => policy.ask(class),
-            ToolPermissionDefault::Deny => policy.deny(
-                class.clone(),
-                context
-                    .metadata
-                    .permission_overrides
-                    .filter(|overrides| overrides.read_only)
-                    .and_then(|_| read_only_denial_reason(&class))
-                    .unwrap_or("denied by explicit permission policy rule"),
-            ),
-            ToolPermissionDefault::NotApplicable => {}
-        }
-    }
+    let mut policy = initial_permission_policy(&context.metadata, context.lockdown.is_some());
     for grant in durable_grants
         .into_iter()
         .filter(|grant| crate::android_policy::effect_allowed(&grant.class))
     {
         policy.allow_session_grant(grant).map_err(tool_error)?;
-    }
-    if haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode)
-        .resolve(haider_core::InteractionGate::EffectBrokerAsk)
-        == haider_core::InteractionResolution::AutoApprove
-    {
-        policy.auto_allow_asks();
-    }
-    if crate::android_policy::enabled() {
-        for class in crate::android_policy::HARD_DENIED_EFFECTS.iter().cloned() {
-            policy.hard_deny(class, "android-standalone platform ceiling");
-        }
-    }
-    if context.lockdown.is_some() {
-        for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
-            policy.hard_deny(
-                class,
-                "provider capability ceiling: lockdown cannot be lifted by user approval",
-            );
-        }
     }
     let output = HubCommandOutputContext {
         store: context.store.clone(),
@@ -17679,6 +17657,7 @@ const LOCKDOWN_HARD_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::MobileControl,
     EffectClass::ReadSms,
     EffectClass::PeerMessage,
+    EffectClass::UsageResetApply,
 ];
 
 pub(crate) const READ_ONLY_WRITE_DENIAL: &str = "write denied: run is --read-only";
@@ -17689,6 +17668,7 @@ pub(crate) const READ_ONLY_COMPUTER_CONTROL_DENIAL: &str =
     "computer control denied: run is --read-only";
 pub(crate) const READ_ONLY_PEER_MESSAGE_DENIAL: &str = "peer message denied: run is --read-only";
 pub(crate) const READ_ONLY_REGISTRY_DENIAL: &str = "registry mutation denied: run is --read-only";
+pub(crate) const READ_ONLY_USAGE_RESET_DENIAL: &str = "usage reset denied: run is --read-only";
 const READ_ONLY_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::FsWrite,
     EffectClass::ProcessExec,
@@ -17697,6 +17677,7 @@ const READ_ONLY_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::GuiAct,
     EffectClass::ScreenControl,
     EffectClass::PeerMessage,
+    EffectClass::UsageResetApply,
 ];
 
 fn read_only_denial_reason(class: &EffectClass) -> Option<&'static str> {
@@ -17707,6 +17688,7 @@ fn read_only_denial_reason(class: &EffectClass) -> Option<&'static str> {
         EffectClass::GitOp => Some(READ_ONLY_GIT_DENIAL),
         EffectClass::GuiAct | EffectClass::ScreenControl => Some(READ_ONLY_COMPUTER_CONTROL_DENIAL),
         EffectClass::PeerMessage => Some(READ_ONLY_PEER_MESSAGE_DENIAL),
+        EffectClass::UsageResetApply => Some(READ_ONLY_USAGE_RESET_DENIAL),
         _ => None,
     }
 }
@@ -17720,6 +17702,7 @@ fn is_read_only_denial(reason: &str) -> bool {
         READ_ONLY_COMPUTER_CONTROL_DENIAL,
         READ_ONLY_PEER_MESSAGE_DENIAL,
         READ_ONLY_REGISTRY_DENIAL,
+        READ_ONLY_USAGE_RESET_DENIAL,
     ]
     .contains(&reason)
 }
@@ -17815,7 +17798,8 @@ pub(crate) fn effective_permission_defaults(
                 // TCC gate for computer actions remains independent, and every
                 // effect is still journaled. Autonomous sessions fail that OS
                 // gate closed instead of opening a blocking grant card.
-                let default = if (autonomous_permissions || overrides.auto_allow)
+                let default = if class != EffectClass::UsageResetApply
+                    && (autonomous_permissions || overrides.auto_allow)
                     && base == ToolPermissionDefault::Ask
                 {
                     ToolPermissionDefault::Allow
@@ -17837,6 +17821,50 @@ pub(crate) fn effective_permission_defaults(
         }
     }
     defaults
+}
+
+/// Session baseline shared by agent tools and direct control RPCs. Durable
+/// grants may add ordinary allows to a worker, but never lift these denies.
+pub(crate) fn initial_permission_policy(
+    metadata: &SessionMetadataV1,
+    lockdown: bool,
+) -> PermissionPolicy {
+    let mut policy = PermissionPolicy::default();
+    for (class, default) in effective_permission_defaults(metadata) {
+        match default {
+            ToolPermissionDefault::Allow => policy.allow(class),
+            ToolPermissionDefault::Ask => policy.ask(class),
+            ToolPermissionDefault::Deny => policy.deny(
+                class.clone(),
+                metadata
+                    .permission_overrides
+                    .filter(|overrides| overrides.read_only)
+                    .and_then(|_| read_only_denial_reason(&class))
+                    .unwrap_or("denied by explicit permission policy rule"),
+            ),
+            ToolPermissionDefault::NotApplicable => {}
+        }
+    }
+    if haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode)
+        .resolve(haider_core::InteractionGate::EffectBrokerAsk)
+        == haider_core::InteractionResolution::AutoApprove
+    {
+        policy.auto_allow_asks();
+    }
+    if crate::android_policy::enabled() {
+        for class in crate::android_policy::HARD_DENIED_EFFECTS.iter().cloned() {
+            policy.hard_deny(class, "android-standalone platform ceiling");
+        }
+    }
+    if lockdown {
+        for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
+            policy.hard_deny(
+                class,
+                "provider capability ceiling: lockdown cannot be lifted by user approval",
+            );
+        }
+    }
+    policy
 }
 
 struct BrokerToolDispatcher {
@@ -21955,6 +21983,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .execute_tool_script(run_id, item_id, call_id, args.as_ref(), cancel)
                 .await;
         }
+        if route == RegisteredToolRoute::UsageResetApply {
+            return self
+                .execute_usage_reset_apply(run_id, call_id, args.as_ref())
+                .await;
+        }
         if self
             .metadata
             .permission_overrides
@@ -24853,6 +24886,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::Monitor
             | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::SessionTranscript
+            | RegisteredToolRoute::UsageResetApply
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList
@@ -27938,6 +27972,9 @@ fn computer_error(error: ComputerError) -> HaiderError {
 
 #[path = "provider_rebind.rs"]
 pub(crate) mod provider_rebind;
+
+#[path = "worker_usage_reset.rs"]
+mod usage_reset_tool;
 
 #[cfg(all(test, feature = "android-standalone"))]
 #[path = "android_inventory_tests.rs"]

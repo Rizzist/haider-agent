@@ -989,6 +989,30 @@ forward-compatibility behavior.
   All these fields are durable and replay byte-for-byte; `schema_version`
   remains 1. Unknown supplemental payloads retain the raw-envelope law.
 
+### v0.0.973 — usage reset inventory and deferred approval
+
+- `usage.report` account rows add optional `reset_credits` and
+  `previous_resets`; unavailable meters add optional `retry_at_ms`. Provider
+  reset history and exact device-journal observations have explicit source
+  labels. Missing fields remain absent.
+- Internal effect class `usage_reset_apply` and menu kind `deferred_approval` park a
+  finite-resource action without changing the run to a blocked state. The
+  menu answer remains the human authorization fact; terminal provider status
+  rides the existing `item:extension` carrier as
+  `usage_reset_apply_result_v1`.
+- New reset intents write the released `credential_access` class plus additive
+  `effect_origin: usage_reset_apply`. Deferred menus write the released `choice`
+  kind plus additive `deferred_approval` coordinates in the kind object. Current
+  readers restore the dedicated types; same-schema older recovery readers can
+  decode both carriers. Earlier native reset/menu records remain readable by
+  current readers. Ordinary effects and menus retain their existing encoding.
+- Direct tool inventory effects and remembered-grant class objects use the
+  same released-class mapping with additive origin metadata, so older strict
+  inventory readers can decode them while current readers retain typed classes.
+- Additive feature `usage_reset_apply_v1` gates RPC `usage.reset_apply`.
+  Initial RPC and agent-tool results are typed `approval_pending` receipts.
+  `schema_version` remains 1.
+
 ### v0.0.973 — client-requested session activity
 
 `session_activity_v1` is an explicit client opt-in. New clients add the optional

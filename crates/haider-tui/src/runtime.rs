@@ -4882,3 +4882,7 @@ mod input_split_dwell_tests;
 #[cfg(test)]
 #[path = "terminal_input_reply_tests.rs"]
 mod terminal_input_reply_tests;
+
+#[cfg(test)]
+#[path = "usage_input_tests.rs"]
+mod usage_input_tests;

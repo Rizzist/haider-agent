@@ -159,6 +159,7 @@ impl OAuthIdentitySource for OpenAiOAuthIdentitySource {
             nonempty(chatgpt_account_id).or_else(|| nonempty(claims.chatgpt_account_id));
         let user = nonempty(claims.sub);
         Ok(Some(AccountIdentity {
+            subject_hash: None,
             email: nonempty(claims.email),
             display_name: nonempty(claims.name),
             // chatgpt_account_id names a workspace shared by Team/Business
@@ -182,6 +183,7 @@ impl OAuthIdentitySource for GrokOAuthIdentitySource {
             return Ok(None);
         };
         Ok(Some(AccountIdentity {
+            subject_hash: None,
             email: nonempty(claims.email),
             display_name: nonempty(claims.name),
             account_id: nonempty(claims.sub),
@@ -250,6 +252,7 @@ impl OAuthIdentitySource for AnthropicOAuthIdentitySource {
         let organization_id = required(&profile.organization.uuid)?;
         let optional = |value: Option<&str>| value.and_then(AccountIdentity::sanitized_field);
         Ok(Some(AccountIdentity {
+            subject_hash: None,
             email: optional(profile.account.email.as_deref()),
             display_name: optional(profile.account.display_name.as_deref())
                 .or_else(|| optional(profile.account.full_name.as_deref())),

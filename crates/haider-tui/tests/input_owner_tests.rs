@@ -696,9 +696,7 @@ fn e1_stale_allow_click_cannot_answer_a_covered_permission() {
 
 #[test]
 fn e2_stale_hover_never_moves_a_covered_choice() {
-    for cover in [
-        "detail", "inbox", "model", "shells", "ssh", "monitors", "lockdown",
-    ] {
+    for cover in ["detail", "inbox", "shells", "ssh", "monitors", "lockdown"] {
         let mut model = model();
         arm(&mut model, "permission");
         model.menu_selection = 0;
@@ -713,18 +711,46 @@ fn e2_stale_hover_never_moves_a_covered_choice() {
         );
         assert_eq!(model.menu_selection, 0, "{cover}");
     }
-    for choice in ["theme", "effort"] {
+    for choice in ["theme", "effort", "model"] {
         let mut model = model();
+        if choice == "model" {
+            model
+                .providers
+                .apply_snapshot(haider_tui::mock::seed_provider_summaries(), 1);
+            model
+                .accounts
+                .apply_snapshot(haider_tui::mock::seed_account_rows(), Some(1));
+        }
         arm(&mut model, choice);
+        let model_row = (choice == "model").then(|| {
+            assert_eq!(model.input_owner(), InputOwner::ModelPicker);
+            let rows = model.model_picker_rows();
+            assert!(rows.len() > 1, "covered hover needs a different target row");
+            rows.into_iter().last().unwrap()
+        });
         arm(&mut model, "permission");
         if choice == "theme" {
             let before = model.theme_picker.unwrap().selection;
             stale_pointer(&mut model, Hit::ThemeOption(2), MouseEventKind::Moved);
             assert_eq!(model.theme_picker.unwrap().selection, before);
-        } else {
+        } else if choice == "effort" {
             let before = model.effort_picker.as_ref().unwrap().selection;
             stale_pointer(&mut model, Hit::EffortOption(1), MouseEventKind::Moved);
             assert_eq!(model.effort_picker.as_ref().unwrap().selection, before);
+        } else {
+            assert_eq!(model.input_owner(), InputOwner::SessionMenu);
+            let before = model.model_picker.as_ref().unwrap().selection;
+            let row = model_row.unwrap();
+            stale_pointer(
+                &mut model,
+                Hit::ModelPickerRow {
+                    provider: row.provider,
+                    model: row.model,
+                    api_group: row.auth == "api",
+                },
+                MouseEventKind::Moved,
+            );
+            assert_eq!(model.model_picker.as_ref().unwrap().selection, before);
         }
     }
 }
@@ -2335,8 +2361,14 @@ fn i_pairwise_overlay_precedence_paints_the_owner_above_every_lower_owner() {
     ];
     for upper in 0..ranked.len() {
         for lower in upper + 1..ranked.len() {
-            let (higher, marker) = ranked[upper];
-            let (lower_name, _) = ranked[lower];
+            let ((higher, marker), (lower_name, _)) =
+                if ranked[upper].0 == "model" && ranked[lower].0 == "permission" {
+                    // A blocking question parks this local picker, while
+                    // Login and Talk retain their independent modal priority.
+                    (ranked[lower], ranked[upper])
+                } else {
+                    (ranked[upper], ranked[lower])
+                };
             let mut model = model();
             arm(&mut model, lower_name);
             arm(&mut model, higher);

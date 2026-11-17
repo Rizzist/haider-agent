@@ -765,10 +765,14 @@ pub fn classify(
             chip_or_session(chips, agent)
         }
         EventPayload::MenuAnswered(haider_protocol::menu::MenuAnswer { menu, .. })
-        | EventPayload::MenuClosed { menu, .. } => match projection.menu_owner(menu) {
-            Some(MenuScopeOwner::Agent(owner)) => Destination::Chip(owner.as_str().to_owned()),
-            _ => Destination::Session,
-        },
+        | EventPayload::MenuClosed { menu, .. } => {
+            let destination = match projection.menu_owner(menu) {
+                Some(MenuScopeOwner::Agent(owner)) => Destination::Chip(owner.as_str().to_owned()),
+                _ => Destination::Session,
+            };
+            projection.forget_menu_owner(menu);
+            destination
+        }
         _ => chip_or_session(chips, agent),
     }
 }

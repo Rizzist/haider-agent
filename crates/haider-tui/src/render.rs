@@ -1393,7 +1393,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if model.ssh_terminal.is_some() {
         render_ssh_terminal(model, theme, frame, body);
         hits.clear();
-    } else if model.model_picker.is_some() {
+    } else if model.model_picker_visible() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {
@@ -5065,7 +5065,7 @@ fn render_usage_calendar(
                     )
             };
             let suffix = match &account.meter {
-                AccountMeterStateV1::Unavailable { reason } => format!(
+                AccountMeterStateV1::Unavailable { reason, .. } => format!(
                     " · meter unavailable ({})",
                     crate::format::fmt_meter_reason(reason)
                 ),
@@ -5134,7 +5134,7 @@ fn render_usage_calendar(
             },
         ));
         match &account.meter {
-            AccountMeterStateV1::Unavailable { reason } => lines.push(Line::styled(
+            AccountMeterStateV1::Unavailable { reason, .. } => lines.push(Line::styled(
                 format!(
                     "      5h reset unknown · weekly reset unknown · meter unavailable · {}",
                     crate::format::fmt_meter_reason(reason)
@@ -5662,7 +5662,9 @@ fn render_usage(
                                 ));
                             }
                         }
-                        haider_protocol::usage::AccountMeterStateV1::Unavailable { reason } => {
+                        haider_protocol::usage::AccountMeterStateV1::Unavailable {
+                            reason, ..
+                        } => {
                             spans.push(Span::styled(
                                 format!(
                                     "meter unavailable · {}",
@@ -5825,7 +5827,7 @@ fn render_usage(
                         lines.push(Line::from(spans));
                     }
                 }
-                AccountMeterStateV1::Unavailable { reason } => {
+                AccountMeterStateV1::Unavailable { reason, .. } => {
                     // The typed reason, honestly — NEVER a fabricated bar.
                     lines.push(Line::from(vec![
                         Span::styled("    meter unavailable · ", theme.warn_style()),
@@ -6515,10 +6517,7 @@ fn render_session(
         // A zero-option ask never REPLACES the composer — the composer is
         // its answer line (owner report: select-only chrome rendered an
         // unanswerable question). Its title/body render above the input.
-        model
-            .projection
-            .open_menu()
-            .filter(|menu| !menu.options.is_empty())
+        model.select_menu()
     };
     let ask_menu = if matches!(
         model.input_owner(),
@@ -7848,7 +7847,19 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = if crate::app::menu_file_review(menu).is_some() {
+        let footer = if crate::app::is_deferred_approval(menu) {
+            // A spend-approval card takes no digits and never wraps: only an
+            // explicit ↓ reaches the spending option.
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(
+                " {} pending · ↓↑ choose · ⏎ confirm (default {default}) · esc later · menu {}",
+                model.projection.pending_menu_count(),
+                menu.id
+            )
+        } else if crate::app::menu_file_review(menu).is_some() {
             format!(
                 " ←→ hunks · ↑↓ scroll · Tab decision · ⏎ apply · 1-{} quick",
                 menu.options.len()
@@ -7863,7 +7874,7 @@ fn render_session(
         };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,
@@ -11774,7 +11785,10 @@ fn render_subagent(
     ) {
         None
     } else {
-        chip.question_menu()
+        chip.question_menu().filter(|menu| {
+            !crate::app::is_deferred_approval(menu)
+                || model.visible_spend_card().as_ref() == Some(&menu.id)
+        })
     };
     let ask_menu = menu.filter(|menu| menu.options.is_empty());
     let menu = menu.filter(|menu| !menu.options.is_empty());
@@ -12176,13 +12190,24 @@ fn render_subagent(
             .style(theme.text_style()),
             rule_area,
         );
-        let footer = format!(
-            " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
-            menu.options.len()
-        );
+        let footer = if crate::app::is_deferred_approval(menu) {
+            let default = menu
+                .options
+                .first()
+                .map_or("", |option| option.label.as_str());
+            format!(
+                " {} pending · ↓↑ choose · ⏎ confirm (default {default}) · esc back to session",
+                chip.transcript.pending_menu_count()
+            )
+        } else {
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
+                menu.options.len()
+            )
+        };
         let (menu_lines, option_rows) = menu_block(
             menu,
-            model.menu_selection,
+            model.menu_display_selection(menu),
             theme,
             composer_area,
             &footer,

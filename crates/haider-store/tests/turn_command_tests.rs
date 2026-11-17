@@ -96,6 +96,57 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
 }
 
 #[test]
+fn attachment_only_turn_commits_a_user_message_and_empty_turn_still_fails() {
+    use haider_store::Cas;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("attachment-only-session");
+    create(&store, &session_id);
+    let artifact = store
+        .put(b"synthetic attachment\n")
+        .expect("put attachment");
+    let mut command = submit(&store, "attachment-only", &session_id, "attachment-run");
+    command.text.clear();
+    command.attachments = vec![AttachmentBlock::File {
+        artifact,
+        name: "synthetic.txt".into(),
+        lines: 1,
+    }];
+    command.request_json = r#"{"text":"","attachments":["synthetic.txt"]}"#.into();
+    let TurnAcceptOutcome::Committed { envelopes, .. } = store
+        .accept_turn(&command)
+        .expect("attachment-only turn accepted")
+    else {
+        panic!("attachment-only turn commits");
+    };
+    assert!(envelopes.iter().any(|envelope| matches!(
+        serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+            .expect("event payload"),
+        EventPayload::UserMessage { ref text, ref attachments, .. }
+            if text.is_empty() && attachments == &command.attachments
+    )));
+    assert!(matches!(
+        store
+            .accept_turn(&command)
+            .expect("idempotent attachment replay"),
+        TurnAcceptOutcome::IdempotentReplay { .. }
+    ));
+
+    let empty_session = SessionId::new("empty-turn-session");
+    create(&store, &empty_session);
+    let mut empty = submit(&store, "empty-turn", &empty_session, "empty-run");
+    empty.text.clear();
+    empty.request_json = r#"{"text":"","attachments":[]}"#.into();
+    let error = store.accept_turn(&empty).expect_err("empty turn rejected");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert!(error.message.contains("message content must not be empty"));
+}
+
+#[test]
 fn injected_agent_turn_journals_identity_and_reopens_without_a_human_or_approval_record() {
     use haider_protocol::history::NodeKind;
     use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};

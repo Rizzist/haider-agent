@@ -4,6 +4,7 @@ use haider_protocol::credential::{AccountIdentity, AccountPrincipal};
 
 fn identity(id: Option<&str>, verified: bool) -> AccountIdentity {
     AccountIdentity {
+        subject_hash: None,
         email: Some("same@example.test".into()),
         display_name: None,
         account_id: id.map(str::to_owned),

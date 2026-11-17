@@ -100,6 +100,7 @@ fn authenticated_catalog_cache_round_trips_by_provider_and_account() {
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: None,
             account_id: Some(account_id.into()),
@@ -389,6 +390,7 @@ fn provider_model_catalog_and_management_revision_roll_back_together() {
 fn account_scoped_cache_key_derivation_is_pinned() {
     let identity = |account_id: Option<&str>, email: Option<&str>, captured_at: u64| {
         Some(AccountIdentity {
+            subject_hash: None,
             email: email.map(Into::into),
             display_name: Some("ignored display name".into()),
             account_id: account_id.map(Into::into),
@@ -457,6 +459,7 @@ fn account_scoped_cache_key_derivation_is_pinned() {
             "kimi-code-home",
             AuthMethod::OAuth,
             Some(AccountIdentity {
+                subject_hash: None,
                 email: None,
                 display_name: Some("Kimi Code subscription".into()),
                 account_id: Some("kimi:0123456789abcdef".into()),
@@ -500,6 +503,7 @@ fn account_scoped_cache_key_derivation_is_pinned() {
             "codex",
             AuthMethod::OAuth,
             Some(AccountIdentity {
+                subject_hash: None,
                 email: email.map(Into::into),
                 display_name: None,
                 account_id: Some("acct-1".into()),
@@ -545,6 +549,7 @@ fn openai_user_coordinate_and_workspace_email_both_scope_catalog_keys() {
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: email.map(str::to_owned),
             display_name: None,
             account_id: Some(id.into()),
@@ -587,6 +592,7 @@ fn account_scope_components_are_length_prefixed_and_byte_exact() {
         active: true,
         label: None,
         account_identity: Some(AccountIdentity {
+            subject_hash: None,
             email: Some(email.into()),
             display_name: None,
             account_id: Some(account_id.into()),

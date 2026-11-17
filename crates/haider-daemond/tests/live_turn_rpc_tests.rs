@@ -5802,6 +5802,9 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             // v0.0.970 modelcat: effect-free cached model/provider inventory.
             "list_models",
             "session_transcript",
+            // 973 usage-data: parks a human-only deferred approval; the
+            // provider reset is dispatched only by the committed menu answer.
+            "usage_reset_apply",
             // 965: peer discovery/messaging and SSH inventory/execution are
             // canonical registry entries with their own typed effects.
             "peer_list",

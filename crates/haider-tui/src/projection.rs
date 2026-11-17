@@ -602,6 +602,12 @@ fn is_foldable_tool_item(item: &TurnItem) -> bool {
     )
 }
 
+#[derive(Debug)]
+struct PendingMenu {
+    menu: Menu,
+    instance: u64,
+}
+
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
@@ -662,7 +668,13 @@ pub struct SessionProjection {
     /// fallback row until the call-id join proves whether the inline row owns
     /// the same failure.
     pending_effect_failures: Vec<PendingEffectFailure>,
-    menu: Option<Menu>,
+    /// Unresolved decisions in arrival order. A blocking question owns input
+    /// ahead of a deferred approval, while the newest decision of equal
+    /// priority is shown until it is resolved.
+    menus: Vec<PendingMenu>,
+    /// Answered locally and hidden at once, retained only until the daemon
+    /// acknowledges so permission outcome notes still use the original row.
+    retired_menus: std::collections::HashMap<haider_protocol::ids::MenuId, Menu>,
     pending_menus: std::collections::HashSet<haider_protocol::ids::MenuId>,
     menu_instance: u64,
     permission_instance: u64,
@@ -871,7 +883,10 @@ impl SessionProjection {
             screen_control_items,
             has_tool_entries,
             pending_menus: menu.iter().map(|menu| menu.id.clone()).collect(),
-            menu,
+            menus: menu
+                .into_iter()
+                .map(|menu| PendingMenu { menu, instance: 0 })
+                .collect(),
             todos,
             usage,
             interrupted,
@@ -1025,6 +1040,10 @@ impl SessionProjection {
         self.menu_owner.get(menu)
     }
 
+    pub fn forget_menu_owner(&mut self, menu: &haider_protocol::ids::MenuId) {
+        self.menu_owner.remove(menu);
+    }
+
     /// The greatest FULLY APPLIED sequence — the only reattach cursor there
     /// is (R9's cursor law: server telemetry like `last_queued_seq` is never
     /// resume authority). `None` before the first envelope.
@@ -1117,17 +1136,26 @@ impl SessionProjection {
             EventPayload::MenuOpened(menu) => {
                 self.pending_menus.insert(menu.id.clone());
                 self.menu_instance = self.menu_instance.wrapping_add(1);
-                self.menu = Some(menu.clone());
+                self.menus.retain(|open| open.menu.id != menu.id);
+                self.retired_menus.remove(&menu.id);
+                self.menus.push(PendingMenu {
+                    menu: menu.clone(),
+                    instance: self.menu_instance,
+                });
             }
             EventPayload::MenuAnswered(answer) => {
                 self.pending_menus.remove(&answer.menu);
-                if self.menu.as_ref().is_some_and(|m| m.id == answer.menu) {
-                    if let Some(menu) = self.menu.as_ref()
-                        && matches!(
-                            menu.kind,
-                            haider_protocol::menu::MenuKind::Permission { .. }
-                        )
-                    {
+                if let Some(menu) = self
+                    .menus
+                    .iter()
+                    .find(|pending| pending.menu.id == answer.menu)
+                    .map(|pending| &pending.menu)
+                    .or_else(|| self.retired_menus.get(&answer.menu))
+                {
+                    if matches!(
+                        menu.kind,
+                        haider_protocol::menu::MenuKind::Permission { .. }
+                    ) {
                         let option = answer
                             .option_key
                             .as_ref()
@@ -1152,14 +1180,16 @@ impl SessionProjection {
                             });
                         }
                     }
-                    self.menu = None;
+                    self.menus.retain(|pending| pending.menu.id != answer.menu);
+                    self.retired_menus.remove(&answer.menu);
+                    self.menu_owner.remove(&answer.menu);
                 }
             }
             EventPayload::MenuClosed { menu, .. } => {
+                self.menus.retain(|open| open.menu.id != *menu);
+                self.retired_menus.remove(menu);
+                self.menu_owner.remove(menu);
                 self.pending_menus.remove(menu);
-                if self.menu.as_ref().is_some_and(|open| open.id == *menu) {
-                    self.menu = None;
-                }
             }
             EventPayload::UserMessage {
                 text, attachments, ..
@@ -2651,14 +2681,39 @@ impl SessionProjection {
 
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
-        self.menu.as_ref()
+        self.open_menu_state().map(|pending| &pending.menu)
+    }
+
+    fn open_menu_state(&self) -> Option<&PendingMenu> {
+        self.menus
+            .iter()
+            .rev()
+            .find(|pending| {
+                pending.menu.blocking
+                    && !matches!(
+                        pending.menu.kind,
+                        haider_protocol::menu::MenuKind::DeferredApproval { .. }
+                    )
+            })
+            .or_else(|| self.menus.last())
+    }
+
+    /// Hide an answer immediately without treating it as a daemon receipt.
+    /// Repeated local gestures cannot queue a second answer for this menu.
+    pub fn retire_local_answer(&mut self, id: &haider_protocol::ids::MenuId) {
+        if let Some(index) = self.menus.iter().position(|pending| &pending.menu.id == id) {
+            let menu = self.menus.remove(index);
+            self.pending_menus.remove(id);
+            self.retired_menus.insert(id.clone(), menu.menu);
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
     }
 
     /// Incarnations are minted at ingestion, so input identity does not
     /// format or copy the card body (which can contain a large file diff).
     #[must_use]
     pub(crate) fn menu_instance(&self) -> u64 {
-        self.menu_instance
+        self.open_menu_state().map_or(0, |pending| pending.instance)
     }
 
     #[must_use]

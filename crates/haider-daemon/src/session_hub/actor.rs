@@ -1870,7 +1870,10 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    if !matches!(menu.kind, MenuKind::GraphHumanConfirm { .. })
+                    if !matches!(
+                        menu.kind,
+                        MenuKind::GraphHumanConfirm { .. } | MenuKind::DeferredApproval { .. }
+                    )
                         // A delegated menu is durable in the parent so its
                         // user can answer it, but the answer belongs to the
                         // child's parked harness. The delegation collector
@@ -2486,7 +2489,9 @@ fn payload_preserves_conversation_tree(payload: &serde_json::Value) -> bool {
             | EventPayload::GraphFinalizationDeferred(_)
             | EventPayload::ProcessSignalRecorded(_)
             | EventPayload::MenuOpened(Menu {
-                kind: MenuKind::GraphHumanConfirm { .. } | MenuKind::GraphAbandonConfirm { .. },
+                kind: MenuKind::GraphHumanConfirm { .. }
+                    | MenuKind::GraphAbandonConfirm { .. }
+                    | MenuKind::DeferredApproval { .. },
                 ..
             })
             | EventPayload::MenuAnswered(_)

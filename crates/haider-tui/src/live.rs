@@ -3324,6 +3324,7 @@ impl LiveDriver {
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         let before = model.input_rows();
         let commands = self.apply_reply(model, reply);
+        model.retire_hidden_spend_card_navigation();
         // A replaced neighbor or changed binding is an outside change even
         // when the selected row still has the same identity. Unchanged and
         // irrelevant bootstrap replies do not retire type-ahead.

@@ -91,6 +91,7 @@ fn ambiguous_email_bridge_has_review_hint_without_false_removal_advice() {
         provider: "anthropic-oauth".to_owned(),
         auth_kind: "oauth",
         identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: Some("OWNER@example.test".to_owned()),
             display_name: None,
             account_id: account_id.map(str::to_owned),
@@ -132,6 +133,7 @@ fn claude_view(alias: &str, account_id: &str, active: bool, usable: bool) -> Acc
         provider: "anthropic-oauth".to_owned(),
         auth_kind: "oauth",
         identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: None,
             display_name: Some("Claude".to_owned()),
             account_id: Some(account_id.to_owned()),
@@ -225,6 +227,7 @@ fn codex_candidate() -> haider_rpc::DeviceCredentialCandidateWire {
         source_label: "Codex".into(),
         account_label: Some("owner@example.invalid".into()),
         identity: Some(haider_protocol::credential::AccountIdentity {
+            subject_hash: None,
             email: Some("owner@example.invalid".into()),
             display_name: None,
             account_id: Some("acct-964".into()),
