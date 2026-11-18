@@ -21270,7 +21270,9 @@ impl AppModel {
         match outcome {
             RawOutcome::Applied => {
                 if let Ok(payload) = envelope.payload.decode_event() {
-                    self.usage.reset_apply.observe(&envelope.session_id, &payload);
+                    self.usage
+                        .reset_apply
+                        .observe(&envelope.session_id, &payload);
                 }
                 // A wheel may acknowledge already-presented activity. Its
                 // nonvisual journal echo is not an outside input change.

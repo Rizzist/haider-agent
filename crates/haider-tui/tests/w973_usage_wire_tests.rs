@@ -2,9 +2,10 @@
 #![allow(clippy::expect_used)]
 use haider_protocol::EventPayload;
 use haider_protocol::credential::AuthMethod;
-use haider_protocol::ids::{CommandId, CredentialAlias, SessionId};
+use haider_protocol::ids::{CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::usage::*;
+use haider_rpc::CommandId;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, RuntimeMode, Screen, UsageScope};
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
@@ -299,7 +300,7 @@ fn live_calendar() -> AppModel {
 #[test]
 fn b_only_requests_the_existing_daemon_approval_and_never_answers_a_card() {
     let mut model = live_calendar();
-    model.composer.set_text("unsent synthetic draft".into());
+    model.composer.set_text("unsent synthetic draft");
     model.handle(AppEvent::Key(KeyEvent::new(
         KeyCode::Char('b'),
         KeyModifiers::NONE,
@@ -897,5 +898,37 @@ fn page_keys_reach_every_credit_in_viewports_smaller_than_the_old_jump() {
                 "{width}x{height} credit {index} was skipped"
             );
         }
+    }
+}
+
+#[test]
+fn receipt_display_and_pending_session_order_are_stable_across_arrival_order() {
+    for order in [["session-z", "session-a"], ["session-a", "session-z"]] {
+        let mut state = UsageApplyState::default();
+        let account = CredentialAlias::new("synthetic-codex");
+        for name in order {
+            let session = SessionId::new(name);
+            state.begin(session.clone(), account.clone());
+        }
+        assert_eq!(
+            state.pending_session(&account).expect("pending").as_str(),
+            "session-a"
+        );
+        for name in order {
+            let mut result = receipt(UsageResetApplyStatusV1::ApprovalPending);
+            result.approval_id = name.into();
+            state.record(&SessionId::new(name), result);
+        }
+        assert_eq!(
+            state.pending_session(&account).expect("receipt").as_str(),
+            "session-a"
+        );
+        let sessions: Vec<_> = state
+            .rows(&account)
+            .into_iter()
+            .filter(|row| row.label == "session")
+            .map(|row| row.text)
+            .collect();
+        assert_eq!(sessions, ["session-a", "session-z"]);
     }
 }

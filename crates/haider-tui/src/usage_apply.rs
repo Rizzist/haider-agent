@@ -2,7 +2,7 @@
 //! No menu or approval answer is created here. Durable menu/result events
 //! rebuild pending and terminal receipts during normal session replay.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 
 use haider_protocol::EventPayload;
 use haider_protocol::effect::EffectClass;
@@ -17,9 +17,9 @@ use crate::usage_detail::{DetailRow, DetailTone, reset_result_rows};
 
 #[derive(Debug, Default)]
 pub struct UsageApplyState {
-    in_flight: BTreeSet<(SessionId, CredentialAlias)>,
-    receipts: BTreeMap<(SessionId, String), UsageResetApplyResultV1>,
-    errors: BTreeMap<CredentialAlias, String>,
+    in_flight: HashSet<(SessionId, CredentialAlias)>,
+    receipts: HashMap<(SessionId, String), UsageResetApplyResultV1>,
+    errors: HashMap<CredentialAlias, String>,
 }
 
 impl UsageApplyState {
@@ -27,18 +27,22 @@ impl UsageApplyState {
     pub fn pending_session(&self, account: &CredentialAlias) -> Option<&SessionId> {
         self.in_flight
             .iter()
-            .find(|(_, alias)| alias == account)
+            .filter(|(_, alias)| alias == account)
             .map(|(session, _)| session)
+            .min_by(|a, b| a.as_str().cmp(b.as_str()))
             .or_else(|| {
-                self.receipts.iter().find_map(|((session, _), result)| {
-                    (&result.account == account
-                        && matches!(
-                            result.status,
-                            UsageResetApplyStatusV1::ApprovalPending
-                                | UsageResetApplyStatusV1::Unknown
-                        ))
-                    .then_some(session)
-                })
+                self.receipts
+                    .iter()
+                    .filter_map(|((session, _), result)| {
+                        (&result.account == account
+                            && matches!(
+                                result.status,
+                                UsageResetApplyStatusV1::ApprovalPending
+                                    | UsageResetApplyStatusV1::Unknown
+                            ))
+                        .then_some(session)
+                    })
+                    .min_by(|a, b| a.as_str().cmp(b.as_str()))
             })
     }
 
@@ -133,7 +137,10 @@ impl UsageApplyState {
                 DetailTone::Warn,
             ));
         }
-        for ((session, _), result) in &self.receipts {
+        let mut receipts: Vec<_> = self.receipts.iter().collect();
+        receipts
+            .sort_unstable_by_key(|((session, approval), _)| (session.as_str(), approval.as_str()));
+        for ((session, _), result) in receipts {
             if &result.account == account {
                 rows.push(DetailRow::new(
                     "session",
