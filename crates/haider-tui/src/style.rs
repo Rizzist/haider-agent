@@ -149,6 +149,24 @@ impl Theme {
         Style::default().bg(self.sel_bg.into())
     }
 
+    /// Keep a span's role ink when it meets AA on the painted ground;
+    /// otherwise use readable body text. Preserve its other style attributes.
+    #[must_use]
+    pub(crate) fn readable_style_on(&self, style: Style, ground: Rgb) -> Style {
+        let rgb = |color, fallback| match color {
+            Some(Color::Rgb(r, g, b)) => Rgb { r, g, b },
+            _ => fallback,
+        };
+        let background = rgb(style.bg, ground);
+        let preferred = rgb(style.fg, self.text);
+        let foreground = if preferred.contrast(background) >= 4.5 {
+            preferred
+        } else {
+            crate::theme::readable_fg(self.text, background)
+        };
+        style.fg(foreground.into())
+    }
+
     /// The sticky origin band (sim StickyLine, tui.js:4597-4623 — owner
     /// item 11). The CSS is REAL chrome: `background: ${bg}f0` +
     /// `backdrop-filter: blur` + `border-bottom: 1px solid frame`. A cell

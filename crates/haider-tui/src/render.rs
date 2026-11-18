@@ -4745,18 +4745,7 @@ fn usage_account_row<'a>(line: Line<'a>, selected: bool, width: u16, theme: &The
     let mut line = hover_band(line, selected, width, theme);
     if selected {
         for span in &mut line.spans {
-            let rgb = |color, fallback| match color {
-                Some(ratatui::style::Color::Rgb(r, g, b)) => crate::theme::Rgb { r, g, b },
-                _ => fallback,
-            };
-            let background = rgb(span.style.bg, theme.sel_bg);
-            let preferred = rgb(span.style.fg, theme.text);
-            if preferred.contrast(background) >= 4.5 {
-                continue;
-            }
-            span.style = span
-                .style
-                .fg(crate::theme::readable_fg(theme.text, background).into());
+            span.style = theme.readable_style_on(span.style, theme.sel_bg);
         }
     }
     line

@@ -631,7 +631,7 @@ fn painted_global_account_rows_meet_aa_in_every_theme() {
             windows: vec![window("weekly", 0.2, None)],
         },
         AccountMeterStateV1::Metered {
-            windows: vec![window("weekly", 0.6, None)],
+            windows: vec![window("weekly", 0.75, None)],
         },
         AccountMeterStateV1::Metered {
             windows: vec![window("weekly", 0.95, None)],
