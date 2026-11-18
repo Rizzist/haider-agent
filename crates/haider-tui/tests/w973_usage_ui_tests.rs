@@ -617,6 +617,103 @@ fn painted_reset_badges_and_snapshot_markers_meet_aa_in_every_theme() {
     }
 }
 
+#[test]
+fn painted_global_account_rows_meet_aa_in_every_theme() {
+    fn rgb(color: Color) -> haider_tui::theme::Rgb {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("expected RGB ink: {color:?}");
+        };
+        haider_tui::theme::Rgb { r, g, b }
+    }
+    let meters = [
+        unavailable("http_status_429"),
+        AccountMeterStateV1::Metered {
+            windows: vec![window("weekly", 0.2, None)],
+        },
+        AccountMeterStateV1::Metered {
+            windows: vec![window("weekly", 0.6, None)],
+        },
+        AccountMeterStateV1::Metered {
+            windows: vec![window("weekly", 0.95, None)],
+        },
+        AccountMeterStateV1::Metered { windows: vec![] },
+        AccountMeterStateV1::LocalOnly,
+    ];
+    for theme in ThemeKey::ALL {
+        for (width, height) in [(118, 36), (80, 24)] {
+            for meter in &meters {
+                let accounts = ["picked", "other"].map(|alias| {
+                    let mut account = account("haider-code", alias, "fixture", None, meter.clone());
+                    account.local.input_tokens = 123;
+                    account.local.output_tokens = 456;
+                    account.local.cached_tokens = 789;
+                    account
+                });
+                let mut model = usage_model(
+                    UsageReportV1 {
+                        generated_at_ms: SNAPSHOT_MS,
+                        accounts: accounts.into(),
+                        orchestration: Default::default(),
+                    },
+                    UsageScope::Global,
+                    UsageTimeZone::UtcOnly,
+                );
+                model.theme = theme;
+                let frame = draw(&model, width, height);
+                for (alias, selected) in [("picked", true), ("other", false)] {
+                    let row = frame.row_containing(alias).expect("account row painted");
+                    assert_eq!(frame.rows[row].starts_with("> "), selected);
+                    assert!(frame.rows[row].contains("haider-code"));
+                    if width == 118 {
+                        // Long friendly errors clip the final counter. The
+                        // shorter meter states exercise all three counters.
+                        for text in ["in 123", "out 456"] {
+                            assert!(frame.rows[row].contains(text), "{meter:?}: {text}");
+                        }
+                        if !matches!(meter, AccountMeterStateV1::Unavailable { .. }) {
+                            assert!(frame.rows[row].contains("cached 789"));
+                        }
+                    }
+                    let expected = match meter {
+                        AccountMeterStateV1::Unavailable { .. } => "meter unavailable",
+                        AccountMeterStateV1::Metered { windows } if windows.is_empty() => {
+                            "metered · no windows published"
+                        }
+                        AccountMeterStateV1::Metered { .. } => "(weekly)",
+                        AccountMeterStateV1::LocalOnly => "local only",
+                    };
+                    assert!(frame.rows[row].contains(expected), "{:?}", frame.rows);
+                    for (symbol, style) in &frame.cells[row] {
+                        if symbol.trim().is_empty() {
+                            continue;
+                        }
+                        let background = if selected {
+                            theme.theme().sel_bg
+                        } else {
+                            theme.theme().bg
+                        };
+                        assert_eq!(rgb(style.bg), background, "{alias}: {symbol}");
+                        let decorative = symbol.chars().all(|c| matches!(c, '▰' | '▱'));
+                        let floor = if decorative { 3.0 } else { 4.5 };
+                        let contrast = rgb(style.fg).contrast(rgb(style.bg));
+                        assert!(
+                            contrast >= floor,
+                            "{theme:?} {width}x{height} {meter:?} {alias} {symbol:?}: {contrast:.3} < {floor}"
+                        );
+                    }
+                    if !selected {
+                        assert_eq!(cell_fg(&frame, row, alias), theme.theme().bright.into());
+                        assert_eq!(
+                            cell_fg(&frame, row, "haider-code"),
+                            theme.theme().dim.into()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Local days: in the owner's UTC+03:30, d's 21:09 UTC five-hour reset is
 /// Thu 24 00:39 local — the marker moves to the 24th.
 #[test]

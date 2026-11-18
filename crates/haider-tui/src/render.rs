@@ -4738,6 +4738,30 @@ fn usage_bar_style(theme: &Theme, utilization: f64) -> ratatui::style::Style {
     }
 }
 
+/// Account rows change ground when selected. Resolve every span against that
+/// painted ground after composing the row, including metadata and meter states.
+/// Keep each role's ink when readable, otherwise use readable body text.
+fn usage_account_row<'a>(line: Line<'a>, selected: bool, width: u16, theme: &Theme) -> Line<'a> {
+    let mut line = hover_band(line, selected, width, theme);
+    if selected {
+        for span in &mut line.spans {
+            let rgb = |color, fallback| match color {
+                Some(ratatui::style::Color::Rgb(r, g, b)) => crate::theme::Rgb { r, g, b },
+                _ => fallback,
+            };
+            let background = rgb(span.style.bg, theme.sel_bg);
+            let preferred = rgb(span.style.fg, theme.text);
+            if preferred.contrast(background) >= 4.5 {
+                continue;
+            }
+            span.style = span
+                .style
+                .fg(crate::theme::readable_fg(theme.text, background).into());
+        }
+    }
+    line
+}
+
 fn calendar_month_name(month: u32) -> &'static str {
     const MONTHS: [&str; 12] = [
         "January",
@@ -5314,7 +5338,12 @@ fn render_usage(
                         ),
                         theme.dim_style(),
                     ));
-                    lines.push(hover_band(Line::from(spans), selected, area.width, theme));
+                    lines.push(usage_account_row(
+                        Line::from(spans),
+                        selected,
+                        area.width,
+                        theme,
+                    ));
                 }
             }
             if !groups.is_empty() {
