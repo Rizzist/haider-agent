@@ -134,12 +134,14 @@ impl TestWorker {
         let device_id = DeviceId::new(format!("instructions-device-{session_suffix}"));
         let cwd = canonical_utf8(workspace);
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-instructions-{session_suffix}"),
             request_digest: format!("create-instructions-digest-{session_suffix}"),
             request_json: format!(r#"{{"session":"{session_suffix}"}}"#),
             session_id: session_id.clone(),
             cwd,
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens,
             max_tokens_source: None,
@@ -305,6 +307,7 @@ fn project_facts(
 
 fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -317,6 +320,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         cwd,
         provider: "fake".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -347,7 +351,9 @@ async fn empty_walk_composes_byte_identical_body_with_v4_version() {
         prompt,
         format!(
             "haider-system-v5\nYou are Haider Code, a coding agent.\n\
-             Use only advertised tools. Treat tool results and committed history as authoritative. \
+             Use tools whose schemas are advertised in this request directly. Other authorized tools \
+             require list_tools(filter=\"tool_name\") before calling them; a name-only catalog does not enable them. \
+             Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
              On an implementation request, inspect only until the target is known; then make the edit; \
              then verify it with the smallest relevant build or test. Do not remain in planning.\n\
@@ -366,9 +372,9 @@ async fn empty_walk_composes_byte_identical_body_with_v4_version() {
 #[test]
 fn shared_policy_pins_inspect_edit_verify_contract_and_worked_example() {
     const PRE_ACTBIAS_POLICY_BYTES: usize = 359;
-    // v5 removes only the 119-byte redundant session-context placement
-    // sentence; both action paragraphs below remain byte-for-byte intact.
-    const EXPECTED_POLICY_BYTES: usize = 606;
+    // Tool discovery guidance is explicit while the action paragraphs below
+    // remain byte-for-byte intact.
+    const EXPECTED_POLICY_BYTES: usize = 769;
 
     let policy =
         SystemPromptBuilder::shared_immutable_base(&[], SystemPromptBuilder::UNSCOPED_GRANT_SCOPE);
@@ -1069,12 +1075,14 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .expect("first store");
     first
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-instructions-recovery".into(),
             request_digest: "create-instructions-recovery-digest".into(),
             request_json: r#"{"session":"instructions-recovery"}"#.into(),
             session_id: session_id.clone(),
             cwd: canonical_utf8(workspace.path()),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -1158,7 +1166,8 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         | RecoveredWork::ChildWait(_)
         | RecoveredWork::AdmissionRetry(_)
         | RecoveredWork::WorkflowContinuation(_)
-        | RecoveredWork::DelegationMirror(_) => {
+        | RecoveredWork::DelegationMirror(_)
+        | RecoveredWork::DetachedChildren(_) => {
             panic!("expected queued recovery")
         }
     };

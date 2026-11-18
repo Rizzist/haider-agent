@@ -315,7 +315,10 @@ fn discovery_reports_metadata_never_token_bytes() {
     let identity = codex.wire.identity.as_ref().expect("Codex identity");
     assert_eq!(identity.email.as_deref(), Some("person@example.invalid"));
     assert_eq!(identity.plan.as_deref(), Some("pro"));
-    assert_eq!(identity.account_id.as_deref(), Some("acct-fake-codex-1"));
+    assert_eq!(
+        identity.account_id, None,
+        "workspace-only JWT has no user dedupe key"
+    );
     assert!(!identity.verified);
 
     let response = serde_json::to_string(&haider_rpc::ResponseBody::AccountDeviceCandidates {

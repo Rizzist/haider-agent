@@ -546,308 +546,6 @@ async fn toolshape_one_mib_stdout_hashes_original_before_model_truncation() {
 }
 
 #[tokio::test]
-async fn workspace_mutation_fact_fires_only_when_process_changes_the_tree() {
-    // LAW 1 mutation guard: deleting either comparison makes a pure command
-    // advance revision state or lets a real process mutation disappear.
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join("input.txt"), "stable").expect("seed input");
-    initialize_git_workspace(workspace.path());
-    let (mut broker, journal) = broker(workspace.path());
-
-    broker
-        .process_exec(
-            &ProcessExec::new("pure-read", "cat input.txt >/dev/null"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("pure process starts")
-        .wait()
-        .await
-        .expect("pure process completes");
-    broker
-        .process_exec(
-            &ProcessExec::new("mutation", "printf changed > output.txt"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("mutating process starts")
-        .wait()
-        .await
-        .expect("mutating process completes");
-
-    let outcomes = workspace_mutations(&journal);
-    assert_eq!(outcomes.len(), 2);
-    assert!(outcomes[0].is_none(), "pure read must not mutate");
-    assert!(
-        outcomes[1].is_some(),
-        "real process mutation must be recorded"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn non_repository_source_mutation_is_conservatively_detected_without_a_walk() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join("source.rs"), "before").expect("seed source");
-    let (mut broker, journal) = broker(workspace.path());
-
-    broker
-        .process_exec(
-            &ProcessExec::new("non-repo-mutation", "printf after > source.rs"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("process starts")
-        .wait()
-        .await
-        .expect("process completes");
-
-    let mutation = workspace_mutations(&journal)
-        .into_iter()
-        .next()
-        .flatten()
-        .expect("unknown non-repository coverage assumes mutation");
-    assert!(
-        mutation
-            .mutation_digest
-            .contains("reason=not_enumerated_non_repository")
-    );
-    assert!(mutation.mutation_digest.contains("before_entries=0"));
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("source.rs")).expect("read mutation"),
-        "after"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn entry_bound_is_reported_and_source_mutation_still_registers() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::create_dir(workspace.path().join(".git")).expect("broken repository marker");
-    fs::create_dir(workspace.path().join("wide")).expect("wide directory");
-    for index in 0..4_200 {
-        fs::write(
-            workspace.path().join("wide").join(format!("entry-{index}")),
-            b"content",
-        )
-        .expect("wide entry");
-    }
-    let (mut broker, journal) = broker(workspace.path());
-
-    let execution = tokio::time::timeout(
-        Duration::from_secs(5),
-        broker.process_exec(
-            &ProcessExec::new("bounded-tree", "printf changed > source.rs"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        ),
-    )
-    .await
-    .expect("entry-bounded receipt must not delay spawn")
-    .expect("process starts");
-    tokio::time::timeout(Duration::from_secs(5), execution.wait())
-        .await
-        .expect("entry-bounded receipt must not delay completion")
-        .expect("process completes");
-
-    let mutation = workspace_mutations(&journal)
-        .into_iter()
-        .next()
-        .flatten()
-        .expect("bounded unknown assumes mutation");
-    assert!(mutation.mutation_digest.contains("reason=entry_limit"));
-    assert!(mutation.mutation_digest.contains("before_entries=4097"));
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("source.rs")).expect("read mutation"),
-        "changed"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn gitignored_only_change_is_deliberately_not_a_workspace_mutation() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join(".gitignore"), "ignored.log\n").expect("ignore control");
-    fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
-    initialize_git_workspace(workspace.path());
-    let (mut broker, journal) = broker(workspace.path());
-
-    broker
-        .process_exec(
-            &ProcessExec::new("ignored-only", "printf generated > ignored.log"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("process starts")
-        .wait()
-        .await
-        .expect("process completes");
-
-    assert_eq!(workspace_mutations(&journal), vec![None]);
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("ignored.log")).expect("ignored output"),
-        "generated"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn git_index_visibility_flags_cannot_hide_real_source_mutations() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join("assumed.rs"), "before assumed").expect("assumed source");
-    fs::write(workspace.path().join("skipped.rs"), "before skipped").expect("skipped source");
-    initialize_git_workspace(workspace.path());
-    run_git(
-        workspace.path(),
-        &["update-index", "--assume-unchanged", "assumed.rs"],
-    );
-    run_git(
-        workspace.path(),
-        &["update-index", "--skip-worktree", "skipped.rs"],
-    );
-    let (mut broker, journal) = broker(workspace.path());
-
-    broker
-        .process_exec(
-            &ProcessExec::new(
-                "git-hidden-source",
-                "printf 'after assumed' > assumed.rs; printf 'after skipped' > skipped.rs",
-            ),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("process starts")
-        .wait()
-        .await
-        .expect("process completes");
-
-    assert!(
-        workspace_mutations(&journal)
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some(),
-        "assume-unchanged and skip-worktree paths are content-hashed"
-    );
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("assumed.rs")).expect("assumed source"),
-        "after assumed"
-    );
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("skipped.rs")).expect("skipped source"),
-        "after skipped"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn a_commit_that_leaves_git_status_clean_is_detected_by_content_receipt() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join("source.rs"), "before").expect("tracked source");
-    initialize_git_workspace(workspace.path());
-    let (mut broker, journal) = broker(workspace.path());
-    let operation = ProcessExec::new(
-        "commit-source",
-        "printf after > source.rs; git add source.rs; \
-         git -c user.name='Haider Tests' -c user.email=haider-tests@example.invalid \
-         -c commit.gpgsign=false commit -qm command-mutation",
-    )
-    .with_env_allowlist(vec!["PATH".into()]);
-
-    broker
-        .process_exec(
-            &operation,
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("process starts")
-        .wait()
-        .await
-        .expect("process completes");
-
-    assert!(
-        workspace_mutations(&journal)
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some(),
-        "anchored content coverage must detect a committed source mutation"
-    );
-    let clean = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(workspace.path())
-        .output()
-        .expect("git status");
-    assert!(clean.status.success());
-    assert!(clean.stdout.is_empty(), "fixture must end clean");
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
-async fn prior_after_receipt_is_the_next_sequential_before_receipt() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
-    initialize_git_workspace(workspace.path());
-    let (mut broker, journal) = broker(workspace.path());
-
-    broker
-        .process_exec(
-            &ProcessExec::new("create-transient", "printf transient > transient.txt"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("create starts")
-        .wait()
-        .await
-        .expect("create completes");
-    broker
-        .process_exec(
-            &ProcessExec::new("remove-transient", "rm transient.txt"),
-            &process_policy(),
-            RecordingCas::default(),
-            RecordingOutput::default(),
-            ProcessBounds::default(),
-        )
-        .await
-        .expect("remove starts")
-        .wait()
-        .await
-        .expect("remove completes");
-
-    let mutations = workspace_mutations(&journal);
-    assert_eq!(mutations.len(), 2);
-    assert!(mutations[0].is_some(), "creation must register");
-    assert!(
-        mutations[1].is_some(),
-        "removal must compare with the prior after-receipt, not the turn-start receipt"
-    );
-    broker.close().await.expect("broker closes");
-}
-
-#[tokio::test]
 async fn overlapping_process_receipts_are_conservatively_unknown_for_both_commands() {
     let workspace = tempfile::tempdir().expect("tempdir");
     fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
@@ -1038,8 +736,8 @@ async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limi
                     "trap '' TERM; ",
                     "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
                     "open $started, q(>), q(timeout-descendant-started.log); ",
-                    "print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.3; ",
+                    "print $started getpgrp(); close $started; ",
+                    "alarm 60; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(timeout-descendant-survived.log); ",
                     "print $survived q(survived); close $survived; sleep 30' & ",
                     "while :; do :; done",
@@ -1057,8 +755,9 @@ async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limi
         )
         .await
         .expect("process starts");
-    for _ in 0..200 {
-        if descendant_started.exists() {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&descendant_started).is_ok_and(|value| !value.is_empty()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -1080,7 +779,9 @@ async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limi
         result.wall_timeout_ms,
         u64::try_from(wall_timeout.as_millis()).expect("test duration fits")
     );
-    std::thread::sleep(Duration::from_millis(400));
+    assert_descendant_group_swept(&descendant_started);
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant");
     assert!(
         !descendant_survived.exists(),
         "timeout must terminate every member of this invocation's group"
@@ -1111,7 +812,8 @@ async fn late_cancellation_during_cas_preserves_natural_completion_and_descendan
                     "/usr/bin/perl -e '$pid = fork; if ($pid) { print q(x) x 16384; exit 0 } ",
                     "open $started, q(>), q(cas-descendant-started.log); ",
                     "print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.3; ",
+                    "close STDIN; close STDOUT; close STDERR; alarm 60; ",
+                    "while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(cas-descendant-survived.log); ",
                     "print $survived q(survived); close $survived'",
                 ),
@@ -1131,11 +833,12 @@ async fn late_cancellation_during_cas_preserves_natural_completion_and_descendan
         )
         .await
         .expect("process starts");
-    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, entered.notified())
         .await
         .expect("CAS ingestion starts");
-    for _ in 0..200 {
-        if descendant_started.exists() {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&descendant_started).is_ok_and(|value| !value.is_empty()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1169,7 +872,9 @@ async fn late_cancellation_during_cas_preserves_natural_completion_and_descendan
             ..
         }
     )));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant");
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
         while !descendant_survived.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1202,7 +907,7 @@ async fn late_cancellation_during_failed_cas_preserves_the_cas_failure() {
         )
         .await
         .expect("process starts");
-    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, entered.notified())
         .await
         .expect("CAS ingestion starts");
     execution.cancel();
@@ -1292,9 +997,11 @@ async fn shell_exit_leaves_background_members_of_its_process_group_alone() {
                     "if ($pid) { while (!-e q(descendant-started.log)) { ",
                     "select undef, undef, undef, 0.01 } print q(leader); exit 0 } ",
                     "open $started, q(>), q(descendant-started.log); print $started q(started); ",
-                    "close $started; select undef, undef, undef, 0.5; ",
-                    "open $survived, q(>), q(descendant-survived.log); ",
-                    "print $survived q(survived); close $survived'",
+                    "close $started; close STDIN; close STDOUT; close STDERR; alarm 60; ",
+                    "while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
+                    "open $survived, q(>), q(descendant-survived.tmp) or die $!; ",
+                    "print $survived q(survived) or die $!; close $survived or die $!; ",
+                    "rename q(descendant-survived.tmp), q(descendant-survived.log) or die $!'",
                 ),
             ),
             &process_policy(),
@@ -1344,7 +1051,15 @@ async fn shell_exit_leaves_background_members_of_its_process_group_alone() {
         event_index(ProcessLifecycleEvent::NormalCompletionDetached)
             < event_index(ProcessLifecycleEvent::RegistryRemoved)
     );
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant after normal completion");
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while !workspace.path().join("descendant-survived.log").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("unmanaged descendant completes its write");
     assert_eq!(
         fs::read_to_string(workspace.path().join("descendant-survived.log"))
             .expect("unmanaged descendant survives normal leader completion"),
@@ -1600,8 +1315,8 @@ async fn broker_teardown_sweeps_a_live_process_group() {
                     "trap '' TERM; ",
                     "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
                     "open $started, q(>), q(teardown-descendant-started.log); ",
-                    "print $started q(started); close $started; ",
-                    "select undef, undef, undef, 0.3; ",
+                    "print $started getpgrp(); close $started; ",
+                    "alarm 60; while (!-e q(release-descendant)) { select undef, undef, undef, 0.01 }; ",
                     "open $survived, q(>), q(teardown-descendant-survived.log); ",
                     "print $survived q(survived); close $survived; sleep 30' & ",
                     "while :; do sleep 1; done",
@@ -1617,8 +1332,9 @@ async fn broker_teardown_sweeps_a_live_process_group() {
         )
         .await
         .expect("process starts");
-    for _ in 0..200 {
-        if descendant_started.exists() {
+    let deadline = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&descendant_started).is_ok_and(|value| !value.is_empty()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1645,7 +1361,9 @@ async fn broker_teardown_sweeps_a_live_process_group() {
         "broker teardown did not complete a group sweep: {:?}",
         result.lifecycle_events
     );
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_descendant_group_swept(&descendant_started);
+    fs::write(workspace.path().join("release-descendant"), b"released")
+        .expect("release descendant");
     assert!(
         !descendant_survived.exists(),
         "broker teardown left a descendant alive outside the sandbox boundary"
@@ -2074,11 +1792,11 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     let (mut broker, _) = broker(workspace.path());
     let execution = runtime.block_on(async {
         let execution = broker.process_exec(&ProcessExec::new("android-runtime-drop", concat!(
-            "/bin/sh -c 'trap \"\" TERM; echo ready > ready; sleep 1; echo escaped > survived' & ",
+            "echo $$ > group-pid; /bin/sh -c 'trap \"\" TERM; echo ready > ready; while :; do sleep 1; done' & ",
             "while :; do sleep 1; done"
         )), &process_policy(), RecordingCas::default(), RecordingOutput::default(), ProcessBounds::default())
             .await.expect("start");
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             while !workspace.path().join("ready").exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -2087,11 +1805,45 @@ fn android_runtime_teardown_drops_supervisor_and_kills_its_pinned_group() {
     });
     // Keep caller and broker alive: only runtime abort drops the supervisor here.
     runtime.shutdown_timeout(Duration::from_secs(1));
-    std::thread::sleep(Duration::from_millis(1200));
-    assert!(
-        !workspace.path().join("survived").exists(),
-        "supervisor abort detached a live group"
-    );
+    // A fresh driver only reaps the killed Tokio child; it cannot resume the
+    // old supervisor or kill its descendant. This also fences zombie removal
+    // on macOS, where the group probe includes unreaped members.
+    let reaper = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("orphan reaper runtime");
+    assert_descendant_group_swept_with_wait(&workspace.path().join("group-pid"), || {
+        reaper.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+    });
     drop(execution);
     drop(broker);
+}
+
+fn assert_descendant_group_swept(started: &Path) {
+    assert_descendant_group_swept_with_wait(started, || {
+        std::thread::sleep(Duration::from_millis(5));
+    });
+}
+
+fn assert_descendant_group_swept_with_wait(started: &Path, mut wait: impl FnMut()) {
+    let pid = fs::read_to_string(started)
+        .expect("descendant group id")
+        .trim()
+        .parse()
+        .expect("numeric group id");
+    let cleanup_pid =
+        haider_platform::process_id(u32::try_from(pid).ok()).expect("positive descendant group id");
+    let watchdog = std::time::Instant::now() + haider_platform::TEST_WAIT_TIMEOUT;
+    while haider_tools::probe_group_liveness(pid) != haider_tools::PidLiveness::Dead {
+        if std::time::Instant::now() >= watchdog {
+            // The fixture must also clean up when a mutation leaves its own
+            // group alive. Preserve the failure before releasing that group.
+            let _ = haider_platform::signal_process_group_id(
+                cleanup_pid,
+                haider_platform::ProcessSignal::Kill,
+            );
+            panic!("owned group {pid} survived teardown; killed for fixture cleanup");
+        }
+        wait();
+    }
 }

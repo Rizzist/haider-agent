@@ -2,6 +2,12 @@
   "contract": "haider-client-wire/v1",
   "methods": [
     {
+      "request_method": "agent.cancel_all",
+      "response_method": "agent.cancel_all",
+      "request": {"method":"agent.cancel_all","command_id":"command-cancel-all","session_id":"session-parent","worker_generation":3},
+      "response": {"method":"agent.cancel_all","session_id":"session-parent","stopped":{"cancelled_runs":3,"sessions":3,"monitors_removed":1,"still_running":0}}
+    },
+    {
       "request_method": "daemon.shutdown",
       "response_method": "daemon.shutdown",
       "request": {"method":"daemon.shutdown"},

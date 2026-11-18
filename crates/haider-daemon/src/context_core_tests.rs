@@ -167,6 +167,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-branch-worker".into(),
         request_digest: "create-branch-worker-digest".into(),
         request_json: r#"{"session":"branch-worker"}"#.into(),
@@ -176,6 +177,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -540,8 +542,9 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
 /// MUTATION CHECK: hard-code automatic compaction planning or emission to
 /// main. Expected RUNTIME failure: the oversized branch turn either compacts
 /// the wrong scope or its summary/node is emitted without branch A.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
+    let _clock = crate::test_clock::FrozenClock::hold();
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let session_id = SessionId::new("auto-compaction-branch-session");
@@ -581,6 +584,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-auto-compaction-branch".into(),
         request_digest: "create-auto-compaction-branch-digest".into(),
         request_json: r#"{"session":"auto-compaction-branch"}"#.into(),
@@ -590,6 +594,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 64,
         max_tokens_source: None,
@@ -1026,6 +1031,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     hub.install_worker_manager(manager_handle.clone())
         .expect("install worker manager");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-manual-compaction".into(),
         request_digest: "create-manual-compaction-digest".into(),
         request_json: r#"{"session":"manual-compaction"}"#.into(),
@@ -1035,6 +1041,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
             .to_string_lossy()
             .into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1697,6 +1704,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
     let device_id = DeviceId::new("compaction-crash-device");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-compaction-crash".into(),
             request_digest: "create-compaction-crash-digest".into(),
             request_json: r#"{"session":"compaction-crash"}"#.into(),
@@ -1706,6 +1714,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

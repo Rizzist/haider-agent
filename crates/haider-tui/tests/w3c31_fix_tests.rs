@@ -45,6 +45,8 @@ fn attachment(n: usize) -> AttachmentId {
 
 fn summary(n: usize, head_seq: u64) -> SessionSummary {
     SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: sid(n),
         head_seq,
@@ -538,6 +540,8 @@ fn a_created_session_attaches_exactly_once_through_the_loop() {
             session: sid(1),
             worker_generation: 7,
             cwd: "~/dev".to_owned(),
+            provider: "anthropic".into(),
+            model_catalog_key: None,
             model: "fable-5".to_owned(),
             metadata: None,
         }),

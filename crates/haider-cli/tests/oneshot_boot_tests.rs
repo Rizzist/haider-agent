@@ -144,6 +144,21 @@ impl Profile {
         command
     }
 
+    fn live_daemon_pid(&self) -> u32 {
+        let status = json_document(
+            &bounded_output(
+                self.command().args(["status", "--json", "--no-spawn"]),
+                "live daemon identity",
+            ),
+            "live daemon identity",
+        );
+        status["daemon"]["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid != 0)
+            .expect("status reply carries daemon PID")
+    }
+
     fn lockdown_root(&self) -> PathBuf {
         self.home.join(".haider").join("lockdown")
     }
@@ -587,7 +602,7 @@ fn one_shot_run_state_is_visible_to_a_later_persistent_daemon() {
             .is_some_and(|generation| generation > first_generation),
         "a new daemon advances the profile generation: {row}"
     );
-    let lingering_pid = daemon_pid(&profile.profile).expect("lingering daemon PID");
+    let lingering_pid = profile.live_daemon_pid();
     assert!(process_alive(lingering_pid));
 
     // The durable journal replays exactly what the one-shot streamed. The
@@ -636,7 +651,7 @@ fn one_shot_run_state_is_visible_to_a_later_persistent_daemon() {
         second_envelopes[0].worker_generation, row["worker_generation"],
         "the follow-up run is served by the lingering daemon's generation"
     );
-    assert_eq!(daemon_pid(&profile.profile), Some(lingering_pid));
+    assert_eq!(profile.live_daemon_pid(), lingering_pid);
     assert!(process_alive(lingering_pid));
 
     profile.stop_daemon_cleanly();
@@ -1297,7 +1312,7 @@ fn fresh_profile_status_is_typed_without_a_daemon_and_reports_the_build_version_
     assert_eq!(status["session_count"], 0);
     assert_eq!(
         status["daemon"]["pid"].as_u64().map(|pid| pid as u32),
-        daemon_pid(&profile.profile)
+        Some(profile.live_daemon_pid())
     );
     profile.stop_daemon_cleanly();
 }

@@ -17,6 +17,7 @@ use haider_store::{
 fn create(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: "create-digest".into(),
             request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#
@@ -24,6 +25,7 @@ fn create(store: &Store, session_id: &SessionId) {
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -240,6 +242,46 @@ fn shell_acceptance_rejects_unreachable_scope_and_accepts_exact_child_agent() {
             .all(|envelope| envelope.agent_id.as_ref() == Some(&child_agent))
     );
 
+    // The real store admission is RunningTool followed by the typed operator
+    // item. Neither live delivery nor replay may revive an earlier agent icon.
+    use haider_protocol::activity::{
+        ActivityKind, ActivityStateV1, ActivityTouchV1, ActivityTracker,
+    };
+    for terminal in [false, true] {
+        let before = ActivityStateV1 {
+            touched: vec![ActivityTouchV1 {
+                kind: ActivityKind::Read,
+                at_ms: 1,
+            }],
+            latest: Some(ActivityTouchV1 {
+                kind: ActivityKind::Read,
+                at_ms: 1,
+            }),
+            terminal,
+            ..ActivityStateV1::default()
+        };
+        let mut live = ActivityTracker::from_state(&before);
+        let mut replay = live.clone();
+        for envelope in &envelopes {
+            live.observe_raw(envelope);
+            let bytes = serde_json::to_vec(envelope).expect("durable child shell");
+            replay.observe_raw(&serde_json::from_slice(&bytes).expect("child shell replay"));
+        }
+        assert_eq!(
+            live.state(),
+            before,
+            "child operator admission is not agent activity"
+        );
+        assert_eq!(
+            replay.state(),
+            before,
+            "child operator replay is not agent activity"
+        );
+    }
+    let accepted_head = store
+        .latest_seq(&child_session)
+        .expect("accepted child head");
+
     let mut omitted_child_agent = command(&store, &child_session, "printf omitted");
     omitted_child_agent.command_id = "shell-command-omitted-agent".into();
     omitted_child_agent.request_digest = "digest-omitted-agent".into();
@@ -250,6 +292,13 @@ fn shell_acceptance_rejects_unreachable_scope_and_accepts_exact_child_agent() {
     assert_eq!(
         error.code,
         haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        store
+            .latest_seq(&child_session)
+            .expect("child head after refusal"),
+        accepted_head,
+        "child session without its typed agent scope adds no journal/activity fact"
     );
 }
 

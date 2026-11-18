@@ -88,6 +88,7 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            resolved_model: None,
             selection_epoch: None,
             route_reset_epoch: None,
             budget_clamp_notice_epoch: None,
@@ -100,6 +101,7 @@ fn digest(
             cwd: format!("/tmp/{id}"),
             provider: "openai".into(),
             account_alias: None,
+            model_catalog_key: None,
             model: "gpt-observe".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -220,6 +222,7 @@ fn fleet_node(
             started_at_ms: 1_800_000_000_000,
             terminal_at_ms: Some(1_800_000_042_000),
             live: state == FleetAgentStateWire::Live,
+            activity: None,
             tool_attempts: 3,
             usage: Some(AgentUsageMetrics {
                 logical_input_tokens: 1_200,
@@ -230,6 +233,8 @@ fn fleet_node(
                 ..AgentUsageMetrics::default()
             }),
         }),
+        activity: None,
+        activities: Vec::new(),
         folded_children,
         children,
     }
@@ -849,6 +854,38 @@ fn fleet_snapshot_rendering_and_raw_json_are_append_only_goldens() {
 }
 
 #[test]
+fn fleet_text_wears_the_activity_glyph_left_of_the_name() {
+    use cli_main::observe::fleet_human_text_with;
+    use haider_protocol::activity::{ActivityDisplay, ActivityKind};
+    let mut snapshot = fleet_snapshot();
+    snapshot.roots[0].activity = Some(ActivityKind::Orchestrate);
+    snapshot.roots[0].children[0].activity = Some(ActivityKind::Edit);
+    let emoji = fleet_human_text_with(&snapshot, ActivityDisplay::Emoji);
+    assert!(
+        emoji.contains("◉ \u{1F9ED} alpha ▸2 — coordinate the sweep"),
+        "{emoji}"
+    );
+    // The done child's stale activity never renders: terminal nodes are quiet.
+    assert!(emoji.contains("│ ✓ done — verify output"), "{emoji}");
+    let text = fleet_human_text_with(&snapshot, ActivityDisplay::Text);
+    assert!(text.contains("◉ [orch] alpha ▸2"), "{text}");
+    let off = fleet_human_text_with(&snapshot, ActivityDisplay::Off);
+    assert_eq!(
+        off,
+        fleet_human_text_with(&fleet_snapshot(), ActivityDisplay::Emoji)
+    );
+    // JSON carries the additive wire fields; a snapshot without them is the
+    // pre-lane shape byte for byte.
+    let raw = serde_json::to_value(&snapshot).expect("json");
+    assert_eq!(raw["roots"][0]["activity"], "orchestrate");
+    assert!(
+        !serde_json::to_string(&fleet_snapshot())
+            .expect("json")
+            .contains("activit")
+    );
+}
+
+#[test]
 fn bare_fleet_lists_only_subagent_sessions_most_recent_first() {
     let mut excluded = digest("session-newest-empty", ObserveRunStateWire::Idle, None);
     excluded.updated_at_ms = 400;
@@ -1024,4 +1061,67 @@ fn selected_task_outcome_is_forwarded_to_cli_json_and_not_reassigned_by_roster()
     assert_eq!(view.json()["run_id"], "new-run");
     assert!(view.json().get("task_outcome").is_none());
     assert!(view.json().get("task_outcome_version").is_none());
+}
+
+/// Recovered own-origin truth is independent of a missing or stale metadata
+/// projection. CLI readers must get the same revision as attach, not zero or
+/// an inherited parent's revision.
+#[test]
+fn sessions_json_preserves_recovered_origin_without_metadata_projection() {
+    let origin = serde_json::json!({
+        "subject_session_id": "session-origin",
+        "open_id": "own-open", "revision": 4,
+        "path": {"kind": "home_relative", "display": "~/fork"},
+        "recorded_at_ms": 40, "selected_seq": 7,
+    });
+    for foreign_projection in [false, true] {
+        let mut observed = digest("session-origin", ObserveRunStateWire::Idle, None);
+        if foreign_projection {
+            let mut foreign = origin.clone();
+            foreign["subject_session_id"] = "session-parent".into();
+            foreign["revision"] = 900.into();
+            observed
+                .metadata
+                .as_mut()
+                .expect("typed fixture")
+                .launch_origin = Some(serde_json::from_value(foreign).expect("foreign projection"));
+        } else {
+            observed.metadata = None;
+        }
+        let roster: SessionSummary = serde_json::from_value(serde_json::json!({
+            "session_id": "session-origin", "head_seq": 12,
+            "worker_generation": 7, "launch_origin": origin,
+            "metadata": observed.metadata,
+        }))
+        .expect("recovered roster");
+        let mut view = summary_view(observed);
+        merge_roster_summary(&mut view, &roster);
+        let json = view.json();
+        assert_eq!(
+            json["launch_origin"], origin,
+            "foreign={foreign_projection}"
+        );
+        assert!(json.get("owner_agent_id").is_none());
+    }
+}
+
+/// Root/legacy absence must stay absent, while delegated and nested owners
+/// are published even without agent metrics or a typed metadata projection.
+#[test]
+fn sessions_json_preserves_owning_agent_scope_and_legacy_absence() {
+    for owner in [None, Some("delegated-owner"), Some("nested-owner")] {
+        let roster: SessionSummary = serde_json::from_value(serde_json::json!({
+            "session_id": "session-scope", "head_seq": 12,
+            "worker_generation": 7, "owner_agent_id": owner,
+        }))
+        .expect("owning roster");
+        let mut view = summary_view(digest("session-scope", ObserveRunStateWire::Idle, None));
+        merge_roster_summary(&mut view, &roster);
+        let json = view.json();
+        match owner {
+            Some(owner) => assert_eq!(json["owner_agent_id"], owner),
+            None => assert!(json.get("owner_agent_id").is_none()),
+        }
+        assert!(json.get("launch_origin").is_none());
+    }
 }

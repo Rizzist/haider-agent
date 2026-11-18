@@ -110,6 +110,9 @@ use haider_protocol::request_budget::{
     PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
     RequestBudgetStatusV1, RequestBudgetV1,
 };
+use haider_protocol::spawn_subagent::{
+    agent_cancel_command, agent_list_command, agent_wait_command,
+};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
     BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES,
@@ -2785,6 +2788,8 @@ pub struct HarnessConfig {
     pub provider_rebind_resolver: Option<Arc<dyn ProviderRebindResolver>>,
     /// Persisted route identity separates cache domains across explicit rebinds.
     pub provider_route_epoch: Option<String>,
+    /// Durable explicit-route generation captured for this active run.
+    pub provider_rebind_seq: u64,
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
@@ -2952,6 +2957,7 @@ impl HarnessConfig {
             provider_attempt_resolver: None,
             provider_rebind_resolver: None,
             provider_route_epoch: None,
+            provider_rebind_seq: 0,
             provider_pair_switch_committer: None,
             provider_route_committer: None,
             compaction_promotion: None,
@@ -3389,8 +3395,32 @@ pub struct DeferredTicket {
 pub struct DeferredToolResult {
     pub report: ChildReport,
     pub chip: ChipState,
+    /// Structured observation status supplied by the dispatcher, independent
+    /// of the human-readable report summary.
+    pub data: Option<haider_protocol::tool::ToolResultData>,
     pub truncated: bool,
     pub truncation: Option<haider_protocol::tool::ToolTruncation>,
+}
+
+impl DeferredToolResult {
+    /// A bounded observation ended before the child did. Terminal reports
+    /// carry `Done` or `Error`; only a still-live child is reported `Waiting`,
+    /// and its data contains the typed `child_still_running` handle.
+    pub fn child_still_running(&self) -> Result<bool, HaiderError> {
+        let waiting = self.chip == ChipState::Waiting;
+        let typed = matches!(
+            &self.data,
+            Some(haider_protocol::tool::ToolResultData::ChildStillRunning { .. })
+        );
+        if waiting != typed {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "deferred child observation and typed result disagree",
+                false,
+            ));
+        }
+        Ok(waiting)
+    }
 }
 
 /// Port for general tool execution. `request_input` remains actor-owned
@@ -3582,6 +3612,9 @@ pub struct ProviderDerivedRequestState {
 /// after [`ProviderPairSwitchCommitter`] confirms the metadata mutation.
 #[derive(Clone)]
 pub struct ProviderPairSwitchTarget {
+    pub model_catalog_key: Option<String>,
+    /// Budget reapplied to the target row; absent for injected legacy lanes.
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub provider: Arc<dyn Provider>,
     pub account: CredentialAlias,
     pub account_incarnation: Option<u64>,
@@ -3616,8 +3649,15 @@ impl std::fmt::Debug for ProviderPairSwitchTarget {
 /// receipted `session.select_model` actor path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPairSwitch {
+    pub model_catalog_key: Option<String>,
+    pub output_budget: Option<haider_protocol::output_budget::SessionOutputBudgetV1>,
     pub run_id: RunId,
     pub switch_ordinal: u32,
+    /// Explicit route generation used to resolve this target. Ordinary
+    /// next-turn settings never change this active-run owner.
+    pub source_rebind_seq: u64,
+    /// Account resolved for the owned target, before crossing the commit.
+    pub target_account: String,
     pub from_provider: String,
     pub from_model: String,
     pub to_provider: String,
@@ -3627,7 +3667,8 @@ pub struct ProviderPairSwitch {
 
 #[async_trait]
 pub trait ProviderPairSwitchCommitter: Send + Sync + std::fmt::Debug {
-    /// Returns the durable selection epoch for requests made after the switch.
+    /// Returns the selection receipt epoch. The active run keeps its frozen
+    /// request-start epoch and uses its rebind generation to own switch facts.
     async fn commit(&self, switch: &ProviderPairSwitch) -> Result<u64, HaiderError>;
 }
 
@@ -3698,10 +3739,13 @@ pub struct ProviderRebindTarget {
     pub account: Option<CredentialAlias>,
     pub account_incarnation: Option<u64>,
     pub context_window: Option<u64>,
+    /// Effective output budget committed with the durable pair rebind.
+    pub max_tokens: u64,
     pub cached_input_is_subset: bool,
     pub provider_request_state: ProviderDerivedRequestState,
     pub auth_scope: String,
     pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    pub rebind_seq: u64,
     pub route_epoch: String,
     pub initial_rotation: Option<RotationEvent>,
     pub rotation_budget_consumed: bool,
@@ -3854,6 +3898,19 @@ pub struct ContextCompactionOutcome {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// Returns activity only for a route owned and registered by this
+    /// dispatcher. The actor never classifies the model's requested name.
+    fn activity_for_route(&self, _name: &str) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
+    /// Effectless routes may publish a live fact at the accepted dispatch
+    /// boundary. Effectful routes already have broker dispatch facts.
+    fn live_activity_for_route(
+        &self,
+        _name: &str,
+    ) -> Option<haider_protocol::activity::ActivityKind> {
+        None
+    }
     /// Hard platform availability precedes actor grant/exposure handling. A false
     /// result routes to the dispatcher's normal unsupported-tool outcome.
     fn platform_tool_supported(&self, _name: &str) -> bool {
@@ -3983,10 +4040,18 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(())
     }
 
-    /// Cancels every child still owned by this turn. The actor invokes this
-    /// only on a real turn cancellation, never when a durable child-wait
-    /// checkpoint is quietly parked for restart.
-    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
+    /// Release a live child handle after a bounded observation ends.
+    async fn detach_deferred(&self, _ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
+    /// Releases every child still owned by this turn WITHOUT cancelling it
+    /// (owner decision 2026-09-25: stopping the main thread stops only the
+    /// main thread). Implementations arrange later delivery of a waited-on
+    /// child's result. The actor invokes this only on a real turn
+    /// cancellation, never when a durable child-wait checkpoint is quietly
+    /// parked for restart.
+    async fn detach_outstanding_deferred(&self, _run_id: &RunId) -> Result<(), HaiderError> {
         Ok(())
     }
 
@@ -5679,7 +5744,7 @@ impl HarnessActor {
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
         // exactly once, under the finished message.
-        let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut server_calls: HashMap<String, ServerCall> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
         // These are one logical provider response, not one physical transport
         // attempt. A reconnect keeps them alive while replay filtering skips
@@ -5751,8 +5816,16 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
-                        server_calls.insert(call_id.clone(), (name.clone(), args.clone()));
+                        server_calls.insert(
+                            call_id.clone(),
+                            ServerCall {
+                                name: name.clone(),
+                                args: args.clone(),
+                                activity: *activity,
+                            },
+                        );
                     }
                     StreamEvent::ServerToolResult { call_id, .. } => {
                         server_calls.remove(call_id);
@@ -5929,6 +6002,8 @@ impl HarnessActor {
                             &mut latest_compaction_summary_end,
                         );
                         self.config.context_window = target.context_window;
+                        self.config.max_tokens = target.max_tokens;
+                        self.config.reserved_output_tokens = target.max_tokens;
                         self.config.cached_input_is_subset = target.cached_input_is_subset;
                         self.config
                             .install_provider_derived_request_state(&target.provider_request_state);
@@ -5942,6 +6017,7 @@ impl HarnessActor {
                         self.config.usage_scope.effort = dimensions.effort;
                         self.config.usage_scope.speed = dimensions.speed;
                         self.config.provider_route_epoch = Some(target.route_epoch);
+                        self.config.provider_rebind_seq = target.rebind_seq;
                         self.config.cache_reuse_gap_ms = None;
                         self.config.context_compactor = None;
                         self.config.compaction_promotion = None;
@@ -6018,6 +6094,7 @@ impl HarnessActor {
                 latest_compaction_summary_end.map(|end| wake_remap.boundary(end));
             logical_request_cacheable_history_end =
                 wake_remap.boundary(logical_request_cacheable_history_end);
+            let switch_ordinal_before_context = provider_pair_switch_ordinal;
             let request_projection_compacted = match self
                 .enforce_context_policy(
                     &run_id,
@@ -6035,6 +6112,7 @@ impl HarnessActor {
                 .await
             {
                 Ok(compacted) => compacted,
+                Err(DriveError::RebindPending) => continue 'requests,
                 Err(error) => {
                     if let Err(state_error) = self
                         .commit_pending_thinking(&run_id, &mut thinking_pending)
@@ -6055,6 +6133,12 @@ impl HarnessActor {
             };
             if request_projection_compacted {
                 cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
+            }
+            if provider_pair_switch_ordinal != switch_ordinal_before_context {
+                // Compaction promotion crosses awaits after the durable
+                // selection. Revisit the live rebind boundary before sending
+                // its first request, just as the fallback path does.
+                continue 'requests;
             }
             if provider_attempt == 0 {
                 logical_request_cacheable_history_end =
@@ -7042,6 +7126,7 @@ impl HarnessActor {
                             .await
                         {
                             return match error {
+                                DriveError::RebindPending => continue 'requests,
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -7626,6 +7711,7 @@ impl HarnessActor {
                             .await
                         {
                             return match error {
+                                DriveError::RebindPending => continue 'requests,
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -8270,6 +8356,7 @@ impl HarnessActor {
                         call_id,
                         name,
                         args,
+                        activity,
                     } => {
                         if let Err(error) = self.flush_pending_item_delta().await {
                             return self
@@ -8282,7 +8369,14 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        server_calls.insert(call_id, (name, args));
+                        server_calls.insert(
+                            call_id,
+                            ServerCall {
+                                name,
+                                args,
+                                activity,
+                            },
+                        );
                         Ok(None)
                     }
                     StreamEvent::ServerToolResult {
@@ -8290,12 +8384,14 @@ impl HarnessActor {
                         preview,
                         is_error,
                     } => {
-                        let (name, args) = server_calls
-                            .remove(&call_id)
-                            .unwrap_or_else(|| ("web_tool".into(), serde_json::Value::Null));
+                        let call = server_calls.remove(&call_id).unwrap_or_else(|| ServerCall {
+                            name: "web_tool".into(),
+                            args: serde_json::Value::Null,
+                            activity: None,
+                        });
                         let result_preview = preview.clone();
-                        let result_name = name.clone();
-                        let result_args = args.clone();
+                        let result_name = call.name.clone();
+                        let result_args = call.args.clone();
                         async {
                             self.complete_text(&run_id, &mut message, false).await?;
                             self.complete_text(&run_id, &mut reasoning, true).await?;
@@ -8328,10 +8424,8 @@ impl HarnessActor {
                                 }),
                                 orchestration: None,
                             };
-                            self.commit_server_tool_row(
-                                &run_id, &call_id, name, args, status, &result,
-                            )
-                            .await?;
+                            self.commit_server_tool_row(&run_id, &call_id, call, status, &result)
+                                .await?;
                             continuation_progress.observe_server_tool(
                                 &result_name,
                                 &result_args,
@@ -9936,8 +10030,12 @@ impl HarnessActor {
             ))
         })?;
         let switch = ProviderPairSwitch {
+            model_catalog_key: target.model_catalog_key.clone(),
+            output_budget: target.output_budget,
             run_id: run_id.clone(),
             switch_ordinal: *provider_pair_switch_ordinal,
+            source_rebind_seq: self.config.provider_rebind_seq,
+            target_account: target.account.as_str().to_owned(),
             from_provider: self.config.usage_scope.provider.clone(),
             from_model: self.config.model.clone(),
             to_provider: target.provider_name.clone(),
@@ -9954,7 +10052,15 @@ impl HarnessActor {
         // cannot relabel this turn's eventual footprint as a request begun
         // under the newly committed selection. The next turn gets a fresh
         // config from durable metadata and may claim the new epoch.
-        committer.commit(&switch).await.map_err(DriveError::Store)?;
+        match committer.commit(&switch).await {
+            Ok(_) => {}
+            Err(error) if error.code == ErrorCode::RevisionConflict => {
+                // The next provider boundary consumes the newer rebind. A
+                // declined, pre-resolved target is not store corruption.
+                return Err(DriveError::RebindPending);
+            }
+            Err(error) => return Err(DriveError::Store(error)),
+        };
         *provider_pair_switch_ordinal = next_switch_ordinal;
 
         remap_after_provider_opaque_strip(
@@ -9976,6 +10082,10 @@ impl HarnessActor {
             &messages[..(*stable_history_end).min(messages.len())],
         );
         self.config.model = target.model.clone();
+        if let Some(budget) = target.output_budget {
+            self.config.max_tokens = budget.max_tokens;
+            self.config.reserved_output_tokens = budget.max_tokens;
+        }
         self.config.context_window = target.context_window;
         self.config.cached_input_is_subset = target.cached_input_is_subset;
         self.config
@@ -10058,19 +10168,24 @@ impl HarnessActor {
         self.commit_ui_extension_marker(run_id, &kind, data)
             .await
             .map_err(DriveError::Store)?;
-        self.commit_ui_extension_marker(
-            run_id,
-            "provider_pair_switch_v1",
-            serde_json::json!({
-                "from_provider": switch.from_provider,
-                "from_model": switch.from_model,
-                "to_provider": switch.to_provider,
-                "to_model": switch.to_model,
-                "why": switch.cause.as_str(),
-            }),
-        )
-        .await
-        .map_err(DriveError::Store)
+        let mut switch_fact = serde_json::json!({
+            "source_rebind_seq": switch.source_rebind_seq,
+            "resolved_alias": target.account.as_str(),
+            "from_provider": switch.from_provider,
+            "from_model": switch.from_model,
+            "to_provider": switch.to_provider,
+            "to_model": switch.to_model,
+            "why": switch.cause.as_str(),
+        });
+        if let Some(key) = &switch.model_catalog_key {
+            switch_fact["model_catalog_key"] = serde_json::json!(key);
+        }
+        if let Some(budget) = switch.output_budget {
+            switch_fact["output_budget"] = serde_json::json!(budget);
+        }
+        self.commit_ui_extension_marker(run_id, "provider_pair_switch_v1", switch_fact)
+            .await
+            .map_err(DriveError::Store)
     }
 
     fn reset_cache_boundaries_after_compaction(
@@ -10848,6 +10963,7 @@ impl HarnessActor {
                     name: name.clone(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             },
         )
@@ -11125,9 +11241,13 @@ impl HarnessActor {
                 .map(|message| CompletedTool::Continue(Some(message)));
         }
         if let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) {
-            self.commit_state(run_id, RunState::RunningTool)
-                .await
-                .map_err(DriveError::Store)?;
+            self.commit_running_tool_activity(
+                run_id,
+                &tools[index],
+                dispatcher.live_activity_for_route(&tools[index].name),
+            )
+            .await
+            .map_err(DriveError::Store)?;
             let outcome = self
                 .execute_general_tool(
                     run_id,
@@ -11165,18 +11285,22 @@ impl HarnessActor {
                         },
                     )
                     .await?;
-                    deferred.push(DeferredAccumulator {
-                        call_id: tools[index].call_id.clone(),
-                        ticket: *ticket,
-                        report_emitted: false,
-                        child_result_emitted: false,
-                        tool_result_emitted: false,
-                        item_completed: false,
-                    });
-                    self.commit_state(run_id, RunState::Streaming)
-                        .await
-                        .map_err(DriveError::Store)?;
-                    return Ok(CompletedTool::Continue(None));
+                    if is_background_spawn(&ticket.manifest) {
+                        background_spawn_result(&self.config.session_id, &ticket.manifest)
+                    } else {
+                        deferred.push(DeferredAccumulator {
+                            call_id: tools[index].call_id.clone(),
+                            ticket: *ticket,
+                            report_emitted: false,
+                            child_result_emitted: false,
+                            tool_result_emitted: false,
+                            item_completed: false,
+                        });
+                        self.commit_state(run_id, RunState::Streaming)
+                            .await
+                            .map_err(DriveError::Store)?;
+                        return Ok(CompletedTool::Continue(None));
+                    }
                 }
             };
             let result = tools[index].correct_result(result);
@@ -11276,10 +11400,23 @@ impl HarnessActor {
                     cancel,
                 ),
             );
-            let result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => None,
-                result = execution => Some(result),
+            // Delegation establishment (spawn/message) is short, bounded store
+            // work that accepts a child turn and then launches it. Dropping it
+            // mid-flight left accepted children never launched (stuck
+            // queued -> cancelling) and a Dispatched effect without an outcome
+            // that fences the parent's terminal commit (9-verify3 B-1). It is
+            // therefore run to completion; the cancellation is observed right
+            // after, and the coordinator finalizes a child whose parent run
+            // is already cancelling instead of launching it.
+            let non_abortable = matches!(tool.name.as_str(), "spawn_subagent" | "message_subagent");
+            let result = if non_abortable {
+                Some(execution.await)
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = execution => Some(result),
+                }
             };
             let Some(result) = result else {
                 // Drop the losing execution future first. Process-backed
@@ -12606,13 +12743,6 @@ impl HarnessActor {
                 if let Some(result) = wake {
                     break match result {
                         Ok(completion) => completion,
-                        // Delegation owns a typed, run-deadline-derived wait
-                        // bound. Do not turn that terminal condition into an
-                        // ordinary red tool result and issue another provider
-                        // request; preserve it as RunFailed + Errored.
-                        Err(error) if delegated_child_wait_timed_out(&error) => {
-                            return Err(DriveError::Store(error));
-                        }
                         Err(error) => DeferredToolResult {
                             report: ChildReport {
                                 agent: pending.ticket.manifest.agent.clone(),
@@ -12621,24 +12751,32 @@ impl HarnessActor {
                                 workspace_revision: None,
                             },
                             chip: ChipState::Error,
+                            data: None,
                             truncated: false,
                             truncation: None,
                         },
                     };
                 }
             };
+            let child_still_running = completion
+                .child_still_running()
+                .map_err(DriveError::Store)?;
             let mut result = BoundedResult {
                 // The opaque id is operational routing, not display identity:
                 // a later `message_subagent` call must be able to name the
                 // direct child without guessing from task/callsign text.
-                preview: format!(
-                    "agent: {}\n\n{}",
-                    completion.report.agent, completion.report.summary
-                ),
+                preview: if child_still_running {
+                    completion.report.summary.clone()
+                } else {
+                    format!(
+                        "agent: {}\n\n{}",
+                        completion.report.agent, completion.report.summary
+                    )
+                },
                 truncated: completion.truncated,
                 truncation: None,
                 effects: Vec::new(),
-                data: None,
+                data: completion.data.clone(),
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -12661,7 +12799,7 @@ impl HarnessActor {
             if let Some(truncation) = completion.truncation {
                 result.declare_truncation(truncation);
             }
-            if !pending.report_emitted {
+            if !pending.report_emitted && !child_still_running {
                 self.commit_payload(
                     run_id,
                     EventPayload::AgentReport(completion.report.clone()),
@@ -12681,7 +12819,7 @@ impl HarnessActor {
             )
             .await
             .map_err(DriveError::Store)?;
-            if !pending.child_result_emitted {
+            if !pending.child_result_emitted && !child_still_running {
                 self.commit_closed_item(
                     run_id,
                     TurnItem::ChildResult {
@@ -12727,10 +12865,17 @@ impl HarnessActor {
             }
             let projection = model_tool_result_projection(&tools[tool_index].name, &result);
             tools.remove(tool_index);
-            dispatcher
-                .acknowledge_deferred(&pending.ticket)
-                .await
-                .map_err(DriveError::Store)?;
+            if child_still_running {
+                dispatcher
+                    .detach_deferred(&pending.ticket)
+                    .await
+                    .map_err(DriveError::Store)?;
+            } else {
+                dispatcher
+                    .acknowledge_deferred(&pending.ticket)
+                    .await
+                    .map_err(DriveError::Store)?;
+            }
             results.push(Message::tool_result_with_receipt(
                 pending.call_id,
                 projection.preview,
@@ -12850,6 +12995,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args: tool_args_or_raw(tool),
                         status: ToolStatus::Pending,
+                        activity: None,
                     },
                 },
             )
@@ -12891,6 +13037,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
         self.commit_item(
             run_id,
             ItemEvent::Completed {
@@ -12900,6 +13050,7 @@ impl HarnessActor {
                     name: tool.name.clone(),
                     args,
                     status,
+                    activity,
                 },
             },
         )
@@ -12990,6 +13141,10 @@ impl HarnessActor {
         } else {
             parse_tool_args(tool)?.as_ref().clone()
         };
+        let activity = (status == ToolStatus::Completed
+            && tool_call_within_advertised_ceiling(&self.config, &tool.name))
+        .then(|| self.dispatcher.as_ref()?.activity_for_route(&tool.name))
+        .flatten();
 
         self.flush_pending_item_delta()
             .await
@@ -13061,6 +13216,7 @@ impl HarnessActor {
                         name: tool.name.clone(),
                         args,
                         status,
+                        activity,
                     },
                 }),
                 prompt_verbatim_render(),
@@ -13180,7 +13336,7 @@ impl HarnessActor {
     ) -> TurnOutcome {
         let mut cleanup_error = None;
         if let Some(dispatcher) = self.dispatcher.as_ref() {
-            if let Err(error) = dispatcher.cancel_outstanding_deferred().await {
+            if let Err(error) = dispatcher.detach_outstanding_deferred(run_id).await {
                 cleanup_error = Some(error);
             }
             // P1-1: a cancel/close failure cannot turn a committed user
@@ -13459,6 +13615,36 @@ impl HarnessActor {
         Ok(())
     }
 
+    async fn commit_running_tool_activity(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        activity: Option<haider_protocol::activity::ActivityKind>,
+    ) -> Result<(), HaiderError> {
+        if let Some(activity) = activity {
+            let mut envelope = self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(RunState::RunningTool),
+                prompt_omit_render(),
+            )?;
+            envelope.payload.insert_metadata(
+                "activity_kind",
+                serde_json::to_value(activity).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?,
+            );
+            envelope.payload.insert_metadata(
+                "activity_call_id",
+                serde_json::Value::String(tool.call_id.clone()),
+            );
+            self.append_and_publish_owned(vec![envelope]).await?;
+            self.state.send_replace(Some(RunState::RunningTool));
+            Ok(())
+        } else {
+            self.commit_state(run_id, RunState::RunningTool).await
+        }
+    }
+
     async fn commit_pending_thinking(
         &mut self,
         run_id: &RunId,
@@ -13614,23 +13800,29 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         call_id: &str,
-        name: String,
-        args: serde_json::Value,
+        call: ServerCall,
         status: ToolStatus,
         result: &BoundedResult,
     ) -> Result<(), DriveError> {
+        let ServerCall {
+            name,
+            args,
+            activity,
+        } = call;
         let item_id = self.next_item_id();
         let started = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
             name: name.clone(),
             args: args.clone(),
             status: ToolStatus::InProgress,
+            activity: None,
         };
         let completed = TurnItem::ToolCall {
             call_id: call_id.to_owned(),
             name,
             args,
             status,
+            activity,
         };
         let render = prompt_omit_render();
         let started = self
@@ -14628,6 +14820,7 @@ enum DriveError {
     Provider(ProviderError),
     Account(HaiderError),
     Store(HaiderError),
+    RebindPending,
     Cancelled,
 }
 
@@ -15095,6 +15288,13 @@ struct PendingItemDelta {
     delta: ItemDelta,
 }
 
+/// One provider-executed, display-only tool row awaiting its result.
+struct ServerCall {
+    name: String,
+    args: serde_json::Value,
+    activity: Option<haider_protocol::activity::ActivityKind>,
+}
+
 /// One in-flight tool call; `args` collects the streamed JSON fragments.
 #[derive(Debug)]
 struct ToolAccumulator {
@@ -15543,14 +15743,48 @@ fn submit_busy_error(capacity: usize) -> HaiderError {
     error
 }
 
-fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
-    error.code == ErrorCode::ProviderTimeout
-        && error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("kind"))
-            .and_then(serde_json::Value::as_str)
-            == Some("delegated_child_wait_timeout")
+fn is_background_spawn(manifest: &AgentManifest) -> bool {
+    manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("background"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The immediate tool result for `spawn_subagent(background=true)`: the
+/// durable child handle and the CLI commands that operate on it.
+fn background_spawn_result(
+    parent_session_id: &SessionId,
+    manifest: &AgentManifest,
+) -> BoundedResult {
+    let agent = &manifest.agent;
+    let coordinates = manifest.coordinates.as_ref();
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "child_spawned",
+            "agent": agent,
+            "parent_session_id": parent_session_id,
+            "child_session_id": coordinates.and_then(|value| value.get("child_session_id")),
+            "child_run_id": coordinates.and_then(|value| value.get("child_run_id")),
+            "collect": agent_wait_command(parent_session_id, agent),
+            "list": agent_list_command(parent_session_id),
+            "cancel": agent_cancel_command(parent_session_id, agent),
+            "cancel_all": haider_protocol::subagent_stop::agent_cancel_all_command(parent_session_id),
+        })
+        .to_string(),
+        truncated: false,
+        truncation: None,
+        effects: Vec::new(),
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+        orchestration: None,
+    }
 }
 
 /// The single publication boundary from a provider failure to a durable
@@ -17779,6 +18013,11 @@ fn drive_error_to_haider(error: DriveError) -> HaiderError {
     match error {
         DriveError::Provider(error) => provider_error_to_haider(error),
         DriveError::Account(error) | DriveError::Store(error) => error,
+        DriveError::RebindPending => HaiderError::new(
+            ErrorCode::Internal,
+            "pending provider rebind escaped its request boundary",
+            true,
+        ),
         DriveError::Cancelled => HaiderError::new(
             ErrorCode::Internal,
             "cancelled drive error escaped its turn outcome boundary",

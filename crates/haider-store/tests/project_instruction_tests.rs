@@ -15,12 +15,14 @@ fn accepted_store() -> (tempfile::TempDir, Store, SessionId, RunId) {
     let run_id = RunId::new("project-instruction-run");
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-project-instruction-store".into(),
             request_digest: "create-project-instruction-store-digest".into(),
             request_json: r#"{"session":"project-instruction-store"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,

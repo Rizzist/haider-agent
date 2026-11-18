@@ -401,6 +401,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(encoded["effort"], "max");
     assert_eq!(encoded["fast"], true);
     let versioned = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: Some(42),
         route_reset_epoch: Some(0),
         budget_clamp_notice_epoch: None,
@@ -898,6 +899,116 @@ fn invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results
 }
 
 #[test]
+fn child_still_running_data_is_additive_and_keeps_legacy_results() {
+    let data = ToolResultData::ChildStillRunning {
+        agent: AgentId::new("agent-1"),
+        parent_session_id: SessionId::new("parent-1"),
+        child_session_id: SessionId::new("child-1"),
+        child_run_id: RunId::new("run-1"),
+        progress: Some(serde_json::json!({"state":"waiting"})),
+        latest_progress_at_ms: 42,
+        wait_limit_ms: 1_000,
+        collect: "haider agent wait parent-1 agent-1 --json".into(),
+    };
+    let wire = serde_json::json!({
+        "kind":"child_still_running", "agent":"agent-1",
+        "parent_session_id":"parent-1", "child_session_id":"child-1",
+        "child_run_id":"run-1", "progress":{"state":"waiting"},
+        "latest_progress_at_ms":42, "wait_limit_ms":1000,
+        "collect":"haider agent wait parent-1 agent-1 --json"
+    });
+    assert_eq!(
+        serde_json::to_value(&data).expect("encode child handle"),
+        wire
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolResultData>(wire).expect("decode child handle"),
+        data
+    );
+    // The previous schema-33 reader has a strict data enum. Test the
+    // enclosing result, not just round-tripping the new enum with itself.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyData {
+        ToolsDiscovered { promoted: Vec<String> },
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyResult {
+        preview: String,
+        data: Option<LegacyData>,
+    }
+    let result = BoundedResult {
+        data: Some(data.clone()),
+        ..serde_json::from_value::<BoundedResult>(
+            serde_json::json!({"preview":"original wait preview","truncated":false}),
+        )
+        .expect("result compatibility fixture")
+    };
+    let envelope = serde_json::to_value(&result).expect("encode observation");
+    assert!(
+        envelope.get("data").is_none(),
+        "new variants must not enter the strict legacy field"
+    );
+    assert!(envelope.get("child_observation").is_some());
+    let old: LegacyResult =
+        serde_json::from_value(envelope.clone()).expect("old reader keeps result");
+    assert_eq!(old.preview, result.preview);
+    assert!(old.data.is_none());
+    assert_eq!(
+        serde_json::from_value::<BoundedResult>(envelope).expect("result compatibility fixture"),
+        result
+    );
+    let earlier =
+        serde_json::json!({"preview":"original wait preview", "truncated":false, "data": data});
+    assert_eq!(
+        serde_json::from_value::<BoundedResult>(earlier).expect("result compatibility fixture"),
+        result
+    );
+    let ordinary = BoundedResult {
+        data: Some(ToolResultData::ToolsDiscovered {
+            promoted: vec!["fs_read".into()],
+        }),
+        ..serde_json::from_value::<BoundedResult>(
+            serde_json::json!({"preview":"discovered","truncated":false}),
+        )
+        .expect("result compatibility fixture")
+    };
+    let old: LegacyResult = serde_json::from_value(
+        serde_json::to_value(ordinary).expect("result compatibility fixture"),
+    )
+    .expect("result compatibility fixture");
+    let Some(LegacyData::ToolsDiscovered { promoted }) = old.data else {
+        panic!("existing data must remain readable")
+    };
+    assert_eq!(promoted, ["fs_read"]);
+    let legacy = serde_json::json!({"preview":"old", "truncated":false});
+    let decoded: BoundedResult = serde_json::from_value(legacy.clone()).expect("legacy result");
+    assert_eq!(serde_json::to_value(decoded).expect("legacy bytes"), legacy);
+}
+
+#[test]
+fn delegated_child_handle_commands_are_pinned() {
+    use haider_protocol::spawn_subagent::{
+        MAX_WAIT_MS, agent_cancel_command, agent_list_command, agent_wait_command,
+    };
+    let parent = SessionId::new("parent-1");
+    let agent = AgentId::new("agent-1");
+    assert_eq!(
+        agent_wait_command(&parent, &agent),
+        "haider agent wait parent-1 agent-1 --json"
+    );
+    assert_eq!(
+        agent_list_command(&parent),
+        "haider agent list parent-1 --json"
+    );
+    assert_eq!(
+        agent_cancel_command(&parent, &agent),
+        "haider agent cancel parent-1 agent-1 --json"
+    );
+    assert_eq!(MAX_WAIT_MS, 24 * 60 * 60 * 1_000);
+}
+
+#[test]
 fn invalid_tool_call_repair_metadata_is_additive_and_round_trips() {
     for repaired in [false, true] {
         let data = ToolResultData::InvalidToolCall {
@@ -1162,6 +1273,7 @@ fn golden_item_lifecycle() {
                 name: "fs_edit".into(),
                 args: serde_json::json!({"path": "src/lib.rs"}),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );
@@ -1174,6 +1286,7 @@ fn golden_item_lifecycle() {
                 name: "fs_read".into(),
                 args: serde_json::json!({}),
                 status: ToolStatus::Cancelled,
+                activity: None,
             },
         },
     );
@@ -1270,6 +1383,7 @@ fn golden_item_lifecycle() {
                     ]
                 }),
                 status: ToolStatus::InProgress,
+                activity: None,
             },
         },
     );
@@ -2004,6 +2118,7 @@ fn golden_agent_metrics_snapshot_fact() {
         started_at_ms: 1_000,
         terminal_at_ms: None,
         live: true,
+        activity: None,
         tool_attempts: 2,
         usage: Some(AgentUsageMetrics {
             logical_input_tokens: 10_000,
@@ -2486,7 +2601,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 name: haider_protocol::graph::build_node(),
                 gate: GraphGateKind::CommandGreen,
                 executor: haider_protocol::graph::GraphExecutorShape::Inline,
-                max_attempts: 8,
+                max_attempts: haider_protocol::graph::GRAPH_DEFAULT_MAX_ATTEMPTS,
                 max_evidence_per_attempt: Some(8),
                 depends_on: Vec::new(),
                 red_target: None,
@@ -2496,7 +2611,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 name: haider_protocol::graph::verify_node(),
                 gate: GraphGateKind::AllOfN { n: 3 },
                 executor: haider_protocol::graph::GraphExecutorShape::FanOut,
-                max_attempts: 8,
+                max_attempts: haider_protocol::graph::GRAPH_DEFAULT_MAX_ATTEMPTS,
                 max_evidence_per_attempt: Some(8),
                 depends_on: vec![haider_protocol::graph::build_node()],
                 red_target: None,
@@ -2513,7 +2628,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 name: haider_protocol::graph::ship_node(),
                 gate: GraphGateKind::HumanConfirm,
                 executor: haider_protocol::graph::GraphExecutorShape::Human,
-                max_attempts: 8,
+                max_attempts: haider_protocol::graph::GRAPH_DEFAULT_MAX_ATTEMPTS,
                 max_evidence_per_attempt: None,
                 depends_on: vec![haider_protocol::graph::verify_node()],
                 red_target: None,
@@ -2617,18 +2732,24 @@ fn deferred_approval_menu_is_explicitly_nonblocking_and_account_scoped() {
         timeout_option: None,
     };
     let value = serde_json::to_value(&menu).expect("menu json");
-    assert_eq!(value["kind"]["kind"], "deferred_approval");
-    assert_eq!(value["kind"]["effect"]["class"], "usage_reset_apply");
+    assert_eq!(value["kind"]["kind"], "choice");
     assert_eq!(
-        value["kind"]["binding"]["account_id"],
+        value["kind"]["deferred_approval"]["effect"]["class"],
+        "usage_reset_apply"
+    );
+    assert_eq!(
+        value["kind"]["deferred_approval"]["binding"]["account_id"],
         "synthetic-workspace"
     );
-    assert_eq!(value["kind"]["binding"]["incarnation"], 7);
+    assert_eq!(
+        value["kind"]["deferred_approval"]["binding"]["incarnation"],
+        7
+    );
     assert_eq!(value["blocking"], false);
     let decoded: Menu = serde_json::from_value(value).expect("menu round trip");
     assert_eq!(decoded, menu);
     let mut legacy = serde_json::to_value(&menu).expect("legacy menu json");
-    legacy["kind"]
+    legacy["kind"]["deferred_approval"]
         .as_object_mut()
         .expect("kind object")
         .remove("binding");

@@ -2191,6 +2191,7 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
                     name: "fs_read".into(),
                     args: serde_json::json!({"path":"a.txt","line":7}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -2296,6 +2297,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let rewound = RunId::new("compacted-rewound-before-anchor");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-compacted-session".into(),
             request_digest: "create-compacted-session-digest".into(),
             request_json: r#"{"session":"compacted-session"}"#.into(),
@@ -2305,6 +2307,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -4335,6 +4338,7 @@ async fn measure_cold_fold_after_several_compactions() {
     let session_id = SessionId::new("multi-compaction-timing-session");
     store
         .create_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-timing-session".into(),
             request_digest: "create-timing-session-digest".into(),
             request_json: r#"{"session":"multi-compaction-timing-session"}"#.into(),
@@ -4344,6 +4348,7 @@ async fn measure_cold_fold_after_several_compactions() {
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -4855,6 +4860,7 @@ async fn tool_result_is_presented_after_its_completed_tool_call() {
                     name: "fs_read".into(),
                     args: serde_json::json!({"path":"note.txt"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -4945,6 +4951,7 @@ async fn journal_keeps_full_tool_output_while_replay_builds_the_same_compact_mod
                     name: "peer_list".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -6263,6 +6270,7 @@ async fn cancelled_and_errored_runs_keep_their_committed_history() {
                     name: "fs_read".into(),
                     args: serde_json::json!({"path": "parser.rs"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -6280,6 +6288,7 @@ async fn cancelled_and_errored_runs_keep_their_committed_history() {
                     name: "process_exec".into(),
                     args: serde_json::json!({"cmd": "cargo test"}),
                     status: ToolStatus::Cancelled,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -6761,6 +6770,7 @@ async fn peer_tool_images_survive_automatic_and_idle_compaction_boundaries() {
                             name: "capture".into(),
                             args: serde_json::json!({}),
                             status: ToolStatus::Completed,
+                            activity: None,
                         },
                     }),
                     PromptRender::Verbatim,
@@ -6917,6 +6927,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
                     name: "read_file".into(),
                     args: serde_json::json!({"path": "/large.log"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -7043,6 +7054,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
                     name: "current_read_file".into(),
                     args: serde_json::json!({"path": "/current.log"}),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,

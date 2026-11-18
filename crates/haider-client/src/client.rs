@@ -318,6 +318,9 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
                 client_instance_id: config.client_instance_id.clone(),
                 client_kind: config.client_kind,
                 capabilities_requested: config.capabilities.clone(),
+                features_requested: [haider_rpc::FEATURE_SESSION_ACTIVITY_V1.to_owned()]
+                    .into_iter()
+                    .collect(),
                 max_receive_frame: u32::try_from(config.frame_limit).unwrap_or(u32::MAX),
                 encodings: (std::env::var("HAIDER_WIRE_MSGPACK").as_deref() == Ok("1"))
                     .then(|| "msgpack".to_owned())

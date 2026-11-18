@@ -121,7 +121,7 @@ fn session() -> AppModel {
     model.accounts.apply_snapshot(seed_account_rows(), Some(1));
     model.identity.provider = "anthropic".into();
     model.identity.model_short = "claude-opus-5".into();
-    model.identity_pinned = true;
+    model.launcher_identity_pinned = true;
     model
 }
 
@@ -315,15 +315,18 @@ fn var_search_over_navigated_card_retires_apply() {
 #[test]
 fn var_history_chooser_over_card_keeps_its_keys() {
     let mut model = session();
-    model.handle(key(KeyCode::Esc));
-    model.handle(key(KeyCode::Esc));
-    if model.backtrack.is_none() {
-        println!(
-            "PRECONDITION unmet: Esc Esc did not open the chooser (prompt_history={})",
-            model.prompt_history.len()
-        );
-        return;
-    }
+    model.prompt_history = [
+        haider_tui::session::PromptEntry::committed("recent synthetic prompt".into(), 20),
+        haider_tui::session::PromptEntry::committed("older synthetic prompt".into(), 10),
+    ]
+    .into();
+    let now = std::time::Instant::now();
+    model.handle_at(key(KeyCode::Esc), now);
+    model.handle_at(key(KeyCode::Esc), now + std::time::Duration::from_millis(5));
+    assert!(
+        model.backtrack.is_some(),
+        "seeded history must open the chooser"
+    );
     open(&mut model, card("og22-chooser"));
     let painted_card = card_painted(&model);
     model.handle(key(KeyCode::Down));
@@ -336,6 +339,8 @@ fn var_history_chooser_over_card_keeps_its_keys() {
     );
     assert!(!painted_card);
     assert!(answers(&model).is_empty());
+    assert!(model.backtrack.is_none());
+    assert_eq!(model.composer.text(), "older synthetic prompt");
 }
 
 /// A blocking menu that arrives after Apply navigation: Enter answers the
@@ -501,6 +506,8 @@ fn a25_frame(model: &AppModel, w: u16, h: u16) -> Vec<(ratatui::layout::Rect, Hi
         .unwrap();
     hits
 }
+// Deliberate legacy controls use the shared runtime clock seam for dwell.
+// Ownership and press identity checks still run unchanged.
 fn a25_mouse(
     model: &mut AppModel,
     hits: &[(ratatui::layout::Rect, Hit)],
@@ -509,7 +516,7 @@ fn a25_mouse(
     y: u16,
 ) {
     use ratatui::crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-    haider_tui::runtime::dispatch_input(
+    haider_tui::runtime::dispatch_input_at(
         model,
         hits,
         Event::Mouse(MouseEvent {
@@ -522,6 +529,7 @@ fn a25_mouse(
             row: y,
             modifiers: KeyModifiers::NONE,
         }),
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
     );
 }
 fn a25_apply_point(hits: &[(ratatui::layout::Rect, Hit)]) -> (u16, u16) {
@@ -897,13 +905,14 @@ fn a25_mouse_press_under_overlay_or_draft_must_not_confirm_restored_card() {
 fn a25_keyboard_presented_card_control() {
     let mut model = session();
     open(&mut model, card("a25-presented"));
-    let last = a25_frame(&model, 118, 36);
     use ratatui::crossterm::event::Event;
     for code in [KeyCode::Down, KeyCode::Enter] {
-        haider_tui::runtime::dispatch_input(
+        let last = a25_frame(&model, 118, 36);
+        haider_tui::runtime::dispatch_input_at(
             &mut model,
             &last,
             Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
     }
     assert_eq!(
@@ -949,10 +958,12 @@ fn repeat_enter_and_double_click_answer_only_once_locally() {
             }
         } else {
             for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
-                haider_tui::runtime::dispatch_input(
+                let last = a25_frame(&model, 118, 36);
+                haider_tui::runtime::dispatch_input_at(
                     &mut model,
-                    &frame,
+                    &last,
                     Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
                 );
             }
         }
@@ -1174,12 +1185,15 @@ fn replayed_menu_arrival_requires_a_new_painted_frame_before_keyboard_answer() {
         );
     }
     assert!(answers(&model).is_empty());
-    let current = a25_frame(&model, 118, 36);
+    // The production loop paints the navigated selection before a fresh
+    // confirmation. The shared clock seam also gives this control its dwell.
     for code in [KeyCode::Down, KeyCode::Enter] {
-        haider_tui::runtime::dispatch_input(
+        let current = a25_frame(&model, 118, 36);
+        haider_tui::runtime::dispatch_input_at(
             &mut model,
             &current,
             Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
         );
     }
     assert_eq!(approvals(&model), 1);

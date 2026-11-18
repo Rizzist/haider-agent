@@ -25,6 +25,87 @@ const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const LEDGER_VERSION: u32 = 1;
 static GLOBAL_MANAGER: OnceLock<LockdownManager> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_IO_HOOK: std::cell::RefCell<Option<std::sync::Arc<PublicationIoCounts>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_IO_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_publication_io_fault<T>(stage: u8, operation: impl FnOnce() -> T) -> T {
+    PUBLICATION_IO_FAULT.with(|fault| assert_eq!(fault.replace(stage), 0));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PUBLICATION_IO_FAULT.with(|fault| fault.set(0));
+        }
+    }
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+fn publication_io_fault(stage: u8, path: &Path) -> Result<(), LockdownError> {
+    if PUBLICATION_IO_FAULT.with(|fault| fault.get() == stage) {
+        Err(io_error(
+            "injected settings save failure",
+            path,
+            std::io::Error::from_raw_os_error(if stage == 1 { 28 } else { 5 }),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PublicationIoCounts {
+    pub(crate) writes: std::sync::atomic::AtomicUsize,
+    pub(crate) syncs: std::sync::atomic::AtomicUsize,
+    pub(crate) full_syncs: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) fn with_publication_io_hook<T>(
+    counts: std::sync::Arc<PublicationIoCounts>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    PUBLICATION_IO_HOOK.with(|hook| {
+        assert!(hook.borrow().is_none(), "publication I/O hooks cannot nest");
+        *hook.borrow_mut() = Some(counts);
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PUBLICATION_IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+fn count_publication_io(sync_policy: Option<SyncPolicy>) {
+    use std::sync::atomic::Ordering;
+    PUBLICATION_IO_HOOK.with(|hook| {
+        if let Some(counts) = hook.borrow().as_ref() {
+            if let Some(policy) = sync_policy {
+                counts.syncs.fetch_add(1, Ordering::Relaxed);
+                if policy == SyncPolicy::Full {
+                    counts.full_syncs.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                counts.writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 pub(crate) const ALLOWED_TOOLS: &[&str] = &[
     "fs_read",
     "fs_glob",
@@ -44,6 +125,7 @@ pub(crate) const ALLOWED_TOOLS: &[&str] = &[
 #[derive(Debug)]
 pub(crate) enum LockdownError {
     AppliedWrite(Box<LockdownError>),
+    SaveSuperseded,
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -72,6 +154,9 @@ pub(crate) enum LockdownError {
         path: PathBuf,
         reason: String,
     },
+    Task {
+        message: String,
+    },
     TurnBindingConflict {
         session_id: String,
         run_id: String,
@@ -84,6 +169,7 @@ impl fmt::Display for LockdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AppliedWrite(source) => fmt::Display::fmt(source, formatter),
+            Self::SaveSuperseded => formatter.write_str("settings save no longer owns activation"),
             Self::Io {
                 operation,
                 path,
@@ -122,6 +208,7 @@ impl fmt::Display for LockdownError {
                 "invalid lockdown quota ledger {}: {reason}",
                 path.display()
             ),
+            Self::Task { message } => write!(formatter, "lockdown blocking task failed: {message}"),
             Self::TurnBindingConflict {
                 session_id,
                 run_id,
@@ -179,7 +266,7 @@ struct QuotaCommandReceipt {
     used: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TurnBindingLedger {
     version: u32,
@@ -206,8 +293,55 @@ struct DurableTurnBinding {
 pub(crate) struct LockdownManager {
     root: PathBuf,
     sandbox_root: PathBuf,
+    confirmed_turns: std::sync::Arc<std::sync::Mutex<Option<ConfirmedTurnBindings>>>,
     #[cfg(all(unix, feature = "android-standalone"))]
     sandbox_directory: std::sync::Arc<haider_platform::WorkspaceDirectory>,
+}
+
+/// The handle keeps the confirmed inode alive, so an equal record replaced by
+/// another manager cannot inherit this manager's durability confirmation.
+#[derive(Debug)]
+struct ConfirmedTurnBindings {
+    file: File,
+    ledger: TurnBindingLedger,
+}
+
+fn same_file(left: &File, right: &File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(haider_platform::windows_file_identity(left)?
+            == haider_platform::windows_file_identity(right)?)
+    }
+}
+
+/// The production fence holds the ownership coordinate across atomic
+/// replacement. Test predicates can revoke it at each storage boundary.
+pub(crate) trait TurnSaveFence {
+    fn is_current(&self) -> bool;
+    fn replace(
+        &self,
+        operation: impl FnOnce() -> Result<(), LockdownError>,
+    ) -> Result<(), LockdownError>;
+}
+
+impl<F: Fn() -> bool> TurnSaveFence for F {
+    fn is_current(&self) -> bool {
+        self()
+    }
+    fn replace(
+        &self,
+        operation: impl FnOnce() -> Result<(), LockdownError>,
+    ) -> Result<(), LockdownError> {
+        ensure_save_current(self)?;
+        operation()
+    }
 }
 
 impl LockdownManager {
@@ -251,6 +385,7 @@ impl LockdownManager {
         let manager = Self {
             root,
             sandbox_root,
+            confirmed_turns: std::sync::Arc::default(),
             #[cfg(all(unix, feature = "android-standalone"))]
             sandbox_directory: std::sync::Arc::new(
                 crate::android_workspace::open_private_sandbox().map_err(|error| {
@@ -303,6 +438,7 @@ impl LockdownManager {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_turn(
         &self,
         profile_id: &str,
@@ -312,7 +448,30 @@ impl LockdownManager {
         proposed_lockdown: bool,
         proposed_auto_hermetic: bool,
     ) -> Result<(String, bool, bool), LockdownError> {
-        self.with_global_lock(|| {
+        self.bind_turn_if_current(
+            profile_id,
+            session_id,
+            run_id,
+            provider,
+            proposed_lockdown,
+            proposed_auto_hermetic,
+            || true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_turn_if_current(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        run_id: &str,
+        provider: &str,
+        proposed_lockdown: bool,
+        proposed_auto_hermetic: bool,
+        is_current: impl TurnSaveFence,
+    ) -> Result<(String, bool, bool), LockdownError> {
+        self.with_turn_save_lock(|| {
+            ensure_save_current(&is_current)?;
             let mut ledger = self.load_turn_bindings()?;
             let (binding, changed) = Self::bind_turn_in_ledger(
                 &mut ledger,
@@ -323,8 +482,8 @@ impl LockdownManager {
                 proposed_lockdown,
                 proposed_auto_hermetic,
             )?;
-            if changed {
-                self.persist_turn_bindings(&ledger)?;
+            if changed || !self.turn_bindings_confirmed(&ledger)? {
+                self.persist_turn_bindings_if_current(&ledger, is_current)?;
             }
             Ok((binding.provider, binding.lockdown, binding.auto_hermetic))
         })
@@ -334,6 +493,7 @@ impl LockdownManager {
     /// The caller must not execute the turn until this returns successfully;
     /// a crash can therefore reveal either the previous active boundary or
     /// the complete new binding and active boundary, never a bound-only gap.
+    #[cfg(test)]
     pub(crate) fn bind_and_activate_turn(
         &self,
         profile_id: &str,
@@ -343,9 +503,32 @@ impl LockdownManager {
         proposed_lockdown: bool,
         proposed_auto_hermetic: bool,
     ) -> Result<(String, bool, bool), LockdownError> {
-        self.with_global_lock(|| {
+        self.bind_and_activate_turn_if_current(
+            profile_id,
+            session_id,
+            run_id,
+            provider,
+            proposed_lockdown,
+            proposed_auto_hermetic,
+            || true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_and_activate_turn_if_current(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        run_id: &str,
+        provider: &str,
+        proposed_lockdown: bool,
+        proposed_auto_hermetic: bool,
+        is_current: impl TurnSaveFence,
+    ) -> Result<(String, bool, bool), LockdownError> {
+        self.with_turn_save_lock(|| {
+            ensure_save_current(&is_current)?;
             let mut ledger = self.load_turn_bindings()?;
-            let (binding, _) = Self::bind_turn_in_ledger(
+            let (binding, changed) = Self::bind_turn_in_ledger(
                 &mut ledger,
                 profile_id,
                 session_id,
@@ -354,13 +537,28 @@ impl LockdownManager {
                 proposed_lockdown,
                 proposed_auto_hermetic,
             )?;
+            let already_active = Self::binding_is_active(&ledger, &binding);
+            if !changed && already_active && self.turn_bindings_confirmed(&ledger)? {
+                return Ok((binding.provider, binding.lockdown, binding.auto_hermetic));
+            }
             ledger.active.retain(|active| {
                 active.profile_id != profile_id || active.session_id != session_id
             });
             ledger.active.push(binding.clone());
-            self.persist_turn_bindings(&ledger)?;
+            ensure_save_current(&is_current)?;
+            self.persist_turn_bindings_if_current(&ledger, is_current)?;
             Ok((binding.provider, binding.lockdown, binding.auto_hermetic))
         })
+    }
+
+    fn binding_is_active(ledger: &TurnBindingLedger, binding: &DurableTurnBinding) -> bool {
+        let mut session_active = ledger.active.iter().filter(|active| {
+            active.profile_id == binding.profile_id && active.session_id == binding.session_id
+        });
+        session_active
+            .next()
+            .is_some_and(|active| active == binding)
+            && session_active.next().is_none()
     }
 
     fn bind_turn_in_ledger(
@@ -446,13 +644,25 @@ impl LockdownManager {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn activate_turn(
         &self,
         profile_id: &str,
         session_id: &str,
         run_id: &str,
     ) -> Result<(), LockdownError> {
-        self.with_global_lock(|| {
+        self.activate_turn_if_current(profile_id, session_id, run_id, || true)
+    }
+
+    pub(crate) fn activate_turn_if_current(
+        &self,
+        profile_id: &str,
+        session_id: &str,
+        run_id: &str,
+        is_current: impl TurnSaveFence,
+    ) -> Result<(), LockdownError> {
+        self.with_turn_save_lock(|| {
+            ensure_save_current(&is_current)?;
             let mut ledger = self.load_turn_bindings()?;
             let binding = ledger
                 .bindings
@@ -469,11 +679,17 @@ impl LockdownManager {
                         "turn {session_id}/{run_id} was activated before its durable binding"
                     ),
                 })?;
+            if Self::binding_is_active(&ledger, &binding)
+                && self.turn_bindings_confirmed(&ledger)?
+            {
+                return Ok(());
+            }
             ledger.active.retain(|active| {
                 active.profile_id != profile_id || active.session_id != session_id
             });
             ledger.active.push(binding);
-            self.persist_turn_bindings(&ledger)
+            ensure_save_current(&is_current)?;
+            self.persist_turn_bindings_if_current(&ledger, is_current)
         })
     }
 
@@ -507,7 +723,7 @@ impl LockdownManager {
         profile_id: &str,
         session_id: &str,
     ) -> Result<(), LockdownError> {
-        self.with_global_lock(|| {
+        self.with_turn_save_lock(|| {
             let mut ledger = self.load_turn_bindings()?;
             let bindings_before = ledger.bindings.len();
             let active_before = ledger.active.len();
@@ -517,8 +733,18 @@ impl LockdownManager {
             ledger.active.retain(|binding| {
                 binding.profile_id != profile_id || binding.session_id != session_id
             });
-            if ledger.bindings.len() != bindings_before || ledger.active.len() != active_before {
+            let changed =
+                ledger.bindings.len() != bindings_before || ledger.active.len() != active_before;
+            let path = self.root.join(TURN_BINDINGS_FILE);
+            let present = path
+                .try_exists()
+                .map_err(|source| io_error("inspect", &path, source))?;
+            if changed || (present && !self.turn_bindings_confirmed(&ledger)?) {
                 self.persist_turn_bindings(&ledger)?;
+            } else if !present {
+                // Confirm absence without creating an empty settings record.
+                // A failed Windows replacement can leave the target missing.
+                sync_named_directory(&self.root, TURN_BINDINGS_FILE)?;
             }
             Ok(())
         })
@@ -744,18 +970,35 @@ impl LockdownManager {
         })
     }
 
+    fn with_turn_save_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, LockdownError>,
+    ) -> Result<T, LockdownError> {
+        let result = self.with_global_lock(operation);
+        // This includes lock/recovery/read/unlock failures, not only failures
+        // inside the atomic replacement. Success belongs to the whole save.
+        if result.is_err()
+            && let Ok(mut confirmed) = self.confirmed_turns.lock()
+        {
+            *confirmed = None;
+        }
+        result
+    }
+
     fn with_global_lock<T>(
         &self,
         operation: impl FnOnce() -> Result<T, LockdownError>,
     ) -> Result<T, LockdownError> {
         let lock_path = self.root.join(QUOTA_LOCK_FILE);
         let lock = private_open(&lock_path, true)?;
-        haider_platform::lock_file_exclusive(&lock)
+        let lock = haider_platform::FileLock::exclusive(lock)
             .map_err(|source| io_error("lock", &lock_path, source))?;
         cleanup_stale_temporaries(&self.root)?;
         let result = operation();
-        let unlocked = haider_platform::unlock_file(&lock)
+        let unlocked = haider_platform::unlock_file(lock.file())
             .map_err(|source| io_error("unlock", &lock_path, source));
+        #[cfg(test)]
+        let unlocked = unlocked.and_then(|()| publication_io_fault(4, &lock_path));
         match result {
             Err(error) => Err(error),
             Ok(value) => {
@@ -860,18 +1103,65 @@ impl LockdownManager {
         }
     }
 
+    fn turn_bindings_confirmed(&self, ledger: &TurnBindingLedger) -> Result<bool, LockdownError> {
+        let confirmed = self
+            .confirmed_turns
+            .lock()
+            .map_err(|error| LockdownError::Task {
+                message: error.to_string(),
+            })?;
+        let Some(confirmed) = confirmed.as_ref().filter(|saved| saved.ledger == *ledger) else {
+            return Ok(false);
+        };
+        let path = self.root.join(TURN_BINDINGS_FILE);
+        let current = private_open(&path, false)?;
+        same_file(&confirmed.file, &current).map_err(|source| io_error("identify", &path, source))
+    }
+
     fn persist_turn_bindings(&self, ledger: &TurnBindingLedger) -> Result<(), LockdownError> {
+        self.persist_turn_bindings_if_current(ledger, || true)
+    }
+
+    fn persist_turn_bindings_if_current(
+        &self,
+        ledger: &TurnBindingLedger,
+        is_current: impl TurnSaveFence,
+    ) -> Result<(), LockdownError> {
+        let mut confirmed = self
+            .confirmed_turns
+            .lock()
+            .map_err(|error| LockdownError::Task {
+                message: error.to_string(),
+            })?;
+        // A failed replacement may already be visible. Equality on readback
+        // cannot turn that uncertain save into a successful one.
+        *confirmed = None;
         let bytes =
             serde_json::to_vec_pretty(ledger).map_err(|error| LockdownError::InvalidLedger {
                 path: self.root.join(TURN_BINDINGS_FILE),
                 reason: error.to_string(),
             })?;
-        atomic_write_named(
+        atomic_write_named_if_current(
             &self.root,
             TURN_BINDINGS_TEMP_FILE,
             TURN_BINDINGS_FILE,
             &bytes,
-        )
+            &is_current,
+        )?;
+        ensure_save_current(&is_current)?;
+        *confirmed = Some(ConfirmedTurnBindings {
+            file: private_open(&self.root.join(TURN_BINDINGS_FILE), false)?,
+            ledger: ledger.clone(),
+        });
+        Ok(())
+    }
+}
+
+fn ensure_save_current(is_current: &impl TurnSaveFence) -> Result<(), LockdownError> {
+    if is_current.is_current() {
+        Ok(())
+    } else {
+        Err(LockdownError::SaveSuperseded)
     }
 }
 
@@ -911,6 +1201,26 @@ pub(crate) fn global() -> Result<&'static LockdownManager, LockdownError> {
             path: PathBuf::from("~/.haider/lockdown"),
             reason: "global lockdown manager is unavailable before daemon startup".to_owned(),
         })
+}
+
+/// Runs filesystem, quota, and binding work away from a Tokio worker. The
+/// caller still awaits completion before it may publish or execute a turn.
+pub(crate) async fn on_blocking_pool<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, LockdownError> + Send + 'static,
+) -> Result<T, LockdownError> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| LockdownError::Task {
+            message: error.to_string(),
+        })?
+}
+
+/// Keeps a caller's domain error while mapping a failed blocking worker to
+/// the typed lockdown task error before the caller translates it to its API.
+pub(crate) async fn on_blocking_pool_result<T: Send + 'static, E: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<Result<T, E>, LockdownError> {
+    on_blocking_pool(move || Ok(operation())).await
 }
 
 /// Returns the process-global manager only after daemon startup installed it.
@@ -1212,7 +1522,7 @@ fn atomic_write_staged(
     let temporary = staging_root.join(temporary_name);
     check_path_budget(&temporary)?;
     check_path_budget(target)?;
-    write_and_replace(&temporary, target, contents)?;
+    write_and_replace(&temporary, target, contents, &|| true)?;
     *applied = true;
     after_apply()?;
     haider_platform::fs::sync_directory(parent, SyncPolicy::Full)
@@ -1230,12 +1540,35 @@ fn atomic_write_named(
     target_name: &str,
     contents: &[u8],
 ) -> Result<(), LockdownError> {
+    atomic_write_named_if_current(parent, temporary_name, target_name, contents, &|| true)
+}
+
+fn atomic_write_named_if_current(
+    parent: &Path,
+    temporary_name: &str,
+    target_name: &str,
+    contents: &[u8],
+    is_current: &impl TurnSaveFence,
+) -> Result<(), LockdownError> {
     let temporary = parent.join(temporary_name);
     let target = parent.join(target_name);
     check_path_budget(&temporary)?;
     check_path_budget(&target)?;
-    write_and_replace(&temporary, &target, contents)?;
-    haider_platform::fs::sync_directory(parent, SyncPolicy::Full)
+    write_and_replace(&temporary, &target, contents, is_current)?;
+    sync_named_directory(parent, target_name)
+}
+
+fn sync_named_directory(parent: &Path, target_name: &str) -> Result<(), LockdownError> {
+    #[cfg(not(test))]
+    let _ = target_name;
+    let sync_policy = SyncPolicy::Full;
+    #[cfg(all(test, unix))]
+    count_publication_io(Some(sync_policy));
+    #[cfg(test)]
+    if target_name == TURN_BINDINGS_FILE {
+        publication_io_fault(3, parent)?;
+    }
+    haider_platform::fs::sync_directory(parent, sync_policy)
         .map_err(|source| io_error("sync directory", parent, source))
 }
 
@@ -1243,6 +1576,7 @@ fn write_and_replace(
     temporary: &Path,
     target: &Path,
     contents: &[u8],
+    is_current: &impl TurnSaveFence,
 ) -> Result<(), LockdownError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1251,13 +1585,34 @@ fn write_and_replace(
         .open(temporary)
         .map_err(|source| io_error("create", temporary, source))?;
     let write_result = (|| {
+        #[cfg(test)]
+        count_publication_io(None);
+        #[cfg(test)]
+        if temporary
+            .file_name()
+            .is_some_and(|name| name == TURN_BINDINGS_TEMP_FILE)
+        {
+            publication_io_fault(1, temporary)?;
+        }
         file.write_all(contents)
             .map_err(|source| io_error("write", temporary, source))?;
-        haider_platform::sync_file(&file, SyncPolicy::Full)
+        let sync_policy = SyncPolicy::Full;
+        #[cfg(test)]
+        count_publication_io(Some(sync_policy));
+        #[cfg(test)]
+        if temporary
+            .file_name()
+            .is_some_and(|name| name == TURN_BINDINGS_TEMP_FILE)
+        {
+            publication_io_fault(2, temporary)?;
+        }
+        haider_platform::sync_file(&file, sync_policy)
             .map_err(|source| io_error("sync", temporary, source))?;
         drop(file);
-        haider_platform::replace_file(temporary, target)
-            .map_err(|source| io_error("replace", target, source))
+        is_current.replace(|| {
+            haider_platform::replace_file(temporary, target)
+                .map_err(|source| io_error("replace", target, source))
+        })
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(temporary);

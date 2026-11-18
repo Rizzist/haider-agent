@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use haider_platform::CivilDateSample;
 
 use super::{
-    CwdReason, MaterializeError, WORKSPACE_BASE_ENV, WorkspaceConfig, WorkspaceEnvironment,
-    WorkspaceError, WorkspaceInvocation, WorkspaceMode, WorkspaceRequest, WorkspaceSelection,
-    available_workspace_allocation, materialize_daily_root, materialize_leaf,
-    materialize_workspace_allocation, path_is_inside_dated_allocation, renew_workspace_allocation,
-    resolve_workspace, validate_workspace_allocation, workspace_allocation,
+    CwdReason, DatedWorkspacePlan, MaterializeError, WORKSPACE_BASE_ENV, WorkspaceBaseSource,
+    WorkspaceConfig, WorkspaceEnvironment, WorkspaceError, WorkspaceInvocation, WorkspaceMode,
+    WorkspaceRequest, WorkspaceSelection, available_workspace_allocation, materialize_daily_root,
+    materialize_leaf, materialize_workspace_allocation, path_is_inside_dated_allocation,
+    renew_workspace_allocation, resolve_workspace, validate_workspace_allocation,
+    workspace_allocation,
 };
 
 const ENTROPY: [u8; 16] = [
@@ -26,6 +27,48 @@ fn reference_sample() -> CivilDateSample {
         utc_ms: 1_789_257_600_000,
         offset_seconds: 0,
     }
+}
+
+#[test]
+fn workspace_startup_errors_project_paths_before_display() {
+    let path = PathBuf::from("/Users/bob/private");
+    let messages = [
+        WorkspaceError::EnvWorkspaceInvalid(path.to_string_lossy().into_owned()).to_string(),
+        WorkspaceError::ExplicitWorkspaceMissing(path.to_string_lossy().into_owned()).to_string(),
+        WorkspaceError::NonUtf8Path(path.clone()).to_string(),
+        MaterializeError::BaseUnavailable(
+            path.clone(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .to_string(),
+        MaterializeError::UnsafeComponent(path.clone()).to_string(),
+        MaterializeError::Io(
+            path.clone(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .to_string(),
+        MaterializeError::LeafValidationFailed(path.clone()).to_string(),
+        MaterializeError::LeafAlreadyExists(path).to_string(),
+    ];
+    for message in messages {
+        assert!(message.contains("/Users/<user>/private"), "{message}");
+        assert!(!message.contains("/Users/bob/"), "{message}");
+    }
+    let plan = DatedWorkspacePlan {
+        base: PathBuf::from("/Users/bob"),
+        base_source: WorkspaceBaseSource::EnvBase,
+        daily_root: PathBuf::from("/Users/bob/private"),
+        leaf: PathBuf::from("/Users/bob/private/leaf"),
+        allocation_id: "00000000000000000000000000000000".into(),
+        calendar_id: "islamic-civil",
+        hijri_label: "1448-01-01".into(),
+        gregorian_label: "2026-09-27".into(),
+        sampled_utc_ms: 0,
+        offset_seconds: 0,
+    };
+    let error = workspace_allocation(&plan).unwrap_err().to_string();
+    assert!(error.contains("/Users/<user>/private"), "{error}");
+    assert!(!error.contains("/Users/bob/"), "{error}");
 }
 
 fn environment_with_base(base: &Path) -> WorkspaceEnvironment {

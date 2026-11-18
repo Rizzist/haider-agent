@@ -26,10 +26,12 @@ use haider_tui::format::{
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::render::render;
+use haider_tui::runtime::dispatch_input;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::KeyCode;
-use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
@@ -187,57 +189,6 @@ fn usage_model() -> AppModel {
     model
 }
 
-#[test]
-fn a_pressed_usage_tab_cannot_select_a_reordered_account() {
-    let mut model = usage_model();
-    let (_, first) = draw(&model, 120, 30);
-    let rect = first
-        .iter()
-        .find_map(|(rect, hit)| {
-            matches!(hit, Hit::UsageAccountTab { provider, index: 0 } if provider.as_str() == "anthropic-oauth")
-                .then_some(*rect)
-        })
-        .expect("first account tab");
-    let (x, y) = (rect.x + 1, rect.y);
-    let mouse = |kind| {
-        Event::Mouse(MouseEvent {
-            kind,
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        })
-    };
-    haider_tui::runtime::dispatch_input(
-        &mut model,
-        &first,
-        mouse(MouseEventKind::Down(MouseButton::Left)),
-    );
-    let mut changed = report();
-    changed.accounts.swap(0, 1);
-    model.usage.apply_report(changed);
-    let (_, second) = draw(&model, 120, 30);
-    haider_tui::runtime::dispatch_input(
-        &mut model,
-        &second,
-        mouse(MouseEventKind::Up(MouseButton::Left)),
-    );
-    assert!(
-        model.usage.tabs.is_empty(),
-        "press must retain the original alias"
-    );
-    haider_tui::runtime::dispatch_input(
-        &mut model,
-        &second,
-        mouse(MouseEventKind::Down(MouseButton::Left)),
-    );
-    haider_tui::runtime::dispatch_input(
-        &mut model,
-        &second,
-        mouse(MouseEventKind::Up(MouseButton::Left)),
-    );
-    assert_eq!(model.usage.tabs.get("anthropic-oauth"), Some(&0));
-}
-
 fn live_gated_model() -> AppModel {
     let mut model = launcher_model();
     model.mode = RuntimeMode::Live;
@@ -386,6 +337,10 @@ fn meter_reason_compaction_preserves_the_typed_mapping() {
     assert_eq!(fmt_meter_reason("http_status_401"), "http 401");
     assert_eq!(fmt_meter_reason("transport_timeout"), "transport timeout");
     assert_eq!(fmt_meter_reason("malformed_response"), "malformed response");
+    assert_eq!(
+        fmt_meter_reason("credential_identity_incomplete"),
+        "identity incomplete; refresh account or sign in again"
+    );
     assert_eq!(
         fmt_meter_reason("credential_unavailable"),
         "credential unavailable"
@@ -937,6 +892,26 @@ fn unavailable_meters_render_the_typed_reason_never_a_bar() {
         body_text(&rows).contains("meter unavailable · http 401"),
         "the compact global row must not swallow the typed reason"
     );
+
+    // Legacy accounts fail closed until refreshed. The recovery action must
+    // remain visible at both gate sizes, rather than a generic unsupported label.
+    let mut usage = report();
+    usage.accounts[1].meter = AccountMeterStateV1::Unavailable {
+        reason: "credential_identity_incomplete".into(),
+        retry_at_ms: None,
+    };
+    model.usage.apply_report(usage);
+    model.usage.scope = UsageScope::Accounts;
+    for (width, height) in [(118, 36), (80, 24)] {
+        let (rows, _) = draw(&model, width, height);
+        let text = body_text(&rows);
+        assert!(
+            text.contains("identity incomplete"),
+            "{width}x{height}: {text}"
+        );
+        assert!(text.contains("refresh account"), "{width}x{height}: {text}");
+        assert!(!text.contains('▰') && !text.contains('▱'));
+    }
 }
 
 /// An API-key account renders tokens + est cost and NEVER a 0–100 meter:
@@ -1150,12 +1125,60 @@ fn left_right_tabs_cycle_the_cursor_groups_accounts_and_wrap() {
     model.handle_hit(Hit::UsageAccountTab {
         provider: "anthropic-oauth".to_owned(),
         index: 0,
+        alias: CredentialAlias::new("anthropic"),
     });
     assert_eq!(
         model.usage.cursor, 0,
         "the click moves the cursor to its group"
     );
     assert_eq!(model.usage.selected_tab(&model.usage.groups()[0]), 0);
+}
+
+#[test]
+fn account_tab_press_is_bound_to_the_alias_after_report_reorder() {
+    let mut model = usage_model();
+    model.usage.cursor = 1;
+    let (_, before) = draw(&model, 110, 30);
+    let (rect, old_hit) = before
+        .iter()
+        .find(|(_, hit)| matches!(hit, Hit::UsageAccountTab { index: 0, .. }))
+        .cloned()
+        .expect("first account chip");
+    let mouse = |kind| {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    dispatch_input(
+        &mut model,
+        &before,
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+    );
+    model
+        .usage
+        .report
+        .as_mut()
+        .expect("report installed")
+        .accounts
+        .swap(0, 1);
+    let (_, after) = draw(&model, 110, 30);
+    dispatch_input(
+        &mut model,
+        &after,
+        mouse(MouseEventKind::Up(MouseButton::Left)),
+    );
+    assert_eq!(
+        model.usage.cursor, 1,
+        "reordered chip consumed an old press"
+    );
+    model.handle_hit(old_hit);
+    assert_eq!(
+        model.usage.cursor, 1,
+        "stale account alias selected a replacement"
+    );
 }
 
 /// KEY-OWNERSHIP LAW: while `/usage` shows, esc closes back to the prior

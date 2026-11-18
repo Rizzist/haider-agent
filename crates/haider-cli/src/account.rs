@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve_profile};
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
+use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{
     AccountSourceWire, Capability, CapabilitySet, ClientKind, CommandId, ErrorData,
@@ -122,6 +122,18 @@ struct AccountView {
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<haider_protocol::credential::AccountIdentity>,
     created: Option<u64>,
+    /// Human-hint inputs only; never serialized, so the JSON schema is
+    /// unchanged.
+    #[serde(skip)]
+    active: bool,
+    #[serde(skip)]
+    usable: bool,
+}
+
+impl AccountView {
+    fn principal(&self) -> Option<haider_protocol::credential::AccountPrincipal<'_>> {
+        haider_protocol::credential::AccountPrincipal::new(&self.provider, self.identity.as_ref())
+    }
 }
 
 #[derive(Serialize)]
@@ -805,6 +817,21 @@ async fn execute_use(
             );
             Ok(ExitCode::SUCCESS)
         }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } if code == haider_rpc::ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED => {
+            Err(AccountError::Rpc {
+                code,
+                message: format!(
+                    "{message}; run `haider account use {alias} --confirm` to confirm this selection"
+                ),
+                retryable,
+                data,
+            })
+        }
         response => Err(response_error(
             response,
             "account.set_active response method mismatch",
@@ -902,6 +929,14 @@ async fn execute_refresh(
     }
 }
 
+fn import_confirmation_instruction(
+    candidate: &haider_rpc::DeviceCredentialCandidateWire,
+) -> Option<String> {
+    candidate
+        .import_supported
+        .then(|| format!("haider account import {} --confirm", candidate.source))
+}
+
 async fn execute_import(
     client: &impl AccountClient,
     source: &str,
@@ -936,11 +971,18 @@ async fn execute_import(
         .into_iter()
         .find(|candidate| candidate.source == source)
         .ok_or_else(|| AccountError::MissingAlias(format!("{source} local login")))?;
-    if !candidate.import_supported {
-        return Err(AccountError::Protocol(
-            "the discovered local login cannot be imported safely",
-        ));
+    if !candidate.import_supported && (!confirm || source != "claude-code") {
+        eprintln!(
+            "haider account: {}",
+            candidate
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("the discovered local login cannot be imported safely")
+        );
+        return Ok(ExitCode::from(EX_USAGE));
     }
+    // Explicit confirmation reaches the daemon's typed policy gate, including
+    // the debug fake-mode refusal. Unsupported candidates get no suggestion.
     let summary = candidate.identity.as_ref().map_or_else(
         || {
             candidate
@@ -952,9 +994,9 @@ async fn execute_import(
     );
     println!("found {source} login: {summary}");
     if !confirm {
-        eprintln!(
-            "haider account: review the identity, then run `haider account import {source} --confirm`"
-        );
+        if let Some(instruction) = import_confirmation_instruction(&candidate) {
+            eprintln!("haider account: review the identity, then run `{instruction}`");
+        }
         return Ok(ExitCode::from(EX_USAGE));
     }
     match client
@@ -1012,12 +1054,31 @@ async fn execute_custom(
         .iter()
         .find(|provider| provider.provider == options.alias)
         .cloned();
-    if create && existing.is_some() {
-        return Err(AccountError::Protocol(
-            "account add alias already names a provider; use account update",
-        ));
-    }
-    if !create && existing.is_none() {
+    if let Some(provider) = &existing {
+        // Removing a credential deliberately retains its custom profile. A
+        // vacant credential slot can be filled again, but an existing account
+        // (including an inactive or expired one) still requires update.
+        let custom_requires_account = provider.catalog
+            == haider_rpc::ProviderCatalogKindWire::Custom
+            && !provider.auth_methods.is_empty();
+        let account_present = if custom_requires_account {
+            account_snapshot(client)
+                .await?
+                .0
+                .iter()
+                .any(|descriptor| descriptor.alias.as_str() == options.alias)
+        } else {
+            false
+        };
+        if create && (!custom_requires_account || account_present) {
+            return Err(AccountError::Protocol(
+                "account add alias already names a provider; use account update",
+            ));
+        }
+        if !create && custom_requires_account && !account_present {
+            return Err(AccountError::MissingAlias(options.alias));
+        }
+    } else if !create {
         return Err(AccountError::MissingAlias(options.alias));
     }
     let existing = existing.as_ref();
@@ -1048,11 +1109,11 @@ async fn execute_custom(
             origin: options.base_url.clone(),
             auth_requirement,
             enabled: existing.is_none_or(|provider| provider.enabled),
-            // Empty commits a remote provider with no invented inventory.
+            // Empty requests no invented inventory; existing explicit models remain.
             // The durable credential commit below schedules discovery in the
             // daemon; this mutation never waits for `/models`.
             models: Vec::new(),
-            default_model: existing.and_then(|provider| provider.default_model.clone()),
+            default_model: None,
             response_open_timeout_ms: options.response_open_timeout_ms,
             chunk_idle_timeout_ms: options.chunk_idle_timeout_ms,
             semantic_progress_timeout_ms: options.semantic_progress_timeout_ms,
@@ -1062,7 +1123,7 @@ async fn execute_custom(
         })
         .await
         .map_err(AccountError::Client)?;
-    let (configured, configured_revision) = match response {
+    let (_configured, configured_revision) = match response {
         ResponseBody::ProviderConfigure { provider, revision } => (provider, revision),
         ResponseBody::Error {
             code,
@@ -1133,7 +1194,7 @@ async fn execute_custom(
                 provider: options.alias.clone(),
                 alias: Some(options.alias.clone()),
                 vault_reference,
-                validation_model: configured.default_model.clone(),
+                validation_model: None,
                 replace_existing: !create,
             })
             .await
@@ -1160,6 +1221,13 @@ async fn execute_custom(
             }
         }
     }
+    let (committed, _) = provider_snapshot(client).await?;
+    let configured = committed
+        .into_iter()
+        .find(|provider| provider.provider == options.alias)
+        .ok_or(AccountError::Protocol(
+            "committed provider disappeared from intake",
+        ))?;
     let document = custom_document(
         if create { "add" } else { "update" },
         &options.alias,
@@ -1423,6 +1491,11 @@ fn account_view(descriptor: CredentialDescriptor) -> AccountView {
         },
         identity: descriptor.account_identity,
         created: descriptor.created_at_ms,
+        active: descriptor.active,
+        usable: matches!(
+            descriptor.status,
+            CredentialStatus::Ok | CredentialStatus::Limited { .. }
+        ),
     }
 }
 
@@ -1441,7 +1514,69 @@ fn write_json(document: &impl Serialize) -> ExitCode {
     }
 }
 
-fn write_human(document: &AccountsDocument) -> ExitCode {
+fn ambiguous_email_bridge<'a>(
+    document: &'a AccountsDocument,
+    account: &AccountView,
+) -> Option<&'a AccountView> {
+    use haider_protocol::credential::AccountIdentity;
+    let email = account.identity.as_ref()?.email.as_deref()?;
+    let provider_identities = || {
+        document
+            .accounts
+            .iter()
+            .filter(|candidate| candidate.provider == account.provider)
+            .filter_map(|candidate| Some((candidate, candidate.identity.as_ref()?)))
+    };
+    if !AccountIdentity::email_names_several_accounts(
+        email,
+        provider_identities().map(|(_, identity)| identity),
+    ) {
+        return None;
+    }
+    provider_identities()
+        .find(|(_, identity)| identity.is_email_only_match(email))
+        .map(|(candidate, _)| candidate)
+}
+
+/// Which row of a duplicate group to keep: the active row, then a usable
+/// one, then the first listed — the same rule the TUI applies when it keeps
+/// the just-signed-in (active) row.
+fn keep_rank(account: &AccountView) -> (bool, bool) {
+    (!account.active, !account.usable)
+}
+
+fn same_duplicate_group(
+    document: &AccountsDocument,
+    left: &AccountView,
+    right: &AccountView,
+) -> bool {
+    let (Some(left_principal), Some(right_principal)) = (left.principal(), right.principal())
+    else {
+        return false;
+    };
+    if !left_principal.same_account(right_principal) {
+        return false;
+    }
+    // An email-only row whose email names several stable accounts is a
+    // review case, never a removable duplicate.
+    let exact_ids = || {
+        left.identity
+            .as_ref()
+            .and_then(|identity| identity.account_id.as_deref())
+            .zip(
+                right
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.account_id.as_deref()),
+            )
+            .is_some_and(|(left, right)| left == right)
+    };
+    (ambiguous_email_bridge(document, left).is_none()
+        && ambiguous_email_bridge(document, right).is_none())
+        || exact_ids()
+}
+
+fn render_human(document: &AccountsDocument) -> String {
     let mut text = String::new();
     for account in &document.accounts {
         text.push_str(&format!(
@@ -1457,7 +1592,63 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
                 |created| created.to_string(),
             )
         ));
+        let Some(principal) = account.principal() else {
+            continue;
+        };
+        if principal.identity_unverified() {
+            text.push_str(&unverified_hint(document, account));
+            continue;
+        }
+        let keep = document
+            .accounts
+            .iter()
+            .filter(|candidate| {
+                candidate.alias == account.alias
+                    || same_duplicate_group(document, candidate, account)
+            })
+            .min_by_key(|candidate| keep_rank(candidate))
+            .filter(|keep| keep.alias != account.alias);
+        if let Some(keep) = keep {
+            text.push_str(&format!(
+                "  matching identity already kept as `{}`; remove this duplicate explicitly with `haider account remove {} --confirm`\n",
+                keep.alias, account.alias
+            ));
+        } else if ambiguous_email_bridge(document, account)
+            .is_some_and(|bridge| bridge.alias == account.alias)
+        {
+            text.push_str("  email matches multiple account IDs; review these accounts and remove duplicates explicitly\n");
+        }
     }
+    text
+}
+
+/// A Claude row still on the synthetic grant-hash id cannot be compared, so
+/// every other row of its provider is a suspected duplicate.
+fn unverified_hint(document: &AccountsDocument, account: &AccountView) -> String {
+    let others = document
+        .accounts
+        .iter()
+        .filter(|other| other.alias != account.alias && other.provider == account.provider)
+        .map(|other| format!("`{}`", other.alias))
+        .collect::<Vec<_>>();
+    let verify = if account.usable {
+        "it is verified automatically while its token works"
+    } else {
+        "re-login it in place from `/accounts` (enter twice on the row) to verify it"
+    };
+    if others.is_empty() {
+        format!("  identity unverified; {verify}\n")
+    } else {
+        format!(
+            "  identity unverified; suspected duplicate of {}; {verify}, or remove it explicitly with `haider account remove {} --confirm`\n",
+            others.join(", "),
+            account.alias
+        )
+    }
+}
+
+fn write_human(document: &AccountsDocument) -> ExitCode {
+    let text = render_human(document);
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if let Err(error) = output

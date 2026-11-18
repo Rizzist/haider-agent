@@ -283,7 +283,7 @@ impl PlanCredentialSource for CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, PlanTransientFailure> {
-        CredentialBroker::resolve(self, descriptor)
+        CredentialBroker::resolve_remote(self, descriptor)
             .await
             .map_err(|_| PlanTransientFailure::CredentialUnavailable)
     }

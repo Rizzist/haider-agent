@@ -98,6 +98,7 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -110,6 +111,7 @@ pub fn transcript() -> Vec<WireFrame> {
         cwd: "/tmp/workspace".into(),
         provider: "anthropic".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "claude-test".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -154,6 +156,7 @@ pub fn transcript() -> Vec<WireFrame> {
             client_instance_id: "client-instance-1".into(),
             client_kind: ClientKind::Gui,
             capabilities_requested: capabilities([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: TEST_FRAME_LIMIT as u32,
             encodings: Vec::new(),
         }),
@@ -211,6 +214,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
@@ -250,6 +255,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-roster"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: session_id.clone(),
                     head_seq: 9,
@@ -407,6 +414,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 command_id: CommandId::new("command-create"),
                 cwd: "/tmp/workspace".into(),
                 provider: "anthropic".into(),
+                expected_catalog_key: None,
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: None,
@@ -428,6 +436,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    resolved_model: None,
                     selection_epoch: None,
                     route_reset_epoch: None,
                     budget_clamp_notice_epoch: None,
@@ -440,6 +449,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     cwd: "/tmp/workspace".into(),
                     provider: "anthropic".into(),
                     account_alias: None,
+                    model_catalog_key: None,
                     model: "claude-test".into(),
                     max_tokens: 4096,
                     max_tokens_source: None,
@@ -716,6 +726,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-providers"),
             body: ResponseBody::ProviderList {
                 providers: vec![ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
@@ -729,6 +742,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         display_name: None,
                         context_window: None,
                         max_output_tokens: Some(16_384),
+                        max_output_tokens_source: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -794,6 +808,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-default-model"),
             body: ResponseBody::AccountSetDefaultModel {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
@@ -807,6 +824,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         display_name: None,
                         context_window: None,
                         max_output_tokens: Some(16_384),
+                        max_output_tokens_source: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -849,6 +867,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-provider-configure"),
             body: ResponseBody::ProviderConfigure {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "local-lab".into(),
                     api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                     endpoint: Some("http://127.0.0.1:11434".into()),
@@ -862,6 +883,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         display_name: None,
                         context_window: None,
                         max_output_tokens: Some(16_384),
+                        max_output_tokens_source: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -920,6 +942,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-provider-models-refresh"),
             body: ResponseBody::ProviderModelsRefresh {
                 provider: ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "openai-oauth".into(),
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://chatgpt.com/backend-api/codex/responses".into()),
@@ -934,6 +959,7 @@ pub fn transcript() -> Vec<WireFrame> {
                             display_name: None,
                             context_window: None,
                             max_output_tokens: Some(16_384),
+                            max_output_tokens_source: None,
                             supported_efforts: Vec::new(),
                             default_effort: None,
                             supported_speeds: Vec::new(),
@@ -946,6 +972,7 @@ pub fn transcript() -> Vec<WireFrame> {
                             display_name: None,
                             context_window: None,
                             max_output_tokens: Some(16_384),
+                            max_output_tokens_source: None,
                             supported_efforts: Vec::new(),
                             default_effort: None,
                             supported_speeds: Vec::new(),
@@ -1071,6 +1098,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 command_id: CommandId::new("command-create-overrides"),
                 cwd: "/tmp/workspace".into(),
                 provider: "anthropic".into(),
+                expected_catalog_key: None,
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: Some(SessionPermissionOverridesV1 {
@@ -1373,6 +1401,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-gemini-provider"),
             body: ResponseBody::ProviderList {
                 providers: vec![ProviderSummaryWire {
+                    catalog_scope: None,
+                    configured_models: Vec::new(),
+                    static_models: Vec::new(),
                     provider: "gemini".into(),
                     api_family: ProviderApiFamilyWire::GeminiGenerateContent,
                     endpoint: Some("https://generativelanguage.googleapis.com/v1beta".into()),
@@ -1386,6 +1417,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         display_name: None,
                         context_window: Some(1_048_576),
                         max_output_tokens: Some(65_536),
+                        max_output_tokens_source: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
                         supported_speeds: Vec::new(),
@@ -1829,6 +1861,7 @@ pub fn transcript() -> Vec<WireFrame> {
                             started_at_ms: 1_753_500_040_000,
                             terminal_at_ms: None,
                             live: true,
+                            activity: None,
                             tool_attempts: 2,
                             usage: Some(AgentUsageMetrics {
                                 logical_input_tokens: 800,
@@ -1846,6 +1879,8 @@ pub fn transcript() -> Vec<WireFrame> {
                                 breakdowns: Vec::new(),
                             }),
                         }),
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 0,
                         children: Vec::new(),
                     }],
@@ -1896,6 +1931,8 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-list-workspace"),
             body: ResponseBody::SessionList {
                 sessions: vec![SessionSummary {
+                    owner_agent_id: None,
+                    launch_origin: None,
                     latest_context_footprint: None,
                     session_id: SessionId::new("session-workspace"),
                     head_seq: 17,
@@ -1975,6 +2012,8 @@ pub fn transcript() -> Vec<WireFrame> {
                         parent_agent_id: None,
                         state: FleetAgentStateWire::Done,
                         metrics: None,
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 3,
                         children: Vec::new(),
                     }],
@@ -2171,6 +2210,7 @@ pub fn transcript() -> Vec<WireFrame> {
             display_name: Some(id.clone()),
             context_window: Some(1_000_000),
             max_output_tokens: None,
+            max_output_tokens_source: None,
             supported_efforts: Vec::new(),
             default_effort: None,
             supported_speeds: Vec::new(),
@@ -2259,6 +2299,8 @@ pub fn provider_rebind_transcript() -> Vec<WireFrame> {
                 account: Some("benchmark-account".into()),
                 selected_seq: 17,
                 worker_generation: 3,
+                output_budget: None,
+                active_output_budget: None,
             },
         },
     ]
@@ -2488,6 +2530,8 @@ fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: Sessi
         },
         WireFrame::SessionRosterDelta {
             summaries: vec![SessionSummary {
+                owner_agent_id: None,
+                launch_origin: None,
                 latest_context_footprint: None,
                 session_id: child_session_id,
                 head_seq: 58,
@@ -2562,6 +2606,8 @@ fn append_fleet_identity_contract_tail(frames: &mut Vec<WireFrame>) {
                         parent_agent_id: None,
                         state: FleetAgentStateWire::Live,
                         metrics: None,
+                        activity: None,
+                        activities: Vec::new(),
                         folded_children: 0,
                         children: Vec::new(),
                     }],
@@ -2662,6 +2708,9 @@ fn append_acp_agent_family_tail(frames: &mut Vec<WireFrame>) {
         request_id: RequestId::new("request-acp-agent-provider"),
         body: ResponseBody::ProviderList {
             providers: vec![ProviderSummaryWire {
+                catalog_scope: None,
+                configured_models: Vec::new(),
+                static_models: Vec::new(),
                 provider: "google-antigravity".into(),
                 api_family: ProviderApiFamilyWire::AcpAgent,
                 endpoint: None,
@@ -2696,6 +2745,7 @@ fn append_workspace_allocation_tail(frames: &mut Vec<WireFrame>) {
             command_id: CommandId::new("command-create-dated-workspace"),
             cwd: "/tmp/Haider/1448-04-07/s-0123456789abcdef0123456789abcdef".into(),
             provider: "anthropic".into(),
+            expected_catalog_key: None,
             model: "claude-test".into(),
             max_tokens: 4096,
             permission_overrides: None,

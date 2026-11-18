@@ -25,6 +25,7 @@ fn shell(id: &str, kind: haider_rpc::ShellKindWire) -> haider_rpc::ShellWire {
         id: id.into(),
         kind,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "/workspace".into(),
         created_at_ms: 1,
@@ -147,37 +148,37 @@ fn ssh_profile_overlay_opens_add_edit_test_remove_and_shell_flows() {
     model.apply_ssh_list(vec![profile("prod")]);
     model.ssh_open = true;
 
-    model.handle_key(key(KeyCode::Char('a')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('a'))));
     let add = model.ssh_form.as_ref().expect("add form");
     assert!(add.original.is_none());
     assert_eq!(add.auth, SshFormAuthKind::KeyFile);
 
     model.ssh_form = None;
-    model.handle_key(key(KeyCode::Char('e')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('e'))));
     let edit = model.ssh_form.as_ref().expect("edit form");
     assert_eq!(edit.original.as_deref(), Some("prod"));
     assert_eq!(edit.auth, SshFormAuthKind::Keep);
 
     model.ssh_form = None;
     model.requests.clear();
-    model.handle_key(key(KeyCode::Char('t')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('t'))));
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshTest { profile }] if profile == "prod"
     ));
 
     model.requests.clear();
-    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('d'))));
     assert_eq!(model.ssh_remove_armed.as_deref(), Some("prod"));
     assert!(model.requests.is_empty());
-    model.handle_key(key(KeyCode::Char('d')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('d'))));
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshRemove { profile }] if profile == "prod"
     ));
 
     model.requests.clear();
-    model.handle_key(key(KeyCode::Enter), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Enter)));
     assert!(matches!(
         model.requests.as_slice(),
         [AppRequest::SshShellOpen { profile, .. }] if profile == "prod"
@@ -195,6 +196,7 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
     form.user = "deploy".into();
     form.auth = SshFormAuthKind::Password;
     form.focus = 6;
+    model.ssh_open = true;
     model.ssh_form = Some(form);
     model.ssh_form_paste(sentinel);
 
@@ -202,11 +204,10 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
     assert_eq!(form.credential_display(), "•".repeat(sentinel.len()));
     assert!(!format!("{form:?}").contains(sentinel));
 
-    model.handle_key(
-        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-        std::time::Instant::now(),
-        None,
-    );
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL,
+    )));
     assert!(matches!(
         model.requests.last(),
         Some(AppRequest::SshProfileSave {
@@ -221,6 +222,199 @@ fn ssh_form_masks_and_redacts_password_before_staging() {
 }
 
 #[test]
+fn ssh_form_shows_remote_paths_exactly_as_typed() {
+    let paths = [
+        ("/Users/bob/.ssh/id", "/home/bob/work", true),
+        (r"C:\Users\o'brien\keys\id", r"C:\Users\o'brien\work", true),
+        ("/Users/bob/Café/ssh key", "/home/bob/Δ backup (v2)", true),
+        (
+            "/Users/bob/a-very-long-directory-name/another-long-directory-name/keys/id_ed25519",
+            "/home/bob/a-very-long-directory-name/another-long-directory-name/project",
+            false,
+        ),
+    ];
+    for (width, height) in [(118, 36), (80, 24)] {
+        for (credential, cwd, fully_visible) in paths {
+            for focus in [0, 6, 7] {
+                for (edit, error) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let mut model = live_session();
+                    let background = ssh_overlay_rows(&model, width, height);
+                    model.ssh_open = true;
+                    let mut form = SshProfileForm::add();
+                    form.name = "prod".into();
+                    form.host = "h".into();
+                    form.user = "u".into();
+                    form.credential = credential.into();
+                    form.cwd = cwd.into();
+                    form.focus = focus;
+                    form.original = edit.then(|| "prod".into());
+                    form.error = error.then(|| "invalid port".into());
+                    assert_eq!(form.credential_display(), credential);
+                    model.ssh_form = Some(form);
+                    let rows = ssh_overlay_rows(&model, width, height);
+                    let start = rows
+                        .iter()
+                        .position(|row| {
+                            row.contains("add SSH profile") || row.contains("edit SSH profile")
+                        })
+                        .expect("form heading");
+                    let end = usize::from(model.status_rect.get().expect("status area").y);
+                    assert!(
+                        rows[start..end].iter().all(|row| !row.contains('X')),
+                        "{}",
+                        rows.join("\n")
+                    );
+                    assert!(rows[end - 1].trim().is_empty());
+                    assert_eq!(
+                        rows[..start],
+                        background[..start],
+                        "the panel must preserve the surrounding context"
+                    );
+                    for (label, value) in [
+                        ("port", "22"),
+                        ("key path / secret", credential),
+                        ("cwd", cwd),
+                    ] {
+                        let row = ssh_field_row(&rows, label);
+                        if label == "port" || fully_visible {
+                            let position = row.find(value).expect("raw field value");
+                            assert!(
+                                row[position + value.len()..].trim().is_empty(),
+                                "field acquired background text: {row}"
+                            );
+                        }
+                    }
+                    let description = ssh_field_row(&rows, "description");
+                    assert!(
+                        description
+                            .split_once("description")
+                            .expect("description row")
+                            .1
+                            .trim()
+                            .is_empty()
+                    );
+                    let form = model.ssh_form.as_ref().expect("form");
+                    assert_eq!(form.credential, credential);
+                    assert_eq!(form.cwd, cwd);
+                }
+            }
+        }
+    }
+}
+
+fn ssh_overlay_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend, text::Line, widgets::Paragraph};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let background = vec![Line::raw("X".repeat(usize::from(width))); usize::from(height)];
+            frame.render_widget(Paragraph::new(background), area);
+            crate::render::render(model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn ssh_field_row<'a>(rows: &'a [String], label: &str) -> &'a str {
+    rows.iter()
+        .find(|row| {
+            let text = row.trim_start();
+            text.strip_prefix("› ")
+                .unwrap_or(text)
+                .starts_with(&format!("{label} "))
+        })
+        .map(String::as_str)
+        .expect("field row")
+}
+
+#[test]
+fn ssh_profile_panels_cover_their_background_at_both_sizes() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        for count in [0, 1, 3, 32] {
+            for remove in [false, true] {
+                let mut model = live_session();
+                let background = ssh_overlay_rows(&model, width, height);
+                model.ssh_open = true;
+                model.ssh_profiles = (0..count)
+                    .map(|index| {
+                        let mut item = profile(&format!("prod-{index}"));
+                        item.host = "h".into();
+                        item.user = "u".into();
+                        item.description = Some(String::new());
+                        item
+                    })
+                    .collect();
+                model.ssh_remove_armed = remove.then(|| "prod-0".into());
+                let rows = ssh_overlay_rows(&model, width, height);
+                let start = rows
+                    .iter()
+                    .position(|row| row.contains("ssh profiles"))
+                    .expect("profile heading");
+                let end = usize::from(model.status_rect.get().expect("status area").y);
+                assert!(
+                    rows[start..end].iter().all(|row| !row.contains('X')),
+                    "{}",
+                    rows.join("\n")
+                );
+                if count <= 3 {
+                    assert!(rows[end - 1].trim().is_empty());
+                }
+                assert_eq!(
+                    rows[..start],
+                    background[..start],
+                    "the panel must preserve the surrounding context"
+                );
+                if count == 0 {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.contains("no SSH profiles"))
+                        .expect("empty list");
+                    assert_eq!(row.trim(), "no SSH profiles");
+                }
+                for row in rows[start..end].iter().filter(|row| row.contains("u@h:22")) {
+                    assert!(
+                        row.trim_end().ends_with("multiplexing"),
+                        "profile acquired background text: {row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shell_registry_projects_cwd_without_changing_wire_value() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut model = live_session();
+    model.shells_open = true;
+    let mut listed = shell("shell-1", haider_rpc::ShellKindWire::Local);
+    listed.cwd_or_host = "/Users/bob/work".into();
+    model.shells.push(listed);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            crate::render::render(&model, frame);
+        })
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let painted = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(painted.contains("/Users/<user>/work"));
+    assert!(!painted.contains("/Users/bob/work"));
+    assert_eq!(model.shells[0].cwd_or_host, "/Users/bob/work");
+}
+
+#[test]
 fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     let mut model = live_session();
     let mut form = SshProfileForm::add();
@@ -229,9 +423,10 @@ fn ssh_form_allows_plain_s_in_cwd_without_submitting() {
     form.user = "deploy".into();
     form.credential = "/keys/prod".into();
     form.focus = 7;
+    model.ssh_open = true;
     model.ssh_form = Some(form);
 
-    model.handle_key(key(KeyCode::Char('s')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('s'))));
 
     assert_eq!(model.ssh_form.as_ref().expect("cwd form").cwd, "s");
     assert!(model.requests.is_empty());
@@ -259,7 +454,7 @@ fn ssh_terminal_input_is_redacted_and_ctrl_d_is_typed_eof() {
     terminal.shell_id = Some("shell-pty".into());
     model.ssh_terminal = Some(terminal);
 
-    model.handle_key(key(KeyCode::Char('x')), std::time::Instant::now(), None);
+    model.handle(AppEvent::Key(key(KeyCode::Char('x'))));
     assert!(matches!(
         model.requests.last(),
         Some(AppRequest::SshShellInput { id, input })
@@ -267,11 +462,10 @@ fn ssh_terminal_input_is_redacted_and_ctrl_d_is_typed_eof() {
     ));
     assert!(!format!("{:?}", model.requests.last()).contains('x'));
 
-    model.handle_key(
-        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        std::time::Instant::now(),
-        None,
-    );
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+    )));
     assert!(matches!(
         model.requests.last(),
         Some(AppRequest::SshShellEof { id }) if id == "shell-pty"
@@ -291,6 +485,92 @@ fn opening_ssh_terminal_swallows_paste_until_the_channel_id_arrives() {
 
     assert_eq!(model.composer.text(), draft_before);
     assert!(model.requests.is_empty());
+}
+
+#[test]
+fn ctrl_bracket_closes_a_connecting_terminal_and_retires_its_late_shell() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('5'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_none());
+    model.apply_ssh_shell_opened(
+        0,
+        shell(
+            "late-shell",
+            haider_rpc::ShellKindWire::Ssh {
+                profile: "prod".into(),
+            },
+        ),
+    );
+    assert!(
+        matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "late-shell")
+    );
+}
+
+#[test]
+fn pane_cancel_chords_share_cli_encodings_but_connected_ctrl_c_is_remote_input() {
+    for c in [']', '5', '\u{1d}', 'c', 'C'] {
+        for has_id in [false, true] {
+            let mut model = live_session();
+            let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+            if has_id {
+                pane.shell_id = Some("owned-shell".into());
+            }
+            model.ssh_terminal = Some(pane);
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(model.ssh_terminal.is_none(), "{c:?} has_id={has_id}");
+            assert_eq!(model.requests.len(), usize::from(has_id));
+            if has_id {
+                assert!(
+                    matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "owned-shell")
+                );
+            }
+        }
+    }
+    for c in ['c', 'C'] {
+        let mut model = live_session();
+        let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+        pane.shell_id = Some("owned-shell".into());
+        pane.connecting = false;
+        model.ssh_terminal = Some(pane);
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(model.ssh_terminal.is_some());
+        assert!(
+            matches!(model.requests.as_slice(), [AppRequest::SshShellInput { id, input }] if id == "owned-shell" && input.as_slice() == [3])
+        );
+    }
+}
+
+#[test]
+fn owned_output_recovers_pane_connection_state_after_event_loss() {
+    let mut model = live_session();
+    let mut pane = SshTerminalPane::opening("prod".into(), model.ssh_terminal_size);
+    pane.shell_id = Some("owned-shell".into());
+    model.ssh_terminal = Some(pane);
+    model.apply_ssh_shell_output("other-shell", b"unrelated");
+    assert!(model.ssh_terminal.as_ref().expect("pane").connecting);
+    model.apply_ssh_shell_output("owned-shell", b"ready");
+    assert!(!model.ssh_terminal.as_ref().expect("pane").connecting);
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_some());
+    assert!(
+        matches!(model.requests.as_slice(), [AppRequest::SshShellInput { id, input }] if id == "owned-shell" && input.as_slice() == [3])
+    );
 }
 
 #[test]
@@ -335,4 +615,132 @@ fn ssh_test_host_key_mismatch_keeps_its_typed_code() {
         [crate::live::LiveReply::SshTestFailed { code, .. }]
             if code == "ssh_host_key_changed"
     ));
+}
+
+#[test]
+fn pending_shell_reply_can_be_cancelled_before_connecting_and_running_is_separate() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    let mut pending = shell(
+        "pending-shell",
+        haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+    );
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(0, pending.clone());
+    assert!(
+        model
+            .ssh_terminal
+            .as_ref()
+            .expect("pending pane")
+            .connecting
+    );
+    assert_eq!(
+        model
+            .ssh_terminal
+            .as_ref()
+            .expect("pending pane")
+            .shell_id
+            .as_deref(),
+        Some("pending-shell")
+    );
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('5'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(model.ssh_terminal.is_none());
+    assert!(
+        matches!(model.requests.last(), Some(AppRequest::ShellClose { id }) if id == "pending-shell")
+    );
+    // A subsequent state event cannot resurrect a cancelled pane.
+    pending.status = haider_rpc::ShellStatusWire::Running;
+    model.apply_shell_event(pending.clone());
+    assert!(model.ssh_terminal.is_none());
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    pending.id = "deliberate-new-shell".into();
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(0, pending.clone());
+    pending.status = haider_rpc::ShellStatusWire::Running;
+    model.apply_shell_event(pending);
+    assert!(
+        !model
+            .ssh_terminal
+            .as_ref()
+            .expect("connected pane")
+            .connecting
+    );
+}
+
+#[test]
+fn failed_pending_setup_keeps_the_owned_error_visible() {
+    let mut model = live_session();
+    model.ssh_terminal = Some(SshTerminalPane::opening(
+        "prod".into(),
+        model.ssh_terminal_size,
+    ));
+    let mut pending = shell(
+        "failed-pending",
+        haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+    );
+    pending.status = haider_rpc::ShellStatusWire::Starting;
+    model.apply_ssh_shell_opened(0, pending.clone());
+    model.apply_ssh_shell_output(&pending.id, b"SSH fixture setup failed\r\n");
+    pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
+    model.apply_shell_event(pending);
+    assert!(model.ssh_terminal.is_none());
+    assert_eq!(
+        model.flash.as_deref(),
+        Some("· remote terminal failed: SSH fixture setup failed")
+    );
+}
+
+#[test]
+fn typed_setup_failure_is_visible_only_on_its_owned_terminal() {
+    for code in [
+        "ssh_connection_failed",
+        "ssh_authentication_failed",
+        "ssh_host_key_changed",
+    ] {
+        let mut model = live_session();
+        model.ssh_terminal = Some(SshTerminalPane::opening(
+            "prod".into(),
+            model.ssh_terminal_size,
+        ));
+        let mut pending = shell(
+            "owned-pending",
+            haider_rpc::ShellKindWire::Ssh {
+                profile: "prod".into(),
+            },
+        );
+        pending.status = haider_rpc::ShellStatusWire::Starting;
+        model.apply_ssh_shell_opened(0, pending.clone());
+        pending.status = haider_rpc::ShellStatusWire::Exited { code: None };
+        pending.setup_error = Some(haider_rpc::ShellSetupErrorWire {
+            code: code.into(),
+            message: "synthetic refusal\r\n".into(),
+            retryable: false,
+        });
+        let mut other = pending.clone();
+        other.id = "other-pending".into();
+        model.apply_shell_event(other);
+        assert!(model.ssh_terminal.is_some());
+        assert_eq!(model.flash.as_deref(), Some("· opening remote terminal…"));
+        model.apply_shell_event(pending);
+        assert!(model.ssh_terminal.is_none());
+        assert_eq!(
+            model.flash,
+            Some(format!(
+                "· remote terminal failed: {code}: synthetic refusal"
+            ))
+        );
+    }
 }

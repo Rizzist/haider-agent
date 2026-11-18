@@ -33,8 +33,8 @@ mod output_budget;
 pub use idle::{ProviderIdleDeadline, ProviderIdleTimeout};
 pub use model_limits::{StaticModelLimits, UNKNOWN_OUTPUT_LIMIT, static_model_limits};
 pub use output_budget::{
-    DEFAULT_OUTPUT_LIMIT, MAX_OUTPUT_LIMIT, explicit_output_ceiling, model_output_limit,
-    provider_stated_output_limit,
+    DEFAULT_OUTPUT_LIMIT, MAX_OUTPUT_LIMIT, OutputLimitProvenance, explicit_output_ceiling,
+    model_output_limit, output_limit_provenance, provider_stated_output_limit,
 };
 #[cfg(test)]
 mod gemini_tests;
@@ -76,7 +76,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -698,9 +698,10 @@ pub use cachemaxxing::{
     plan_inline_breakpoints, validate_provider_view_prefix,
 };
 pub use oauth_identity::{
-    AnthropicOAuthIdentitySource, GrokOAuthIdentitySource, IdentityEndpoint, IdentityError,
-    KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens, OpenAiOAuthIdentitySource,
-    oauth_identity_source,
+    ANTHROPIC_OAUTH_PROFILE_URL, AnthropicOAuthIdentitySource, GrokOAuthIdentitySource,
+    IdentityEndpoint, IdentityError, KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens,
+    OpenAiOAuthIdentitySource, oauth_identity_source, openai_user_account_coordinate,
+    openai_workspace_from_account_coordinate,
 };
 
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
@@ -1239,10 +1240,10 @@ pub use cache::{
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
-    PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition, catalog_request_url,
-    compatible_model_id_is_display_safe, discover_models, discover_models_with_resolver,
-    model_list_forbidden, model_servable_by_endpoint, openai_compatible_catalog_endpoint,
-    parse_catalog, pickable, provider_catalog_definition,
+    MODEL_LIST_REFUSED_FOR_CREDENTIAL, PUBLIC_CATALOG_PROVIDERS, ProviderCatalogDefinition,
+    catalog_request_url, compatible_model_id_is_display_safe, discover_models,
+    discover_models_with_resolver, model_list_forbidden, model_servable_by_endpoint,
+    openai_compatible_catalog_endpoint, parse_catalog, pickable, provider_catalog_definition,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -4091,6 +4092,8 @@ pub enum FakeStep {
         call_id: String,
         name: String,
         args: serde_json::Value,
+        #[serde(default)]
+        activity: Option<haider_protocol::activity::ActivityKind>,
     },
     /// Emits the display outcome of one provider-executed tool call.
     EmitServerToolResult {
@@ -4209,6 +4212,32 @@ pub struct FakeProvider {
     vision: FeatureResolve,
     pdf_documents: FeatureResolve,
     route_status: Option<Arc<Mutex<haider_platform::RouteStatus>>>,
+    request_count: Arc<AtomicUsize>,
+    request_started: Arc<tokio::sync::Notify>,
+    stream_barrier: Option<(usize, usize, FakeStreamBarrier)>,
+}
+
+/// An event-driven fixture pause before one stream step. Unlike a sleep, the
+/// stream cannot pass this point until the test has performed its action.
+#[derive(Debug, Clone)]
+pub struct FakeStreamBarrier {
+    entered: tokio::sync::watch::Sender<bool>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl FakeStreamBarrier {
+    pub async fn wait_until_entered(&self) {
+        let mut entered = self.entered.subscribe();
+        while !*entered.borrow_and_update() {
+            if entered.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 impl FakeProvider {
@@ -4221,6 +4250,9 @@ impl FakeProvider {
             vision: FeatureResolve::Unsupported,
             pdf_documents: FeatureResolve::ExplicitlyEmulated,
             route_status: None,
+            request_count: Arc::new(AtomicUsize::new(0)),
+            request_started: Arc::new(tokio::sync::Notify::new()),
+            stream_barrier: None,
         }
     }
 
@@ -4271,6 +4303,33 @@ impl FakeProvider {
         }
     }
 
+    /// Waits for admission of a request without polling/cloning its ledger.
+    pub async fn wait_for_requests(&self, count: usize) {
+        loop {
+            let changed = self.request_started.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.request_count.load(Ordering::Acquire) >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Request numbers are one-based; stream step indices are zero-based.
+    pub fn with_stream_barrier(
+        mut self,
+        request: usize,
+        before_step: usize,
+    ) -> (Self, FakeStreamBarrier) {
+        let barrier = FakeStreamBarrier {
+            entered: tokio::sync::watch::channel(false).0,
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        self.stream_barrier = Some((request, before_step, barrier.clone()));
+        (self, barrier)
+    }
+
     fn record_request(&self, request: &TurnRequest) {
         if !self.record_requests {
             return;
@@ -4308,6 +4367,8 @@ impl Provider for FakeProvider {
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.record_request(&request);
+        let ordinal = self.request_count.fetch_add(1, Ordering::AcqRel) + 1;
+        self.request_started.notify_waiters();
         let segment = self.next_segment();
         for step in segment.iter() {
             if let FakeStep::ExpectToolResult { call_id } = step
@@ -4323,7 +4384,12 @@ impl Provider for FakeProvider {
             }
         }
         let (sender, receiver) = mpsc::channel(32);
-        let producer = tokio::spawn(play_script(segment, sender));
+        let barrier = self
+            .stream_barrier
+            .as_ref()
+            .filter(|(request, _, _)| *request == ordinal)
+            .map(|(_, step, barrier)| (*step, barrier.clone()));
+        let producer = tokio::spawn(play_script(segment, sender, barrier));
         Ok(ProviderStream::owned(receiver, producer))
     }
 }
@@ -4361,9 +4427,21 @@ impl FakeProvider {
 /// Plays one fixture script into `sender`. Stops early once the consumer
 /// drops the stream; otherwise ends with `Finish`, a typed error, or (for a
 /// script that ends mid-scalar) a trailing invalid-UTF-8 error.
-async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderStreamItem>) {
+async fn play_script(
+    script: Arc<Vec<FakeStep>>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    barrier: Option<(usize, FakeStreamBarrier)>,
+) {
     let mut utf8 = Utf8Assembler::default();
-    for step in script.iter().cloned() {
+    for (index, step) in script.iter().cloned().enumerate() {
+        if let Some((before_step, barrier)) = &barrier
+            && index == *before_step
+        {
+            barrier.entered.send_replace(true);
+            if let Ok(permit) = barrier.release.acquire().await {
+                permit.forget();
+            }
+        }
         match step {
             FakeStep::ExpectToolResult { .. } => {}
             FakeStep::EmitNetworkUnavailable => {
@@ -4408,6 +4486,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 call_id,
                 name,
                 args,
+                activity,
             } => {
                 if !send_event(
                     &sender,
@@ -4415,6 +4494,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                         call_id,
                         name,
                         args,
+                        activity,
                     },
                 )
                 .await

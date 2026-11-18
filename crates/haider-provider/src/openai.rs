@@ -3331,6 +3331,7 @@ fn hosted_web_search_call_events(
             call_id: call_id.clone(),
             name: "web_search".into(),
             args: action,
+            activity: Some(haider_protocol::activity::ActivityKind::Web),
         },
         StreamEvent::ServerToolResult {
             call_id,
@@ -3378,8 +3379,9 @@ fn url_citation_sources(item: &serde_json::Map<String, serde_json::Value>) -> Ve
 }
 
 /// The alpha/search endpoint for one subscription origin. The credential's
-/// own `base_url` wins when it carries one (an imported codex credential may
-/// point at a proxy); otherwise the sanctioned subscription base. Always
+/// own `base_url` wins when it carries one; credential-bearing callers must
+/// validate that destination before invoking this string join. Otherwise
+/// use the sanctioned subscription base. Always
 /// `{base}/alpha/search` — the same `{provider_base}` join codex performs.
 #[must_use]
 pub fn codex_alpha_search_url(base_url: Option<&str>) -> String {

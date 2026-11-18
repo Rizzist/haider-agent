@@ -219,9 +219,9 @@ fn subscriber_start_observation_timeout(
         + HOOK_OBSERVATION_POLL_INTERVAL
 }
 
-// Snapshot-only waits do not spawn a process: one second is the product idle
-// delay and two seconds cover the test observer's SQLite/runtime scheduling.
-const SNAPSHOT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(3);
+// Snapshot-only readiness follows the observed journal state. Use the shared
+// watchdog for SQLite/runtime scheduling; the product idle timer is unchanged.
+const SNAPSHOT_OBSERVATION_TIMEOUT: Duration = haider_platform::TEST_WAIT_TIMEOUT;
 
 #[cfg(unix)]
 fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
@@ -951,12 +951,14 @@ impl EngineFixture {
         let session_id = SessionId::new("hooks-test-session");
         let run_id = RunId::new("hooks-test-run");
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-hooks-test".into(),
             request_digest: "create-hooks-test-digest".into(),
             request_json: r#"{"session":"hooks-test"}"#.into(),
             session_id: session_id.clone(),
             cwd: workspace.to_str().expect("UTF-8 workspace").to_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -2328,12 +2330,14 @@ async fn durable_ask_bytes_without_hooks(workspace: &Path, menu: Menu) -> Vec<u8
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let session_id = SessionId::new("hooks-test-session");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-test".into(),
         request_digest: "create-hooks-test-digest".into(),
         request_json: r#"{"session":"hooks-test"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_str().expect("UTF-8").to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -2608,6 +2612,9 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
         created_at_ms: None,
     };
     let provider = ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: "fake".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9/v1".to_owned()),
@@ -2769,12 +2776,14 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         .expect("engine");
     hub.install_hooks(service.clone()).expect("install");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-recovery".into(),
         request_digest: "create-hooks-recovery-digest".into(),
         request_json: r#"{"session":"hooks-recovery"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_str().expect("UTF-8").to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -2959,12 +2968,14 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
         .expect("engine");
     hub.install_hooks(service.clone()).expect("install");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-exact-replay".into(),
         request_digest: "create-hooks-exact-replay-digest".into(),
         request_json: r#"{"session":"hooks-exact-replay"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_str().expect("UTF-8").to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -3101,12 +3112,14 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
     let store = SqliteStoreHandle::open(&profile).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     hub.create_internal_session(SessionCreateCommand {
+        resolved_model: None,
         command_id: "create-hooks-run-trust".into(),
         request_digest: "create-hooks-run-trust-digest".into(),
         request_json: r#"{"session":"hooks-run-trust"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_str().expect("UTF-8").to_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,

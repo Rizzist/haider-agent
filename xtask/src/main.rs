@@ -28,12 +28,14 @@ fn main() -> ExitCode {
         Some("platform-goldens") => platform_goldens::check(&workspace_root()),
         Some("race-catalog") => race_catalog::check(&workspace_root()),
         Some("android-standalone-check") => android_standalone_check(),
+        Some("credential-http-clients") => credential_http_clients(),
         Some("check") => {
             let a = loc_lint();
             let b = test_count(false);
             let c = platform_goldens::check(&workspace_root());
             let d = race_catalog::check(&workspace_root());
-            if [a, b, c, d]
+            let e = credential_http_clients();
+            if [a, b, c, d, e]
                 .into_iter()
                 .all(|status| status == ExitCode::SUCCESS)
             {
@@ -44,7 +46,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xtask <loc-lint|test-count [--update]|platform-goldens|race-catalog|android-standalone-check|check>"
+                "usage: xtask <loc-lint|test-count [--update]|platform-goldens|race-catalog|credential-http-clients|android-standalone-check|check>"
             );
             ExitCode::from(2)
         }
@@ -122,6 +124,76 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
+    }
+}
+
+/// Credential-bearing crates must use the platform builder so desktop
+/// environment/system proxies cannot redirect a bearer to another host.
+/// The only exclusion is provider/lib.rs's inline test module. Test files
+/// are fixtures; the production scan includes every other Rust source file.
+fn credential_http_clients() -> ExitCode {
+    let root = workspace_root();
+    let mut violations = Vec::new();
+    for name in [
+        "haider-daemon",
+        "haider-accounts",
+        "haider-provider",
+        "haider-daemond",
+        "haider-cli",
+    ] {
+        let mut files = Vec::new();
+        rust_files(&root.join("crates").join(name).join("src"), &mut files);
+        for file in files {
+            let filename = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if filename.ends_with("_tests.rs") || filename.ends_with("_test.rs") {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(&file) else {
+                violations.push(format!("{}: cannot read", file.display()));
+                continue;
+            };
+            let production = if name == "haider-provider" && filename == "lib.rs" {
+                // Explicit allowlist: these two bare clients exercise only
+                // fixture HTTP in the inline #[cfg(test)] module.
+                match source.split_once("#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod e2_contract_tests {") {
+                    Some((before, _)) => before,
+                    None => {
+                        violations.push("haider-provider/src/lib.rs: inline test allowlist marker missing".to_owned());
+                        source.as_str()
+                    }
+                }
+            } else {
+                source.as_str()
+            };
+            for (line, text) in production.lines().enumerate() {
+                if [
+                    "reqwest::Client::builder()",
+                    "reqwest::Client::new()",
+                    "ClientBuilder::new()",
+                ]
+                .iter()
+                .any(|pattern| text.contains(pattern))
+                {
+                    violations.push(format!(
+                        "{}:{}: bare HTTP client builder",
+                        file.display(),
+                        line + 1
+                    ));
+                }
+            }
+        }
+    }
+    if violations.is_empty() {
+        println!("credential-http-clients: PASS");
+        ExitCode::SUCCESS
+    } else {
+        for violation in violations {
+            eprintln!("credential-http-clients: {violation}");
+        }
+        ExitCode::FAILURE
     }
 }
 

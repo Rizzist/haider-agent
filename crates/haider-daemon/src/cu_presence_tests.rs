@@ -44,14 +44,22 @@ fn presence_with_capturable(
     acks: bool,
     capturable: bool,
 ) -> (Arc<CuPresence>, Arc<Recorded>) {
-    // Conceal tests intentionally wait through the 600 ms ack bound. Keep
-    // their fixture's idle timer out of that interleaving; the dedicated
-    // idle-expiry test below uses the shorter non-capturable fixture.
-    let idle_timeout = if capturable {
-        Duration::from_secs(5)
-    } else {
-        Duration::from_millis(200)
-    };
+    presence_with_idle_timeout(
+        surface,
+        acks,
+        capturable,
+        haider_platform::TEST_WAIT_TIMEOUT,
+    )
+}
+
+fn presence_with_idle_timeout(
+    surface: PresenceSurface,
+    acks: bool,
+    capturable: bool,
+    idle_timeout: Duration,
+) -> (Arc<CuPresence>, Arc<Recorded>) {
+    // Only the idle-expiry probe uses a short real idle timer. Other fixtures
+    // keep scheduler delay independent of the presence behavior they exercise.
     let presence = CuPresence::new(idle_timeout, Duration::from_millis(20));
     let recorded = Arc::new(Recorded::default());
     let factory_record = Arc::clone(&recorded);
@@ -183,9 +191,15 @@ async fn overlay_stop_cancels_the_in_flight_action_the_run_and_refuses_later_act
     assert_eq!(recorded.spawned.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
-    let (presence, recorded) = presence_with(PresenceSurface::Screen, false);
+    let (presence, recorded) = presence_with_idle_timeout(
+        PresenceSurface::Screen,
+        false,
+        false,
+        Duration::from_millis(200),
+    );
+    presence.set_idle_clock_for_test();
     let (stop, _) = counting_hook();
     let lease = PresenceLease::new(Arc::clone(&presence), "s/idle".into(), stop);
     let cancel = haider_tools::ComputerCancelToken::new();
@@ -195,14 +209,13 @@ async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
             .await
             .expect("begin"),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while presence.is_shown(PresenceSurface::Screen) {
-        assert!(
-            Instant::now() < deadline,
-            "idle ticker never retired presence"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
+        while presence.is_shown(PresenceSurface::Screen) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("idle ticker retires presence on the virtual clock");
     assert!(
         recorded
             .commands
@@ -223,14 +236,14 @@ async fn idle_expiry_hides_the_overlay_and_the_next_action_reshows_it() {
     assert_eq!(recorded.spawned.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn pointer_input_waits_for_the_overlay_ack_but_never_longer_than_the_bound() {
     let (presence, recorded) = presence_with(PresenceSurface::Screen, true);
     let (stop, _) = counting_hook();
     let lease = PresenceLease::new(Arc::clone(&presence), "s/ack".into(), stop);
     let cancel = haider_tools::ComputerCancelToken::new();
     // Nobody acknowledges: the bounded wait elapses and control proceeds.
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     drop(
         lease
             .begin_computer(&click(), None, &cancel)
@@ -238,7 +251,11 @@ async fn pointer_input_waits_for_the_overlay_ack_but_never_longer_than_the_bound
             .expect("begin"),
     );
     let waited = started.elapsed();
-    assert!(waited >= POINTER_ACK_TIMEOUT && waited < POINTER_ACK_TIMEOUT * 4);
+    assert_eq!(
+        waited,
+        Duration::from_millis(250),
+        "the production pointer policy is unchanged"
+    );
     // A prompt ack releases the action immediately.
     let sink = recorded.sink.lock().unwrap().clone().expect("sink");
     let acker = tokio::spawn({
@@ -260,7 +277,7 @@ async fn pointer_input_waits_for_the_overlay_ack_but_never_longer_than_the_bound
             }
         }
     });
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     drop(
         lease
             .begin_computer(
@@ -277,7 +294,7 @@ async fn pointer_input_waits_for_the_overlay_ack_but_never_longer_than_the_bound
     acker.await.expect("acker");
     assert!(started.elapsed() < POINTER_ACK_TIMEOUT);
     // Typing never waits (no pointer input is posted).
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     drop(
         lease
             .begin_computer(&ComputerAction::Type { text: "x".into() }, None, &cancel)
@@ -285,6 +302,28 @@ async fn pointer_input_waits_for_the_overlay_ack_but_never_longer_than_the_bound
             .expect("begin"),
     );
     assert!(started.elapsed() < POINTER_ACK_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parked_pointer_fixture_waits_for_stop_even_after_the_policy_ack_window() {
+    let (presence, recorded) = presence_with(PresenceSurface::Screen, true);
+    presence.set_pointer_ack_timeout_for_test(haider_platform::TEST_WAIT_TIMEOUT);
+    let (stop, stops) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/late-stop".into(), stop);
+    let token = haider_tools::ComputerCancelToken::new();
+    let action = click();
+    let begin = lease.begin_computer(&action, None, &token);
+    tokio::pin!(begin);
+    assert!(poll_once(begin.as_mut()));
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert!(
+        poll_once(begin.as_mut()),
+        "the fixture owns its parked-ack window"
+    );
+    recorded.sink.lock().unwrap().clone().expect("sink")(PresenceEvent::Stop);
+    assert_eq!(begin.await.err(), Some(PresenceRefusal::Stopped));
+    assert!(token.is_cancelled());
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -378,7 +417,7 @@ async fn dropping_a_lease_without_close_still_retires_presence() {
 /// MUTATION CHECK: flip the token after `dispatch` and drop the post-wait
 /// `is_stopped` re-check. Expected runtime failure: the waiting `begin`
 /// returns Ok (the click would execute) or its token is not yet cancelled.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stop_during_the_pointer_ack_wait_refuses_the_click_and_cancels_its_token() {
     for _ in 0..50 {
         let (presence, recorded) = presence_with(PresenceSurface::Screen, true);
@@ -585,6 +624,68 @@ async fn first_capture_is_concealed_before_the_helper_reports_ready() {
     lease.end(false);
 }
 
+#[tokio::test]
+async fn a_subagent_lease_names_itself_on_the_overlay_badge() {
+    // 973-activity-icons, dry-run backend: the recording renderer stands in
+    // for the real overlay, so no real screen is driven.
+    let (presence, recorded) = presence_with(PresenceSurface::Screen, false);
+    let (stop, _stops) = counting_hook();
+    let lease = PresenceLease::new(Arc::clone(&presence), "s/sub".into(), stop)
+        .with_actor(Some("Ammar".into()));
+    let cancel = haider_tools::ComputerCancelToken::new();
+    {
+        let _guard = lease
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    lease.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    let expected_label = if !crate::cu_presence::overlay_emoji(
+        std::env::var("HAIDER_ACTIVITY_ICONS").ok().as_deref(),
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+    ) {
+        "Ammar is using your screen".to_owned()
+    } else {
+        "\u{1F5A5}\u{FE0F} Ammar is using your screen".to_owned()
+    };
+    assert!(
+        matches!(commands.first(), Some(PresenceCommand::Show { label, .. }) if *label == expected_label),
+        "{commands:?}"
+    );
+    // An empty name keeps the generic badge.
+    let (stop, _stops) = counting_hook();
+    let generic = PresenceLease::new(Arc::clone(&presence), "s/main".into(), stop)
+        .with_actor(Some("  ".into()));
+    {
+        let _guard = generic
+            .begin_computer(&ComputerAction::Screenshot, None, &cancel)
+            .await
+            .expect("begin");
+    }
+    generic.end(false);
+    let commands = recorded.commands.lock().unwrap().clone();
+    assert!(commands.iter().any(|command| matches!(command,
+        PresenceCommand::Show { label, .. } if label == "Haider is controlling this screen")));
+}
+
+#[test]
+fn overlay_emoji_rule_follows_override_then_no_color() {
+    use crate::cu_presence::overlay_emoji;
+    assert!(overlay_emoji(None, false));
+    assert!(
+        !overlay_emoji(None, true),
+        "NO_COLOR selects the plain badge"
+    );
+    assert!(overlay_emoji(Some("emoji"), true), "explicit override wins");
+    assert!(!overlay_emoji(Some("text"), false));
+    assert!(!overlay_emoji(Some("off"), false));
+    assert!(
+        overlay_emoji(Some("sparkles"), false),
+        "unparseable override ignored"
+    );
+}
+
 /// Polls a future once without a runtime wake-up; true while it is pending.
 fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -699,12 +800,11 @@ async fn overlapping_captures_reveal_only_when_the_last_one_retires() {
     let guard_a = capture_a.await;
     // B's capture overlaps: the surface is already concealed and acked, so
     // B neither re-conceals nor waits.
-    let started = Instant::now();
-    let guard_b = lease_b.conceal_for_capture().await;
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "no second ack wait"
-    );
+    use futures_util::FutureExt as _;
+    let guard_b = lease_b
+        .conceal_for_capture()
+        .now_or_never()
+        .expect("verified overlap needs no second ack wait");
     assert_eq!(
         conceal_log(&recorded),
         vec!["conceal"],
@@ -729,7 +829,7 @@ async fn overlapping_captures_reveal_only_when_the_last_one_retires() {
 /// release a newer Conceal's wait (the helper handles Conceal(1), Reveal,
 /// Conceal(2) in order, so ack(1) arriving after Conceal(2) was sent says
 /// nothing about Conceal(2)). Expected on a correct implementation: PASS.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn regression_stale_conceal_ack_does_not_release_a_newer_conceal() {
     let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
     let (stop, _) = counting_hook();
@@ -862,12 +962,11 @@ async fn regression_hide_while_awaiting_ack_releases_wait_no_leak() {
     tokio::pin!(capture);
     assert!(poll_once(capture.as_mut()));
     lease.end(true);
-    let started = Instant::now();
-    let guard = capture.await;
-    assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "released by the Hide"
-    );
+    use futures_util::FutureExt as _;
+    let guard = capture
+        .as_mut()
+        .now_or_never()
+        .expect("Hide releases the ack wait synchronously");
     assert!(guard.is_err(), "renderer retirement refuses capture");
     drop(guard);
     assert_eq!(presence.capture_holders(PresenceSurface::Screen), 0);
@@ -910,7 +1009,7 @@ async fn regression_panic_while_holding_releases_the_hold() {
     lease.end(false);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn conceal_ack_accepts_only_the_current_sequence_once() {
     let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
     let (stop, _) = counting_hook();
@@ -940,7 +1039,7 @@ async fn conceal_ack_accepts_only_the_current_sequence_once() {
         );
     }
     sink(PresenceEvent::Ack { seq });
-    let guard = tokio::time::timeout(Duration::from_millis(100), capture.as_mut())
+    let guard = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, capture.as_mut())
         .await
         .expect("matching ack must release promptly");
     sink(PresenceEvent::Ack { seq }); // Duplicate cannot release a later hold.
@@ -961,7 +1060,7 @@ async fn conceal_ack_accepts_only_the_current_sequence_once() {
     lease.end(false);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn overlapping_holders_wait_for_the_same_outstanding_conceal() {
     let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
     let (stop_a, _) = counting_hook();
@@ -990,10 +1089,10 @@ async fn overlapping_holders_wait_for_the_same_outstanding_conceal() {
     sink(PresenceEvent::Ack {
         seq: conceal_seq(&recorded),
     });
-    let first_guard = tokio::time::timeout(Duration::from_millis(100), first.as_mut())
+    let first_guard = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, first.as_mut())
         .await
         .expect("first");
-    let second_guard = tokio::time::timeout(Duration::from_millis(100), second.as_mut())
+    let second_guard = tokio::time::timeout(haider_platform::TEST_WAIT_TIMEOUT, second.as_mut())
         .await
         .expect("second");
     drop(first_guard);
@@ -1004,7 +1103,7 @@ async fn overlapping_holders_wait_for_the_same_outstanding_conceal() {
     b.end(false);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retired_renderer_ack_cannot_release_recreated_renderer_conceal() {
     let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
     let (stop_a, _) = counting_hook();
@@ -1161,7 +1260,7 @@ async fn failed_first_conceal_retires_the_renderer_before_capture() {
     lease.end(false);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_the_latest_conceal_ack_is_retained_across_timeouts() {
     let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
     let (stop, _) = counting_hook();
@@ -1186,6 +1285,53 @@ async fn only_the_latest_conceal_ack_is_retained_across_timeouts() {
         assert_eq!(state.conceal_acks.get(&seq), Some(&PresenceSurface::Screen));
     }
     lease.end(false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn conceal_fixture_accepts_a_late_ack_while_the_policy_still_times_out() {
+    for fixture_bound in [false, true] {
+        let (presence, recorded) = presence_with_capturable(PresenceSurface::Screen, false, true);
+        if fixture_bound {
+            presence.set_conceal_ack_timeout_for_test(haider_platform::TEST_WAIT_TIMEOUT);
+        }
+        let (stop, _) = counting_hook();
+        let lease = PresenceLease::new(Arc::clone(&presence), "s/late-conceal".into(), stop);
+        drop(
+            lease
+                .begin_computer(
+                    &ComputerAction::Screenshot,
+                    None,
+                    &haider_tools::ComputerCancelToken::new(),
+                )
+                .await
+                .expect("begin"),
+        );
+        if !fixture_bound {
+            let started = tokio::time::Instant::now();
+            assert!(lease.conceal_for_capture().await.is_err());
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_millis(600),
+                "the production conceal refusal policy is unchanged"
+            );
+            assert_eq!(presence.capture_holders(PresenceSurface::Screen), 0);
+            continue;
+        }
+        let capture = lease.conceal_for_capture();
+        tokio::pin!(capture);
+        assert!(poll_once(capture.as_mut()));
+        tokio::time::advance(Duration::from_millis(1_200)).await;
+        assert!(
+            poll_once(capture.as_mut()),
+            "the fixture owns its ack window"
+        );
+        let sink = recorded.sink.lock().unwrap().clone().expect("sink");
+        sink(PresenceEvent::Ack {
+            seq: conceal_seq(&recorded),
+        });
+        drop(capture.await.expect("late fixture ack verifies conceal"));
+        assert_eq!(presence.capture_holders(PresenceSurface::Screen), 0);
+    }
 }
 
 #[tokio::test]

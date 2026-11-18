@@ -106,3 +106,40 @@ pub fn run_slash(model: &mut AppModel, line: &str) {
     model.handle(key(KeyCode::Esc));
     model.handle(key(KeyCode::Enter));
 }
+
+/// Deliver the owned Running reply before exercising connected shell controls.
+pub fn mark_ssh_terminal_running(model: &mut AppModel, id: &str) {
+    let terminal = model.ssh_terminal.as_ref().expect("opening terminal");
+    assert_eq!(terminal.shell_id.as_deref(), Some(id));
+    let profile = terminal.profile.clone();
+    let commands = haider_tui::live::LiveDriver::new("connected-control-fixture").apply(
+        model,
+        haider_tui::live::LiveReply::ShellChanged {
+            shell: haider_rpc::ShellWire {
+                id: id.into(),
+                kind: haider_rpc::ShellKindWire::Ssh { profile },
+                status: haider_rpc::ShellStatusWire::Running,
+                setup_error: None,
+                title: "synthetic connected terminal".into(),
+                cwd_or_host: "127.0.0.1".into(),
+                created_at_ms: 0,
+                last_activity_ms: 0,
+                bytes_out: 0,
+            },
+        },
+    );
+    assert!(commands.is_empty());
+    assert!(
+        !model
+            .ssh_terminal
+            .as_ref()
+            .expect("running terminal")
+            .connecting
+    );
+    assert!(
+        model
+            .shells
+            .iter()
+            .any(|shell| shell.id == id && shell.status == haider_rpc::ShellStatusWire::Running)
+    );
+}

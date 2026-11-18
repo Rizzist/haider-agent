@@ -4,15 +4,13 @@
 //! It exposes typed spawn/collect operations, never a raw store or child
 //! session address.
 //!
-//! # Sequential spawn contract
+//! # Spawn contract
 //!
 //! The codex responses-lite history contract admits one tool call per provider
 //! round and requires that call's result to remain paired with the call in the
-//! next request. A spawn round therefore parks in `Waiting(LocalChild)` until
-//! the coordinator has the child's report; only then does core journal the
-//! tool result and acknowledge collection. Do not "parallelize" this by
-//! acknowledging spawn before the report: that would advance provider history
-//! without the result paired to the call that created the child.
+//! next request. Blocking spawn parks in `Waiting(LocalChild)` until the child
+//! report is collected. Background spawn returns a durable handle immediately;
+//! either result is journalled before the next provider round.
 
 use crate::session_hub::SessionHub;
 use crate::usage_report::SessionFolder;
@@ -33,7 +31,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
     ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphGateKind, GraphPhase,
@@ -49,8 +47,10 @@ use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuScope};
 use haider_protocol::reply::ReplyText;
 use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::spawn_subagent::agent_wait_command;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::task::TaskEventPayload;
+use haider_protocol::tool::ToolResultData;
 use haider_tools::{MessageSubagent, SpawnSubagent};
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
@@ -63,18 +63,31 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "delegation_stop.rs"]
+mod stop;
+#[cfg(all(test, unix))]
+pub(crate) use stop::pause_after_first_drain;
+pub(crate) use stop::{StopIncarnation, SubagentStopSummary, SubagentTreeRoot};
+
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHILD_NUDGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
 const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
-// Registry #94 production arithmetic: 120s pre-nudge stall attribution +
-// 120s post-nudge grace + 1s cancellation/reap tail = 241s run wait bound.
-// Unlike the two blame clocks, this absolute run clock never pauses.
+// Registry #94 arithmetic: 120s pre-nudge stall attribution + 120s
+// post-nudge grace + 1s cancellation/reap tail = 241s. Ordinary production
+// collection has no default child deadline; this bound applies only to
+// cancellation settlement and explicitly stall-cancelling test handles.
 const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
 pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
-const DELEGATED_WAIT_TIMEOUT_KIND: &str = "delegated_child_wait_timeout";
 pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
     "delegation_terminal_mirror_handoff_v1";
-pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
+/// Explicit opt-in nesting cap for delegated children. Unset (the default)
+/// means subagent depth is unbounded: long-horizon agents may delegate as deep
+/// as their work needs, and the device-wide live-child admission limit
+/// (`SUBAGENT_LIVE_LIMIT`, a retryable backpressure rejection) is the resource
+/// bound. A positive integer caps depth; the call past it receives the typed,
+/// continuable `recursion_depth_limit` tool result.
+pub(crate) const SUBAGENT_MAX_DEPTH_ENV: &str = "HAIDER_SUBAGENT_MAX_DEPTH";
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "recursion depth limit";
 const STALL_NUDGE_TEXT: &str = "report your status or conclude";
 const STALL_REPORT_SUMMARY: &str =
@@ -90,9 +103,31 @@ pub(crate) struct DelegationHandle {
     hub: SessionHub,
     stall_deadline: Duration,
     run_wait_timeout: Duration,
+    stall_supervision: bool,
+    stall_cancel_on_grace: bool,
     settlement_tail_timeout: Duration,
+    /// Opt-in nesting cap (`None` = unbounded; see `SUBAGENT_MAX_DEPTH_ENV`).
+    max_depth: Option<u32>,
     #[cfg(all(test, unix))]
     stall_deadline_clock: Option<Arc<StallDeadlineTestClock>>,
+}
+
+/// Parses the opt-in `HAIDER_SUBAGENT_MAX_DEPTH` value. Absent, empty, `0`
+/// or non-numeric values leave depth unbounded (invalid values are logged so
+/// a mistyped cap is visible rather than silently enforced as something else).
+pub(crate) fn configured_max_depth(value: Option<&str>) -> Option<u32> {
+    let raw = value.map(str::trim).filter(|raw| !raw.is_empty())?;
+    match raw.parse::<u32>() {
+        Ok(0) => None,
+        Ok(limit) => Some(limit),
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                "{SUBAGENT_MAX_DEPTH_ENV} is not a positive integer; subagent depth stays unbounded"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -100,10 +135,27 @@ pub(crate) struct DelegationHandle {
 pub(crate) struct StallDeadlineTestClock {
     now_ms: AtomicU64,
     checked: Mutex<(u64, u64)>,
+    parked_checks: Mutex<(u64, u64)>,
+    wait_clock_origin: Option<tokio::time::Instant>,
 }
 
 #[cfg(all(test, unix))]
 impl StallDeadlineTestClock {
+    /// Anchor the fixture's persisted wait budget to paused Tokio time.
+    /// Stall time stays frozen while the test exercises only the absolute wait.
+    pub(crate) fn for_paused_wait_deadline() -> Self {
+        Self {
+            wait_clock_origin: Some(tokio::time::Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn wait_elapsed_ms(&self) -> Option<u64> {
+        self.wait_clock_origin.map(|origin| {
+            duration_millis(tokio::time::Instant::now().saturating_duration_since(origin))
+        })
+    }
+
     pub(crate) fn set_now_ms(&self, now_ms: u64) {
         self.now_ms.store(now_ms, Ordering::SeqCst);
     }
@@ -117,6 +169,31 @@ impl StallDeadlineTestClock {
             checked.1
         } else {
             0
+        }
+    }
+
+    pub(crate) fn parked_checks_at(&self, expected_ms: u64) -> u64 {
+        let checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == expected_ms {
+            checked.1
+        } else {
+            0
+        }
+    }
+
+    fn observe_park(&self) {
+        let now_ms = self.now_ms.load(Ordering::SeqCst);
+        let mut checked = self
+            .parked_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == now_ms {
+            checked.1 = checked.1.saturating_add(1);
+        } else {
+            *checked = (now_ms, 1);
         }
     }
 
@@ -309,10 +386,21 @@ impl DelegationHandle {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: true,
+            stall_cancel_on_grace: false,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            max_depth: configured_max_depth(std::env::var(SUBAGENT_MAX_DEPTH_ENV).ok().as_deref()),
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
+    }
+
+    /// Test/embedder constructor with an explicit opt-in nesting cap.
+    #[cfg(test)]
+    pub(crate) fn with_max_depth(hub: SessionHub, max_depth: Option<u32>) -> Self {
+        let mut handle = Self::new(hub);
+        handle.max_depth = max_depth;
+        handle
     }
 
     #[cfg(all(test, unix))]
@@ -323,9 +411,19 @@ impl DelegationHandle {
             hub,
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: true,
+            stall_cancel_on_grace: true,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            max_depth: None,
             stall_deadline_clock: None,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_nudge_deadline(hub: SessionHub, stall_deadline: Duration) -> Self {
+        let mut handle = Self::new(hub);
+        handle.stall_deadline = stall_deadline;
+        handle
     }
 
     #[cfg(all(test, unix))]
@@ -334,15 +432,31 @@ impl DelegationHandle {
         stall_deadline: Duration,
         stall_deadline_clock: Arc<StallDeadlineTestClock>,
     ) -> Self {
-        Self {
-            #[cfg(test)]
-            establishment_fault: false,
+        Self::with_wait_budgets_and_stall_clock(
             hub,
             stall_deadline,
-            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
-            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
-            stall_deadline_clock: Some(stall_deadline_clock),
-        }
+            CHILD_RUN_WAIT_TIMEOUT,
+            CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            stall_deadline_clock,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_wait_budgets_and_stall_clock(
+        hub: SessionHub,
+        stall_deadline: Duration,
+        run_wait_timeout: Duration,
+        settlement_tail_timeout: Duration,
+        stall_deadline_clock: Arc<StallDeadlineTestClock>,
+    ) -> Self {
+        let mut handle = Self::with_wait_budgets(
+            hub,
+            stall_deadline,
+            run_wait_timeout,
+            settlement_tail_timeout,
+        );
+        handle.stall_deadline_clock = Some(stall_deadline_clock);
+        handle
     }
 
     #[cfg(test)]
@@ -356,7 +470,10 @@ impl DelegationHandle {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            stall_supervision: false,
+            stall_cancel_on_grace: false,
             settlement_tail_timeout,
+            max_depth: None,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
@@ -375,7 +492,10 @@ impl DelegationHandle {
             hub,
             stall_deadline,
             run_wait_timeout,
+            stall_supervision: true,
+            stall_cancel_on_grace: true,
             settlement_tail_timeout,
+            max_depth: None,
             #[cfg(all(test, unix))]
             stall_deadline_clock: None,
         }
@@ -410,6 +530,10 @@ impl DelegationHandle {
                 false,
             )
         })?;
+        let explicit_provider = request
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty());
         let summaries = self
             .hub
             .accounts()
@@ -420,10 +544,33 @@ impl DelegationHandle {
                     false,
                 )
             })?
-            .and_then(|facade| facade.management.read())
-            .map(|view| view.providers)
-            .unwrap_or_default();
+            .map(|facade| {
+                facade
+                    .management
+                    .read()
+                    .map(|mut view| {
+                        view.scope_catalogs_for_session(
+                            &parent.provider,
+                            if explicit_provider {
+                                None
+                            } else {
+                                parent.account_alias.as_deref()
+                            },
+                        );
+                        view.providers
+                    })
+                    .unwrap_or_default()
+            });
+        let explicit_model = request
+            .model
+            .as_deref()
+            .is_some_and(|model| !model.trim().is_empty());
         let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        let authority = if explicit_provider {
+            authority
+        } else {
+            authority.scoped_to_session_route(parent, &parent.provider)
+        };
         Ok(authority
             .resolve_child_selector(
                 &parent.provider,
@@ -431,11 +578,33 @@ impl DelegationHandle {
                 request.model.as_deref(),
                 request.provider.as_deref(),
             )
-            .map(|(provider, model)| {
+            .and_then(|(provider, model)| {
                 let mut child = parent.clone();
-                if child.provider != provider {
-                    // A child that explicitly chooses another provider starts
-                    // under that provider's own account and endpoint.
+                if explicit_model {
+                    let validated = authority.validate_selection_with_status(
+                        &parent.provider,
+                        Some(&provider),
+                        &model,
+                    )?;
+                    let budget =
+                        crate::session_hub::rpc::reapply_session_output_budget(parent, &validated);
+                    // Explicit choices get their own row and settings provenance.
+                    // Only implicit model inheritance retains the parent's owner.
+                    child.model_catalog_key =
+                        authority.model_catalog_key(&provider, &model).or_else(|| {
+                            authority.model_settings_catalog_key(&provider, &model, &budget)
+                        });
+                    child.max_tokens = budget.max_tokens;
+                    child.max_tokens_source = Some(budget.source);
+                    child.budget_clamp_notice_epoch = budget.clamped.map(|_| 0);
+                    child.resolved_model = None;
+                    child.selection_epoch = Some(0);
+                    child.route_reset_epoch = Some(0);
+                    child.resolved_route_alias = None;
+                    child.resolved_route_seen = false;
+                }
+                if explicit_provider || child.provider != provider {
+                    // An explicit provider uses its own route, even for the same pair.
                     child.account_alias = None;
                     child.provider_base_url = None;
                     child.provider_rebind_id = None;
@@ -444,7 +613,7 @@ impl DelegationHandle {
                 }
                 child.provider = provider;
                 child.model = model;
-                child
+                Ok(child)
             }))
     }
 
@@ -453,7 +622,7 @@ impl DelegationHandle {
     /// `AgentSpawn` outcome before [`Self::launch`] crosses that boundary.
     pub(crate) async fn establish(
         &self,
-        coordinates: SpawnCoordinates,
+        mut coordinates: SpawnCoordinates,
         request: SpawnSubagent,
     ) -> Result<EstablishedSpawn, HaiderError> {
         let (public_headless, direct_operator_spawn) =
@@ -467,11 +636,13 @@ impl DelegationHandle {
         let handoff_dir = if coordinates.lockdown {
             let relative =
                 Path::new("handoff").join(handoff_session_short(&coordinates.parent_session_id));
-            crate::lockdown::global()
-                .and_then(|manager| {
-                    manager.sandbox_location(&coordinates.metadata.provider, &relative)
-                })
-                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
+            let provider = coordinates.metadata.provider.clone();
+            crate::lockdown::on_blocking_pool(move || {
+                crate::lockdown::global()
+                    .and_then(|manager| manager.sandbox_location(&provider, &relative))
+            })
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
         } else {
             self.ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
                 .await?
@@ -487,6 +658,81 @@ impl DelegationHandle {
         let lease = LeaseId::new(format!("lease-child-{identity}"));
         let callsign = callsign_from_identity(&identity);
         let existing_spawn = self.hub.delegation(agent_id.clone()).await?;
+        // A retry uses the child admission that was actually committed. A
+        // catalog edit may re-derive a different effective budget, and older
+        // receipts omit max_tokens_source altogether. Neither is a caller
+        // change. Compare caller intent and the other coordinates below.
+        let original_admission = self
+            .hub
+            .child_create_admission(
+                format!("delegation-session-{identity}"),
+                child_session_id.clone(),
+                coordinates.parent_session_id.clone(),
+            )
+            .await?;
+        if existing_spawn.is_some() && original_admission.is_none() {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "established child has no creation admission",
+                false,
+            ));
+        }
+        if let Some((original, admitted)) = original_admission {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            let old_max = old
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "child creation admission has no output budget",
+                        false,
+                    )
+                })?;
+            if haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                coordinates.metadata.max_tokens_source,
+                coordinates.metadata.max_tokens,
+            ) != haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                admitted.max_tokens_source,
+                admitted.max_tokens,
+            ) {
+                return Err(workflow_rejection(
+                    "changed_child_budget",
+                    "child budget intent differs from its durable admission",
+                ));
+            }
+            coordinates.metadata.max_tokens = old_max;
+            // Old explicit same-provider selectors retained the parent's
+            // route. Clearing now applies to new child admissions; an
+            // unchanged retry keeps the Store-proven original route, from
+            // its digest, frozen reply or creation-bounded parent history.
+            // ce9d0976 also wrote current-schema receipts with the retained
+            // route. Restore only a route identical to the frozen reply;
+            // the Store still compares the complete replay body strictly.
+            let recorded_route_matches = [
+                ("inherited_account_alias", &admitted.account_alias),
+                ("inherited_provider_base_url", &admitted.provider_base_url),
+                ("inherited_provider_rebind_id", &admitted.provider_rebind_id),
+            ]
+            .into_iter()
+            .all(|(key, value)| old.get(key) == Some(&serde_json::json!(value)));
+            if (old.get("inheritance_parent_session_id").is_none() || recorded_route_matches)
+                && request
+                    .provider
+                    .as_deref()
+                    .is_some_and(|provider| provider.trim() == admitted.provider)
+                && coordinates.metadata.provider == admitted.provider
+                && coordinates.metadata.model == admitted.model
+                && coordinates.metadata.account_alias.is_none()
+                && coordinates.metadata.provider_base_url.is_none()
+                && coordinates.metadata.provider_rebind_id.is_none()
+            {
+                coordinates.metadata.account_alias = admitted.account_alias;
+                coordinates.metadata.provider_base_url = admitted.provider_base_url;
+                coordinates.metadata.provider_rebind_id = admitted.provider_rebind_id;
+            }
+        }
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -671,6 +917,43 @@ impl DelegationHandle {
             "lockdown": child_lockdown,
             "auto_hermetic": coordinates.auto_hermetic,
         });
+        if request.model.is_some()
+            && let Some(haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                requested,
+            }) = coordinates.metadata.max_tokens_source
+            && requested > coordinates.metadata.max_tokens
+        {
+            // A model-selected child has no CLI response. Publish the same
+            // typed clamp notice in its durable spawn fact for observers.
+            manifest_coordinates["output_budget"] =
+                serde_json::json!(haider_protocol::output_budget::SessionOutputBudgetV1 {
+                    max_tokens: coordinates.metadata.max_tokens,
+                    source: haider_protocol::output_budget::SessionOutputBudgetSourceV1::UserSet {
+                        requested,
+                    },
+                    clamped: Some(haider_protocol::output_budget::OutputBudgetClampV1 {
+                        requested,
+                        max_output_tokens: coordinates.metadata.max_tokens,
+                    }),
+                });
+        }
+        if let Some(existing) = &existing_spawn {
+            // A display coordinate introduced after the original spawn is
+            // not part of the caller's retry semantics.
+            match existing
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|value| value.get("output_budget"))
+            {
+                Some(budget) => manifest_coordinates["output_budget"] = budget.clone(),
+                None => {
+                    if let Some(fields) = manifest_coordinates.as_object_mut() {
+                        fields.remove("output_budget");
+                    }
+                }
+            }
+        }
         // Display identity is not new retry semantics. Reuse the first
         // durable value (including legacy absence) after a registry edit;
         // grants/CLI scope still undergo the existing semantics check.
@@ -710,6 +993,13 @@ impl DelegationHandle {
             manifest_coordinates["request_budget"] =
                 serde_json::to_value(budget).map_err(internal_serialization)?;
         }
+        if let Some(wait_ms) = request.wait_ms {
+            manifest_coordinates["wait_ms"] = serde_json::json!(wait_ms);
+            manifest_coordinates["wait_started_at_ms"] = serde_json::json!(unix_time_ms());
+        }
+        if request.background {
+            manifest_coordinates["background"] = serde_json::Value::Bool(true);
+        }
         let manifest = AgentManifest {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,
@@ -723,9 +1013,11 @@ impl DelegationHandle {
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
+            // The durable child already owns its original fence. A daemon
+            // restart advances the worker generation but does not turn the
+            // same child-establishment retry into a new delegation.
             fencing_epoch: existing_spawn
                 .as_ref()
-                .filter(|_| direct_operator_spawn)
                 .map_or(self.hub.worker_generation(), |record| {
                     record.manifest.fencing_epoch
                 }),
@@ -765,7 +1057,7 @@ impl DelegationHandle {
         } else {
             haider_protocol::session::SessionInteractionModeV1::Interactive
         };
-        let create_json = serde_json::to_string(&serde_json::json!({
+        let create_value = serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
@@ -783,24 +1075,27 @@ impl DelegationHandle {
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
             "interaction_mode": child_interaction_mode,
-            // Needed only to reconstruct the implicit inheritance of a
-            // pre-route-digest receipt, from durable history at create time.
             "inheritance_parent_session_id": coordinates.parent_session_id,
             "inherited_account_alias": coordinates.metadata.account_alias,
             "inherited_provider_base_url": coordinates.metadata.provider_base_url,
             "inherited_provider_rebind_id": coordinates.metadata.provider_rebind_id,
-        }))
-        .map_err(internal_serialization)?;
+        });
+        // Store owns the one legacy digest-equivalence rule. Its historical
+        // route witness and frozen response validate additions without changing
+        // the original receipt; the effective budget above stays admitted.
+        let create_json = serde_json::to_string(&create_value).map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
         self.hub
             .create_internal_session_with_interaction_mode(
                 SessionCreateCommand {
+                    resolved_model: coordinates.metadata.resolved_model.clone(),
                     command_id: format!("delegation-session-{identity}"),
                     request_digest: create_digest,
                     request_json: create_json,
                     session_id: child_session_id.clone(),
                     cwd: coordinates.metadata.cwd.clone(),
                     provider: coordinates.metadata.provider.clone(),
+                    model_catalog_key: coordinates.metadata.model_catalog_key.clone(),
                     model: coordinates.metadata.model.clone(),
                     max_tokens: coordinates.metadata.max_tokens,
                     max_tokens_source: coordinates.metadata.max_tokens_source,
@@ -895,6 +1190,11 @@ impl DelegationHandle {
             state: DelegationState::Spawned,
             report: None,
         };
+        // A stop snapshot must not observe registration without the original
+        // accepted child run. Share its admission mutex across that boundary;
+        // launch itself remains outside the lock.
+        let monitor = self.hub.inner_monitor();
+        let _admission = monitor.admission_lock().await;
         let record = match self.hub.create_delegation(record).await? {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,
@@ -921,23 +1221,41 @@ impl DelegationHandle {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if persisted_lockdown {
-            self.hub
-                .bind_lockdown_turn(
-                    &record.child_session_id,
-                    &record.child_run_id,
-                    &coordinates.metadata.provider,
+            let hub = self.hub.clone();
+            let child_session = record.child_session_id.clone();
+            let child_run = record.child_run_id.clone();
+            let provider = coordinates.metadata.provider.clone();
+            let save_guard = hub
+                .begin_lockdown_save(&child_session, &child_run)
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), true))?;
+            let save = save_guard.permit();
+            crate::lockdown::on_blocking_pool_result(move || {
+                hub.bind_lockdown_turn_owned(
+                    &child_session,
+                    &child_run,
+                    &provider,
                     crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
                         persisted_lockdown,
                         persisted_auto_hermetic,
                     ),
+                    &save,
                 )
-                .map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::Internal,
-                        format!("cannot bind child provider ceiling: {error}"),
-                        true,
-                    )
-                })?;
+            })
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("child lockdown binding task failed: {error}"),
+                    true,
+                )
+            })?
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot bind child provider ceiling: {error}"),
+                    true,
+                )
+            })?;
         }
         self.hub
             .notify_roster_session(record.child_session_id.clone());
@@ -977,7 +1295,32 @@ impl DelegationHandle {
                 fields.remove("worker_generation");
             }
         }
-        let turn_json = serde_json::to_string(&turn_value).map_err(internal_serialization)?;
+        let original_turn = self
+            .hub
+            .child_turn_admission(
+                format!("delegation-turn-{identity}"),
+                record.child_session_id.clone(),
+            )
+            .await?;
+        let replaying_turn = original_turn.is_some();
+        let turn_json = if let Some(original) = original_turn {
+            let old: serde_json::Value =
+                serde_json::from_str(&original).map_err(internal_serialization)?;
+            if let Some(generation) = old.get("worker_generation") {
+                turn_value["worker_generation"] = generation.clone();
+            } else if let Some(fields) = turn_value.as_object_mut() {
+                fields.remove("worker_generation");
+            }
+            if turn_value != old {
+                return Err(workflow_rejection(
+                    "changed_child_turn",
+                    "child first-turn coordinates differ from the durable admission",
+                ));
+            }
+            original
+        } else {
+            serde_json::to_string(&turn_value).map_err(internal_serialization)?
+        };
         let mut accepted = self
             .hub
             .accept_internal_turn(TurnAcceptCommand {
@@ -998,7 +1341,7 @@ impl DelegationHandle {
                 device_id: self.hub.device_id(),
             })
             .await?;
-        if direct_operator_spawn {
+        if direct_operator_spawn || replaying_turn {
             accepted.worker_generation = self.hub.worker_generation();
         }
         Ok(EstablishedSpawn {
@@ -1167,9 +1510,74 @@ impl DelegationHandle {
         self.hub
             .mark_delegation_running(established.ticket.manifest.agent.clone())
             .await?;
+        // Never launch a spawn whose parent run is already stopping: the
+        // accepted child turn is moved to cancelling first, and the
+        // submission below lets its supervisor finalize it as Cancelled
+        // without starting provider work (9-verify3 B-1).
+        if self
+            .parent_run_stopping(&established.ticket.manifest.agent)
+            .await?
+        {
+            self.cancel_unlaunched_child(&established.ticket.manifest.agent)
+                .await?;
+            self.hub
+                .submit_internal_turn(established.accepted.clone())
+                .await?;
+            return Ok(());
+        }
         self.hub
             .submit_internal_turn(established.accepted.clone())
-            .await
+            .await?;
+        // A collector can end at wait_ms or never exist for a background
+        // child. Keep the non-terminating nudge alive for that child run.
+        if self.stall_supervision && !self.stall_cancel_on_grace {
+            let coordinator = self.clone();
+            let agent = established.ticket.manifest.agent.clone();
+            tokio::spawn(async move {
+                coordinator.watch_stall_nudge(agent).await;
+            });
+        }
+        Ok(())
+    }
+
+    async fn watch_stall_nudge(&self, agent: AgentId) {
+        loop {
+            let progress = async {
+                let Some(record) = self.hub.delegation(agent.clone()).await? else {
+                    return Ok::<_, HaiderError>(None);
+                };
+                let progress = self.delegation_progress(&record).await?;
+                Ok(Some((record, progress)))
+            }
+            .await;
+            match progress {
+                Ok(Some((record, progress))) => {
+                    if progress.state.as_ref().is_some_and(RunState::is_terminal)
+                        || progress.nudge.is_some()
+                    {
+                        return;
+                    }
+                    let active = progress.state.as_ref().is_some_and(|state| {
+                        state != &RunState::Queued && state != &RunState::Cancelling
+                    });
+                    if active
+                        && !progress.human_required
+                        && self.stall_deadline_elapsed(progress.latest_at_ms)
+                    {
+                        if let Err(error) = self.nudge(&record).await {
+                            tracing::warn!(%agent, %error, "child stall nudge failed");
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%agent, %error, "child stall nudge watcher stopped");
+                    return;
+                }
+            }
+            tokio::time::sleep(CHILD_NUDGE_POLL_INTERVAL).await;
+        }
     }
 
     pub(crate) async fn record_launch_failure(
@@ -1229,7 +1637,18 @@ impl DelegationHandle {
                     false,
                 )
             })?;
-        let budget = self.child_wait_budget(&initial, run_deadline).await?;
+        let observation_deadline = match (run_deadline, observation_wait_deadline(ticket)) {
+            (Some(run), Some(wait)) => Some(run.min(wait)),
+            (run, wait) => run.or(wait),
+        };
+        let budget = if observation_deadline.is_some() || self.stall_cancel_on_grace {
+            Some(
+                self.child_wait_budget(&initial, observation_deadline)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let wait = async {
             loop {
                 let record = self
@@ -1271,6 +1690,7 @@ impl DelegationHandle {
                             completion: DeferredToolResult {
                                 report,
                                 chip,
+                                data: None,
                                 truncated: truncation.is_some(),
                                 truncation,
                             },
@@ -1296,25 +1716,36 @@ impl DelegationHandle {
                             completion: DeferredToolResult {
                                 report,
                                 chip: completion.chip,
+                                data: completion.data,
                                 truncated: completion.truncated,
                                 truncation: completion.truncation,
                             },
                         });
                     }
                 }
-                let progress = self.delegation_progress(&record).await?;
-                if !progress.human_required {
-                    match progress.nudge {
-                        None if self.stall_deadline_elapsed(progress.latest_at_ms) => {
-                            self.nudge(&record).await?;
+                if self.stall_cancel_on_grace {
+                    let progress = self.delegation_progress(&record).await?;
+                    if !progress.human_required {
+                        match progress.nudge {
+                            None if self.stall_deadline_elapsed(progress.latest_at_ms) => {
+                                self.nudge(&record).await?;
+                            }
+                            Some((_, nudge_at_ms))
+                                if self.stall_cancel_on_grace
+                                    && self.stall_deadline_elapsed(
+                                        progress.latest_at_ms.max(nudge_at_ms),
+                                    ) =>
+                            {
+                                self.cancel_subtree(&record, CancelCause::Stall).await?;
+                            }
+                            _ => {}
                         }
-                        Some((_, nudge_at_ms))
-                            if self
-                                .stall_deadline_elapsed(progress.latest_at_ms.max(nudge_at_ms)) =>
-                        {
-                            self.cancel_subtree(&record, CancelCause::Stall).await?;
-                        }
-                        _ => {}
+                    }
+                    #[cfg(all(test, unix))]
+                    if progress.human_required
+                        && let Some(clock) = &self.stall_deadline_clock
+                    {
+                        clock.observe_park();
                     }
                 }
                 tokio::select! {
@@ -1322,21 +1753,29 @@ impl DelegationHandle {
                     () = cancel.cancelled() => {
                         return Ok(ChildWaitWake::ParentCancelled(record));
                     }
-                    () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+                    () = self.wait_for_collection_poll() => {}
                 }
             }
         };
-        let active_limit = budget
-            .active_deadline
-            .saturating_duration_since(tokio::time::Instant::now());
-        match haider_platform::bounded_wait("delegated child active wait", active_limit, wait).await
-        {
+        let outcome = if let Some(budget) = budget {
+            let active_limit = budget
+                .active_deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            haider_platform::bounded_wait("delegated child active wait", active_limit, wait).await
+        } else {
+            haider_platform::BoundedWait::Completed(wait.await)
+        };
+        match outcome {
             haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::Ready {
                 record,
                 completion,
             })) => {
+                let deadline = budget.map_or_else(
+                    || tokio::time::Instant::now() + self.settlement_tail_timeout,
+                    |budget| budget.deadline,
+                );
                 let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, budget.deadline)
+                    .mirror_until_child_terminal(&record, &mut chip_mirror, deadline)
                     .await?;
                 report_child_settlement_outcome(settlement);
                 self.collapse_child_contract(&record, &completion.report)
@@ -1344,29 +1783,15 @@ impl DelegationHandle {
                 Ok(completion)
             }
             haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::ParentCancelled(record))) => {
-                let handoff = self
-                    .begin_terminal_mirror_handoff(
-                        &record,
-                        &budget,
-                        CancelCause::Parent,
-                        "collector",
-                    )
+                // Owner decision 2026-09-25: stopping the parent stops only
+                // the parent. The waited-on child keeps running in the
+                // background and its result is delivered to the parent
+                // session when it finishes.
+                self.detach_parent_run_children(&record.parent_session_id, &record.parent_run_id)
                     .await?;
-                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
-                let _cancel_issued = self
-                    .cancel_subtree_before(&record, CancelCause::Parent, terminal_deadline)
-                    .await?;
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                if chip_mirror.child_run_terminal {
-                    self.complete_terminal_mirror_handoff(&record, handoff)
-                        .await?;
-                }
                 Err(HaiderError::new(
                     ErrorCode::RunNotActive,
-                    "parent cancelled while waiting for local child",
+                    "parent stopped while waiting for local child; the child continues in the background",
                     false,
                 ))
             }
@@ -1383,31 +1808,8 @@ impl DelegationHandle {
                             false,
                         )
                     })?;
-                // Registry #94: the pending journal fact is committed before
-                // cancellation, and every following phase consumes the one
-                // original absolute deadline. No awaited receipt/store work
-                // restarts or extends the reserved terminal/reap tail.
-                let handoff = self
-                    .begin_terminal_mirror_handoff(
-                        &record,
-                        &budget,
-                        CancelCause::Deadline,
-                        "collector",
-                    )
-                    .await?;
-                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
-                let _cancel_issued = self
-                    .cancel_subtree_before(&record, CancelCause::Deadline, terminal_deadline)
-                    .await?;
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                if chip_mirror.child_run_terminal {
-                    self.complete_terminal_mirror_handoff(&record, handoff)
-                        .await?;
-                }
-                Err(delegated_wait_timeout(timeout, &record))
+                let progress = self.session_progress(&record).await?;
+                child_still_running_result(&record, &progress, timeout.limit())
             }
         }
     }
@@ -1417,20 +1819,22 @@ impl DelegationHandle {
         record: &DelegationRecord,
         run_deadline: Option<tokio::time::Instant>,
     ) -> Result<ChildWaitBudget, HaiderError> {
-        // This is the delegation clock, not the workflow continuation clock:
-        // logical provider-request boundaries own the continuation count,
-        // while every child wait in every hop consumes this one parent-run
-        // deadline and never increments that count. Interactive runs have no
-        // explicit client deadline, so their durable delegation budget starts
-        // at the parent run's first committed fact:
-        // one stall interval before the nudge + one grace interval after it +
-        // the terminal/reap tail. Recovery re-derives the same absolute bound
-        // from the journal instead of restarting a relative timer.
+        // Only an explicit observation deadline reaches ordinary collection.
+        // The legacy fallback remains for cancellation settlement and
+        // explicitly supervised test fixtures; it never limits a production
+        // child's active work by default.
         let now = tokio::time::Instant::now();
         let started_at_ms = self.parent_run_started_at_ms(record).await?;
+        let now_ms = unix_time_ms();
+        #[cfg(all(test, unix))]
+        let now_ms = self
+            .stall_deadline_clock
+            .as_ref()
+            .and_then(|clock| clock.wait_elapsed_ms())
+            .map_or(now_ms, |elapsed| started_at_ms.saturating_add(elapsed));
         let deadline = anchored_child_wait_deadline(
             now,
-            unix_time_ms(),
+            now_ms,
             started_at_ms,
             self.run_wait_timeout,
             run_deadline,
@@ -1699,47 +2103,6 @@ impl DelegationHandle {
             .mark_delegation_collected(ticket.manifest.agent.clone())
             .await
             .map(|_| ())
-    }
-
-    pub(crate) async fn cancel_ticket(
-        &self,
-        ticket: &DeferredTicket,
-        run_deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), HaiderError> {
-        let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await? else {
-            return Ok(());
-        };
-        let budget = self.child_wait_budget(&record, run_deadline).await?;
-        let handoff = self
-            .begin_terminal_mirror_handoff(
-                &record,
-                &budget,
-                CancelCause::Parent,
-                "cleanup_fallback",
-            )
-            .await?;
-        // This cleanup hook runs inside parent terminalization, so waiting for
-        // the child here would deadlock the cancellation handoff. The active
-        // collector normally performs the flush. The detached wake is safe to
-        // lose because `handoff` is already durable in the child journal and
-        // startup recovery replays it until a completion fact is committed.
-        let coordinator = self.clone();
-        tokio::spawn(async move {
-            match coordinator
-                .reconcile_terminal_mirror_handoff(record.clone(), handoff)
-                .await
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        agent = %record.agent_id,
-                        ?error,
-                        "terminal child metrics flush failed"
-                    );
-                }
-            }
-        });
-        Ok(())
     }
 
     /// Reconcile one journal-derived cancellation mirror after startup.
@@ -2335,7 +2698,7 @@ impl DelegationHandle {
         Ok(path)
     }
 
-    async fn derive_terminal_report(
+    pub(crate) async fn derive_terminal_report(
         &self,
         record: &DelegationRecord,
     ) -> Result<Option<DeferredToolResult>, HaiderError> {
@@ -2444,7 +2807,7 @@ impl DelegationHandle {
                     failure
                         .unwrap_or_else(|| "subagent failed without public failure detail".into()),
                 ),
-                ReportVerification::Red,
+                ReportVerification::from_terminal_run_state(&state),
                 ChipState::Error,
             ),
             RunState::Cancelled => (
@@ -2453,7 +2816,7 @@ impl DelegationHandle {
                 } else {
                     "subagent was cancelled before completing its report".into()
                 }),
-                ReportVerification::Red,
+                ReportVerification::from_terminal_run_state(&state),
                 ChipState::Error,
             ),
             _ => unreachable!("terminal state match is exhaustive"),
@@ -2486,6 +2849,7 @@ impl DelegationHandle {
                 workspace_revision: workflow_graph.and(latest_revision),
             },
             chip,
+            data: None,
             truncated,
             truncation,
         }))
@@ -2523,12 +2887,13 @@ impl DelegationHandle {
         }
         crate::worker::validate_grant(&parent.manifest.grant)?;
         let depth = parent.depth.saturating_add(1);
-        if depth > RECURSION_DEPTH_LIMIT {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                RECURSION_LIMIT_MESSAGE,
-                false,
-            ));
+        if let Some(limit) = self.max_depth
+            && depth > limit
+        {
+            let mut error =
+                HaiderError::new(ErrorCode::InvalidArgument, RECURSION_LIMIT_MESSAGE, false);
+            error.details = Some(serde_json::json!({ "limit": limit, "depth": depth }));
+            return Err(error);
         }
         Ok(SpawnAncestry {
             root_session_id: parent.root_session_id,
@@ -2592,6 +2957,7 @@ impl DelegationHandle {
     ) -> Result<DelegationProgress, HaiderError> {
         let direct = self.session_progress(record).await?;
         let mut progress = DelegationProgress {
+            state: direct.state.clone(),
             latest_at_ms: direct.latest_at_ms,
             nudge: direct.nudge,
             human_required: matches!(
@@ -2740,11 +3106,11 @@ impl DelegationHandle {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) async fn terminal_mirror_times_out_for_test(
+    pub(crate) async fn terminal_mirror_timeout_for_test(
         &self,
         record: &DelegationRecord,
         limit: Duration,
-    ) -> Result<bool, HaiderError> {
+    ) -> Result<Option<haider_platform::WaitTimeout>, HaiderError> {
         let ticket = DeferredTicket {
             id: record.agent_id.as_str().to_owned(),
             manifest: record.manifest.clone(),
@@ -2755,7 +3121,10 @@ impl DelegationHandle {
         mirror.emit_projections = false;
         self.mirror_until_child_terminal(record, &mut mirror, tokio::time::Instant::now() + limit)
             .await
-            .map(|outcome| matches!(outcome, ChildSettlementOutcome::TerminalTimedOut(_)))
+            .map(|outcome| match outcome {
+                ChildSettlementOutcome::TerminalTimedOut(timeout) => Some(timeout),
+                _ => None,
+            })
     }
 
     async fn mirror_child_chip_states(
@@ -3145,6 +3514,9 @@ impl DelegationHandle {
         }
     }
 
+    /// Legacy cancellation handoff writer, retained for the recovery tests
+    /// that pin how pre-2026-09-25 pending handoffs are replayed.
+    #[cfg(all(test, unix))]
     async fn begin_terminal_mirror_handoff(
         &self,
         record: &DelegationRecord,
@@ -3216,6 +3588,21 @@ impl DelegationHandle {
         .await
     }
 
+    async fn wait_for_collection_poll(&self) {
+        // The paused fixture keeps policy time fixed during native store I/O.
+        // Poll its actual collector without consuming that deadline clock.
+        #[cfg(all(test, unix))]
+        if self
+            .stall_deadline_clock
+            .as_ref()
+            .is_some_and(|clock| clock.wait_elapsed_ms().is_some())
+        {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+    }
+
     async fn stall_cancel_requested(&self, record: &DelegationRecord) -> Result<bool, HaiderError> {
         let command = self.cancellation_command(record, CancelCause::Stall)?;
         self.hub
@@ -3276,6 +3663,7 @@ struct SessionProgress {
 }
 
 struct DelegationProgress {
+    state: Option<RunState>,
     latest_at_ms: u64,
     nudge: Option<(u64, u64)>,
     human_required: bool,
@@ -3356,12 +3744,8 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-/// Returns the earlier of the explicit parent-run deadline and the fallback
-/// delegation deadline anchored to the parent's first durable fact.
-///
-/// Both inputs are absolute run clocks. In particular, `fallback_total` is
-/// never applied to the current hop's `now`: a later autonomous workflow hop
-/// can only consume the original child-wait budget, never refresh it.
+/// Returns an explicit observation deadline when given, otherwise the legacy
+/// fallback used only by cancellation settlement and test supervision.
 pub(crate) fn anchored_child_wait_deadline(
     now: tokio::time::Instant,
     now_unix_ms: u64,
@@ -3372,8 +3756,67 @@ pub(crate) fn anchored_child_wait_deadline(
     let fallback_deadline_ms = parent_started_at_ms.saturating_add(duration_millis(fallback_total));
     let fallback_deadline =
         now + Duration::from_millis(fallback_deadline_ms.saturating_sub(now_unix_ms));
-    run_deadline.map_or(fallback_deadline, |deadline| {
-        deadline.min(fallback_deadline)
+    run_deadline.unwrap_or(fallback_deadline)
+}
+
+/// The absolute end of a blocking spawn's explicit `wait_ms` observation,
+/// anchored to when the spawn was established so recovery never extends it.
+fn observation_wait_deadline(ticket: &DeferredTicket) -> Option<tokio::time::Instant> {
+    let coordinates = ticket.manifest.coordinates.as_ref()?;
+    let started_at_ms = coordinates.get("wait_started_at_ms")?.as_u64()?;
+    let wait_ms = coordinates.get("wait_ms")?.as_u64()?;
+    Some(instant_from_unix_deadline(
+        started_at_ms.saturating_add(wait_ms),
+    ))
+}
+
+/// The typed `child_still_running` handle returned when an observation window
+/// ends before the child does. The child is left live and collectable.
+fn child_still_running_result(
+    record: &DelegationRecord,
+    progress: &SessionProgress,
+    wait_limit: Duration,
+) -> Result<DeferredToolResult, HaiderError> {
+    let collect = agent_wait_command(&record.parent_session_id, &record.agent_id);
+    let wait_limit_ms = duration_millis(wait_limit);
+    let progress_data = progress
+        .state
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(internal_serialization)?;
+    Ok(DeferredToolResult {
+        report: ChildReport {
+            agent: record.agent_id.clone(),
+            summary: serde_json::json!({
+                "kind": "child_still_running",
+                "status": "child_still_running",
+                "agent": record.agent_id,
+                "parent_session_id": record.parent_session_id,
+                "child_session_id": record.child_session_id,
+                "child_run_id": record.child_run_id,
+                "progress": progress.state,
+                "latest_progress_at_ms": progress.latest_at_ms,
+                "wait_limit_ms": wait_limit_ms,
+                "collect": collect.clone(),
+            })
+            .to_string(),
+            verified: ReportVerification::Unverified,
+            workspace_revision: None,
+        },
+        chip: ChipState::Waiting,
+        data: Some(ToolResultData::ChildStillRunning {
+            agent: record.agent_id.clone(),
+            parent_session_id: record.parent_session_id.clone(),
+            child_session_id: record.child_session_id.clone(),
+            child_run_id: record.child_run_id.clone(),
+            progress: progress_data,
+            latest_progress_at_ms: progress.latest_at_ms,
+            wait_limit_ms,
+            collect,
+        }),
+        truncated: false,
+        truncation: None,
     })
 }
 
@@ -3940,40 +4383,6 @@ fn workflow_rejection(kind: &'static str, message: impl Into<String>) -> HaiderE
     error
 }
 
-fn delegated_wait_timeout(
-    timeout: haider_platform::WaitTimeout,
-    record: &DelegationRecord,
-) -> HaiderError {
-    let limit_ms = duration_millis(timeout.limit());
-    let mut error = HaiderError::new(
-        ErrorCode::ProviderTimeout,
-        format!(
-            "delegated child {} did not settle before the run deadline",
-            record.agent_id
-        ),
-        true,
-    )
-    .with_presentation(
-        ErrorPresentation::new(
-            "delegated-child-wait-timeout",
-            "Delegated child timed out",
-            "The child did not finish before this run's wait deadline. It was cancelled and reaped.",
-            ErrorScope::Turn,
-            [ErrorAction::Retry],
-        )
-        .with_timeout_budget(limit_ms, limit_ms),
-    );
-    error.details = Some(serde_json::json!({
-        "kind": DELEGATED_WAIT_TIMEOUT_KIND,
-        "operation": timeout.operation(),
-        "limit_ms": limit_ms,
-        "agent": record.agent_id,
-        "child_session_id": record.child_session_id,
-        "child_run_id": record.child_run_id,
-    }));
-    error
-}
-
 fn delegation_child_graph(
     record: &DelegationRecord,
 ) -> Result<Option<ChildGraphAttached>, HaiderError> {
@@ -4355,3 +4764,7 @@ mod toolshape_tests {
         assert!(marker.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_model_owner_tests.rs"]
+mod model_owner_tests;

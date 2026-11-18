@@ -50,6 +50,7 @@ rmp-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 url.workspace = true
 zeroize.workspace = true
 

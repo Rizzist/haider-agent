@@ -42,7 +42,7 @@ impl SessionHub {
         {
             return Ok(Some("session_ineligible"));
         }
-        let bound = self.bound_session_lockdown(session_id);
+        let bound = self.bound_session_lockdown_blocking(session_id).await;
         let selected = self.provider_lockdown_policy_detail(&metadata.provider);
         match (bound, selected) {
             (Ok(bound), Ok(selected)) => {

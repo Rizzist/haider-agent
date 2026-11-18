@@ -71,6 +71,8 @@ mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;
+#[cfg(all(test, unix))]
+mod checkpoint_test_support;
 mod completion;
 mod config;
 mod connection;
@@ -100,6 +102,12 @@ mod image_events;
 mod lifecycle;
 mod lockdown;
 #[cfg(test)]
+#[path = "lockdown_binding_tests.rs"]
+mod lockdown_binding_tests;
+
+#[cfg(test)]
+mod lockdown_save_tests;
+#[cfg(test)]
 #[path = "lockdown_tests.rs"]
 mod lockdown_tests;
 mod loom_author;
@@ -117,6 +125,7 @@ mod manual_retry_tests;
 mod mobile_transport;
 mod model_select;
 mod monitor;
+mod monitor_stop_fence;
 mod native_process;
 mod oauth;
 mod orchestration;
@@ -142,6 +151,8 @@ mod subagent_core_tests;
 mod tasks;
 #[cfg(all(test, unix))]
 mod tasks_runtime_tests;
+#[cfg(test)]
+mod test_clock;
 mod turn_recovery;
 mod typed_agent_executor;
 mod typed_agent_installer;
@@ -160,9 +171,9 @@ mod workspace;
 mod project_instructions_tests;
 
 pub use accounts::{
-    AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
-    CredentialValidator, ProviderCredentialValidator, ProviderModelDiscoverer, ValidatedIdentity,
-    ValidationError, ValidationFailureKind, VaultProvision,
+    AccountProviderBuilder, AccountsDependencies, AnthropicValidator, CatalogDestination,
+    ConnectionTransport, CredentialValidator, ProviderCredentialValidator, ProviderModelDiscoverer,
+    ValidatedIdentity, ValidationError, ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
 pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};

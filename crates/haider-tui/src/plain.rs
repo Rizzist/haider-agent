@@ -83,6 +83,38 @@ pub fn render_plain_with_status(
         throughput,
         Some(cache_usage),
         Some(background),
+        &crate::toolview::PathContext::process_homes(),
+    )
+}
+
+/// Projection-only rendering with an explicit session path snapshot.
+#[must_use]
+pub fn render_plain_with_context(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    paths: &crate::toolview::PathContext,
+) -> String {
+    render_plain_impl_with_status(projection, window, throughput, None, None, paths)
+}
+
+/// Render with the same workspace and home snapshot as the styled session.
+#[must_use]
+pub fn render_plain_with_status_and_context(
+    projection: &SessionProjection,
+    window: u64,
+    throughput: Option<&crate::throughput::ThroughputReadout>,
+    cache_usage: &crate::cache_usage::SessionUsageFold,
+    background: &crate::statusline::StatusLine,
+    paths: &crate::toolview::PathContext,
+) -> String {
+    render_plain_impl_with_status(
+        projection,
+        window,
+        throughput,
+        Some(cache_usage),
+        Some(background),
+        paths,
     )
 }
 
@@ -92,7 +124,14 @@ fn render_plain_impl(
     throughput: Option<&crate::throughput::ThroughputReadout>,
     cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
 ) -> String {
-    render_plain_impl_with_status(projection, window, throughput, cache_usage, None)
+    render_plain_impl_with_status(
+        projection,
+        window,
+        throughput,
+        cache_usage,
+        None,
+        &crate::toolview::PathContext::process_homes(),
+    )
 }
 
 fn render_plain_impl_with_status(
@@ -101,6 +140,7 @@ fn render_plain_impl_with_status(
     throughput: Option<&crate::throughput::ThroughputReadout>,
     cache_usage: Option<&crate::cache_usage::SessionUsageFold>,
     background: Option<&crate::statusline::StatusLine>,
+    paths: &crate::toolview::PathContext,
 ) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
@@ -161,9 +201,13 @@ fn render_plain_impl_with_status(
                     out.push('\n');
                 }
             }
-            TranscriptEntry::Item(block) => render_item(&mut out, block),
+            TranscriptEntry::Item(block) => render_item(&mut out, block, paths),
             TranscriptEntry::Note { text, .. } => {
                 out.push_str(text);
+                out.push('\n');
+            }
+            TranscriptEntry::Workspace { event } => {
+                out.push_str(&crate::toolview::workspace_event_text(event, paths));
                 out.push('\n');
             }
             TranscriptEntry::Refusal {
@@ -250,7 +294,7 @@ fn render_plain_impl_with_status(
         {
             out.push_str(&format!(
                 "  file review: {} · +{} -{} · {} hunk(s){}\n",
-                review.path,
+                paths.shorten(&review.path),
                 review.added,
                 review.removed,
                 review.hunks.len(),
@@ -530,12 +574,21 @@ pub fn agent_metrics_plain(model: &crate::app::AppModel) -> String {
     out.push_str(&row("main", main));
     out.push('\n');
     for (chip, metrics) in children {
-        let label = if chip.callsign.is_empty() {
+        let name = if chip.callsign.is_empty() {
             chip.agent.as_str()
         } else {
             chip.callsign.as_str()
         };
-        out.push_str(&row(label, metrics));
+        // 973-activity-icons: plain rows carry the TEXT activity label.
+        let label = match model.chip_activity(chip).and_then(|kind| {
+            (model.activity_display != haider_protocol::activity::ActivityDisplay::Off)
+                .then(|| haider_protocol::activity::ActivityDisplay::Text.glyph(kind))
+                .flatten()
+        }) {
+            Some(activity) => format!("{activity} {name}"),
+            None => name.to_owned(),
+        };
+        out.push_str(&row(&label, metrics));
         out.push('\n');
     }
     if model.screen == crate::app::Screen::Subagent
@@ -574,7 +627,7 @@ pub fn status_line(projection: &SessionProjection, window: u64) -> String {
     )
 }
 
-fn render_item(out: &mut String, block: &ItemBlock) {
+fn render_item(out: &mut String, block: &ItemBlock, paths: &crate::toolview::PathContext) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
             text.visit_strs(|part| out.push_str(part));
@@ -598,7 +651,7 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         TurnItem::ToolCall {
             name, status, args, ..
         } => {
-            let summary = crate::toolfold::semantic_summary(name, args);
+            let summary = crate::toolfold::semantic_summary_with_context(name, args, paths);
             out.push_str(&format!("⚒ {name}"));
             out.push(' ');
             out.push_str(status_glyph(*status));
@@ -658,7 +711,7 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             added,
             removed,
         } => {
-            out.push_str(&format!("± {path} +{added} -{removed}\n"));
+            out.push_str(&format!("± {} +{added} -{removed}\n", paths.shorten(path)));
         }
         TurnItem::ChildSpawn { agent } => {
             out.push_str(&format!("◉ subagent {} spawned\n", agent.as_str()));
@@ -704,7 +757,21 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             {
                 out.push_str(&note.summary());
                 out.push('\n');
-            } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+            } else if let Some(marker) =
+                haider_protocol::subagent_stop::SubagentsStillRunningV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                out.push_str(&format!("⧗ {}\n", marker.summary()));
+            } else if let Some(result) =
+                haider_protocol::subagent_stop::DetachedChildResultV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                out.push_str(&format!("↩ {}\n", result.summary_line()));
+            } else if let Some((_, label)) =
+                crate::projection::image_created_fact_with_context(kind, data, paths)
+            {
                 out.push_str(&label);
                 out.push('\n');
             } else if let Some(transition) =

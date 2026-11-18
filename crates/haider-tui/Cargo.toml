@@ -38,6 +38,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = { workspace = true, optional = true }
 
 [dev-dependencies]
+haider-store = { path = "../haider-store" }
 haider-provider = { path = "../haider-provider" }
 # 973-tui-toolview: the edit-span law runs the REAL edit application.
 haider-tools = { path = "../haider-tools" }

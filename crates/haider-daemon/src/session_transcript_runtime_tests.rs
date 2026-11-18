@@ -9,7 +9,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::provider::FinishReason;
 use haider_protocol::session::SessionMetadataV1;
 use haider_provider::{FakeProvider, FakeStep, Provider};
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 struct FixedProviderFactory {
     provider: Arc<FakeProvider>,
@@ -82,12 +82,14 @@ impl World {
             .to_string_lossy()
             .into_owned();
         hub.create_internal_session(SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{prefix}"),
             request_digest: format!("create-{prefix}-digest"),
             request_json: format!(r#"{{"session":"{prefix}"}}"#),
             session_id: session_id.clone(),
             cwd,
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -150,22 +152,38 @@ impl World {
     }
 
     async fn await_done(&self, session_id: &SessionId, run_id: &RunId) {
-        timeout(Duration::from_secs(10), async {
+        timeout(haider_platform::TEST_WAIT_TIMEOUT, async {
             loop {
                 let events = self
                     .store
                     .read(session_id, 0, 2048)
                     .await
                     .expect("read journal");
-                if events.iter().any(|event| {
-                    event.run_id.as_ref() == Some(run_id)
+                let done_seq = events.iter().find_map(|event| {
+                    (event.run_id.as_ref() == Some(run_id)
                         && event.payload.decode_event().is_ok_and(|payload| {
                             matches!(payload, EventPayload::RunState(RunState::Done))
-                        })
+                        }))
+                    .then_some(event.seq)
+                });
+                // Done precedes the worker's final aggregate-idle commit.
+                // Fence that tail before taking the head and paging receipts.
+                if done_seq.is_some_and(|done_seq| {
+                    events.iter().any(|event| {
+                        event.seq > done_seq
+                            && event.payload.decode_event().is_ok_and(|payload| {
+                                matches!(
+                                    payload,
+                                    EventPayload::SessionState(
+                                        haider_protocol::state::SessionState::Idle { .. }
+                                    )
+                                )
+                            })
+                    })
                 }) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -224,7 +242,7 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
     let provider = Arc::new(FakeProvider::new(script));
     let world = World::boot_with_scope("handoff", provider, vec![], false).await;
     let source = SessionId::new("source-session");
-    let mut source_events = [RawEnvelope {
+    let mut source_events = vec![RawEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new("source-user"),
         seq: 0,
@@ -251,12 +269,36 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
         .expect("source payload")
         .into(),
     }];
+    // A detached result is not a normal tool-result row. Exercise the real
+    // provider tool route with its report and public delivery notice, while
+    // keeping private obligation/unknown extensions out of the tool receipt.
+    for (index, item) in [
+        serde_json::json!({"item":"child_result","report":{"agent":"child",
+            "summary":"late child report","verified":"unverified"}}),
+        serde_json::json!({"item":"extension","kind":"detached_child_result_v1","data":{
+            "agent":"child","task":"review","stopped_run_id":"stopped-run","state":"done",
+            "verified":"unverified","summary":"late child report"}}),
+        serde_json::json!({"item":"extension","kind":"detached_delivery_v1","data":{
+            "agent":"child","phase":"owed","private_extra":"must-not-appear"}}),
+        serde_json::json!({"item":"extension","kind":"unknown","data":{
+            "summary":"must-not-appear"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut envelope = source_events[0].clone();
+        envelope.event_id = EventId::new(format!("source-child-{index}"));
+        envelope.payload = serde_json::json!({"type":"item","event":"completed",
+            "item_id":format!("child-{index}"),"item":item})
+        .into();
+        source_events.push(envelope);
+    }
     world
         .store
         .append(&mut source_events)
         .await
         .expect("source journal");
-    world.run_turn("handoff", "read the prior session").await;
+    let run = world.run_turn("handoff", "read the prior session").await;
     assert_eq!(
         world
             .store
@@ -265,11 +307,40 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
             .expect("unchanged source"),
         source_events
     );
-    let events = world
-        .store
-        .read(&world.session_id, 0, 2048)
-        .await
-        .expect("receipts");
+    // Done precedes the supervisor's final Idle append. Wait for that
+    // committed boundary before comparing a paginated immutable journal.
+    let events = timeout(Duration::from_secs(10), async {
+        loop {
+            let events = world
+                .store
+                .read(&world.session_id, 0, 2048)
+                .await
+                .expect("receipts");
+            let done = events.iter().find(|event| {
+                event.run_id.as_ref() == Some(&run)
+                    && matches!(
+                        event.payload.decode_event(),
+                        Ok(EventPayload::RunState(RunState::Done))
+                    )
+            });
+            if let Some(done) = done
+                && events.iter().any(|event| {
+                    event.seq > done.seq
+                        && matches!(
+                            event.payload.decode_event(),
+                            Ok(EventPayload::SessionState(
+                                haider_protocol::state::SessionState::Idle { .. }
+                            ))
+                        )
+                })
+            {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("final session idle committed");
     let results: Vec<_> = events
         .iter()
         .filter_map(|event| match event.payload.decode_event().ok()? {
@@ -289,6 +360,9 @@ async fn session_transcript_discovery_read_and_denial_are_durable_tool_receipts(
         read.preview
     );
     assert!(read.preview.contains("next_after_seq="));
+    assert!(read.preview.contains("late child report"));
+    assert!(read.preview.contains("result delivered"));
+    assert!(!read.preview.contains("must-not-appear"));
     let denied = &results
         .iter()
         .find(|(id, _)| id == "foreign")

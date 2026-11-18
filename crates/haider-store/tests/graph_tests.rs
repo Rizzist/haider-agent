@@ -99,12 +99,14 @@ fn create_session(store: &Store, name: &str) -> SessionId {
     let session_id = SessionId::new(name);
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{name}"),
             request_digest: format!("create-digest-{name}"),
             request_json: format!(r#"{{"session":"{name}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -125,12 +127,14 @@ fn create_autonomous_session(store: &Store, name: &str) -> SessionId {
     store
         .create_session_with_interaction_mode(
             &SessionCreateCommand {
+                resolved_model: None,
                 command_id: format!("create-{name}"),
                 request_digest: format!("create-digest-{name}"),
                 request_json: format!(r#"{{"session":"{name}","interaction_mode":"autonomous"}}"#),
                 session_id: session_id.clone(),
                 cwd: "/tmp".into(),
                 provider: "fake".into(),
+                model_catalog_key: None,
                 model: "fake-v1".into(),
                 max_tokens: 4096,
                 max_tokens_source: None,
@@ -1544,50 +1548,69 @@ fn process_signal_binds_to_its_outcome_revision_across_interleaved_mutation() {
 fn read_class_effect_cannot_forge_a_workspace_mutation() {
     // LAW 1 — MUTATION CHECK: a caller-supplied mutation on a pure read must
     // not advance the durable revision counter.
-    let root = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(root.path()).expect("open store");
-    let session_id = create_session(&store, "read-cannot-bump-revision");
-    let run_id = RunId::new("read-cannot-bump-run");
-    let head = store.latest_seq(&session_id).expect("head");
-    let effect = EffectId::new("forged-read-mutation");
-    let mut facts = vec![
-        raw_envelope(
-            &store,
-            &session_id,
-            &run_id,
-            "forged-read-intent",
-            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-                effect: effect.clone(),
-                class: EffectClass::FsRead,
-                summary: "pure read".into(),
-                args_digest: "blake3:pure-read".into(),
-                workspace_revision: None,
-            })),
-        ),
-        raw_envelope(
-            &store,
-            &session_id,
-            &run_id,
-            "forged-read-outcome",
-            EventPayload::Effect(EffectPhase::Outcome {
-                effect: effect.clone(),
-                outcome: EffectOutcome::Ok,
-                freshness: None,
-                workspace_mutation: Some(WorkspaceMutation {
-                    effect_id: effect,
-                    mutation_digest: "blake3:forged-read".into(),
+    for class in [
+        EffectClass::FsRead,
+        EffectClass::ProviderTransport,
+        EffectClass::RemoteExecution,
+        EffectClass::Network {
+            host: "example.invalid".into(),
+        },
+        EffectClass::GitOp,
+        EffectClass::AgentSpawn,
+        EffectClass::PeerMessage,
+        EffectClass::CredentialAccess,
+        EffectClass::GuiAct,
+        EffectClass::ScreenObserve,
+        EffectClass::ScreenControl,
+        EffectClass::MobileObserve,
+        EffectClass::MobileControl,
+        EffectClass::ReadSms,
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, "read-cannot-bump-revision");
+        let run_id = RunId::new("read-cannot-bump-run");
+        let head = store.latest_seq(&session_id).expect("head");
+        let effect = EffectId::new("forged-read-mutation");
+        let mut facts = vec![
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "forged-read-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: effect.clone(),
+                    class,
+                    summary: "pure read".into(),
+                    args_digest: "blake3:pure-read".into(),
                     workspace_revision: None,
-                    subject_digest: None,
-                    redacted_content: false,
+                })),
+            ),
+            raw_envelope(
+                &store,
+                &session_id,
+                &run_id,
+                "forged-read-outcome",
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: effect.clone(),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: Some(WorkspaceMutation {
+                        effect_id: effect,
+                        mutation_digest: "blake3:forged-read".into(),
+                        workspace_revision: None,
+                        subject_digest: None,
+                        redacted_content: false,
+                    }),
                 }),
-            }),
-        ),
-    ];
-    let error = store
-        .append(&mut facts)
-        .expect_err("read-class mutation must reject");
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
-    assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+            ),
+        ];
+        let error = store
+            .append(&mut facts)
+            .expect_err("read-class mutation must reject");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(store.latest_seq(&session_id).expect("head"), head);
+    }
 }
 
 #[test]
@@ -1641,57 +1664,74 @@ fn later_filesystem_mutation_stales_revision_bound_process_evidence() {
 fn filesystem_mutation_subject_is_daemon_verified_and_stale_checkable() {
     // LAWS 2/4 — MUTATION CHECK: dropping the fs provenance branch either
     // rejects a fresh subject or accepts it after the common revision moves.
-    let root = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(root.path()).expect("open store");
-    let session_id = create_session(&store, "fs-mutation-evidence-law");
-    pin(&store, &session_id, "fs-mutation-evidence-law");
-    advance_to_verify(&store, &session_id, 52_000);
-    let run_id = RunId::new("fs-mutation-evidence-run");
-    let (mutation, _) =
-        append_workspace_mutation(&store, &session_id, &run_id, 52_001, EffectClass::FsWrite);
-    let mutation_ref = WorkspaceMutationRef {
-        run_id: run_id.clone(),
-        effect_id: mutation.effect_id.clone(),
-    };
-    let mut fresh = evidence_command(
-        &store,
-        &session_id,
-        52_002,
-        haider_protocol::graph::verify_node(),
-        EvidenceVerdict::Green,
-        "filesystem mutation committed",
-    );
-    fresh.run_id = run_id;
-    fresh.slot = Some("tests".into());
-    fresh.subject_digest = mutation.subject_digest.clone();
-    fresh.workspace_mutation = Some(mutation_ref.clone());
-    store
-        .record_graph_evidence(&fresh)
-        .expect("fresh fs mutation is daemon-verifiable");
-
-    append_workspace_mutation(
-        &store,
-        &session_id,
-        &RunId::new("fs-mutation-evidence-later"),
-        52_003,
+    for class in [
         EffectClass::FsWrite,
-    );
-    let mut stale = fresh;
-    stale.command_id = "fs-mutation-stale-command".into();
-    stale.request_digest = "fs-mutation-stale-digest".into();
-    stale.request_json = r#"{"stale":true}"#.into();
-    stale.workspace_mutation = Some(mutation_ref);
-    let error = store
-        .record_graph_evidence(&stale)
-        .expect_err("later mutation stales fs subject");
-    assert_eq!(error.code, ErrorCode::RevisionConflict);
-    assert_eq!(
-        error
-            .details
-            .as_ref()
-            .and_then(|details| details["kind"].as_str()),
-        Some("stale_evidence_subject")
-    );
+        EffectClass::CheckpointRestore,
+        EffectClass::ProcessExec,
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, "fs-mutation-evidence-law");
+        pin(&store, &session_id, "fs-mutation-evidence-law");
+        advance_to_verify(&store, &session_id, 52_000);
+        let run_id = RunId::new("fs-mutation-evidence-run");
+        let (mutation, _) =
+            append_workspace_mutation(&store, &session_id, &run_id, 52_001, class.clone());
+        let mutation_ref = WorkspaceMutationRef {
+            run_id: run_id.clone(),
+            effect_id: mutation.effect_id.clone(),
+        };
+        let mut fresh = evidence_command(
+            &store,
+            &session_id,
+            52_002,
+            haider_protocol::graph::verify_node(),
+            EvidenceVerdict::Green,
+            "filesystem mutation committed",
+        );
+        fresh.run_id = run_id;
+        fresh.slot = Some("tests".into());
+        fresh.subject_digest = mutation.subject_digest.clone();
+        fresh.workspace_mutation = Some(mutation_ref.clone());
+        if class == EffectClass::ProcessExec {
+            let error = store
+                .record_graph_evidence(&fresh)
+                .expect_err("process intent is not filesystem restore authority");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(
+                error.details.as_ref().and_then(|d| d["kind"].as_str()),
+                Some("mismatched_signal_provenance")
+            );
+            continue;
+        }
+        store
+            .record_graph_evidence(&fresh)
+            .expect("fresh fs mutation is daemon-verifiable");
+
+        append_workspace_mutation(
+            &store,
+            &session_id,
+            &RunId::new("fs-mutation-evidence-later"),
+            52_003,
+            EffectClass::FsWrite,
+        );
+        let mut stale = fresh;
+        stale.command_id = "fs-mutation-stale-command".into();
+        stale.request_digest = "fs-mutation-stale-digest".into();
+        stale.request_json = r#"{"stale":true}"#.into();
+        stale.workspace_mutation = Some(mutation_ref);
+        let error = store
+            .record_graph_evidence(&stale)
+            .expect_err("later mutation stales fs subject");
+        assert_eq!(error.code, ErrorCode::RevisionConflict);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["kind"].as_str()),
+            Some("stale_evidence_subject")
+        );
+    }
 }
 
 /// MUTATION CHECK: drop either the payload-kind branch or the legacy
@@ -2119,12 +2159,68 @@ fn legacy_empty_slot_all_of_n_retains_flat_counter_reduction() {
     );
 }
 
+/// OWNER RULE (no default caps): the built-in ship-loop repair loop keeps
+/// iterating while each red is new information, far past the former 8-attempt
+/// default, and then completes its VERIFY gate productively.
+/// MUTATION CHECK: restore a default attempt ceiling below 12. Expected
+/// failure: the graph blocks RoundsExhausted instead of reaching SHIP.
 #[test]
-fn eighth_unsatisfied_epoch_blocks_rounds_exhausted_without_back_edge_facts() {
+fn default_repair_loop_runs_past_eight_epochs_and_completes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "attempt-unbounded");
+    pin(&store, &session_id, "attempt-unbounded");
+    let mut serial = 1;
+    for epoch in 1..=12 {
+        advance_to_verify(&store, &session_id, serial);
+        serial += 1;
+        exhaust_verify_epoch(&store, &session_id, &mut serial, epoch);
+        let status = store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph");
+        assert_eq!(status.phase, GraphPhase::Active, "epoch {epoch}");
+    }
+    advance_to_verify(&store, &session_id, serial);
+    serial += 1;
+    for slot in ["tests", "lint", "typecheck"] {
+        record_verify_slot(
+            &store,
+            &session_id,
+            serial,
+            slot,
+            EvidenceVerdict::Green,
+            &format!("{slot} passed on epoch 13"),
+        );
+        serial += 1;
+    }
+    let status = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(status.phase, GraphPhase::Active);
+    assert_eq!(status.attempt, 13);
+    assert_eq!(status.blocked_reason, None);
+    assert_eq!(
+        status.current_node,
+        Some(haider_protocol::graph::ship_node()),
+        "the productive loop converged past the former 8-attempt default"
+    );
+}
+
+/// An EXPLICIT per-node `max_attempts` stays an honoured opt-in bound.
+/// MUTATION CHECK: ignore the pinned template's max_attempts. Expected
+/// failure: the graph stays active after the eighth unsatisfied epoch.
+#[test]
+fn explicit_eight_attempt_bound_blocks_rounds_exhausted_without_back_edge_facts() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "attempt-cap");
-    pin(&store, &session_id, "attempt-cap");
+    let mut nodes = haider_protocol::graph::ship_loop_nodes();
+    for node in &mut nodes {
+        node.max_attempts = 8;
+    }
+    pin_runtime_graph(&store, &session_id, "attempt-cap", "BUILD", nodes);
     let mut serial = 1;
     for epoch in 1..=8 {
         advance_to_verify(&store, &session_id, serial);
@@ -3806,7 +3902,12 @@ fn back_edge_preserves_unrelated_ready_sibling_evidence_and_epoch() {
 }
 
 #[test]
-fn twenty_four_conditional_hops_is_a_hard_runtime_bound() {
+/// OWNER RULE (no default caps): the former global 24-conditional-hop bound
+/// is gone; conditional loops continue past it and stop only at the pinned
+/// template's explicit per-node `max_attempts` (8 here).
+/// MUTATION CHECK: restore the 24-hop runtime bound. Expected failure: FOUR's
+/// fourth red blocks at attempt 25 instead of reopening at 26.
+fn conditional_hops_continue_past_twenty_four_until_the_explicit_node_bound() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_session(&store, "conditional-hop-bound");
@@ -3870,19 +3971,36 @@ fn twenty_four_conditional_hops_is_a_hard_runtime_bound() {
     );
     assert_eq!(at_bound.phase, GraphPhase::Active);
 
+    for round in 3..7 {
+        record(
+            &store,
+            &session_id,
+            serial,
+            fourth.clone(),
+            EvidenceVerdict::Red,
+            &format!("FOUR distinct failure past the old hop bound {round}"),
+        );
+        serial += 1;
+        let status = store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph");
+        assert_eq!(status.phase, GraphPhase::Active, "round {round}");
+        assert_eq!(status.attempt, 26 + (round - 3));
+    }
     record(
         &store,
         &session_id,
         serial,
         fourth,
         EvidenceVerdict::Red,
-        "FOUR hop 25 is refused",
+        "FOUR exhausts its explicit eight attempts",
     );
     let blocked = store
         .graph_status(&session_id)
         .expect("status")
         .expect("graph");
-    assert_eq!(blocked.attempt, 25);
+    assert_eq!(blocked.attempt, 29);
     assert_eq!(blocked.phase, GraphPhase::Blocked);
     assert_eq!(
         blocked.blocked_reason,
@@ -4922,6 +5040,7 @@ fn append_tool_attempt(
                     name: tool_name.into(),
                     args: args.clone(),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -4960,6 +5079,7 @@ fn append_tool_attempt(
                     name: tool_name.into(),
                     args,
                     status: item_status,
+                    activity: None,
                 },
             }),
         ),
@@ -6018,7 +6138,9 @@ fn m2e_cached_template_is_revalidated_and_poison_is_typed() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let mut malformed = implement_verify_child_template();
-    malformed.nodes[0].max_attempts = haider_protocol::graph::GRAPH_MAX_ATTEMPTS + 1;
+    // Zero attempts is the remaining invalid bound (explicit bounds have no
+    // ceiling).
+    malformed.nodes[0].max_attempts = 0;
     let key = ChildTemplateCacheKey {
         task_shape: "mutation_verify".into(),
         effective_grant_digest: "grant-poison".into(),

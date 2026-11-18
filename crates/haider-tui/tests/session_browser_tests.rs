@@ -34,6 +34,8 @@ fn live_model() -> AppModel {
 
 fn summary(id: &str, seen_at_ms: Option<u64>, last_activity_ms: Option<u64>) -> SessionSummary {
     let mut summary = SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: SessionId::new(id),
         head_seq: 4,
@@ -74,6 +76,7 @@ fn seed(model: &mut AppModel, summary: SessionSummary) {
 
 fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -86,6 +89,7 @@ fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionM
         cwd: cwd.to_owned(),
         provider: "openai".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: model.to_owned(),
         max_tokens: 4_096,
         max_tokens_source: None,
@@ -176,6 +180,26 @@ fn rows_order_needs_you_then_unseen_then_recent() {
     assert!(rows[0].needs_input.is_some());
     assert!(rows[1].unseen && rows[2].unseen);
     assert!(!rows[3].unseen, "activity older than seen is settled");
+}
+
+#[test]
+fn browser_rows_project_real_workspace_paths_for_active_and_inactive_sessions() {
+    let mut model = live_model();
+    let mut row = summary("other", None, None);
+    row.workspace_cwd = Some("/Users/bob/project".to_owned());
+    seed(&mut model, row);
+    assert_eq!(model.session_browser_rows()[0].dir, "/Users/<user>/project");
+
+    model.active_session = Some(SessionId::new("other"));
+    let mut active = summary("other", None, None);
+    active.workspace_cwd = Some("/home/bob/work".to_owned());
+    model.note_summary_counts(&active);
+    assert_eq!(model.session_browser_rows()[0].dir, "/home/<user>/work");
+    assert_eq!(
+        model.session_workspace_cwd.as_deref(),
+        Some("/home/bob/work"),
+        "RPC authority keeps the real path"
+    );
 }
 
 /// The browser is reachable, selects, opens, and returns — the whole

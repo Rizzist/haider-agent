@@ -123,6 +123,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
     let device_id = DeviceId::new("route-wait-device");
     first
         .create_session(haider_core::SessionCreateCommand {
+            resolved_model: None,
             command_id: "create-route-wait".into(),
             request_digest: "create-route-wait-digest".into(),
             request_json: r#"{"session":"route-wait"}"#.into(),
@@ -132,6 +133,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
                 .to_string_lossy()
                 .into_owned(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -284,6 +286,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
                     name: "inspect".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -313,6 +316,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
                     name: "inspect".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
         ),
@@ -368,6 +372,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
                     name: "inspect".into(),
                     args: completed_args.clone(),
                     status: ToolStatus::Completed,
+                    activity: None,
                 },
             }),
         ),

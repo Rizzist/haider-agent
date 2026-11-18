@@ -87,6 +87,17 @@ fn subdirectory_becomes_a_colon_namespace() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn command_warning_escapes_control_characters_in_its_path() {
+    let temp = tempfile::tempdir().expect("temp");
+    write(temp.path(), "bad\nname.md", "");
+    let result = load(Some(temp.path()), None);
+    let warning = result.warnings.first().expect("malformed command warning");
+    assert!(!warning.contains('\n'));
+    assert!(warning.contains("\\u{000a}"), "{warning}");
+}
+
 #[test]
 fn project_wins_over_global_on_name_collision() {
     let global = tempfile::tempdir().expect("temp");
@@ -304,6 +315,9 @@ fn live_session_model() -> AppModel {
 
 fn provider_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,

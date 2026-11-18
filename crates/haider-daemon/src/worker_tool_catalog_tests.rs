@@ -30,12 +30,22 @@ fn usage_reset_tool_is_root_only_and_declares_the_human_only_effect() {
     assert_eq!(tool.route, RegisteredToolRoute::UsageResetApply);
     assert_eq!(tool.default, ToolPermissionDefault::Ask);
     assert_eq!(tool.manifest.effects, vec![EffectClass::UsageResetApply]);
+    assert_eq!(
+        tool.route.activity(),
+        None,
+        "account maintenance is not agent activity"
+    );
     assert!(
         !default_child_grant()
             .tools
             .iter()
             .any(|name| name == "usage_reset_apply"),
         "a delegated child cannot spend the parent account's reset credit"
+    );
+    assert!(
+        !default_child_grant()
+            .effect_ceiling
+            .contains(&EffectClass::UsageResetApply)
     );
 }
 
@@ -460,9 +470,13 @@ fn automatic_pair_switches_cannot_cross_a_lockdown_boundary() {
     let switch = haider_core::ProviderPairSwitch {
         run_id: haider_protocol::ids::RunId::new("lockdown-switch-run"),
         switch_ordinal: 0,
+        source_rebind_seq: 0,
+        target_account: "automatic-account".into(),
         from_provider: "source".to_owned(),
         from_model: "source-model".to_owned(),
         to_provider: "target".to_owned(),
+        model_catalog_key: None,
+        output_budget: None,
         to_model: "target-model".to_owned(),
         cause: haider_core::ProviderPairSwitchCause::FallbackChain,
     };
@@ -915,7 +929,7 @@ fn list_models_surface_is_manifest_route_and_text_pinned() {
     // request-budget argument, spawn authorization, and deferred report wait.
     assert_eq!(
         spawn,
-        "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+        "spawn_subagent(task, prompt, background?, wait_ms?, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate a child under AgentSpawn policy; waits for child report by default; background=true returns an immediate handle, wait_ms bounds only the observation; use haider agent wait/list/message/cancel on the handle; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
     );
 }
 

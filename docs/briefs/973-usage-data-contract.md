@@ -59,6 +59,16 @@ without answering the card. The menu is session-scoped and
 Both entry points apply the same session policy denial before opening a menu;
 read-only and hard-denied sessions receive a typed refusal.
 
+The card uses the shared toolview input owner, presentation identity, pointer
+binding, 400 ms decision dwell, and local-input queue rebasing. Hidden cards
+leave the composer in charge; pickers, Search and History cover a spending
+card. Same-id menu updates receive a new presentation incarnation. Pending
+decisions remain stacked, with blocking questions first. Answered spending
+cards retire locally at once; their successor starts at Deny and must satisfy
+its own dwell before a pointer can confirm it. The footer shows the pending
+decision count. Local typing survives owner changes caused by earlier queued
+input; outside replacements retire that input, including equal-value clears.
+
 The committed `menu_answer` proves accepted menu coordinates, not human origin.
 Same-UID self-approval remains deferred to lane 975 (registry #165). The card
 captures the provider, provider-issued account id used for the consume header,
@@ -66,6 +76,24 @@ and daemon-minted account incarnation when it opens. Replacement, removal and
 recreation, or missing legacy binding closes the old approval with typed
 `account_changed`, without a consume request. A proven same-account credential
 rotation keeps the incarnation and may complete the pending approval.
+The saved sign-in must also match the account record's principal and workspace.
+Older records without a principal binding require an account refresh or a new
+sign-in before reset apply; RPC errors and tool previews explain this action.
+Journaled reset intents use the released `credential_access` carrier and an
+additive `effect_origin: usage_reset_apply` field. Current readers reconstruct
+the dedicated reset class only with that carrier; incompatible carriers are
+rejected. This follows the shared journal compatibility codec. Reset apply
+does not generate an agent workspace or web activity indicator.
+Direct tool inventory also keeps the released effect-class vocabulary. Its
+effect objects carry additive `effect_origin` metadata, using the same mapping
+as intents; current readers restore the dedicated class. Ordinary inventory
+effects keep their existing encoding, and inventory remains read-only data.
+Within a serialized `Menu`, deferred approval uses the released `choice` kind
+with additive `deferred_approval` coordinates inside the kind object. Current
+readers restore the dedicated menu kind, including its account binding; older
+readers ignore those coordinates. Earlier native deferred-menu records remain
+readable by the current daemon and normalize to this carrier on their next
+write. Other menu kinds keep their existing encoding.
 An import without qualifying provider account proof mints a new incarnation,
 so its earlier approval closes even if the display alias is unchanged.
 On approval the daemon calls the provider with the same opaque approval id as OpenAI's

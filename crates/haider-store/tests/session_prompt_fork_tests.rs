@@ -44,12 +44,14 @@ struct AcceptedFixture {
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"session_id":"{session_id}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp/prompt-fork".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-model".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -257,6 +259,7 @@ fn completed_agent_facts(
                             name: format!("tool_{index}"),
                             args: serde_json::json!({}),
                             status: ToolStatus::InProgress,
+                            activity: None,
                         },
                     }),
                     PromptRender::Verbatim,
@@ -299,6 +302,7 @@ fn completed_agent_facts(
                             name: format!("tool_{index}"),
                             args: serde_json::json!({"index": index}),
                             status: ToolStatus::Completed,
+                            activity: None,
                         },
                     }),
                     PromptRender::Verbatim,
@@ -870,6 +874,19 @@ fn retry_reuses_child_cas_refs_stay_deduplicated_and_running_parent_cannot_chang
     else {
         panic!("fresh prompt fork must commit");
     };
+    let pair = store
+        .session_output_pair_at(&created.session_id, created.created_seq)
+        .expect("prompt-fork snapshot")
+        .expect("typed prompt-fork origin");
+    assert_eq!(
+        (pair.provider.as_str(), pair.model.as_str(), pair.max_tokens),
+        (
+            created.metadata.provider.as_str(),
+            created.metadata.model.as_str(),
+            created.metadata.max_tokens
+        )
+    );
+    assert_eq!(pair.source, created.metadata.max_tokens_source);
     assert_eq!(
         store.journal_replay(&source).expect("parent after fork"),
         parent_at_cut,
@@ -974,6 +991,7 @@ fn incomplete_tool_fact(
                     name: "fs_read".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::Cancelled,
+                    activity: None,
                 },
             }),
             PromptRender::Verbatim,
@@ -1107,6 +1125,7 @@ fn completed_tool_fact(
                 name: "fs_read".into(),
                 args: serde_json::json!({"path": "note.txt"}),
                 status: ToolStatus::Completed,
+                activity: None,
             },
         }),
         render,
@@ -1291,6 +1310,7 @@ fn terminal_boundaries_accept_only_closed_tool_exchanges() {
                         name: "fs_read".into(),
                         args: serde_json::json!({}),
                         status: ToolStatus::InProgress,
+                        activity: None,
                     },
                 }),
                 PromptRender::Verbatim,
@@ -1398,6 +1418,7 @@ fn prompt_omitted_server_tool_pair_may_settle_after_its_call() {
                     name: "web_search".into(),
                     args: serde_json::json!({}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }),
             PromptRender::Omit,

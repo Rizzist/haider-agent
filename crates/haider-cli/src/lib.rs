@@ -208,7 +208,7 @@ async fn dispatch(command: routing::Command<'_>) -> ExitCode {
                  [--json|--output print|json|jsonl] [--timeout <dur>] \
                  [--max-tokens <n>] [--max-output-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
                  [--request-tranche <n>] [--max-requests <n>] [--resume <run-id>] \
-                 [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
+                 [--start] | run --status <run-id> | run --stop|--stop-main|--stop-subagents <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--read-only] [--allow-writes] [--allow-exec] [--auto-allow] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], daemon stop [--json] [--timeout <duration>], \
@@ -446,7 +446,7 @@ async fn ready_command() -> ExitCode {
                     "haider {VERSION} — daemon ready ({how}): profile {} at {} \
                      (daemon v{}, generation {})",
                     &profile.profile_id[..12],
-                    profile.endpoint_path.display(),
+                    daemon_ready_endpoint_display(&profile.endpoint_path),
                     ensured.welcome.daemon_version,
                     ensured.welcome.daemon_generation,
                 );
@@ -461,6 +461,10 @@ async fn ready_command() -> ExitCode {
             ExitCode::from(front_door_exit_code(&error))
         }
     }
+}
+
+fn daemon_ready_endpoint_display(endpoint: &std::path::Path) -> String {
+    haider_client::launch_origin::display_path(endpoint)
 }
 pub fn front_door_exit_code(error: &haider_client::EnsureError) -> u8 {
     use haider_client::EnsureError;
@@ -500,12 +504,24 @@ pub fn hold_explorer_console_on_failure(code: ExitCode) {
 
 #[cfg(test)]
 mod runtime_tests {
-    use super::footprint_hold_ms;
+    use super::{daemon_ready_endpoint_display, footprint_hold_ms};
     #[test]
     fn footprint_hold_is_opt_in_and_bounded() {
         assert_eq!(footprint_hold_ms("60000"), Some(60_000));
         assert_eq!(footprint_hold_ms("0"), None);
         assert_eq!(footprint_hold_ms("300001"), None);
         assert_eq!(footprint_hold_ms("not-a-duration"), None);
+    }
+
+    #[test]
+    fn daemon_ready_endpoint_uses_the_shared_display_projection() {
+        assert_eq!(
+            daemon_ready_endpoint_display(std::path::Path::new("/Users/bob/haider.sock")),
+            "/Users/<user>/haider.sock"
+        );
+        assert_eq!(
+            daemon_ready_endpoint_display(std::path::Path::new(r"\\.\pipe\haider-0123")),
+            r"\\.\pipe\haider-0123"
+        );
     }
 }

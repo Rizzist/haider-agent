@@ -1,0 +1,49 @@
+# tuivirt golden · accounts_dead_switch_prompt · 80x24
+00|ACCOUNTS — auth is harness-owned · the ADE reads this list                      |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×50; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×22
+01|· `anthropic-dead` unusable — enter again re-logs it in place · ↑/↓ choose live |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×79; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+02|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+03|openai-oauth                                                                    |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×12; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×68
+04|  ○ openai-live [oauth] · o********@e******.test · active                       |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×11; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×34; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×23
+05|  ○ openai-second [oauth] · o********@e******.test · active                     |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×13; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×34; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
+06|anthropic-oauth                                                                 |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×65
+07|  ● anthropic-dead [oauth] · a********@e******.test · expired · in use          |
+   ~ Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×2; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×2; Rgb(242, 242, 242)/Rgb(39, 39, 39)/BOLD×14; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×8; Rgb(139, 148, 158)/Rgb(39, 39, 39)/NONE×35; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×9; Rgb(212, 212, 212)/Rgb(39, 39, 39)/NONE×10
+08|  ○ anthropic-live [oauth] · a********@e******.test · active                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×14; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×34; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×20
+09|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+10|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+11|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+12|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                     |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
+13|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×7
+14|[+ Google Antigravity (OAuth)]                                                  |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×50
+15|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                        |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×13; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×24
+16|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                              |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×15; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×30
+17|[+ Ollama (local)]  [+ LM Studio (local)]                                       |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×18; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
+18|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                     |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×16; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×20; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×19; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×21
+19|[+ Add custom server]                                                           |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×21; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×59
+20|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+21|click an account · + adds · x removes · r reveals · PgUp/PgDn scroll · esc back |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×79; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+22|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

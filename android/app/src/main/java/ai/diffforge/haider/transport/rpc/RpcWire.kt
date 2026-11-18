@@ -99,6 +99,7 @@ object RpcWire {
         "client_name" to "haider-android", "client_version" to version,
         "client_instance_id" to instance, "client_kind" to "gui",
         "capabilities_requested" to JsonArray((if (control) listOf("view", "control") else listOf("view")).map(::JsonPrimitive)),
+        "features_requested" to JsonArray(listOf(JsonPrimitive("session_activity_v1"))),
         "max_receive_frame" to MAX_BODY, "encodings" to JsonArray(listOf(JsonPrimitive("json"))),
     )
 }

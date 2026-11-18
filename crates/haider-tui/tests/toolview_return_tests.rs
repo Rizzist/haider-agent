@@ -119,6 +119,7 @@ impl Builder {
             name: name.to_owned(),
             args: args.clone(),
             status,
+            activity: None,
         };
         apply(
             &mut self.model,

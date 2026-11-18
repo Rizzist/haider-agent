@@ -44,6 +44,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value, status: ToolStatus) 
             name: name.to_owned(),
             args,
             status,
+            activity: None,
         },
     })
 }
@@ -56,6 +57,7 @@ fn tool_started(id: &str, name: &str, args: serde_json::Value) -> EventPayload {
             name: name.to_owned(),
             args,
             status: ToolStatus::InProgress,
+            activity: None,
         },
     })
 }
@@ -551,6 +553,7 @@ fn shell_row(id: &str) -> haider_rpc::ShellWire {
         id: id.into(),
         kind: haider_rpc::ShellKindWire::Local,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "/workspace".into(),
         created_at_ms: 1,

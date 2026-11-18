@@ -6,6 +6,8 @@ mod tests;
 use super::*;
 use crate::provider_registry::{ProductionProviderEndpointValidator, ProviderEndpointValidator};
 
+type RebindView = Result<crate::accounts::ManagementView, (&'static str, &'static str)>;
+
 impl HubConnection {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn session_provider_rebind(
@@ -50,6 +52,37 @@ impl HubConnection {
             Ok(None) => {}
             Err(error) => return self.respond_turn_error(request_id, error),
         }
+        let Some(_) = (match self.hub.session_metadata(&session_id).await {
+            Ok(value) => value,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "provider rebind requires a session with typed metadata",
+                false,
+                None,
+            );
+        };
+        // Reject invalid targets before any endpoint probe, then read the
+        // account projection again after the network wait.
+        if let Err((code, message)) = self.provider_rebind_view(&provider, account.as_deref())? {
+            return self.respond_error(request_id, code, message, false, None);
+        }
+        // Custom endpoint validation probes its inventory over the network.
+        // It depends only on the requested route; validate before fencing the
+        // mutable session pair, then compute both budgets under the fence.
+        let base_url = match base_url {
+            None => None,
+            Some(url) => {
+                #[cfg(test)]
+                self.hub.pause_selection_network(&session_id).await;
+                match validate_rebind_endpoint(&provider, &url).await {
+                    Ok(url) => Some(url),
+                    Err(error) => return self.respond_turn_error(request_id, error),
+                }
+            }
+        };
         let _selection = self.hub.lock_workflow_selection(&session_id).await;
         let Some(current) = (match self.hub.session_metadata(&session_id).await {
             Ok(value) => value,
@@ -63,76 +96,51 @@ impl HubConnection {
                 None,
             );
         };
-        let view = self
-            .hub
-            .accounts()?
-            .and_then(|facade| facade.management.read());
-        let Some(view) = view else {
-            return self.respond_error(
-                request_id,
-                "provider_unknown",
-                "provider registry is unavailable",
-                false,
-                None,
-            );
-        };
-        let Some(profile) = view.providers.iter().find(|p| p.provider == provider) else {
-            return self.respond_error(
-                request_id,
-                "provider_unknown",
-                "provider is not registered",
-                false,
-                None,
-            );
-        };
-        if !profile.enabled {
-            return self.respond_error(
-                request_id,
-                haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
-                "provider is disabled",
-                false,
-                None,
-            );
-        }
-        if let Some(alias) = account.as_deref() {
-            let Some(descriptor) = view.descriptors.iter().find(|d| d.alias.as_str() == alias)
-            else {
-                return self.respond_error(
-                    request_id,
-                    "account_unknown",
-                    "account is not registered",
-                    false,
-                    None,
-                );
-            };
-            if descriptor.provider != provider {
-                return self.respond_error(
-                    request_id,
-                    "account_provider_mismatch",
-                    "account does not belong to the requested provider",
-                    false,
-                    None,
-                );
+        let view = match self.provider_rebind_view(&provider, account.as_deref())? {
+            Ok(view) => view,
+            Err((code, message)) => {
+                return self.respond_error(request_id, code, message, false, None);
             }
-        }
-        let base_url = match base_url {
-            None => None,
-            Some(url) => match validate_rebind_endpoint(&provider, &url).await {
-                Ok(url) => Some(url),
-                Err(error) => return self.respond_turn_error(request_id, error),
-            },
         };
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
-            view.providers.clone(),
-        );
-        if let Err(refusal) = authority.validate_selection_with_status(
+            Some(view.providers.clone()),
+        )
+        .scoped_to_route(&provider, base_url.as_deref(), account.as_deref());
+        let validated = match authority.validate_selection_with_status(
             &current.provider,
             Some(&provider),
-            &current.model,
+            current.model_coordinate(),
         ) {
-            return self.respond_selection_refusal(request_id, &refusal);
-        }
+            Ok(selection) => selection,
+            Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        let budget = super::rpc::reapply_session_output_budget(&current, &validated);
+        let active_output_budget =
+            if let Some(active) = self.hub.active_run_output_pair(&session_id).await? {
+                let selection = match authority.validate_selection_with_status(
+                    &active.provider,
+                    Some(&provider),
+                    &active.model,
+                ) {
+                    Ok(selection) => selection,
+                    Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+                };
+                Some(haider_protocol::session::ActiveRunOutputBudgetV1 {
+                    run_id: active.run_id,
+                    model: active.model,
+                    budget: haider_protocol::output_budget::SessionOutputBudgetSourceV1::classify(
+                        active.source,
+                        active.max_tokens,
+                    )
+                    .apply(
+                        selection.max_output_tokens,
+                        selection.explicit_max_output_tokens,
+                    ),
+                })
+            } else {
+                None
+            };
         // Admission shares this lock. Compare against the ACTIVE run's
         // frozen ceiling: session.select_model can already describe the next
         // turn, and is not evidence of the current turn's authority.
@@ -143,7 +151,10 @@ impl HubConnection {
             .hub
             .provider_lockdown_policy_for_active(&provider, new_no_auth)?;
         if self.hub.session_has_nonterminal_runs(&session_id).await? {
-            let frozen = self.hub.bound_session_lockdown(&session_id)?;
+            let frozen = self
+                .hub
+                .bound_session_lockdown_blocking(&session_id)
+                .await?;
             if !frozen.as_ref().is_some_and(|(old_provider, old_policy)| {
                 rebind_matches_frozen_policy(old_provider, *old_policy, &provider, new_policy)
             }) {
@@ -160,6 +171,10 @@ impl HubConnection {
             provider,
             base_url,
             account,
+            max_tokens: budget.max_tokens,
+            max_tokens_source: budget.source,
+            clamped: budget.clamped,
+            active_output_budget,
             event_id: EventId::new(random_id("session-provider-rebound")?),
             device_id: self.hub.inner.device_id.clone(),
         };
@@ -176,6 +191,47 @@ impl HubConnection {
         self.respond_provider_rebound(request_id, selected)
     }
 
+    /// Both preflight and post-probe admission use the same account rules.
+    fn provider_rebind_view(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<RebindView, SessionHubError> {
+        let Some(mut view) = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+        else {
+            return Ok(Err((
+                "provider_unknown",
+                "provider registry is unavailable",
+            )));
+        };
+        view.scope_catalog_for_account(provider, account);
+        let Some(profile) = view.providers.iter().find(|p| p.provider == provider) else {
+            return Ok(Err(("provider_unknown", "provider is not registered")));
+        };
+        if !profile.enabled {
+            return Ok(Err((
+                haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
+                "provider is disabled",
+            )));
+        }
+        if let Some(alias) = account {
+            let Some(descriptor) = view.descriptors.iter().find(|d| d.alias.as_str() == alias)
+            else {
+                return Ok(Err(("account_unknown", "account is not registered")));
+            };
+            if descriptor.provider != provider {
+                return Ok(Err((
+                    "account_provider_mismatch",
+                    "account does not belong to the requested provider",
+                )));
+            }
+        }
+        Ok(Ok(view))
+    }
+
     fn respond_provider_rebound(
         &self,
         request_id: RequestId,
@@ -190,6 +246,14 @@ impl HubConnection {
                 account: selected.account,
                 selected_seq: selected.selected_seq,
                 worker_generation: selected.worker_generation,
+                output_budget: (selected.max_tokens != 0).then_some(
+                    haider_protocol::output_budget::SessionOutputBudgetV1 {
+                        max_tokens: selected.max_tokens,
+                        source: selected.max_tokens_source,
+                        clamped: selected.clamped,
+                    },
+                ),
+                active_output_budget: selected.active_output_budget,
             },
         })
     }

@@ -78,6 +78,10 @@ use std::path::{Path, PathBuf};
 /// The state file's name — `demo-` prefixed on purpose (see module docs).
 pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 
+// Reuse the v2 item extension carrier: released readers reject new EntryDto
+// variants, but retain unknown TurnItem extensions without losing the store.
+const WORKSPACE_RECEIPT_EXTENSION_KIND: &str = "haider.demo.workspace.v1";
+
 /// The on-disk format version. Checked as part of guard 1: any value
 /// outside [`SUPPORTED_VERSIONS`] (or its absence) rejects the whole file
 /// back to seeds — the demo store never guesses at a foreign format
@@ -86,14 +90,25 @@ pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 /// **v2 (W3c3, report R11 cut 1)**: `SessionDto.id` became the protocol's
 /// opaque STRING session id and gained the row's local `ui_gen`. A v1 file
 /// (numeric ids, no generation) still hydrates — see [`SessionIdDto`] and
-/// the upcast in [`hydrate`] — and the next save rewrites it as v2.
-pub const DEMO_STORE_VERSION: u32 = 2;
+/// the upcast in [`hydrate`] — and the next save rewrites it at the current version.
+///
+/// **v3**: projections retain every pending menu id, rather than only the
+/// visible menu. The strict DTO gained a field, so writes advance the
+/// version; v1/v2 still hydrate with their single known menu.
+pub const DEMO_STORE_VERSION: u32 = 3;
 
 /// The pre-W3c3 version: numeric session ids, no recorded generation.
 pub const DEMO_STORE_VERSION_V1: u32 = 1;
 
+/// The opaque-session-id format before complete pending-menu retention.
+pub const DEMO_STORE_VERSION_V2: u32 = 2;
+
 /// Versions this build hydrates. Anything else → seeds.
-pub const SUPPORTED_VERSIONS: [u32; 2] = [DEMO_STORE_VERSION_V1, DEMO_STORE_VERSION];
+pub const SUPPORTED_VERSIONS: [u32; 3] = [
+    DEMO_STORE_VERSION_V1,
+    DEMO_STORE_VERSION_V2,
+    DEMO_STORE_VERSION,
+];
 
 /// Handle on the demo state file: knows the path and the hash of the last
 /// write, so unchanged frames skip the disk entirely.
@@ -350,6 +365,8 @@ pub struct ProjectionDto {
     #[serde(default)]
     pub menu: Option<Menu>,
     #[serde(default)]
+    pub pending_menus: Vec<haider_protocol::ids::MenuId>,
+    #[serde(default)]
     pub todos: Option<TodosDto>,
     #[serde(default)]
     pub usage: Option<Usage>,
@@ -557,8 +574,14 @@ pub fn snapshot(model: &AppModel) -> StateDto {
 
 fn projection_to_dto(projection: &SessionProjection) -> ProjectionDto {
     ProjectionDto {
-        entries: projection.entries().iter().map(entry_to_dto).collect(),
+        entries: projection
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| entry_to_dto(entry, index))
+            .collect(),
         menu: projection.open_menu().cloned(),
+        pending_menus: projection.pending_menu_ids(),
         todos: projection.todos().map(|panel| TodosDto {
             item_id: panel.item_id.clone(),
             items: panel.items.clone(),
@@ -569,7 +592,7 @@ fn projection_to_dto(projection: &SessionProjection) -> ProjectionDto {
     }
 }
 
-fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
+fn entry_to_dto(entry: &TranscriptEntry, index: usize) -> EntryDto {
     match entry {
         TranscriptEntry::User {
             text,
@@ -607,6 +630,18 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text, .. } => EntryDto::Note { text: text.clone() },
+        TranscriptEntry::Workspace { event } => EntryDto::Item {
+            item_id: ItemId::new(format!("demo-workspace-receipt-{index}")),
+            item: TurnItem::Extension {
+                kind: WORKSPACE_RECEIPT_EXTENSION_KIND.into(),
+                data: serde_json::json!(event),
+            },
+            output_tail_b64: String::new(),
+            output_truncated: false,
+            output_decode_error: false,
+            tool_reason: None,
+            spoken: false,
+        },
         TranscriptEntry::Refusal {
             provider,
             tool,
@@ -730,7 +765,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
                 entry.head_ros = Some(claimed.ros);
             }
         }
-        entry.dir = s.dir;
+        entry.dir = model.display_path(&s.dir);
         entry.model_short = s.model_short;
         entry.device = s.device;
         entry.ago = s.ago;
@@ -760,10 +795,10 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     vfs.extend(dto.vfs);
     model.vfs = vfs;
     if !dto.launcher_dir.is_empty() {
-        model.launcher_dir = dto.launcher_dir.clone();
+        model.launcher_dir = model.display_path(&dto.launcher_dir);
         // The no-session scratch dir mirrors the launcher's (fresh_session
         // law) — per-session dirs rode in with their sessions above.
-        model.session_dir = dto.launcher_dir;
+        model.session_dir = model.launcher_dir.clone();
     }
     if let Some(voice) = dto.voice {
         model.voice = VoiceState {
@@ -811,7 +846,7 @@ fn backfill_callsigns(chips: &mut [ChipModel], next: &mut u64) {
 }
 
 fn projection_from_dto(dto: ProjectionDto) -> SessionProjection {
-    SessionProjection::hydrate(
+    let mut projection = SessionProjection::hydrate(
         dto.entries.into_iter().map(entry_from_dto).collect(),
         dto.menu,
         dto.todos.map(|todos| TodoPanel {
@@ -821,7 +856,9 @@ fn projection_from_dto(dto: ProjectionDto) -> SessionProjection {
         }),
         dto.usage,
         dto.interrupted,
-    )
+    );
+    projection.restore_pending_menu_ids(dto.pending_menus);
+    projection
 }
 
 fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
@@ -861,6 +898,12 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             tool_reason,
             spoken,
         } => {
+            if let TurnItem::Extension { kind, data } = &item
+                && kind == WORKSPACE_RECEIPT_EXTENSION_KIND
+                && let Ok(event) = serde_json::from_value(data.clone())
+            {
+                return TranscriptEntry::Workspace { event };
+            }
             // A restored block is FINAL: no stream survives a restart, so
             // `streaming` is false and the fragment accumulator is empty
             // (the sim's reloaded entries render as finished rows).
@@ -912,6 +955,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         // truth); the clocks reload so a terminal chip's frozen final and
         // a live chip's running measure both survive a restart.
         child_session: None,
+        state_child_head_seq: None,
         handoff_dir: None,
         spawned_at_ms: dto.spawned_at_ms,
         last_event_at_ms: dto.last_event_at_ms,
@@ -923,6 +967,8 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
             options: q.options,
             resolved: q.resolved,
         }),
+        // Activity is live-only display state; a reload starts quiet.
+        activity: haider_protocol::activity::ActivityTracker::new(),
         closed: dto.closed,
         // A persisted closed chip is mid-removal by definition; guard 4's
         // sweep drops it before it ever renders.
@@ -959,6 +1005,41 @@ fn chip_state_from_label(label: &str) -> ChipDisplayState {
         "WAITING" => ChipDisplayState::Waiting,
         "DONE" => ChipDisplayState::Done,
         "ERROR" => ChipDisplayState::Error,
+        "CANCELLED" => ChipDisplayState::Cancelled,
         _ => ChipDisplayState::Idle,
+    }
+}
+
+#[cfg(test)]
+mod pending_retention_tests {
+    use super::*;
+    use haider_protocol::{
+        EventPayload,
+        menu::{AnswerVia, MenuAnswer},
+    };
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restored_projection_counts_every_pending_card_and_deduplicates() {
+        let mut projection = SessionProjection::new();
+        for id in ["a", "b", "c", "b"] {
+            projection.apply(&EventPayload::MenuOpened(
+                crate::runtime::input_typeahead_tests::decision(id),
+            ));
+        }
+        let dto = projection_to_dto(&projection);
+        let serialized = serde_json::to_string(&dto).unwrap();
+        let restored_dto = serde_json::from_str::<ProjectionDto>(&serialized).unwrap();
+        let mut restored = projection_from_dto(restored_dto);
+        assert_eq!(restored.pending_menu_count(), 3);
+        for (id, count) in [("a", 2), ("b", 1), ("c", 0)] {
+            restored.apply(&EventPayload::MenuAnswered(MenuAnswer {
+                menu: haider_protocol::ids::MenuId::new(id),
+                option_key: None,
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Tui,
+            }));
+            assert_eq!(restored.pending_menu_count(), count);
+        }
     }
 }

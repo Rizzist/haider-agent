@@ -685,6 +685,7 @@ pub struct OAuthProviderRegistration {
     issuer: String,
     authorization_endpoint: Url,
     token_endpoint: Url,
+    identity_endpoint: Option<Url>,
     client_id: String,
     scopes: Vec<String>,
     audience: String,
@@ -721,6 +722,10 @@ impl fmt::Debug for OAuthProviderRegistration {
                 &safe_url(&self.authorization_endpoint),
             )
             .field("token_endpoint", &safe_url(&self.token_endpoint))
+            .field(
+                "identity_endpoint",
+                &self.identity_endpoint.as_ref().map(safe_url),
+            )
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
             .field("audience", &self.audience)
@@ -813,6 +818,18 @@ impl OAuthProviderRegistration {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_identity_endpoint(
+        mut self,
+        endpoint: impl AsRef<str>,
+    ) -> Result<Self, OAuthPublicError> {
+        let endpoint = Url::parse(endpoint.as_ref())
+            .map_err(|_| OAuthPublicError::new("invalid_test_identity_endpoint", false))?;
+        validate_metadata_url(&endpoint)?;
+        self.identity_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_identity(
         provider_id: impl Into<String>,
@@ -853,6 +870,7 @@ impl OAuthProviderRegistration {
             issuer,
             authorization_endpoint,
             token_endpoint,
+            identity_endpoint: None,
             client_id,
             scopes,
             audience,
@@ -899,14 +917,218 @@ fn invalid_metadata() -> OAuthPublicError {
     OAuthPublicError::new("invalid_provider_metadata", false)
 }
 
+/// DEBUG/TEST BUILDS ONLY — the whole module is compiled out of release
+/// binaries (`debug_assertions` is off in the `release` and `ci` profiles).
+///
+/// `HAIDER_TEST_FAKE_OAUTH_ORIGIN=http://127.0.0.1:<port>` points the Claude
+/// (`anthropic-oauth`) registration at a local fake OAuth/profile server
+/// (`scripts/test-support/fake_oauth_server.py`, see
+/// `docs/testing/fake-oauth.md`) so real `haiderd` binaries can run
+/// end-to-end login/re-login tests.
+///
+/// Safety properties:
+/// - explicit opt-in: nothing changes unless the variable is set;
+/// - numeric IPv4 loopback `http://127.x.y.z:<port>` only, with no path,
+///   query, fragment or credentials; any other value disables the provider
+///   rather than falling back to the live endpoints;
+/// - the fake registration's ISSUER is the fake origin, so a bundle issued
+///   by the real provider (`https://claude.ai`) fails
+///   `validate_bundle_against`/issuer checks and is never refreshed, probed
+///   or otherwise sent to the fake server (and fake-issued bundles never
+///   reach the real token or profile endpoints).
+#[cfg(debug_assertions)]
+pub(crate) mod debug_fake_oauth {
+    use super::{OAuthProviderRegistration, Url};
+
+    pub(crate) const ORIGIN_ENV: &str = "HAIDER_TEST_FAKE_OAUTH_ORIGIN";
+    /// Providers the fake may stand in for: authorization-code providers whose
+    /// identity comes from the token grant plus a profile document (no
+    /// signed ID token a fake could not honestly produce).
+    const FAKEABLE_PROVIDERS: [&str; 1] = [haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME];
+
+    /// `Some(origin)` only for an `http://<ipv4 loopback>:<port>` value.
+    ///
+    /// The literal authority is checked on the RAW input: `Url` normalizes a
+    /// scheme-default port away (`:80` parses as "no port"), so an explicit
+    /// port cannot be read back from the parsed URL. The authority must be a
+    /// strict dotted-quad `127.x.y.z` (std `Ipv4Addr` parsing: no shorthand,
+    /// no leading zeros, no hostnames) followed by an explicit decimal port.
+    pub(crate) fn parse_origin(value: &str) -> Option<Url> {
+        let rest = value.strip_prefix("http://")?;
+        let authority = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, port) = authority.split_once(':')?;
+        let ip = host.parse::<std::net::Ipv4Addr>().ok()?;
+        let port_is_explicit = !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0);
+        if !ip.is_loopback() || !port_is_explicit {
+            return None;
+        }
+        let url = Url::parse(value).ok()?;
+        let parsed_loopback = matches!(url.host(), Some(url::Host::Ipv4(parsed)) if parsed == ip);
+        (url.scheme() == "http"
+            && parsed_loopback
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none())
+        .then_some(url)
+    }
+
+    /// Whether this process opted in to faking `provider` (any value, even an
+    /// invalid one that disabled it, counts: the process is in test mode).
+    pub(crate) fn active_for(provider: &str) -> bool {
+        FAKEABLE_PROVIDERS.contains(&provider) && std::env::var_os(ORIGIN_ENV).is_some()
+    }
+
+    /// The loopback model-catalog URL standing in for `provider`'s live
+    /// subscription catalog, when this process fakes it.
+    pub(crate) fn catalog_url(provider: &str) -> Option<Url> {
+        if !FAKEABLE_PROVIDERS.contains(&provider) {
+            return None;
+        }
+        let value = std::env::var_os(ORIGIN_ENV)?;
+        parse_origin(value.to_str()?)?.join("/v1/models").ok()
+    }
+
+    pub(super) fn apply(
+        registration: OAuthProviderRegistration,
+    ) -> Option<OAuthProviderRegistration> {
+        let Some(value) = std::env::var_os(ORIGIN_ENV) else {
+            return Some(registration);
+        };
+        if !FAKEABLE_PROVIDERS.contains(&registration.provider_id.as_str()) {
+            return Some(registration);
+        }
+        let Some(origin) = value.to_str().and_then(parse_origin) else {
+            eprintln!(
+                "haiderd: {ORIGIN_ENV} is not an http://127.x.y.z:<port> origin; {} OAuth is disabled",
+                registration.provider_id
+            );
+            return None;
+        };
+        apply_origin(registration, &origin)
+    }
+
+    pub(crate) fn apply_origin(
+        mut registration: OAuthProviderRegistration,
+        origin: &Url,
+    ) -> Option<OAuthProviderRegistration> {
+        let join = |path: &str| origin.join(path).ok();
+        registration.authorization_endpoint = join("/oauth/authorize")?;
+        registration.token_endpoint = join("/oauth/token")?;
+        registration.identity_endpoint = Some(join("/api/oauth/profile")?);
+        registration.issuer = origin.as_str().trim_end_matches('/').to_owned();
+        // Once per process: the catalog is rebuilt for legacy probes.
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            eprintln!(
+                "haiderd: TEST MODE — {} OAuth uses the fake server at {}",
+                registration.provider_id, registration.issuer
+            );
+        });
+        Some(registration)
+    }
+}
+
+/// The issuer the RELEASED sanctioned registration uses for `provider`
+/// (never the debug fake's). `None` for providers without one (test-only
+/// registrations, API-key providers).
+pub(crate) fn live_issuer(provider: &str) -> Option<&'static str> {
+    SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == provider)
+        .map(|registration| registration.issuer)
+}
+
+/// Data-plane guard, every build: an OAuth token whose bundle was minted by
+/// anything other than the provider's live issuer (e.g. the debug fake OAuth
+/// server) is never sent to a non-loopback host: catalog, inference or
+/// usage. Only [`CredentialBroker::resolve_to_loopback`] may hand one out.
+fn ensure_live_issuer_for_remote(
+    descriptor: &CredentialDescriptor,
+    bundle: &OAuthTokenBundleV1,
+) -> Result<(), HaiderError> {
+    match live_issuer(&descriptor.provider) {
+        Some(live) if bundle.issuer != live => Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "OAuth credential `{}` was issued by {} rather than the live {} issuer; it is never sent to a non-loopback endpoint",
+                descriptor.alias, bundle.issuer, descriptor.provider
+            ),
+            false,
+        )),
+        Some(_) => Ok(()),
+        None => Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            "OAuth live issuer is unavailable; sign in again",
+            false,
+        )),
+    }
+}
+
+/// Refuses credential import, device adoption and import heal for a provider
+/// the debug fake-OAuth hook is faking. Those paths ingest credentials Haider
+/// did not mint through the fake (a real Claude Code login, for instance);
+/// in test mode they must never be read, stored or refreshed. Always `Ok` in
+/// release builds (the hook does not exist there).
+pub(crate) fn require_live_oauth_provider(provider: &str) -> Result<(), HaiderError> {
+    #[cfg(debug_assertions)]
+    if debug_fake_oauth::active_for(provider) {
+        return Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "credential import, adoption and heal are disabled for {provider} while {} points it at a fake OAuth server (debug test mode); sign in through the fake instead",
+                debug_fake_oauth::ORIGIN_ENV
+            ),
+            false,
+        ));
+    }
+    let _ = provider;
+    Ok(())
+}
+
+/// The issuer this process's catalog uses for `provider` (the live issuer in
+/// release builds; the fake origin under the debug-only test hook). Legacy
+/// profile probes send a row's token only when its bundle carries it.
+pub(crate) fn catalog_issuer(provider: &str) -> Option<String> {
+    OAuthProviderCatalog::default().registration_issuer(provider)
+}
+
 /// One availability authority shared by RPC and the later management view.
+#[cfg(test)]
+type TestOAuthRegistrations = Arc<Mutex<HashMap<String, Arc<OAuthProviderRegistration>>>>;
+
 #[derive(Clone)]
 pub struct OAuthProviderCatalog {
     registrations: Arc<HashMap<String, Arc<OAuthProviderRegistration>>>,
+    // Only unit fixtures may switch a registration while a flight is parked.
+    // Production and integration-test catalogs remain immutable.
+    #[cfg(test)]
+    test_registrations: Option<TestOAuthRegistrations>,
 }
 
 impl Default for OAuthProviderCatalog {
+    /// The process catalog: the sanctioned table, plus (debug builds only)
+    /// the opt-in fake-OAuth test hook.
     fn default() -> Self {
+        Self::build(true)
+    }
+}
+
+impl OAuthProviderCatalog {
+    /// The sanctioned table exactly as released, NEVER rewritten by the
+    /// debug fake-OAuth hook. Credential imports stamp their issuer from it,
+    /// so a credential Haider did not mint through the fake can never carry
+    /// the fake's issuer (and pass the fake registration's issuer guards).
+    pub(crate) fn live() -> Self {
+        Self::build(false)
+    }
+
+    fn build(apply_test_hook: bool) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = apply_test_hook;
         let registrations = SANCTIONED_PROVIDER_REGISTRATIONS
             .iter()
             .filter_map(|metadata| {
@@ -934,6 +1156,16 @@ impl Default for OAuthProviderCatalog {
                 )
                 .ok()?;
                 registration.redirect_policy = metadata.redirect_policy;
+                registration.identity_endpoint =
+                    haider_provider::oauth_identity_source(metadata.provider_id)
+                        .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+                        .map(|endpoint| endpoint.url)
+                        .map(Url::parse)
+                        .transpose()
+                        .ok()?;
+                if let Some(endpoint) = registration.identity_endpoint.as_ref() {
+                    validate_metadata_url(endpoint).ok()?;
+                }
                 registration.authorize_parameters = metadata
                     .authorize_parameters
                     .iter()
@@ -949,16 +1181,22 @@ impl Default for OAuthProviderCatalog {
                 registration.flow_mode = metadata.flow_mode;
                 registration.auth_header_set = metadata.auth_header_set;
                 registration.refresh_policy = metadata.refresh_policy;
+                #[cfg(debug_assertions)]
+                let registration = if apply_test_hook {
+                    debug_fake_oauth::apply(registration)?
+                } else {
+                    registration
+                };
                 Some((registration.provider_id.clone(), Arc::new(registration)))
             })
             .collect::<HashMap<_, _>>();
         Self {
             registrations: Arc::new(registrations),
+            #[cfg(test)]
+            test_registrations: None,
         }
     }
-}
 
-impl OAuthProviderCatalog {
     pub fn with_test_registrations(
         registrations: impl IntoIterator<Item = OAuthProviderRegistration>,
     ) -> Result<Self, OAuthPublicError> {
@@ -981,6 +1219,8 @@ impl OAuthProviderCatalog {
             }
         }
         Ok(Self {
+            #[cfg(test)]
+            test_registrations: Some(Arc::new(Mutex::new(by_provider.clone()))),
             registrations: Arc::new(by_provider),
         })
     }
@@ -1018,7 +1258,17 @@ impl OAuthProviderCatalog {
     }
 
     fn registration(&self, provider: &str) -> Option<Arc<OAuthProviderRegistration>> {
+        #[cfg(test)]
+        if let Some(registrations) = &self.test_registrations {
+            return registrations.lock().ok()?.get(provider).cloned();
+        }
         self.registrations.get(provider).cloned()
+    }
+
+    /// The issuer this catalog's registration for `provider` uses.
+    pub(crate) fn registration_issuer(&self, provider: &str) -> Option<String> {
+        self.registration(provider)
+            .map(|registration| registration.issuer.clone())
     }
 }
 
@@ -1908,6 +2158,7 @@ pub(crate) fn load_oauth_import_material_with_native(
 ) -> Result<OAuthImportMaterial, HaiderError> {
     require_credential_import_available()?;
     let spec = oauth_import_source_spec(source)?;
+    require_live_oauth_provider(spec.provider)?;
     let path = oauth_import_path(source)?;
     let input = if spec.source == "claude-code" {
         load_claude_credential_input(&path, native, event)?
@@ -1937,6 +2188,8 @@ pub(crate) fn load_claude_native_import_material(
     event: ClaudeNativeReadEvent,
 ) -> Result<OAuthImportMaterial, ClaudeNativeImportError> {
     require_credential_import_available().map_err(ClaudeNativeImportError::Invalid)?;
+    require_live_oauth_provider(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)
+        .map_err(ClaudeNativeImportError::Invalid)?;
     let mut input = native
         .read(event)
         .map_err(ClaudeNativeImportError::Access)?;
@@ -1972,11 +2225,14 @@ fn load_oauth_import_material_from_input(
     generation: u64,
     input: ClaudeCredentialInput,
 ) -> Result<OAuthImportMaterial, HaiderError> {
+    require_live_oauth_provider(spec.provider)?;
     let claude_native_owner = input.native_owner;
     let path = input.location;
     let bytes = input.bytes;
     let source_fingerprint = *blake3::hash(&bytes).as_bytes();
-    let registration = OAuthProviderCatalog::default()
+    // Imported credentials always carry the LIVE issuer: never the debug
+    // fake's, whose registration would otherwise accept them.
+    let registration = OAuthProviderCatalog::live()
         .registration(spec.provider)
         .ok_or_else(|| {
             HaiderError::new(
@@ -2188,6 +2444,7 @@ fn codex_import_bundle(
         .unwrap_or_else(|| "imported".to_owned());
     let subject = identity_claims
         .sub
+        .clone()
         .and_then(nonempty)
         // A workspace id is shared by its members. When the imported ID
         // token has no user subject, the grant itself supplies the stable
@@ -2198,16 +2455,22 @@ fn codex_import_bundle(
                 blake3::hash(auth.tokens.refresh_token.0.as_slice()).to_hex()
             )
         });
+    let user_account_id = identity_claims
+        .sub
+        .and_then(nonempty)
+        .map(|user| haider_provider::openai_user_account_coordinate(&user, account_id.as_deref()));
     let account_identity = account_identity.or_else(|| {
-        (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
-            subject_hash: None,
-            email,
-            display_name: None,
-            account_id,
-            plan: None,
-            issuer: Some(registration.issuer.clone()),
-            captured_at,
-            verified: false,
+        (email.is_some() || account_id.is_some() || user_account_id.is_some()).then(|| {
+            AccountIdentity {
+                subject_hash: None,
+                email,
+                display_name: None,
+                account_id: user_account_id,
+                plan: None,
+                issuer: Some(registration.issuer.clone()),
+                captured_at,
+                verified: false,
+            }
         })
     });
     let id_token = auth.tokens.id_token.map(|token| token.0);
@@ -2624,7 +2887,7 @@ fn invalid_import(path: &Path, source: &str) -> HaiderError {
     )
 }
 
-fn is_numeric_loopback_http(url: &Url) -> bool {
+pub(crate) fn is_numeric_loopback_http(url: &Url) -> bool {
     url.scheme() == "http" && matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
 }
 
@@ -3624,7 +3887,8 @@ async fn run_device_token_flow(
             }
             Ok(DeviceTokenPoll::Tokens(bytes)) => {
                 set_terminal(&inner, &flow_id, InternalFlowStatus::Exchanging);
-                match token_bundle_from_response(&registration, &bytes, &[], 1, None).await {
+                match token_bundle_from_response(client, &registration, &bytes, &[], 1, None).await
+                {
                     Ok(bundle) => {
                         if registration.provider_id == haider_provider::KIMI_OAUTH_PROVIDER_NAME
                             && let Err(error) = validate_kimi_oauth_bundle(&bundle).await
@@ -4495,7 +4759,7 @@ async fn exchange_authorization_code(
     if !status.is_success() {
         return Err(classify_token_error(status.as_u16(), &bytes));
     }
-    token_bundle_from_response(registration, &bytes, nonce, 1, None).await
+    token_bundle_from_response(client, registration, &bytes, nonce, 1, None).await
 }
 
 async fn bounded_response(
@@ -4709,7 +4973,193 @@ struct TokenResponse {
     id_token: Option<SecretJson>,
 }
 
+/// Backoff before each retry of a transient identity-endpoint failure
+/// (transport error, 429, 5xx). Three attempts in total; a `Retry-After`
+/// hint is honoured up to [`IDENTITY_ENDPOINT_MAX_RETRY_DELAY`].
+const IDENTITY_ENDPOINT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(1000)];
+const IDENTITY_ENDPOINT_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// The identity recorded when a Claude grant succeeded but its profile could
+/// not be read: the pre-973 synthetic `anthropic:<grant hash>` form, with
+/// `verified = false`. It is never identity-deduplicated
+/// (`AccountPrincipal::identity_unverified`), and the daemon's legacy
+/// upgrade pass replaces it from the row's own token once the profile
+/// endpoint answers (startup, and every later Claude login).
+fn unverified_grant_identity(
+    registration: &OAuthProviderRegistration,
+    identity: &OAuthIdentityV1,
+    captured_at: u64,
+) -> AccountIdentity {
+    let suffix = identity.subject_hash.chars().take(16).collect::<String>();
+    AccountIdentity {
+        subject_hash: Some(identity.subject_hash.clone()),
+        email: None,
+        display_name: Some(identity.display_identity.clone()),
+        account_id: Some(format!(
+            "{}{suffix}",
+            haider_protocol::credential::ANTHROPIC_UNVERIFIED_ID_PREFIX
+        )),
+        plan: None,
+        issuer: Some(registration.issuer.clone()),
+        captured_at,
+        verified: false,
+    }
+}
+
+/// Fetches and parses a provider's authenticated identity document (today:
+/// Claude's OAuth profile, see [`haider_provider::ANTHROPIC_OAUTH_PROFILE_URL`]).
+///
+/// The access token rides only a sensitive `Authorization` header; redirects
+/// are refused (the OAuth client never follows them); the body is bounded.
+/// Parsing belongs to the provider's identity source. The result is promoted
+/// to `verified` because this request itself authenticated the facts.
+async fn account_identity_from_endpoint(
+    client: &reqwest::Client,
+    registration: &OAuthProviderRegistration,
+    access_token: &[u8],
+    captured_at: u64,
+) -> Result<Option<(OAuthIdentityV1, AccountIdentity)>, OAuthPublicError> {
+    let Some(endpoint) = registration.identity_endpoint.clone() else {
+        return Ok(None);
+    };
+    let source = haider_provider::oauth_identity_source(&registration.provider_id);
+    let mut authorization = Zeroizing::new(b"Bearer ".to_vec());
+    authorization.extend_from_slice(access_token);
+    let mut authorization = reqwest::header::HeaderValue::from_bytes(&authorization)
+        .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    authorization.set_sensitive(true);
+    let mut attempt = 0_usize;
+    let response = loop {
+        let mut request = client
+            .get(endpoint.clone())
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::CONNECTION, "close");
+        for &(name, value) in source
+            .and_then(haider_provider::OAuthIdentitySource::identity_endpoint)
+            .map_or(&[][..], |endpoint| endpoint.headers)
+        {
+            request = request.header(name, value);
+        }
+        let outcome = match request.send().await {
+            Err(_) => Err((
+                OAuthPublicError::new("identity_endpoint_unavailable", true),
+                None,
+            )),
+            Ok(response) if response.status().is_redirection() => {
+                return Err(OAuthPublicError::new("identity_redirect_rejected", false));
+            }
+            Ok(response) if response.status().is_success() => Ok(response),
+            // Rate limiting and server faults are transient: retry them with
+            // a bounded backoff before degrading the login.
+            Ok(response)
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error() =>
+            {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                Err((
+                    OAuthPublicError::new("identity_endpoint_unavailable", true),
+                    retry_after,
+                ))
+            }
+            Ok(_) => return Err(OAuthPublicError::new("identity_endpoint_rejected", false)),
+        };
+        match outcome {
+            Ok(response) => break response,
+            Err((error, retry_after)) => {
+                let Some(&delay) = IDENTITY_ENDPOINT_RETRY_DELAYS.get(attempt) else {
+                    return Err(error);
+                };
+                attempt += 1;
+                tokio::time::sleep(
+                    retry_after
+                        .unwrap_or(delay)
+                        .min(IDENTITY_ENDPOINT_MAX_RETRY_DELAY),
+                )
+                .await;
+            }
+        }
+    };
+    let bytes = bounded_response(response).await?;
+    let mut account_identity = source
+        .and_then(|source| {
+            source
+                .identity_from_endpoint_document(&bytes, captured_at)
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
+    account_identity.issuer = Some(registration.issuer.clone());
+    account_identity.verified = true;
+    let stable_account_coordinate = account_identity
+        .account_id
+        .as_deref()
+        .ok_or_else(|| OAuthPublicError::new("identity_response_invalid", false))?;
+    Ok(Some((
+        OAuthIdentityV1 {
+            subject_hash: blake3::hash(stable_account_coordinate.as_bytes())
+                .to_hex()
+                .to_string(),
+            display_identity: account_identity.summary(),
+        },
+        account_identity,
+    )))
+}
+
+/// Best-effort migration for an older Claude OAuth row whose descriptor only
+/// holds a synthetic `anthropic:<hash>` identity. The caller supplies that
+/// row's own still-valid access token; no other account's credential is used.
+pub(crate) async fn legacy_anthropic_profile_identity(
+    access_token: &[u8],
+    expected_issuer: &str,
+) -> Option<AccountIdentity> {
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME)?;
+    // Account-actor unit fixtures use live-shaped identities, but a removed
+    // issuer guard must still never give them a live profile transport.
+    #[cfg(test)]
+    let registration = {
+        let mut registration = (*registration).clone();
+        registration.identity_endpoint = Some(Url::parse("http://127.0.0.1:9/profile").ok()?);
+        registration
+    };
+    legacy_anthropic_profile_identity_with_registration(
+        access_token,
+        expected_issuer,
+        &registration,
+    )
+    .await
+}
+
+async fn legacy_anthropic_profile_identity_with_registration(
+    access_token: &[u8],
+    expected_issuer: &str,
+    registration: &OAuthProviderRegistration,
+) -> Option<AccountIdentity> {
+    if registration.issuer != expected_issuer {
+        return None;
+    }
+    let client = haider_platform::native_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    account_identity_from_endpoint(&client, registration, access_token, now_ms()?)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, identity)| identity)
+}
+
 async fn token_bundle_from_response(
+    client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
     bytes: &[u8],
     nonce: &[u8],
@@ -4740,7 +5190,7 @@ async fn token_bundle_from_response(
     {
         return Err(OAuthPublicError::new("scope_mismatch", false));
     }
-    let identity = match &registration.identity_mode {
+    let mut identity = match &registration.identity_mode {
         RuntimeIdentityMode::VerifiedIdToken(verifier) => {
             let id_token = response
                 .id_token
@@ -4789,6 +5239,33 @@ async fn token_bundle_from_response(
         // The generic decoder is informational; this bit is promoted only
         // because the flow independently verified this exact ID token.
         account_identity.verified = true;
+    }
+    if account_identity.is_none() {
+        match account_identity_from_endpoint(
+            client,
+            registration,
+            response.access_token.0.as_slice(),
+            now,
+        )
+        .await
+        {
+            Ok(Some((endpoint_identity, endpoint_account))) => {
+                identity = endpoint_identity;
+                account_identity = Some(endpoint_account);
+            }
+            Ok(None) => {}
+            // The token exchange itself succeeded: an unreadable profile is
+            // no reason to fail the login. Save the account WITHOUT identity
+            // dedupe, marked unverified, and upgrade it later.
+            Err(error) => {
+                tracing::warn!(
+                    provider = %registration.provider_id,
+                    code = error.code,
+                    "OAuth identity endpoint unavailable; saving account with unverified identity"
+                );
+                account_identity = Some(unverified_grant_identity(registration, &identity, now));
+            }
+        }
     }
     if account_identity.is_none()
         && matches!(
@@ -5121,9 +5598,106 @@ impl RefreshFlight {
 #[derive(Clone, Default)]
 pub(crate) struct RefreshFenceRegistry {
     fences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    credential_writes: Arc<Mutex<HashMap<String, Arc<CredentialWriteState>>>>,
+}
+
+#[derive(Default)]
+struct CredentialWriteState {
+    generation: AtomicU64,
+    legacy_digest: Mutex<Option<LegacyApiKeyBinding>>,
+}
+
+struct LegacyApiKeyBinding {
+    incarnation: u64,
+    digest: Option<String>,
+}
+
+/// Covers the vault-first commit, snapshot publication and any rollback.
+/// An odd generation denies readers, including legacy descriptors with no digest.
+pub(crate) struct CredentialWriteGuard(Arc<CredentialWriteState>);
+
+impl Drop for CredentialWriteGuard {
+    fn drop(&mut self) {
+        self.0.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl RefreshFenceRegistry {
+    fn credential_write_counter(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<Arc<CredentialWriteState>, HaiderError> {
+        let mut writes = self
+            .credential_writes
+            .lock()
+            .map_err(|_| credential_changed())?;
+        Ok(Arc::clone(
+            writes
+                .entry(alias.as_str().to_owned())
+                .or_insert_with(|| Arc::new(CredentialWriteState::default())),
+        ))
+    }
+
+    /// Bind a migrated API key before replacing its bytes. The binding survives
+    /// receipt failure while the published snapshot still refers to that incarnation.
+    pub(crate) fn bind_legacy_api_key(
+        &self,
+        descriptor: Option<&CredentialDescriptor>,
+        secret: Option<&SecretHandle>,
+    ) -> Result<(), HaiderError> {
+        if let Some(descriptor) = descriptor
+            && descriptor.auth_method == AuthMethod::ApiKey
+            && descriptor.credential_digest.is_none()
+            && !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        {
+            let state = self.credential_write_counter(&descriptor.alias)?;
+            *state
+                .legacy_digest
+                .lock()
+                .map_err(|_| credential_changed())? = Some(LegacyApiKeyBinding {
+                incarnation: descriptor.incarnation,
+                // An unreadable old secret cannot authorize any replacement bytes.
+                digest: secret
+                    .map(|secret| blake3::hash(secret.expose_secret()).to_hex().to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_credential_write(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<CredentialWriteGuard, HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2)
+            || counter
+                .generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(credential_changed());
+        }
+        Ok(CredentialWriteGuard(counter))
+    }
+
+    fn credential_read_generation(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<(Arc<CredentialWriteState>, u64), HaiderError> {
+        let counter = self.credential_write_counter(alias)?;
+        let generation = counter.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return Err(credential_changed());
+        }
+        Ok((counter, generation))
+    }
+
     fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
         self.fences
             .lock()
@@ -5164,6 +5738,40 @@ struct BrokerInner {
     panic_refresh_worker: AtomicBool,
 }
 
+pub(crate) fn api_key_descriptor_is_current(
+    snapshot: &crate::accounts::AccountsSnapshot,
+    expected: &CredentialDescriptor,
+) -> bool {
+    snapshot.lock().is_ok_and(|descriptors| {
+        descriptors.iter().any(|current| {
+            current.alias == expected.alias
+                && current.provider == expected.provider
+                && current.auth_method == expected.auth_method
+                && current.base_url == expected.base_url
+                && current.incarnation == expected.incarnation
+        })
+    })
+}
+
+pub(crate) fn validate_api_key_secret(
+    descriptor: &CredentialDescriptor,
+    secret: &SecretHandle,
+) -> Result<(), HaiderError> {
+    // The native gcloud account deliberately rotates its access token without
+    // replacing the account. Ordinary API keys are immutable within an incarnation.
+    if !crate::gcloud::is_gcloud_refresh_descriptor(descriptor)
+        && descriptor
+            .credential_digest
+            .as_ref()
+            .is_some_and(|expected| {
+                expected != &blake3::hash(secret.expose_secret()).to_hex().to_string()
+            })
+    {
+        return Err(credential_changed());
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 pub(crate) trait OAuthRefreshExchange: Send + Sync {
     async fn exchange(
@@ -5195,6 +5803,53 @@ enum SnapshotOAuthState {
     Current,
     Expired,
     Replaced,
+}
+
+/// The destination approved before resolving an OAuth access token. This
+/// value travels with the resolution through every vault re-read and flight.
+#[derive(Clone)]
+enum CredentialDestination {
+    Remote,
+    Loopback(Url),
+    InProcess,
+}
+
+impl CredentialDestination {
+    fn check(
+        &self,
+        descriptor: &CredentialDescriptor,
+        bundle: &OAuthTokenBundleV1,
+    ) -> Result<(), HaiderError> {
+        match self {
+            Self::Remote => ensure_live_issuer_for_remote(descriptor, bundle),
+            Self::Loopback(url) if !is_numeric_loopback_http(url) => Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "a loopback credential resolution requires a numeric-loopback http destination",
+                false,
+            )),
+            Self::Loopback(_)
+                if live_issuer(&descriptor.provider) == Some(bundle.issuer.as_str()) =>
+            {
+                Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "a live-issued OAuth credential is never sent to a loopback endpoint",
+                    false,
+                ))
+            }
+            Self::Loopback(url)
+                if !Url::parse(&bundle.issuer).is_ok_and(|issuer| {
+                    is_numeric_loopback_http(&issuer) && issuer.origin() == url.origin()
+                }) =>
+            {
+                Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "OAuth credential issuer does not match the loopback destination",
+                    false,
+                ))
+            }
+            Self::Loopback(_) | Self::InProcess => Ok(()),
+        }
+    }
 }
 
 /// Completes the public single-flight even if the worker unwinds before its
@@ -5432,18 +6087,106 @@ impl CredentialBroker {
         Ok(self)
     }
 
+    /// Resolves a credential for a request to the provider's REAL (network)
+    /// endpoint: inference, usage, catalog. An OAuth token not minted by the
+    /// live issuer is refused (typed) before it can leave the process; see
+    /// [`ensure_live_issuer_for_remote`]. Every network send point uses
+    /// this or [`Self::resolve_to_loopback`].
+    pub(crate) async fn resolve_remote(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.resolve_for_destination(descriptor, CredentialDestination::Remote)
+            .await
+    }
+
+    /// Resolves a credential for a request to a numeric-loopback `destination`
+    /// (the debug fake data plane). Any other destination is refused.
+    pub(crate) async fn resolve_to_loopback(
+        &self,
+        descriptor: &CredentialDescriptor,
+        destination: &Url,
+    ) -> Result<SecretHandle, HaiderError> {
+        if !is_numeric_loopback_http(destination) {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "a loopback credential resolution requires a numeric-loopback http destination",
+                false,
+            ));
+        }
+        self.resolve_for_destination(
+            descriptor,
+            CredentialDestination::Loopback(destination.clone()),
+        )
+        .await
+    }
+
+    /// A credential for a consumer that cannot make an HTTP request.
+    pub(crate) async fn resolve_in_process(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.resolve_for_destination(descriptor, CredentialDestination::InProcess)
+            .await
+    }
+
+    /// Legacy test seam. Production callers must name a destination.
+    #[cfg(test)]
     pub(crate) async fn resolve(
         &self,
         descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.resolve_in_process(descriptor).await
+    }
+
+    async fn resolve_for_destination(
+        &self,
+        descriptor: &CredentialDescriptor,
+        destination: CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(broker_stopped());
         }
         match descriptor.auth_method {
-            AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
+            AuthMethod::ApiKey => {
+                let (counter, generation) = self
+                    .inner
+                    .fences
+                    .credential_read_generation(&descriptor.alias)?;
+                if !api_key_descriptor_is_current(&self.inner.snapshot, descriptor) {
+                    return Err(credential_changed());
+                }
+                let secret = self.resolve_vault(&descriptor.alias).await?;
+                if counter.generation.load(Ordering::Acquire) != generation
+                    || !api_key_descriptor_is_current(&self.inner.snapshot, descriptor)
+                {
+                    return Err(credential_changed());
+                }
+                validate_api_key_secret(descriptor, &secret)?;
+                if descriptor.credential_digest.is_none()
+                    && counter
+                        .legacy_digest
+                        .lock()
+                        .map_err(|_| credential_changed())?
+                        .as_ref()
+                        .is_some_and(|binding| {
+                            binding.incarnation == descriptor.incarnation
+                                && binding.digest.as_ref().is_none_or(|expected| {
+                                    expected
+                                        != &blake3::hash(secret.expose_secret())
+                                            .to_hex()
+                                            .to_string()
+                                })
+                        })
+                {
+                    return Err(credential_changed());
+                }
+                Ok(secret)
+            }
             AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
                 SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
-                    self.resolve_oauth(descriptor, false, None).await
+                    self.resolve_oauth(descriptor, false, None, &destination)
+                        .await
                 }
                 SnapshotOAuthState::Replaced => {
                     let Some(flight) = self.active_flight(descriptor) else {
@@ -5451,13 +6194,15 @@ impl CredentialBroker {
                     };
                     match flight.wait().await? {
                         RefreshFlightOutcome::Imported(expected) => {
-                            self.resolve_imported_bundle(descriptor, &expected).await
+                            self.resolve_imported_bundle(descriptor, &expected, &destination)
+                                .await
                         }
                         RefreshFlightOutcome::Refreshed
                             if Self::snapshot_oauth_state(&self.inner, descriptor)
                                 != SnapshotOAuthState::Replaced =>
                         {
-                            self.resolve_oauth(descriptor, false, None).await
+                            self.resolve_oauth(descriptor, false, None, &destination)
+                                .await
                         }
                         RefreshFlightOutcome::Refreshed => Err(expired_or_replaced(descriptor)),
                     }
@@ -5466,14 +6211,44 @@ impl CredentialBroker {
         }
     }
 
+    /// Refreshes a rejected token for a retry to the provider's real
+    /// endpoint, enforcing the live issuer on the returned access token.
+    pub(crate) async fn refresh_after_auth_failure_remote(
+        &self,
+        descriptor: &CredentialDescriptor,
+        failed_access_fingerprint: Option<[u8; 32]>,
+    ) -> Result<SecretHandle, HaiderError> {
+        self.refresh_after_auth_failure_for_destination(
+            descriptor,
+            failed_access_fingerprint,
+            &CredentialDestination::Remote,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn refresh_after_auth_failure(
         &self,
         descriptor: &CredentialDescriptor,
         failed_access_fingerprint: Option<[u8; 32]>,
     ) -> Result<SecretHandle, HaiderError> {
+        self.refresh_after_auth_failure_for_destination(
+            descriptor,
+            failed_access_fingerprint,
+            &CredentialDestination::InProcess,
+        )
+        .await
+    }
+
+    async fn refresh_after_auth_failure_for_destination(
+        &self,
+        descriptor: &CredentialDescriptor,
+        failed_access_fingerprint: Option<[u8; 32]>,
+        destination: &CredentialDestination,
+    ) -> Result<SecretHandle, HaiderError> {
         match descriptor.auth_method {
             AuthMethod::OAuth => {
-                self.resolve_oauth(descriptor, true, failed_access_fingerprint)
+                self.resolve_oauth(descriptor, true, failed_access_fingerprint, destination)
                     .await
             }
             // G4b (LV2): the vertex gcloud-refresh credential re-mints
@@ -5550,6 +6325,7 @@ impl CredentialBroker {
         descriptor: &CredentialDescriptor,
         force_refresh: bool,
         failed_access_fingerprint: Option<[u8; 32]>,
+        destination: &CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
@@ -5565,6 +6341,7 @@ impl CredentialBroker {
                         .await?;
                 return Err(error);
             }
+            destination.check(descriptor, &bundle)?;
             let now = now_ms().ok_or_else(|| {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
@@ -5611,7 +6388,9 @@ impl CredentialBroker {
             {
                 match flight.wait().await? {
                     RefreshFlightOutcome::Imported(expected) => {
-                        return self.resolve_imported_bundle(descriptor, &expected).await;
+                        return self
+                            .resolve_imported_bundle(descriptor, &expected, destination)
+                            .await;
                     }
                     RefreshFlightOutcome::Refreshed
                         if Self::snapshot_oauth_state(&self.inner, descriptor)
@@ -5762,7 +6541,9 @@ impl CredentialBroker {
         }
         let outcome = flight.wait().await?;
         if let RefreshFlightOutcome::Imported(expected) = outcome {
-            return self.resolve_imported_bundle(descriptor, &expected).await;
+            return self
+                .resolve_imported_bundle(descriptor, &expected, destination)
+                .await;
         }
         if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
             return Err(rotation_error(
@@ -5786,6 +6567,7 @@ impl CredentialBroker {
                     .await?;
             return Err(error);
         }
+        destination.check(descriptor, &refreshed)?;
         if now_ms().is_none_or(|current| refreshed.expires_at_unix_ms <= current) {
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,
@@ -5869,6 +6651,7 @@ impl CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
         expected: &crate::accounts::OAuthRefreshFence,
+        destination: &CredentialDestination,
     ) -> Result<SecretHandle, HaiderError> {
         if self.fence_for(&descriptor.alias).load(Ordering::Acquire) != expected.fence_epoch {
             return Err(stale_refresh());
@@ -5886,6 +6669,7 @@ impl CredentialBroker {
             return Err(stale_refresh());
         }
         self.validate_bundle(&current, &bundle)?;
+        destination.check(&current, &bundle)?;
         if now_ms().is_none_or(|now| bundle.expires_at_unix_ms <= now) {
             return Err(imported_credential_expired_for_provider(
                 descriptor,
@@ -5914,6 +6698,18 @@ impl CredentialBroker {
                 "OAuth registration is unavailable",
             ));
         };
+        // A refresh token is only ever sent to the registration that issued
+        // it (also what keeps a live token away from a debug fake issuer).
+        // `refresh_bundle_from_response` rejects this after the fact; the
+        // token must not leave the process in the first place.
+        if bundle.issuer != registration.issuer {
+            return Err(rotation_error(
+                descriptor,
+                haider_accounts::RotationTrigger::RefreshFailed,
+                false,
+                "OAuth token was issued by a different authority; sign in again",
+            ));
+        }
         let active_serialized_marker = bundle
             .refresh_rejected_until_unix_ms
             .is_some_and(|until| now_ms().is_none_or(|now| now < until));
@@ -7010,6 +7806,14 @@ fn expired_or_replaced(descriptor: &CredentialDescriptor) -> HaiderError {
     )
 }
 
+fn credential_changed() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "the account credential changed while resolving it; retry with the current account",
+        true,
+    )
+}
+
 fn stale_refresh() -> HaiderError {
     HaiderError::new(
         ErrorCode::Unauthorized,
@@ -7038,3 +7842,9 @@ mod openai_tests;
 #[cfg(test)]
 #[path = "oauth_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::{
+    isolated_oauth_catalog_for_test, live_issued_broker_for_sendpoint,
+    non_live_issued_broker_for_sendpoint,
+};

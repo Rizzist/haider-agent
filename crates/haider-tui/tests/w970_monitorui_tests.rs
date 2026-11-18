@@ -43,6 +43,7 @@ fn shell(id: &str) -> haider_rpc::ShellWire {
         id: id.into(),
         kind: haider_rpc::ShellKindWire::Local,
         status: haider_rpc::ShellStatusWire::Running,
+        setup_error: None,
         title: "tests".into(),
         cwd_or_host: "/workspace".into(),
         created_at_ms: 1,
@@ -810,6 +811,26 @@ fn the_source_summary_says_what_each_kind_watches() {
         haider_tui::app::monitor_source_summary(&daemon_said),
         "every minute, on the minute"
     );
+}
+
+#[test]
+fn typed_file_monitor_summary_masks_account_even_with_daemon_summary() {
+    let mut file = monitor(
+        "f",
+        haider_rpc::MonitorSourceWire::File {
+            path: "/Users/bob/watch.txt".to_owned(),
+        },
+        haider_rpc::MonitorStateWire::Armed,
+    );
+    file.source_summary = "/Users/bob/watch.txt".to_owned();
+    assert_eq!(
+        haider_tui::app::monitor_source_summary(&file),
+        "file /Users/<user>/watch.txt"
+    );
+    assert!(matches!(
+        file.source,
+        haider_rpc::MonitorSourceWire::File { ref path } if path == "/Users/bob/watch.txt"
+    ));
 }
 
 fn policy() -> haider_rpc::MonitorControlPolicyWire {

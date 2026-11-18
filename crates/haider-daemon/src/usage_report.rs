@@ -88,7 +88,8 @@ impl MeterTokenSource for CredentialBroker {
         }
         // The broker's own message may name vault/refresh internals; the
         // report carries only the bounded classification.
-        self.resolve(descriptor).await.map_err(|error| {
+        // The meter endpoint is the provider's real one.
+        self.resolve_remote(descriptor).await.map_err(|error| {
             let reason = if error.code == ErrorCode::CredentialMissing {
                 "credential_source_gone"
             } else {
@@ -929,11 +930,9 @@ impl UsageReportService {
         } else {
             OpenAiTokenIdentity::default()
         };
-        // OpenAI's WHAM meter is account-scoped. This value is the
-        // `chatgpt_account_id` captured from the OAuth ID token by
-        // `OpenAiOAuthIdentitySource`; an OpenAI organization id is never a
-        // substitute. Refuse early instead of sending an ambiguous request
-        // that fails later as a bare 401/403.
+        // OpenAI's WHAM meter requires the raw workspace id. The descriptor
+        // now stores a user+workspace dedupe coordinate, so extract only the
+        // workspace component for this request header.
         let chatgpt_account_id = if endpoint == UsageMeterEndpoint::OpenAiOauth {
             match descriptor
                 .account_identity
@@ -999,15 +998,8 @@ impl UsageReportService {
 /// `haider_provider::openai_workspace_from_account_coordinate`; collapse onto
 /// that helper when both lanes land.
 fn openai_workspace_account_id(coordinate: &str) -> Option<&str> {
-    let Some(rest) = coordinate.strip_prefix("user:") else {
-        return (!coordinate.trim().is_empty()).then_some(coordinate);
-    };
-    let (length, rest) = rest.split_once(':')?;
-    let length = length.parse::<usize>().ok()?;
-    let suffix = rest.get(length..)?.strip_prefix(";workspace:")?;
-    let (workspace_length, workspace) = suffix.split_once(':')?;
-    let workspace_length = workspace_length.parse::<usize>().ok()?;
-    (workspace_length == workspace.len() && !workspace.trim().is_empty()).then_some(workspace)
+    haider_provider::openai_workspace_from_account_coordinate(coordinate)
+        .filter(|workspace| !workspace.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -1837,6 +1829,8 @@ pub(crate) struct SessionFolder {
     provider_operation_runs: HashSet<String>,
     root_run_seen: bool,
     primary_agent: Option<AgentId>,
+    /// 973-activity-icons: per-agent typed activity, keyed like `timings`.
+    activity: HashMap<String, haider_protocol::activity::ActivityTracker>,
 }
 
 impl SessionFolder {
@@ -1851,6 +1845,7 @@ impl SessionFolder {
             provider_operation_runs: HashSet::new(),
             root_run_seen: false,
             primary_agent: None,
+            activity: HashMap::new(),
         }
     }
 
@@ -2011,6 +2006,15 @@ impl SessionFolder {
             .stats
             .last_committed_at_ms
             .max(envelope.committed_at_ms);
+        if matches!(
+            envelope.payload.get("type").and_then(|kind| kind.as_str()),
+            Some("item" | "run_state" | "effect" | "checkpoint_recorded")
+        ) {
+            self.activity
+                .entry(envelope_agent.clone())
+                .or_default()
+                .observe_raw(envelope);
+        }
         let Some(kind) = envelope.payload.get("type").and_then(|kind| kind.as_str()) else {
             return;
         };
@@ -2378,6 +2382,11 @@ impl SessionFolder {
                 .try_into()
                 .unwrap_or(u64::MAX),
             usage,
+            activity: self
+                .activity
+                .get(agent_key)
+                .filter(|tracker| !tracker.is_empty())
+                .map(haider_protocol::activity::ActivityTracker::state),
         })
     }
 

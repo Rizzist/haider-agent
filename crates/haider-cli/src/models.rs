@@ -264,17 +264,9 @@ fn refresh_targets(document: &ModelsDocument, requested: Option<&ModelsRefresh>)
             .filter(|provider| provider_supports_live_discovery(provider))
             .map(|provider| provider.provider.clone())
             .collect(),
-        None => document
-            .providers
-            .iter()
-            .filter(|provider| {
-                matches!(
-                    provider.inventory,
-                    haider_rpc::ModelInventoryWire::Stale { .. }
-                )
-            })
-            .map(|provider| provider.provider.clone())
-            .collect(),
+        // Ordinary reads expose cached uncertainty immediately. The daemon
+        // schedules bounded background refresh; only --refresh waits for it.
+        None => Vec::new(),
     }
 }
 
@@ -378,13 +370,15 @@ fn provider_view(
     now_ms: u64,
 ) -> ProviderView {
     let mut provider = provider;
-    provider.inventory = provider.inventory.at_time(now_ms);
+    provider.project_inventory_at_time(now_ms, descriptors);
     if !provider.has_known_models() {
         provider.models.clear();
         provider.model_details.clear();
         provider.default_model = None;
         provider.availability = ProviderAvailabilityWire::Unavailable;
     }
+    provider.availability = provider.selection_availability(None);
+    provider.availability_reason = provider.selection_reason(None);
     let auth_state = auth_state(&provider, descriptors);
     let has_credential = descriptors
         .iter()
@@ -576,18 +570,7 @@ fn failure(error: &ModelsError) -> ExitCode {
         ModelsError::Client(ClientError::Disconnected(_)) => EX_IOERR,
         ModelsError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
         | ModelsError::SnapshotChanged => EX_SOFTWARE,
-        ModelsError::Rpc { code, .. }
-            if matches!(
-                code.as_str(),
-                "provider_error"
-                    | "provider_timeout"
-                    | "credential_missing"
-                    | "credential_limited"
-                    | "unauthorized"
-            ) =>
-        {
-            EX_PROVIDER
-        }
+        ModelsError::Rpc { code, .. } if super::run::is_provider_error_code(code) => EX_PROVIDER,
         ModelsError::Rpc { .. } => EX_SOFTWARE,
     };
     ExitCode::from(code)

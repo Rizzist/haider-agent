@@ -39,6 +39,8 @@ fn oauth_descriptor(provider: &str) -> CredentialDescriptor {
         label: None,
         account_identity: None,
         created_at_ms: None,
+        incarnation: 0,
+        credential_digest: None,
     }
 }
 
@@ -62,6 +64,7 @@ fn summary(
                 display_name: None,
                 context_window: *window,
                 max_output_tokens: None,
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -79,6 +82,9 @@ fn summary(
         default_model: Some(default.to_owned()),
         enabled: true,
         trust: haider_rpc::ProviderTrustWire::Full,
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
     }
 }
 
@@ -715,6 +721,7 @@ fn deliver_model_fact(
         selection_epoch: Some(seq),
         provider: provider.to_owned(),
         model: slug.to_owned(),
+        model_catalog_key: None,
         route_only: false,
         cleared_account_pin: None,
         cleared_provider_endpoint: None,
@@ -751,6 +758,7 @@ fn model_selected_reply_at(
         command_id: haider_rpc::CommandId::new(format!("select-{slug}")),
         session: session.clone(),
         provider: provider.to_owned(),
+        model_catalog_key: None,
         model: slug.to_owned(),
         worker_generation: 7,
         output_budget,
@@ -975,6 +983,7 @@ fn detail(slug: &str, window: u64, max_output: u64) -> haider_rpc::ModelDetailWi
         display_name: None,
         context_window: Some(window),
         max_output_tokens: Some(max_output),
+        max_output_tokens_source: None,
         supported_efforts: Vec::new(),
         default_effort: None,
         supported_speeds: Vec::new(),
@@ -1365,6 +1374,7 @@ fn listed_summary(
     max_tokens: u64,
 ) -> haider_rpc::SessionSummary {
     let metadata = haider_protocol::session::SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: Some(3),
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -1390,8 +1400,11 @@ fn listed_summary(
         agent_type: None,
         context_economy: Default::default(),
         created_at_ms: 1,
+        model_catalog_key: None,
     };
     haider_rpc::SessionSummary {
+        owner_agent_id: None,
+        launch_origin: None,
         latest_context_footprint: None,
         session_id: session.clone(),
         head_seq: 3,
@@ -1439,6 +1452,8 @@ fn launcher_create_reply_binds_pair_budget_and_waits_for_current_account_truth()
             worker_generation: 7,
             cwd: metadata.cwd.clone(),
             model: metadata.model.clone(),
+            provider: metadata.provider.clone(),
+            model_catalog_key: metadata.model_catalog_key.clone(),
             metadata: Some(metadata.clone()),
         },
     );
@@ -1595,6 +1610,7 @@ fn cross_provider_pick_shows_new_default_and_pin_notice_at_both_widths() {
         selection_epoch: Some(2),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_account_pin: Some("bed-b".into()),
         cleared_provider_endpoint: None,
@@ -1722,6 +1738,7 @@ fn same_pair_route_fact_keeps_budget_and_has_no_model_note() {
             selection_epoch: Some(3),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: true,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -2042,6 +2059,7 @@ fn astra_noop_selection_fact_does_not_hide_current_daemon_truth() {
         selection_epoch: Some(0),
         provider: "eq-oauth".into(),
         model: "eq-wide".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_account_pin: None,
         cleared_provider_endpoint: None,
@@ -2237,6 +2255,7 @@ fn astra_a_fact_during_an_inflight_list_gets_a_fresh_budget_read() {
             selection_epoch: Some(epoch),
             provider: "eq-oauth".into(),
             model: m.into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -2402,6 +2421,7 @@ fn astra_failed_metadata_read_releases_the_refresh_latch() {
             selection_epoch: Some(epoch),
             provider: "eq-oauth".into(),
             model: m.into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -2475,6 +2495,7 @@ fn newer_selection_dirty_during_a_failed_list_gets_one_followup() {
             selection_epoch: Some(next + 2),
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -2613,6 +2634,8 @@ fn astra_provider_rebind_and_parked_rebind_use_own_pair() {
     model.open_session(&b);
     model.open_session(&a); // B has a bound own pair before its background rebind
     let rebound = haider_protocol::session::SessionProviderRebound {
+        output_budget: None,
+        active_output_budget: None,
         selection_epoch: Some(3),
         rebind_id: "r1".into(),
         provider: "rebound".into(),
@@ -2711,6 +2734,7 @@ fn child_selection_waits_for_its_own_control_attachment() {
             provider: "q-oauth".into(),
             model: "big-model".into(),
             confirm_new_epoch: false,
+            expected_catalog_key: None,
         },
     );
     assert!(issued.iter().any(|command| matches!(command,
@@ -2748,6 +2772,7 @@ fn child_selection_reattaches_before_replay_after_disconnect() {
             provider: "q-oauth".into(),
             model: "big-model".into(),
             confirm_new_epoch: false,
+            expected_catalog_key: None,
         },
     );
     assert!(issued.iter().any(|command| matches!(command,
@@ -2928,6 +2953,8 @@ fn astra_same_provider_endpoint_rebind_does_not_keep_the_old_routes_snapshot_win
     );
     assert_eq!(model.context_meter().window, Some(1_000_000));
     let rebound = haider_protocol::session::SessionProviderRebound {
+        output_budget: None,
+        active_output_budget: None,
         selection_epoch: Some(next),
         rebind_id: "new-route".into(),
         provider: "custom-proxy".into(),
@@ -3268,6 +3295,7 @@ fn older_daemon_selection_fact_and_metadata_bind_pair_without_claiming_snapshot_
             selection_epoch: None,
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -3311,6 +3339,7 @@ fn epochless_durable_fact_after_a_selection_reply_still_advances_its_pair() {
             selection_epoch: None,
             provider: "eq-oauth".into(),
             model: "eq-mid".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -3580,6 +3609,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -3617,6 +3647,7 @@ fn cross_session_fact_during_paginated_list_gets_one_dirty_followup() {
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-sonnet-4-6".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -3665,6 +3696,8 @@ fn parked_same_provider_route_rebind_discards_old_route_window() {
         ),
     );
     let rebound = haider_protocol::session::SessionProviderRebound {
+        output_budget: None,
+        active_output_budget: None,
         selection_epoch: Some(next),
         rebind_id: "route-b".into(),
         provider: "custom-proxy".into(),
@@ -3936,6 +3969,7 @@ fn reconnect_retags_a_pending_selection_for_the_new_socket() {
             model: "eq-small".into(),
             provider: "eq-oauth".into(),
             confirm_new_epoch: false,
+            expected_catalog_key: None,
         },
     );
     assert!(issued.iter().any(|command| matches!(
@@ -4075,6 +4109,7 @@ fn boot_list_in_flight_gets_one_dirty_followup_for_a_new_selection() {
             selection_epoch: Some(1),
             provider: "eq-oauth".into(),
             model: "eq-small".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -4159,6 +4194,7 @@ fn astra15_older_clear_fact_keeps_notice_when_newer_metadata_already_loaded() {
         selection_epoch: Some(1),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_provider_endpoint: None,
         output_budget_clamp: None,
@@ -4196,6 +4232,7 @@ fn astra15_parked_clear_notice_control_with_newer_metadata() {
         selection_epoch: Some(1),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_provider_endpoint: None,
         output_budget_clamp: None,
@@ -4230,6 +4267,8 @@ fn astra15_cross_provider_rebind_does_not_attribute_old_route_to_new_provider() 
     );
     assert_eq!(model.attached_account_label(), "previous-provider-account");
     let rebound = haider_protocol::session::SessionProviderRebound {
+        output_budget: None,
+        active_output_budget: None,
         selection_epoch: Some(4),
         rebind_id: "synthetic-cross-provider".into(),
         provider: "other-provider".into(),
@@ -4320,6 +4359,7 @@ fn astra15_viewed_child_shows_its_explicit_pin_clear_notice() {
         selection_epoch: Some(1),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_provider_endpoint: None,
         output_budget_clamp: None,
@@ -4492,6 +4532,7 @@ fn sol16_viewed_child_and_nested_child_subscribe_and_follow_external_selection()
                 selection_epoch: Some(1),
                 provider: "q-oauth".into(),
                 model: "big-model".into(),
+                model_catalog_key: None,
                 route_only: false,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -4833,6 +4874,7 @@ fn sol16_recreated_nested_child_restores_owned_notices_without_duplicating_them(
         selection_epoch: Some(1),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: false,
         cleared_account_pin: Some("kid-pin".into()),
         cleared_provider_endpoint: Some("http://127.0.0.1:8010".into()),
@@ -4976,6 +5018,7 @@ fn sol16_child_external_budget_endpoint_and_away_changes_keep_own_meter() {
                 selection_epoch: Some(epoch),
                 provider: provider.into(),
                 model: slug.into(),
+                model_catalog_key: None,
                 route_only: false,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -4985,6 +5028,8 @@ fn sol16_child_external_budget_endpoint_and_away_changes_keep_own_meter() {
             .expect("budget fact")
         } else {
             haider_protocol::session::SessionProviderRebound {
+                output_budget: None,
+                active_output_budget: None,
                 selection_epoch: Some(epoch),
                 rebind_id: format!("endpoint-{epoch}"),
                 provider: provider.into(),
@@ -5095,6 +5140,7 @@ fn sol16_first_route_fact_dirties_an_inflight_read_at_the_same_epoch() {
             selection_epoch: Some(0),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -5117,6 +5163,7 @@ fn sol16_first_route_fact_dirties_an_inflight_read_at_the_same_epoch() {
             selection_epoch: Some(0),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: true,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -5233,6 +5280,8 @@ fn sol16_rebind_updates_cached_route_before_list_and_preserves_noop_truth() {
             );
             let original = model.attached_account_label();
             let fact = haider_protocol::session::SessionProviderRebound {
+                output_budget: None,
+                active_output_budget: None,
                 rebind_id: "rebind-cache".into(),
                 provider: "anthropic-oauth".into(),
                 base_url: Some(
@@ -5301,6 +5350,8 @@ fn sol16_rebind_behind_served_metadata_preserves_actual_route_and_legacy_noop_st
             },
         );
         let fact = haider_protocol::session::SessionProviderRebound {
+            output_budget: None,
+            active_output_budget: None,
             rebind_id: "same-route".into(),
             provider: "anthropic-oauth".into(),
             base_url: None,
@@ -5346,6 +5397,7 @@ fn sol16_first_route_fact_before_run_history_disables_default_forecast() {
         selection_epoch: Some(0),
         provider: "anthropic-oauth".into(),
         model: "claude-opus-5-5".into(),
+        model_catalog_key: None,
         route_only: true,
         cleared_account_pin: None,
         cleared_provider_endpoint: None,
@@ -5422,6 +5474,7 @@ fn sol16_rotation_waits_for_actual_account_and_same_epoch_metadata_wins() {
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: true,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -5477,6 +5530,7 @@ fn sol16_noop_rebind_after_unread_route_cannot_borrow_old_metadata_or_erase_budg
             selection_epoch: Some(1),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: route_commit,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -5490,6 +5544,8 @@ fn sol16_noop_rebind_after_unread_route_cannot_borrow_old_metadata_or_erase_budg
             selected.to_payload_value().expect("selection"),
         );
         let rebound = haider_protocol::session::SessionProviderRebound {
+            output_budget: None,
+            active_output_budget: None,
             selection_epoch: Some(2),
             rebind_id: "noop-after-unread".into(),
             provider: "anthropic-oauth".into(),
@@ -5564,6 +5620,7 @@ fn sol16_external_and_historical_child_clamp_facts_are_visible_and_echo_once() {
                 selection_epoch: Some(1),
                 provider: "q-oauth".into(),
                 model: "shared-model".into(),
+                model_catalog_key: None,
                 route_only: false,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -5701,6 +5758,8 @@ fn sol16_epochless_account_snapshot_cannot_restore_pin_after_explicit_rebind() {
             &session,
             1,
             haider_protocol::session::SessionProviderRebound {
+                output_budget: None,
+                active_output_budget: None,
                 selection_epoch: Some(1),
                 rebind_id: "epochless-reset".into(),
                 provider: "anthropic-oauth".into(),
@@ -5789,6 +5848,8 @@ fn sol16_frozen_create_receipt_never_supplies_current_account_provenance() {
                 worker_generation: 7,
                 cwd: receipt.cwd.clone(),
                 model: receipt.model.clone(),
+                provider: receipt.provider.clone(),
+                model_catalog_key: receipt.model_catalog_key.clone(),
                 metadata: Some(receipt.clone()),
             };
             let commands = driver.apply(&mut model, reply());
@@ -5850,6 +5911,7 @@ fn sol16_failed_coalesced_route_read_keeps_original_and_newer_targets() {
                 selection_epoch: Some(0),
                 provider: "anthropic-oauth".into(),
                 model: "claude-opus-5-5".into(),
+                model_catalog_key: None,
                 route_only: false,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -5878,6 +5940,7 @@ fn sol16_failed_coalesced_route_read_keeps_original_and_newer_targets() {
             selection_epoch: Some(0),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -6164,6 +6227,7 @@ fn sol16_child_selection_advances_during_first_view_metadata_read() {
             selection_epoch: Some(1),
             provider: "q-oauth".into(),
             model: "big-model".into(),
+            model_catalog_key: None,
             route_only: false,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -6325,6 +6389,7 @@ fn sol16_current_route_fact_ends_forecast_above_the_local_journal_sequence() {
                 selection_epoch: Some(epoch),
                 provider: "anthropic-oauth".into(),
                 model: "claude-opus-5-5".into(),
+                model_catalog_key: None,
                 route_only: true,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -6486,6 +6551,7 @@ fn sol18_route_read_backoff_is_exponential_capped_and_facts_do_not_bypass_it() {
             selection_epoch: Some(selection_epoch),
             provider: "anthropic-oauth".into(),
             model: "claude-opus-5-5".into(),
+            model_catalog_key: None,
             route_only,
             cleared_account_pin: None,
             cleared_provider_endpoint: None,
@@ -6607,6 +6673,7 @@ fn sol18_route_read_backoff_resets_at_connection_boundaries_and_ignores_stale_fa
                 selection_epoch: Some(0),
                 provider: "anthropic-oauth".into(),
                 model: "claude-opus-5-5".into(),
+                model_catalog_key: None,
                 route_only: true,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -6662,6 +6729,7 @@ fn sol18_route_read_backoff_resets_at_connection_boundaries_and_ignores_stale_fa
                 selection_epoch: Some(0),
                 provider: "anthropic-oauth".into(),
                 model: "claude-opus-5-5".into(),
+                model_catalog_key: None,
                 route_only: true,
                 cleared_account_pin: None,
                 cleared_provider_endpoint: None,
@@ -6710,5 +6778,103 @@ fn sol18_unknown_account_label_fits_with_a_moderate_title_at_both_widths() {
             "{width}: {}",
             frame[1]
         );
+    }
+}
+
+#[test]
+fn rebound_clamp_and_restore_advance_each_sessions_budget_epoch_at_both_sizes() {
+    use haider_protocol::output_budget::{SessionOutputBudgetSourceV1, SessionOutputBudgetV1};
+    use haider_protocol::session::SessionProviderRebound;
+    for source in [
+        SessionOutputBudgetSourceV1::Derived,
+        SessionOutputBudgetSourceV1::UserSet { requested: 20_000 },
+    ] {
+        let user_budget = matches!(source, SessionOutputBudgetSourceV1::UserSet { .. });
+        for (cols, rows) in [(118, 36), (80, 24)] {
+            let (mut model, mut driver) = two_attached_sessions();
+            let a = session_id("s-meter-a");
+            let b = session_id("s-meter-b");
+            for (epoch, cap) in [(1, 8192), (2, 20_000)] {
+                let rebound = SessionProviderRebound {
+                    selection_epoch: Some(epoch),
+                    rebind_id: format!("rebind-{epoch}"),
+                    provider: "anthropic-oauth".into(),
+                    base_url: None,
+                    account: None,
+                    output_budget: Some(SessionOutputBudgetV1 {
+                        max_tokens: cap,
+                        source,
+                        clamped: (user_budget && cap < 20_000).then_some(
+                            haider_protocol::output_budget::OutputBudgetClampV1 {
+                                requested: 20_000,
+                                max_output_tokens: cap,
+                            },
+                        ),
+                    }),
+                    active_output_budget: None,
+                };
+                if epoch == 2 {
+                    model.open_session(&b);
+                }
+                deliver(
+                    &mut driver,
+                    &mut model,
+                    &a,
+                    epoch,
+                    rebound.to_payload_value().expect("fact"),
+                );
+                if epoch == 2 {
+                    assert_eq!(
+                        model.meter_epoch.output_budget,
+                        Some(30_000),
+                        "parked rebound cannot change B"
+                    );
+                    model.open_session(&a);
+                }
+                assert_eq!(
+                    model.meter_epoch.selection_epoch,
+                    Some(epoch),
+                    "rebind fact advances immediately"
+                );
+                assert_eq!(
+                    model.meter_epoch.output_budget,
+                    Some(cap),
+                    "rebind fact carries the committed budget without a List reply"
+                );
+                assert_eq!(model.meter_epoch.user_budget, user_budget);
+                let mut summary = listed_summary(&a, "anthropic-oauth", "claude-opus-5-5", cap);
+                let metadata = summary.metadata.as_mut().expect("metadata");
+                metadata.selection_epoch = Some(epoch);
+                metadata.max_tokens_source = Some(source);
+                summary.head_seq = epoch;
+                driver.apply(
+                    &mut model,
+                    LiveReply::Listed {
+                        sessions: vec![summary],
+                        next_cursor: None,
+                    },
+                );
+                assert_eq!(model.meter_epoch.selection_epoch, Some(epoch));
+                assert_eq!(model.meter_epoch.output_budget, Some(cap));
+                let mut terminal = Terminal::new(TestBackend::new(cols, rows)).expect("terminal");
+                terminal
+                    .draw(|frame| {
+                        render(&model, frame);
+                    })
+                    .expect("render");
+                model.open_session(&b);
+                assert_eq!(
+                    model.meter_epoch.output_budget,
+                    Some(30_000),
+                    "other session stays independent"
+                );
+                model.open_session(&a);
+                assert_eq!(
+                    model.meter_epoch.output_budget,
+                    Some(cap),
+                    "reopened session owns its budget"
+                );
+            }
+        }
     }
 }

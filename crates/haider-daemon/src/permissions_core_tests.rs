@@ -293,6 +293,7 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 #[test]
 fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -305,6 +306,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -461,6 +463,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
 #[test]
 fn autonomous_effect_defaults_keep_sensitive_reset_human_only() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -473,6 +476,7 @@ fn autonomous_effect_defaults_keep_sensitive_reset_human_only() {
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -601,6 +605,7 @@ fn autonomous_effect_defaults_keep_sensitive_reset_human_only() {
 #[test]
 fn auto_allow_promotes_ordinary_asks_but_not_sensitive_reset() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        resolved_model: None,
         selection_epoch: None,
         route_reset_epoch: None,
         budget_clamp_notice_epoch: None,
@@ -613,6 +618,7 @@ fn auto_allow_promotes_ordinary_asks_but_not_sensitive_reset() {
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,
+        model_catalog_key: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         max_tokens_source: None,
@@ -1096,12 +1102,14 @@ fn c1_freshness_and_anchor_errors_are_typed_for_the_model() {
 fn create_durable_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: format!("create-{session_id}"),
             request_digest: format!("create-digest-{session_id}"),
             request_json: format!(r#"{{"cwd":"/tmp","session":"{session_id}"}}"#),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -1174,6 +1182,7 @@ fn append_permission_checkpoint(
                     name: "exec".into(),
                     args: serde_json::json!({"command":"printf old"}),
                     status: ToolStatus::InProgress,
+                    activity: None,
                 },
             }))
             .expect("item payload")
@@ -1343,7 +1352,8 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             | RecoveredWork::ChildWait(_)
             | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
-            | RecoveredWork::DelegationMirror(_) => None,
+            | RecoveredWork::DelegationMirror(_)
+            | RecoveredWork::DetachedChildren(_) => None,
         })
         .collect::<Vec<_>>();
     recovered_menus.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
@@ -1542,15 +1552,17 @@ fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
     // must fail, even while that authorization guidance remains present.
     for text in [manual, manifest.description.as_str()] {
         assert!(
-            text.contains("durable sms/process/file/poll/timer/cli watches"),
-            "monitor description must advertise all six supported source classes: {text}"
+            text.contains("durable sms/task/agent/process/file/poll/timer/cli watches"),
+            "monitor description must advertise all eight supported source classes: {text}"
         );
     }
     for schema in [&manifest.input_schema, &monitor.input_schema] {
         assert_eq!(
             schema["properties"]["source"]["properties"]["kind"]["enum"],
-            serde_json::json!(["sms", "process", "file", "poll", "timer", "cli"]),
-            "monitor source schema must expose all six supported classes"
+            serde_json::json!([
+                "sms", "task", "agent", "process", "file", "poll", "timer", "cli"
+            ]),
+            "monitor source schema must expose all eight supported classes"
         );
     }
     for operation in [
@@ -1606,8 +1618,9 @@ fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
         spawn.description.as_str(),
     ] {
         assert!(text.contains("AgentSpawn policy"));
-        assert!(text.contains("waits for"));
-        assert!(text.contains("child report"));
+        assert!(text.contains("report"));
+        assert!(text.contains("background=true"));
+        assert!(text.contains("wait_ms"));
     }
 }
 
@@ -1659,8 +1672,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
     // Provider-dialect JSON framing is measured separately by AHRB.
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_602;
-    // Union of 971 redaction paging (+42) and 972 task_outcome (+515) additions.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 6_723;
+    // Prior wire pack plus explicit child-handle and bounded-wait schemas.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 7_183;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1691,22 +1704,20 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         })
         .sum();
     // Union full-pack pin: 971 redaction, 972 task_outcome/output ergonomics,
-    // 972-ax-testrun, the frozen typed `tool_script` DAG schema, and the
-    // platform-invariant 1,237 bytes of the usage-reset manifest. The
+    // 972-ax-testrun, the typed `tool_script` DAG schema, handle sources, and the 1,237-byte usage-reset manifest. The
     // default instruct-pipe pack is unchanged: the large orchestration schema
-    // remains discovery-only until explicitly promoted. The full pack lost
-    // six bytes when the optional spawn_subagent.request_budget description
-    // changed from 154 to 148 bytes; only its description is in this pin.
+    // remains discovery-only until explicitly promoted. Both stop scopes and
+    // the optional request-budget description are included in this pin.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_634;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 45_417;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_585;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 45_368;
     #[cfg(target_os = "windows")]
     // `tool_script` nests the platform-specific `process_exec` schema, so
     // Windows carries the historical 3-byte command-description delta twice.
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_581;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 45_364;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 44_579;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 45_362;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1746,9 +1757,9 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
             .as_object()
             .expect("properties")
             .len(),
-        2
+        4
     );
-    for name in ["task", "prompt"] {
+    for name in ["task", "prompt", "background", "wait_ms"] {
         assert_eq!(
             spawn.input_schema["properties"][name],
             full_spawn.input_schema["properties"][name]
@@ -1771,7 +1782,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         tools,
         SystemPromptBuilder::UNSCOPED_GRANT_SCOPE,
     );
-    assert_eq!(policy.len(), 606);
+    eprintln!("instruct-pipe policy bytes measured={}", policy.len());
+    assert_eq!(policy.len(), 769);
     let manual_bytes = system.len() - policy.len();
     assert_eq!(
         manual_bytes, 0,
@@ -1793,13 +1805,15 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         (EXPECTED_FULL_PREFIX_BYTES, expected_pipe_bytes),
         "full-manifest and default instruct-pipe byte pins"
     );
-    assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
+    // Handle controls increase the default schema, while the pack still
+    // retains at least a 40% reduction from the pre-diet comparator.
+    assert!(pipe_bytes * 5 <= PRE_DIET_INSTRUCT_PIPE_BYTES * 3);
     assert!(full_prefix > 0 && pipe_bytes < full_prefix);
     assert!(
         (full_prefix - pipe_bytes) * 10 >= full_prefix * 3,
         "instruct pipe must retain the full-manifest reduction floor of 30%"
     );
-    assert_eq!(system.len() + tool_bytes, 606 + expected_pipe_bytes);
+    assert_eq!(system.len() + tool_bytes, 769 + expected_pipe_bytes);
 }
 
 /// C1 MUTATION CHECK: drop the node walk or the agent-type/task rendering.
@@ -2127,4 +2141,34 @@ fn agent_type_identity_line_is_bounded_and_names_the_signature() {
         "the tail line stays bounded: {}",
         line.len()
     );
+}
+#[test]
+fn activity_is_derived_from_registered_routes_only() {
+    use haider_protocol::activity::ActivityKind as A;
+    for (name, expected) in [
+        ("computer", Some(A::Computer)),
+        ("mobile", Some(A::Mobile)),
+        ("web_fetch", Some(A::Web)),
+        ("web_search", Some(A::Web)),
+        ("ssh_shell", Some(A::Remote)),
+        ("fs_read", Some(A::Read)),
+        ("fs_write", Some(A::Edit)),
+        ("process_exec", Some(A::Run)),
+        ("spawn_subagent", Some(A::Orchestrate)),
+        ("list_models", Some(A::Read)),
+        ("session_transcript", Some(A::Read)),
+        ("peer_list", Some(A::Read)),
+        ("computer ", None),
+        ("COMPUTER", None),
+        ("mcp__server__computer", None),
+        ("browser_open", None),
+        ("web_tool", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            registered_tool_route(name).and_then(super::worker::RegisteredToolRoute::activity),
+            expected,
+            "{name}"
+        );
+    }
 }

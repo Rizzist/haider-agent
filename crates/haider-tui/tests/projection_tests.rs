@@ -224,6 +224,7 @@ fn tool_call_accumulates_arg_fragments_for_display() {
             name: "fs_read".to_owned(),
             args: serde_json::Value::Null,
             status: ToolStatus::InProgress,
+            activity: None,
         },
     ));
     projection.apply(&delta(
@@ -608,6 +609,7 @@ fn completed_tool_call_releases_the_fragment_accumulation() {
             name: "fs_edit".to_owned(),
             args: serde_json::Value::Null,
             status: ToolStatus::InProgress,
+            activity: None,
         },
     ));
     projection.apply(&delta(
@@ -623,6 +625,7 @@ fn completed_tool_call_releases_the_fragment_accumulation() {
             name: "fs_edit".to_owned(),
             args: serde_json::json!({"big": "payload"}),
             status: ToolStatus::Completed,
+            activity: None,
         },
     ));
     let TranscriptEntry::Item(block) = &projection.entries()[0] else {

@@ -2699,7 +2699,8 @@ async fn handle_committed(
         let binding = match service
             .inner
             .hub
-            .bound_lockdown_run(&envelope.session_id, run_id)
+            .bound_lockdown_run_blocking(&envelope.session_id, run_id)
+            .await
         {
             Ok(binding) => binding,
             Err(error) => {
@@ -2791,7 +2792,8 @@ async fn handle_committed(
         None => match service
             .inner
             .hub
-            .bound_session_lockdown(&envelope.session_id)
+            .bound_session_lockdown_blocking(&envelope.session_id)
+            .await
         {
             Ok(bound) => bound,
             Err(error) => {

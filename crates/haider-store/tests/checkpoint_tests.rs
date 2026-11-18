@@ -16,12 +16,14 @@ use haider_store::{EventStore, SessionCreateCommand, Store};
 fn create_session(store: &Store, session_id: &SessionId) {
     store
         .create_session(&SessionCreateCommand {
+            resolved_model: None,
             command_id: "checkpoint-create-session".into(),
             request_digest: "checkpoint-create-digest".into(),
             request_json: r#"{"session":"checkpoint-projection"}"#.into(),
             session_id: session_id.clone(),
             cwd: "/tmp".into(),
             provider: "fake".into(),
+            model_catalog_key: None,
             model: "fake-v1".into(),
             max_tokens: 4096,
             max_tokens_source: None,
@@ -167,4 +169,98 @@ fn checkpoint_fact_is_stamped_and_projected_in_the_effect_transaction() {
         .list_checkpoints(&session_id, None, Some(&CheckpointCursor(events[2].seq)), 1)
         .expect("list older checkpoint page");
     assert!(empty.checkpoints.is_empty());
+}
+
+#[test]
+fn unknown_or_wrong_run_intent_cannot_commit_workspace_mutation() {
+    use haider_protocol::error::ErrorCode;
+    for class in [
+        EffectClass::FsWrite,
+        EffectClass::ProcessExec,
+        EffectClass::CheckpointRestore,
+    ] {
+        for unknown_class in [false, true] {
+            let root = tempfile::tempdir().expect("store");
+            let store = Store::open(root.path()).expect("open");
+            let session = SessionId::new("strict-checkpoint-authority");
+            create_session(&store, &session);
+            let run = RunId::new("intent-run");
+            let effect = EffectId::new("strict-effect");
+            let mut intent = envelope(
+                &store,
+                &session,
+                &run,
+                "strict-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: effect.clone(),
+                    class: class.clone(),
+                    summary: "synthetic".into(),
+                    args_digest: "digest".into(),
+                    workspace_revision: None,
+                })),
+            );
+            if unknown_class {
+                let mut payload: serde_json::Value = intent.payload.clone().into();
+                payload["class"]["class"] = "future_restore_authority".into();
+                intent.payload = payload.into();
+            }
+            store
+                .append(&mut [intent])
+                .expect("raw intent is retained without guessing its class");
+            let head = store.latest_seq(&session).expect("head");
+            // Keep the run valid when testing unknown authority so the two
+            // rejection paths cannot mask one another.
+            let outcome_run = if unknown_class {
+                run.clone()
+            } else {
+                RunId::new("wrong-run")
+            };
+            let mut outcome = [envelope(
+                &store,
+                &session,
+                &outcome_run,
+                "strict-outcome",
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect: effect.clone(),
+                    outcome: EffectOutcome::Ok,
+                    freshness: None,
+                    workspace_mutation: Some(WorkspaceMutation {
+                        effect_id: effect,
+                        mutation_digest: "digest".into(),
+                        workspace_revision: None,
+                        subject_digest: None,
+                        redacted_content: false,
+                    }),
+                }),
+            )];
+            let error = store
+                .append(&mut outcome)
+                .expect_err("unknown authority or a different run must refuse mutation");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(store.latest_seq(&session).expect("unchanged journal"), head);
+            if unknown_class {
+                assert!(
+                    error
+                        .message
+                        .contains("no durable mutation-class effect intent")
+                );
+                drop(store);
+                let reopened =
+                    Store::open(root.path()).expect("unknown raw authority is safe to reopen");
+                let journal = reopened
+                    .read(&session, 0, 100)
+                    .expect("raw journal fallback");
+                assert_eq!(
+                    journal.last().expect("preserved intent").payload["class"]["class"],
+                    "future_restore_authority"
+                );
+                assert_eq!(
+                    reopened.latest_seq(&session).expect("same durable head"),
+                    head
+                );
+            } else {
+                assert!(error.message.contains("same run"));
+            }
+        }
+    }
 }

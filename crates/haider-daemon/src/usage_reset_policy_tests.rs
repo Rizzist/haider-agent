@@ -37,6 +37,11 @@ enum Case {
 
 fn metadata(cwd: &str, read_only: bool) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        selection_epoch: None,
+        route_reset_epoch: None,
+        budget_clamp_notice_epoch: None,
+        resolved_route_alias: None,
+        resolved_route_seen: false,
         launch_origin: None,
         workspace_allocation: None,
         provider_base_url: None,
@@ -45,6 +50,8 @@ fn metadata(cwd: &str, read_only: bool) -> SessionMetadataV1 {
         provider: "fake".into(),
         account_alias: None,
         model: "fake-model".into(),
+        resolved_model: None,
+        model_catalog_key: None,
         max_tokens: 4096,
         max_tokens_source: None,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -122,6 +129,8 @@ async fn run_case(case: Case) -> Outcome {
         cwd: cwd.clone(),
         provider: "fake".into(),
         model: "fake-model".into(),
+        resolved_model: None,
+        model_catalog_key: None,
         max_tokens: 4096,
         max_tokens_source: None,
         permission_overrides: metadata(&cwd, read_only).permission_overrides,

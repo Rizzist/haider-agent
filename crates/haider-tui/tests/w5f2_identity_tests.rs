@@ -18,6 +18,8 @@ use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 
 mod common;
+#[path = "common/selection_owner_cases.rs"]
+mod selection_owner_cases;
 use common::{launcher_model, run_slash};
 
 fn oauth_descriptor(provider: &str, alias: &str, active: bool) -> CredentialDescriptor {
@@ -43,6 +45,9 @@ fn provider_summary(
     default: &str,
 ) -> haider_rpc::ProviderSummaryWire {
     haider_rpc::ProviderSummaryWire {
+        catalog_scope: None,
+        configured_models: Vec::new(),
+        static_models: Vec::new(),
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
@@ -58,6 +63,7 @@ fn provider_summary(
                 display_name: None,
                 context_window: None,
                 max_output_tokens: Some(30_000),
+                max_output_tokens_source: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
                 supported_speeds: Vec::new(),
@@ -75,6 +81,20 @@ fn provider_summary(
         enabled: true,
         trust: haider_rpc::ProviderTrustWire::Full,
     }
+}
+
+fn private_summary(incarnation: u64, model: &str) -> haider_rpc::ProviderSummaryWire {
+    let mut summary = provider_summary("custom", &[model], model);
+    summary.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: format!("synthetic-producer-{incarnation}"),
+        account_alias: Some("work".into()),
+        account_incarnation: Some(incarnation),
+    });
+    summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    summary.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Remote);
+    summary.model_details[0].context_window = Some(123_456);
+    summary
 }
 
 fn live_model() -> AppModel {
@@ -490,4 +510,3479 @@ fn never_fetched_state_refreshes_even_when_legacy_rows_are_nonempty() {
         model.identity.model_short, before,
         "never adopt a legacy seed before discovery"
     );
+}
+
+#[test]
+fn same_alias_new_incarnation_retires_current_picker_and_launcher_default() {
+    for account_first in [true, false] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut a = oauth_descriptor("custom", "work", true);
+        a.incarnation = 1;
+        let mut summary = provider_summary("custom", &["a-private"], "a-private");
+        summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+        summary.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Remote);
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![a.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary.clone()],
+                revision: 1,
+            },
+        );
+        assert_eq!(model.identity.model_short, "a-private");
+        model.open_model_picker("a-private".into());
+        assert!(model.requests.contains(&AppRequest::AccountsRefresh));
+        assert!(model.requests.contains(&AppRequest::ProvidersRefresh));
+        model.apply_model_selected("custom", "a-private");
+        // Benign refresh keeps both the choice and its pin.
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![a.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.identity.model_short, "a-private");
+        assert!(model.launcher_identity_pinned);
+        let mut unrelated = oauth_descriptor("unrelated", "other", true);
+        unrelated.incarnation = 3;
+        let mut unrelated_summary =
+            provider_summary("unrelated", &["other-current"], "other-current");
+        unrelated_summary.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Static);
+        let mut b = a;
+        b.incarnation = 2;
+        summary.models = vec!["b-current".into()];
+        summary.model_details[0].name = "b-current".into();
+        summary.default_model = Some("b-current".into());
+        if !account_first {
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![unrelated_summary.clone(), summary.clone()],
+                    revision: 2,
+                },
+            );
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![unrelated, b],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        if account_first {
+            assert!(
+                model.identity.model_short.is_empty(),
+                "old provider snapshot cannot restore A's model"
+            );
+            assert!(
+                !model
+                    .model_picker_rows()
+                    .iter()
+                    .any(|row| row.model == "a-private"),
+                "account reply fences the old provider reply immediately"
+            );
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![unrelated_summary.clone(), summary.clone()],
+                    revision: 2,
+                },
+            );
+        }
+        assert_eq!(model.identity.provider, "custom");
+        assert_eq!(model.identity.model_short, "b-current");
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![unrelated_summary, summary],
+                revision: 2,
+            },
+        );
+        assert_eq!(model.identity.provider, "custom");
+        assert_eq!(model.identity.model_short, "b-current");
+        assert!(
+            !model
+                .model_picker_rows()
+                .iter()
+                .any(|row| row.model == "a-private")
+        );
+    }
+}
+
+#[test]
+fn static_or_configured_picker_choice_survives_an_account_incarnation_change() {
+    for source in [
+        haider_rpc::ModelDetailSourceWire::Static,
+        haider_rpc::ModelDetailSourceWire::Configured,
+    ] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut descriptor = oauth_descriptor("custom", "work", true);
+        descriptor.incarnation = 1;
+        let mut summary = provider_summary(
+            "custom",
+            &["permanent-choice", "other-default"],
+            "permanent-choice",
+        );
+        for detail in &mut summary.model_details {
+            detail.source = Some(source);
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![descriptor.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary.clone()],
+                revision: 1,
+            },
+        );
+        model.apply_model_selected("custom", "permanent-choice");
+        descriptor.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![descriptor],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        summary.default_model = Some("other-default".into());
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary],
+                revision: 2,
+            },
+        );
+        assert_eq!(model.identity.model_short, "permanent-choice");
+        assert!(model.launcher_identity_pinned);
+    }
+}
+
+#[test]
+fn private_choice_before_first_accounts_reply_is_not_stamped_as_replacement_owner() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(1, "a-private")],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected("custom", "a-private");
+    let mut b = oauth_descriptor("custom", "work", true);
+    b.incarnation = 2;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![b],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert!(model.identity.model_short.is_empty());
+    assert_eq!(model.identity.context_window, 0);
+    assert_eq!(model.context_meter().window, None);
+    assert!(
+        !model
+            .model_picker_rows()
+            .iter()
+            .any(|row| row.model == "a-private")
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(2, "b-current")],
+            revision: 2,
+        },
+    );
+    assert_eq!(model.identity.model_short, "b-current");
+}
+
+#[test]
+fn account_selection_reply_cannot_pin_the_old_provider_default() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let mut a = oauth_descriptor("custom", "work", true);
+    a.incarnation = 1;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![a.clone()],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(1, "a-private")],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected("custom", "a-private");
+    a.incarnation = 2;
+    model.apply_account_selected(&a, 2);
+    assert!(model.identity.model_short.is_empty());
+    assert!(!model.launcher_identity_pinned);
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(2, "b-current")],
+            revision: 2,
+        },
+    );
+    assert_eq!(model.identity.model_short, "b-current");
+    assert!(
+        !model
+            .model_picker_rows()
+            .iter()
+            .any(|row| row.model == "a-private")
+    );
+}
+
+#[test]
+fn unrelated_provider_delta_does_not_make_a_retired_catalog_current() {
+    for provider_first in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 1;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![private_summary(1, "a-private")],
+                revision: 1,
+            },
+        );
+        model.apply_model_selected("custom", "a-private");
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::ProviderModelsRefreshed {
+                provider: provider_summary("unrelated", &["public"], "public"),
+                revision: 2,
+            },
+        );
+        if provider_first {
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::ProviderModelsRefreshed {
+                    provider: private_summary(2, "b-current"),
+                    revision: 2,
+                },
+            );
+            assert!(
+                !model
+                    .model_picker_rows()
+                    .iter()
+                    .any(|row| row.model == "a-private")
+            );
+            // Another delta while B waits must not replace B's raw catalog
+            // with the fenced projection shown for A.
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::ProviderModelsRefreshed {
+                    provider: provider_summary("unrelated", &["public"], "public"),
+                    revision: 2,
+                },
+            );
+        }
+        account.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert!(
+            !model
+                .model_picker_rows()
+                .iter()
+                .any(|row| row.model == "a-private")
+        );
+        if !provider_first {
+            assert!(model.identity.model_short.is_empty());
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::ProviderModelsRefreshed {
+                    provider: private_summary(2, "b-current"),
+                    revision: 2,
+                },
+            );
+        }
+        assert_eq!(model.identity.model_short, "b-current");
+        assert!(
+            model
+                .model_picker_rows()
+                .iter()
+                .any(|row| row.model == "b-current" && row.is_current)
+        );
+    }
+}
+
+#[test]
+fn public_fetched_choice_and_same_producer_refresh_keep_the_user_pin() {
+    for public in [true, false] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 1;
+        let mut summary = private_summary(1, "stable-choice");
+        if public {
+            // A GENUINE public listing: anonymous, unauthenticated and
+            // authoritative. (An authenticated or advisory catalog under a
+            // public provider name is account-owned since 67ab6384; see
+            // `picked_public_namespace_model_retains_its_private_producer`.)
+            summary.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+            summary.catalog_scope = None;
+            summary.auth_methods.clear();
+            summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary.clone()],
+                revision: 1,
+            },
+        );
+        model.apply_model_selected("custom", "stable-choice");
+        if public {
+            account.incarnation = 2;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::ProviderModelsRefreshed {
+                provider: summary,
+                revision: 2,
+            },
+        );
+        assert_eq!(model.identity.model_short, "stable-choice");
+        assert!(model.launcher_identity_pinned);
+        assert_eq!(model.identity.context_window, 123_456);
+    }
+}
+
+#[test]
+fn remote_metadata_for_a_static_slug_is_retired_without_unpinning_the_static_choice() {
+    let provider = "kimi-oauth";
+    let slug = haider_provider::subscription_static_models(provider)
+        .first()
+        .expect("maintained Kimi model")
+        .slug
+        .clone();
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let mut account = oauth_descriptor(provider, "work", true);
+    account.incarnation = 1;
+    let mut summary = private_summary(1, &slug);
+    summary.provider = provider.into();
+    summary.catalog = haider_rpc::ProviderCatalogKindWire::Authenticated;
+    summary.static_models = vec![slug.clone()];
+    summary.model_details[0].supports_vision = Some(false);
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected(provider, &slug);
+    assert_eq!(model.identity.context_window, 123_456);
+    account.incarnation = 2;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert_eq!(model.identity.model_short, slug);
+    assert!(model.launcher_identity_pinned);
+    assert_eq!(model.identity.context_window, 0, "A's context is retired");
+    let detail = model
+        .providers
+        .providers
+        .iter()
+        .flat_map(|row| &row.model_details)
+        .find(|detail| detail.name == slug)
+        .expect("release-owned name remains");
+    assert_eq!(
+        detail.source,
+        Some(haider_rpc::ModelDetailSourceWire::Static)
+    );
+    assert_eq!(
+        detail.supports_vision, None,
+        "A's capability flags are retired"
+    );
+    assert_eq!(detail.context_window, None);
+}
+
+#[test]
+fn unsupported_configured_deployment_evidence_is_not_inherited_by_a_replacement() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 1;
+    let mut summary = private_summary(1, "my-deployment");
+    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+    summary.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+    summary.availability_reason =
+        Some("configured (unverified): server returned 404 for /models".into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected("custom", "my-deployment");
+    account.incarnation = 2;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert_eq!(
+        model.identity.model_short, "my-deployment",
+        "explicit deployment survives"
+    );
+    let row = model
+        .model_picker_rows()
+        .into_iter()
+        .find(|row| row.model == "my-deployment")
+        .expect("configured row remains visible");
+    assert!(
+        !row.available,
+        "A's unsupported-listing permission is retired"
+    );
+    assert!(!row.reason.expect("fresh fetch reason").contains("404"));
+}
+
+#[test]
+fn anonymous_catalog_is_not_owned_by_the_account_row_waiting_to_be_removed() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 1;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(1, "a-private")],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected("custom", "a-private");
+    let mut anonymous = private_summary(2, "anonymous-current");
+    anonymous.auth_methods.clear();
+    anonymous.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+        key: "synthetic-anonymous-origin".into(),
+        account_alias: None,
+        account_incarnation: None,
+    });
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![anonymous],
+            revision: 2,
+        },
+    );
+    assert_eq!(model.identity.model_short, "anonymous-current");
+    assert!(model.identity.account.is_empty());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert_eq!(model.identity.model_short, "anonymous-current");
+    assert!(model.identity.account.is_empty());
+    assert!(
+        !model
+            .model_picker_rows()
+            .iter()
+            .any(|row| row.model == "a-private")
+    );
+}
+
+#[test]
+fn automatic_session_default_is_resolved_by_daemon_instead_of_echoed() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(41, "a-private-alpha")],
+            revision: 1,
+        },
+    );
+    model.identity.provider = "custom".into();
+    model.identity.model_short = "a-private-alpha".into();
+    model.launcher_identity_pinned = false;
+    model.requests.push(AppRequest::CreateSession {
+        text: "hello".into(),
+    });
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    let create = pass
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::Create { .. }))
+        .expect("create");
+    let haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
+        model,
+        resolve_model,
+        expected_catalog_key,
+        ..
+    } = haider_tui::link::request_body(create)
+    else {
+        unreachable!()
+    };
+    assert!(
+        model.is_empty(),
+        "A's derived default never becomes explicit configuration"
+    );
+    assert!(resolve_model);
+    assert_eq!(expected_catalog_key, None);
+}
+
+#[test]
+fn delayed_session_selection_does_not_borrow_replacement_catalog_owner() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(42, "b-private-beta")],
+            revision: 2,
+        },
+    );
+    let mut descriptor = oauth_descriptor("custom", "work", true);
+    descriptor.incarnation = 42;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![descriptor],
+            revision: Some(2),
+            sources: Vec::new(),
+        },
+    );
+    let session = haider_protocol::ids::SessionId::new("old-derived-session");
+    model.upsert_live_session(&session);
+    model.open_session(&session);
+    model.apply_scoped_model_selected(
+        "custom",
+        "a-private-alpha",
+        Some("synthetic-producer-41".into()),
+    );
+    assert!(
+        model.identity.model_short.is_empty(),
+        "retired current marker removed"
+    );
+    model.bootstrap_identity_from_daemon();
+    assert!(
+        model.identity.model_short.is_empty(),
+        "attached session awaits an explicit choice: no default is adopted into it"
+    );
+    assert_eq!(model.identity.context_window, 0);
+    model.apply_scoped_model_selected(
+        "custom",
+        "b-private-beta",
+        Some("synthetic-producer-42".into()),
+    );
+    assert_eq!(model.identity.model_short, "b-private-beta");
+    assert_eq!(model.identity.context_window, 123_456);
+}
+
+#[test]
+fn picker_request_captures_owner_before_a_replacement_reply_is_applied() {
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert("session_model_select_v1".into());
+    let mut driver = LiveDriver::new("test");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 51;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(51, "a-private-alpha")],
+            revision: 1,
+        },
+    );
+    let session = haider_protocol::ids::SessionId::new("picker-account-race");
+    model.upsert_live_session(&session);
+    model.open_session(&session);
+    let row = model
+        .model_picker_rows()
+        .into_iter()
+        .find(|row| row.model == "a-private-alpha")
+        .expect("A row");
+    model.select_model_row(&row);
+    assert!(model.requests.iter().any(|request| matches!(request,
+        AppRequest::SelectModel { expected_catalog_key: Some(key), .. } if key == "synthetic-producer-51")));
+    // A replacement reply reaches the reducer before the queued UI request
+    // is drained. Encoding must retain A's observation, not label it B.
+    account.incarnation = 52;
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        }),
+        std::time::Instant::now(),
+    );
+    // The selection is held for the session's control attachment (wave
+    // 973 route epochs); the attach completes after the replacement reply.
+    let mut commands = pass.commands;
+    if !commands
+        .iter()
+        .any(|command| matches!(command, LiveCommand::SelectModel { .. }))
+    {
+        commands.extend(
+            live_pass(
+                &mut driver,
+                &mut model,
+                Some(LiveReply::Attached {
+                    attachment: haider_rpc::AttachmentId::new("picker-account-race-att"),
+                    session: session.clone(),
+                    worker_generation: 7,
+                    replay_through_seq: 0,
+                    launch_origin: None,
+                }),
+                std::time::Instant::now(),
+            )
+            .commands,
+        );
+    }
+    let select = commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::SelectModel { .. }))
+        .expect("queued selection");
+    let haider_rpc::RequestBody::SessionSelectModel {
+        model,
+        expected_catalog_key,
+        ..
+    } = haider_tui::link::request_body(select)
+    else {
+        unreachable!()
+    };
+    assert_eq!(model, "a-private-alpha");
+    assert_eq!(
+        expected_catalog_key.as_deref(),
+        Some("synthetic-producer-51")
+    );
+}
+
+#[test]
+fn configured_id_survives_remote_metadata_retirement_but_owned_session_defaults_do_not() {
+    for (attached, owned_defaults) in [(false, false), (true, false), (true, true)] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 61;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        let mut profile = private_summary(61, "my-deployment");
+        profile.configured_models = vec!["my-deployment".into()];
+        profile.model_details[0].supports_vision = Some(true);
+        profile.model_details[0].default_effort = Some("high".into());
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![profile],
+                revision: 1,
+            },
+        );
+        if attached {
+            let session = haider_protocol::ids::SessionId::new("configured-default-session");
+            model.upsert_live_session(&session);
+            model.open_session(&session);
+        }
+        if attached {
+            model.apply_scoped_model_selected(
+                "custom",
+                "my-deployment",
+                owned_defaults.then(|| "synthetic-producer-61".into()),
+            );
+        } else {
+            model.apply_model_selected("custom", "my-deployment");
+        }
+        account.incarnation = 62;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        let mut next_profile = private_summary(62, "my-deployment");
+        next_profile.configured_models = vec!["my-deployment".into()];
+        next_profile.model_details[0].source = Some(haider_rpc::ModelDetailSourceWire::Configured);
+        next_profile.model_details[0].context_window = None;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![next_profile],
+                revision: 2,
+            },
+        );
+        let profile = model
+            .providers
+            .providers
+            .iter()
+            .find(|profile| profile.provider == "custom")
+            .expect("profile");
+        assert_eq!(profile.models, vec!["my-deployment"]);
+        let detail = &profile.model_details[0];
+        assert_eq!(
+            detail.source,
+            Some(haider_rpc::ModelDetailSourceWire::Configured)
+        );
+        assert_eq!(detail.context_window, None);
+        assert_eq!(detail.supports_vision, None);
+        assert_eq!(detail.default_effort, None);
+        assert_eq!(model.identity.context_window, 0);
+        if owned_defaults {
+            assert!(
+                model.identity.model_short.is_empty(),
+                "captured A defaults require a fresh selection"
+            );
+            assert!(model.launcher_identity_pinned);
+        } else {
+            assert_eq!(
+                model.identity.model_short, "my-deployment",
+                "user declaration remains configuration"
+            );
+        }
+    }
+}
+
+#[test]
+fn restarted_last_model_retains_its_producer_and_retirement_clears_the_file() {
+    use haider_tui::settings::SettingsStore;
+    let root = tempfile::tempdir().expect("settings");
+    let path = root.path().join("tui-settings.json");
+    let mut settings = Some(SettingsStore::at(path.clone()));
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(71, "a-private-alpha")],
+            revision: 1,
+        },
+    );
+    model.apply_model_selected("custom", "a-private-alpha");
+    let mut seen = 0;
+    haider_tui::runtime::sync_model_persistence(&model, &mut seen, &mut settings);
+    let mut store = SettingsStore::at(path.clone());
+    let pick = store.load_last_model().expect("saved pick");
+    assert_eq!(pick.catalog_key.as_deref(), Some("synthetic-producer-71"));
+    assert!(pick.scope_known);
+    store.set_last_model(Some(pick.clone()));
+    store.save_if_changed(haider_tui::theme::ThemeChoice::System);
+    assert_eq!(
+        SettingsStore::at(path.clone()).load_last_model(),
+        Some(pick.clone()),
+        "theme write preserves provenance"
+    );
+    let mut restarted = live_model();
+    restarted.restore_last_model_pick(&pick);
+    let mut driver = LiveDriver::new("restart");
+    restarted.requests.push(AppRequest::CreateSession {
+        text: "before any inventory reply".into(),
+    });
+    let initial = live_pass(&mut driver, &mut restarted, None, std::time::Instant::now());
+    let create = initial
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::Create { .. }))
+        .expect("create");
+    let haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
+        expected_catalog_key,
+        model,
+        ..
+    } = haider_tui::link::request_body(create)
+    else {
+        unreachable!()
+    };
+    assert_eq!(model, "a-private-alpha");
+    assert_eq!(
+        expected_catalog_key, pick.catalog_key,
+        "an early request cannot lose A's owner"
+    );
+    // An old provider reply may arrive before B's account reply after restart.
+    pass(
+        &mut driver,
+        &mut restarted,
+        LiveReply::Providers {
+            providers: vec![private_summary(71, "a-private-alpha")],
+            revision: 1,
+        },
+    );
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 72;
+    pass(
+        &mut driver,
+        &mut restarted,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert!(
+        restarted.identity.model_short.is_empty(),
+        "retired A preference cannot become B's current marker"
+    );
+    let mut seen = 0;
+    haider_tui::runtime::sync_model_persistence(&restarted, &mut seen, &mut settings);
+    assert_eq!(
+        SettingsStore::at(path).load_last_model(),
+        None,
+        "retirement removes the persisted pick too"
+    );
+}
+
+#[test]
+fn legacy_last_model_waits_for_truth_but_explicit_unowned_configuration_is_preserved() {
+    use haider_tui::settings::LastModelPick;
+    for scope_known in [false, true] {
+        let mut model = live_model();
+        let pick = if scope_known {
+            LastModelPick {
+                provider: "custom".into(),
+                model: "manual-unlisted".into(),
+                catalog_key: None,
+                scope_known: true,
+            }
+        } else {
+            let root = tempfile::tempdir().expect("legacy settings");
+            let path = root.path().join("tui-settings.json");
+            std::fs::write(&path, r#"{"version":1,"theme":"system","last_provider":"custom","last_model":"manual-unlisted"}"#).expect("legacy file");
+            haider_tui::settings::SettingsStore::at(path)
+                .load_last_model()
+                .expect("legacy pick")
+        };
+        assert_eq!(pick.scope_known, scope_known);
+        model.restore_last_model_pick(&pick);
+        let mut driver = LiveDriver::new("test");
+        model.requests.push(AppRequest::CreateSession {
+            text: "early".into(),
+        });
+        let initial = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+        let create = initial
+            .commands
+            .into_iter()
+            .find(|command| matches!(command, LiveCommand::Create { .. }))
+            .expect("create");
+        let haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
+            model: sent,
+            resolve_model,
+            expected_catalog_key,
+            ..
+        } = haider_tui::link::request_body(create)
+        else {
+            unreachable!()
+        };
+        assert_eq!(sent, if scope_known { "manual-unlisted" } else { "" });
+        assert_eq!(resolve_model, !scope_known);
+        assert_eq!(expected_catalog_key, None);
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![private_summary(81, "b-private-beta")],
+                revision: 1,
+            },
+        );
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 81;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        assert_eq!(
+            model.identity.model_short,
+            if scope_known {
+                "manual-unlisted"
+            } else {
+                "b-private-beta"
+            }
+        );
+    }
+}
+
+#[test]
+fn provider_rebound_retires_owned_selection_without_erasing_explicit_configuration() {
+    for (route, owned, retired) in [
+        ("same", true, false),
+        ("endpoint", true, true),
+        ("account", true, true),
+        ("provider", true, true),
+        ("endpoint", false, false),
+        ("account", false, false),
+    ] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 71;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        let mut profile = private_summary(71, "my-deployment");
+        profile.configured_models = vec!["my-deployment".into()];
+        profile.endpoint = Some("http://127.0.0.1:23456/v1".into());
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![profile],
+                revision: 1,
+            },
+        );
+        let session = haider_protocol::ids::SessionId::new("route-owner-session");
+        model.upsert_live_session(&session);
+        model.open_session(&session);
+        model.apply_scoped_model_selected(
+            "custom",
+            "my-deployment",
+            owned.then(|| "synthetic-producer-71".into()),
+        );
+        assert_eq!(model.identity.model_short, "my-deployment");
+        model.apply_session_provider_rebound(&haider_protocol::session::SessionProviderRebound {
+            output_budget: None,
+            active_output_budget: None,
+            rebind_id: format!("synthetic-{route}"),
+            provider: if route == "provider" {
+                "other-custom"
+            } else {
+                "custom"
+            }
+            .into(),
+            base_url: Some(
+                if route == "endpoint" {
+                    "http://127.0.0.1:23457/v1"
+                } else {
+                    "http://127.0.0.1:23456/v1"
+                }
+                .into(),
+            ),
+            account: Some(if route == "account" { "other" } else { "work" }.into()),
+            selection_epoch: None,
+        });
+        if route == "endpoint" || route == "account" {
+            assert_eq!(
+                model.identity.context_window, 0,
+                "{route}: explicit names cannot borrow A's context"
+            );
+            assert!(model.current_pair_detail().is_none());
+            let row = model
+                .model_picker_rows()
+                .into_iter()
+                .find(|row| row.model == "my-deployment")
+                .expect("configured ID");
+            assert_eq!(row.context_window, None);
+            assert_eq!(
+                row.source,
+                Some(haider_rpc::ModelDetailSourceWire::Configured)
+            );
+        }
+        if retired {
+            assert!(
+                model.identity.model_short.is_empty(),
+                "{route}: derived marker retired"
+            );
+            assert_eq!(model.identity.context_window, 0);
+            assert!(!model.model_picker_rows().iter().any(|row| row.is_current));
+            let other = haider_protocol::ids::SessionId::new("route-owner-other-session");
+            model.upsert_live_session(&other);
+            model.open_session(&other);
+            model.open_session(&session);
+            assert!(
+                model.identity.model_short.is_empty(),
+                "{route}: reopening cannot relabel the old choice"
+            );
+        } else {
+            assert_eq!(
+                model.identity.model_short, "my-deployment",
+                "{route}: negative control"
+            );
+        }
+    }
+}
+
+#[test]
+fn idle_management_refresh_is_bounded_and_retires_header_without_input() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("idle-refresh");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 1;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(1),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(1, "a-private")],
+            revision: 1,
+        },
+    );
+    assert_eq!(model.identity.model_short, "a-private");
+    assert_eq!(
+        driver.refresh_management(),
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ]
+    );
+    assert!(driver.refresh_management().is_empty());
+    account.incarnation = 2;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    assert!(model.identity.model_short.is_empty());
+    assert_eq!(model.identity.context_window, 0);
+    assert!(driver.refresh_management().is_empty());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![],
+            revision: 2,
+        },
+    );
+    assert_eq!(driver.refresh_management().len(), 2);
+}
+
+#[test]
+fn picker_and_daemon_share_configured_availability_for_every_provider_kind() {
+    for catalog in [
+        haider_rpc::ProviderCatalogKindWire::Custom,
+        haider_rpc::ProviderCatalogKindWire::Public,
+        haider_rpc::ProviderCatalogKindWire::Authenticated,
+        haider_rpc::ProviderCatalogKindWire::Offline,
+        haider_rpc::ProviderCatalogKindWire::Adapter,
+    ] {
+        for inventory in [
+            haider_rpc::ModelInventoryWire::Configured,
+            haider_rpc::ModelInventoryWire::Stale {
+                fetched_at_ms: 1,
+                reason: "server returned 503 for /models".into(),
+            },
+            haider_rpc::ModelInventoryWire::Fetched {
+                fetched_at_ms: u64::MAX,
+            },
+        ] {
+            for availability in [
+                haider_rpc::ProviderAvailabilityWire::Available,
+                haider_rpc::ProviderAvailabilityWire::Unavailable,
+            ] {
+                let mut model = live_model();
+                let mut summary = provider_summary("custom", &["deployment"], "deployment");
+                summary.catalog = catalog;
+                summary.configured_models = vec!["deployment".into()];
+                summary.inventory = inventory.clone();
+                summary.availability = availability;
+                let expected = summary.model_is_selectable("deployment");
+                model.providers.apply_snapshot(vec![summary], 1);
+                let row = model
+                    .model_picker_rows()
+                    .into_iter()
+                    .find(|row| row.model == "deployment")
+                    .expect("configured row");
+                assert_eq!(
+                    row.available, expected,
+                    "{catalog:?} {inventory:?} {availability:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tui_ages_configured_absence_with_shared_policy_and_matching_account_proof() {
+    fn publish(
+        driver: &mut LiveDriver,
+        model: &mut AppModel,
+        kind: u8,
+        summary: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    ) {
+        match kind {
+            0 => pass(
+                driver,
+                model,
+                LiveReply::Providers {
+                    providers: vec![summary],
+                    revision,
+                },
+            ),
+            1 => pass(
+                driver,
+                model,
+                LiveReply::ProviderModelsRefreshed {
+                    provider: summary,
+                    revision,
+                },
+            ),
+            2 => pass(
+                driver,
+                model,
+                LiveReply::DefaultModelSet {
+                    command_id: haider_rpc::CommandId::new("catalog-default-reply"),
+                    provider: summary,
+                    revision,
+                },
+            ),
+            _ => pass(
+                driver,
+                model,
+                LiveReply::ProviderTrustSet {
+                    command_id: haider_rpc::CommandId::new("catalog-trust-reply"),
+                    provider: summary,
+                    revision,
+                },
+            ),
+        }
+    }
+
+    fn account(
+        driver: &mut LiveDriver,
+        model: &mut AppModel,
+        alias: &str,
+        incarnation: u64,
+        status: CredentialStatus,
+        revision: u64,
+    ) {
+        let mut descriptor = oauth_descriptor("custom", alias, true);
+        descriptor.auth_method = AuthMethod::ApiKey;
+        descriptor.incarnation = incarnation;
+        descriptor.status = status;
+        pass(
+            driver,
+            model,
+            LiveReply::Accounts {
+                descriptors: vec![descriptor],
+                revision: Some(revision),
+                sources: vec![],
+            },
+        );
+    }
+
+    // Exercise receipt reducers themselves: an older success can arrive
+    // after the active account changed, before its provider list arrives.
+    for kind in 0..4 {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("late-provider-receipt");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        publish(
+            &mut driver,
+            &mut model,
+            0,
+            private_summary(1, "private-A"),
+            1,
+        );
+        account(
+            &mut driver,
+            &mut model,
+            "second",
+            2,
+            CredentialStatus::Ok,
+            3,
+        );
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            private_summary(1, "private-A"),
+            2,
+        );
+        assert!(
+            model.providers.providers[0].models.is_empty(),
+            "late receipt={kind}"
+        );
+        assert!(model.identity.model_short.is_empty(), "late receipt={kind}");
+        assert_eq!(model.identity.context_window, 0, "late receipt={kind}");
+        assert!(
+            !model
+                .providers
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("private-A"),
+            "late receipt message={kind}"
+        );
+    }
+
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("late-configure-receipt");
+    account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+    publish(
+        &mut driver,
+        &mut model,
+        0,
+        private_summary(1, "private-A"),
+        1,
+    );
+    let configure = driver.handle_request(
+        &mut model,
+        AppRequest::ProviderConfigure {
+            attempt: 1,
+            name: "custom".into(),
+            origin: "http://127.0.0.1:9/v1".into(),
+            model: "deployment".into(),
+            keyless: false,
+            secret: None,
+            family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
+            models: vec![],
+            default_model: None,
+            expected_revision: 1,
+        },
+    );
+    let command_id = configure
+        .into_iter()
+        .find_map(|command| match command {
+            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id),
+            _ => None,
+        })
+        .expect("correlated configure command");
+    account(
+        &mut driver,
+        &mut model,
+        "second",
+        2,
+        CredentialStatus::Ok,
+        3,
+    );
+    let mut summary = private_summary(1, "private-A");
+    summary.configured_models = vec!["deployment".into()];
+    summary.default_model = Some("deployment".into());
+    summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::ProviderConfigured {
+            command_id,
+            provider: summary,
+            revision: 2,
+        },
+    );
+    assert!(
+        !model.providers.providers[0]
+            .models
+            .iter()
+            .any(|name| name == "private-A")
+    );
+    assert!(
+        model.providers.providers[0]
+            .model_details
+            .iter()
+            .all(|detail| detail.context_window.is_none() && detail.max_output_tokens.is_none())
+    );
+    assert!(model.identity.model_short.is_empty());
+    assert_eq!(model.identity.context_window, 0);
+
+    for remove_provider in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("removed-current-identity");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        publish(
+            &mut driver,
+            &mut model,
+            0,
+            private_summary(1, "private-A"),
+            1,
+        );
+        assert_eq!(model.identity.model_short, "private-A");
+        let command_id = haider_rpc::CommandId::new("catalog-removal-reply");
+        let reply = if remove_provider {
+            LiveReply::ProviderRemoved {
+                command_id,
+                provider: "custom".into(),
+                revision: 2,
+            }
+        } else {
+            LiveReply::AccountRemoved {
+                command_id,
+                removed_alias: "work".into(),
+                replacement_active_alias: None,
+                revision: 2,
+            }
+        };
+        pass(&mut driver, &mut model, reply);
+        assert!(
+            model.identity.model_short.is_empty(),
+            "removed provider={remove_provider}"
+        );
+        assert_eq!(
+            model.identity.context_window, 0,
+            "removed provider={remove_provider}"
+        );
+    }
+
+    for kind in 0..4 {
+        for catalog in [
+            haider_rpc::ProviderCatalogKindWire::Custom,
+            haider_rpc::ProviderCatalogKindWire::Public,
+            haider_rpc::ProviderCatalogKindWire::Authenticated,
+            haider_rpc::ProviderCatalogKindWire::Offline,
+            haider_rpc::ProviderCatalogKindWire::Adapter,
+        ] {
+            for aged in [false, true] {
+                for anonymous in [false, true] {
+                    for status in [
+                        CredentialStatus::Ok,
+                        CredentialStatus::Limited { until_ms: u64::MAX },
+                        CredentialStatus::Expired,
+                        CredentialStatus::Revoked,
+                        CredentialStatus::NeedsAttention {
+                            reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+                        },
+                    ] {
+                        let mut model = live_model();
+                        let mut driver = LiveDriver::new("credential-proof-order");
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+                        let mut summary = private_summary(1, "deployment");
+                        summary.catalog = catalog;
+                        summary.configured_models = vec!["deployment".into()];
+                        summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+                        summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+                        summary.auth_methods = if anonymous { vec![] } else { vec![AuthMethod::ApiKey] };
+                        summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+                            fetched_at_ms: if aged { 1 } else { u64::MAX },
+                        };
+                        publish(&mut driver, &mut model, 0, summary.clone(), 1);
+                        assert!(model.providers.providers[0].model_is_selectable("deployment"));
+                        let expected = anonymous || matches!(status, CredentialStatus::Ok | CredentialStatus::Limited { .. });
+                        account(&mut driver, &mut model, "work", 1, status.clone(), 2);
+                        let context = format!("publication={kind} catalog={catalog:?} aged={aged} anonymous={anonymous} status={status:?}");
+                        assert_eq!(model.providers.providers[0].model_is_selectable("deployment"), expected, "{context}");
+                        assert_eq!(model.model_picker_rows().into_iter().find(|row| row.model=="deployment").expect("configured row").available, expected, "{context}");
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 3);
+                        assert!(model.providers.providers[0].model_is_selectable("deployment"), "recovery {context}");
+
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Expired, 4);
+                        summary.inventory = haider_rpc::ModelInventoryWire::Unavailable { reason: "synthetic catalog authentication failure".into() };
+                        summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                        publish(&mut driver, &mut model, kind, summary, 5);
+                        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 6);
+                        assert!(!model.providers.providers[0].model_is_selectable("deployment"), "new negative publication {context}");
+                    }
+                }
+            }
+        }
+
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("newer-provider-credential-proof");
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+        let summary = private_summary(1, "deployment");
+        publish(&mut driver, &mut model, 0, summary.clone(), 1);
+        account(
+            &mut driver,
+            &mut model,
+            "work",
+            1,
+            CredentialStatus::Expired,
+            2,
+        );
+        assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+        publish(&mut driver, &mut model, kind, summary, 3);
+        assert!(
+            model.providers.providers[0].model_is_selectable("deployment"),
+            "new provider proof publication={kind}"
+        );
+        account(
+            &mut driver,
+            &mut model,
+            "work",
+            1,
+            CredentialStatus::Expired,
+            3,
+        );
+        assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+        account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 4);
+        assert!(model.providers.providers[0].model_is_selectable("deployment"));
+        if kind != 0 {
+            publish(
+                &mut driver,
+                &mut model,
+                kind,
+                provider_summary("other", &["other-model"], "other-model"),
+                6,
+            );
+            account(
+                &mut driver,
+                &mut model,
+                "work",
+                1,
+                CredentialStatus::Expired,
+                5,
+            );
+            assert!(
+                !model.providers.providers[0].model_is_selectable("deployment"),
+                "other provider must not hide credential proof publication={kind}"
+            );
+        }
+    }
+
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("retired-credential-proof");
+    account(&mut driver, &mut model, "work", 1, CredentialStatus::Ok, 1);
+    let mut summary = private_summary(1, "deployment");
+    summary.configured_models = vec!["deployment".into()];
+    publish(&mut driver, &mut model, 0, summary, 1);
+    account(
+        &mut driver,
+        &mut model,
+        "work",
+        1,
+        CredentialStatus::Expired,
+        2,
+    );
+    account(
+        &mut driver,
+        &mut model,
+        "second",
+        2,
+        CredentialStatus::Ok,
+        3,
+    );
+    assert!(
+        !model.providers.providers[0].model_is_selectable("deployment"),
+        "a new account cannot restore the retired credential baseline"
+    );
+
+    // Accepted full, refresh, default, and trust publications supersede buffered
+    // evidence even when their revision is equal. Rejected older replies do
+    // not erase a valid pending projection.
+    for kind in 0..4 {
+        for publication_revision in [1, 2, 3] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("superseded-listing-proof");
+            let mut previous = oauth_descriptor("custom", "previous", true);
+            previous.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![previous],
+                    revision: Some(1),
+                    sources: vec![],
+                },
+            );
+            let mut summary = private_summary(2, "deployment");
+            summary.configured_models = vec!["deployment".into()];
+            summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+            summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            publish(&mut driver, &mut model, 0, summary.clone(), 2);
+            // The new projection can look exactly like the retired buffer.
+            // Equality of visible rows cannot preserve old listing evidence.
+            summary.retire_fetched_catalog();
+            publish(&mut driver, &mut model, kind, summary, publication_revision);
+            let mut current = oauth_descriptor("custom", "work", true);
+            current.incarnation = 2;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![current],
+                    revision: Some(3),
+                    sources: vec![],
+                },
+            );
+            assert_eq!(
+                model.providers.providers[0].model_is_selectable("deployment"),
+                publication_revision == 1,
+                "replacement={kind} publication={publication_revision}"
+            );
+        }
+
+        // Two rapid switches can publish A's newer catalog before B's
+        // delayed account reply. That reply cannot revive B's old buffer or
+        // overwrite the new A projection waiting for its own account proof.
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("superseded-account-proof");
+        let mut account_a = oauth_descriptor("custom", "work", true);
+        account_a.incarnation = 1;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_a.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        let mut summary_b = private_summary(2, "retired-B");
+        summary_b
+            .catalog_scope
+            .as_mut()
+            .expect("scoped private summary")
+            .account_alias = Some("second".into());
+        publish(&mut driver, &mut model, 0, summary_b, 2);
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            private_summary(1, "latest-A"),
+            3,
+        );
+        let mut account_b = oauth_descriptor("custom", "second", true);
+        account_b.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_b],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert!(
+            model.providers.providers[0].models.is_empty(),
+            "replacement={kind}"
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account_a],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        assert_eq!(
+            model.providers.providers[0].models,
+            ["latest-A"],
+            "replacement={kind}"
+        );
+    }
+
+    // A partial publication for a different provider preserves this one's
+    // pending proof, even though it advances the global management revision.
+    for kind in [1, 2, 3] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("independent-provider-proof");
+        let mut previous = oauth_descriptor("custom", "previous", true);
+        previous.incarnation = 1;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![previous],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        publish(&mut driver, &mut model, 0, private_summary(2, "pending"), 2);
+        publish(
+            &mut driver,
+            &mut model,
+            kind,
+            provider_summary("other", &["other-model"], "other-model"),
+            3,
+        );
+        let mut current = oauth_descriptor("custom", "work", true);
+        current.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![current],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.providers.providers[0].models, ["pending"]);
+    }
+
+    // A same/older publication cannot assert a different active owner.
+    // A later account reply must not revive that discarded listing proof.
+    for previous_incarnation in [1, 42] {
+        for publication_revision in [1, 2] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("nonfuture-catalog-proof");
+            let mut previous = oauth_descriptor("custom", "previous", true);
+            previous.auth_method = AuthMethod::ApiKey;
+            previous.incarnation = previous_incarnation;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![previous],
+                    revision: Some(2),
+                    sources: vec![],
+                },
+            );
+            let mut summary = private_summary(1, "deployment");
+            summary.auth_methods = vec![AuthMethod::ApiKey];
+            summary.models.clear();
+            summary.model_details.clear();
+            summary.configured_models = vec!["deployment".into()];
+            summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+            summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+            summary.inventory = haider_rpc::ModelInventoryWire::Fetched { fetched_at_ms: 1 };
+            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![summary],
+                    revision: publication_revision,
+                },
+            );
+            let mut current = oauth_descriptor("custom", "work", true);
+            current.auth_method = AuthMethod::ApiKey;
+            current.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![current],
+                    revision: Some(3),
+                    sources: vec![],
+                },
+            );
+            assert!(
+                !model.providers.providers[0].model_is_selectable("deployment"),
+                "discarded publication={publication_revision} previous={previous_incarnation}"
+            );
+        }
+    }
+    for previous_incarnation in [None, Some(1), Some(42)] {
+        for catalog in [
+            haider_rpc::ProviderCatalogKindWire::Custom,
+            haider_rpc::ProviderCatalogKindWire::Public,
+            haider_rpc::ProviderCatalogKindWire::Authenticated,
+            haider_rpc::ProviderCatalogKindWire::Offline,
+            haider_rpc::ProviderCatalogKindWire::Adapter,
+        ] {
+            for aged in [false, true] {
+                for other_listed in [false, true] {
+                    for accounts_first in [false, true] {
+                        for (state, status, active) in [
+                            ("anonymous", None, false),
+                            ("ok", Some(CredentialStatus::Ok), true),
+                            (
+                                "limited",
+                                Some(CredentialStatus::Limited { until_ms: u64::MAX }),
+                                true,
+                            ),
+                            ("expired", Some(CredentialStatus::Expired), true),
+                            ("revoked", Some(CredentialStatus::Revoked), true),
+                            (
+                                "attention",
+                                Some(CredentialStatus::NeedsAttention {
+                                    reason: haider_protocol::credential::CredentialAttentionReason::SourceUnreadable,
+                                }),
+                                true,
+                            ),
+                            ("inactive", Some(CredentialStatus::Ok), false),
+                            ("missing", None, true),
+                            ("foreign", Some(CredentialStatus::Ok), true),
+                        ] {
+                            let mut model = live_model();
+                            let mut driver = LiveDriver::new("tui-freshness-boundary");
+                            if let Some(incarnation) = previous_incarnation {
+                                let mut previous = oauth_descriptor("custom", "previous", true);
+                                previous.auth_method = AuthMethod::ApiKey;
+                                previous.incarnation = incarnation;
+                                pass(&mut driver, &mut model, LiveReply::Accounts {
+                                    descriptors: vec![previous],
+                                    revision: Some(1),
+                                    sources: vec![],
+                                });
+                            }
+                            let listed = if other_listed {
+                                &["another-listed"][..]
+                            } else {
+                                &[][..]
+                            };
+                            let mut summary = provider_summary("custom", listed, "");
+                            summary.catalog = catalog;
+                            summary.endpoint = Some("http://127.0.0.1:9/v1".into());
+                            summary.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+                            summary.configured_models = vec!["deployment".into()];
+                            summary.default_model = None;
+                            summary.inventory = haider_rpc::ModelInventoryWire::Fetched {
+                                fetched_at_ms: if aged { 1 } else { u64::MAX },
+                            };
+                            summary.inventory_authority =
+                                haider_rpc::ModelInventoryAuthorityWire::Authoritative;
+                            summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                            summary.availability_reason =
+                                Some("deployment is absent from the latest model list".into());
+                            if state == "anonymous" {
+                                summary.auth_methods.clear();
+                            } else {
+                                summary.auth_methods = vec![AuthMethod::ApiKey];
+                                summary.catalog_scope = Some(haider_rpc::ProviderCatalogScopeWire {
+                                    key: "synthetic-producer-1".into(),
+                                    account_alias: Some("work".into()),
+                                    account_incarnation: Some(1),
+                                });
+                            }
+                            let descriptors = status
+                                .map(|status| {
+                                    let provider = if state == "foreign" {
+                                        "elsewhere"
+                                    } else {
+                                        "custom"
+                                    };
+                                    let mut descriptor = oauth_descriptor(provider, "work", active);
+                                    descriptor.auth_method = AuthMethod::ApiKey;
+                                    descriptor.incarnation = 1;
+                                    descriptor.status = status;
+                                    vec![descriptor]
+                                })
+                                .unwrap_or_default();
+                            let accounts = LiveReply::Accounts {
+                                descriptors,
+                                revision: Some(2),
+                                sources: vec![],
+                            };
+                            if accounts_first {
+                                pass(&mut driver, &mut model, accounts.clone());
+                            }
+                            pass(
+                                &mut driver,
+                                &mut model,
+                                LiveReply::Providers {
+                                    providers: vec![summary],
+                                    revision: 2,
+                                },
+                            );
+                            if !accounts_first {
+                                // Until the matching account arrives, an authenticated
+                                // unavailable row cannot acquire readiness from expiry.
+                                if state != "anonymous" {
+                                    assert!(!model.providers.providers[0].model_is_selectable("deployment"));
+                                }
+                                pass(&mut driver, &mut model, accounts);
+                            }
+                            let expected = aged && matches!(state, "anonymous" | "ok" | "limited");
+                            let context = format!(
+                                "{catalog:?} aged={aged} other={other_listed} accounts_first={accounts_first} state={state} previous_incarnation={previous_incarnation:?}"
+                            );
+                            let summary = &model.providers.providers[0];
+                            assert_eq!(summary.model_is_selectable("deployment"), expected, "{context}");
+                            if expected {
+                                assert!(matches!(summary.inventory, haider_rpc::ModelInventoryWire::Stale { .. }), "{context}");
+                                assert!(summary.selection_reason(Some("deployment")).unwrap_or_default().contains("refresh"), "{context}");
+                                assert!(summary.model_details.iter().filter(|row| row.name == "deployment").all(|row| row.context_window.is_none() && row.max_output_tokens.is_none()), "{context}");
+                                let row = model.model_picker_rows().into_iter().find(|row| row.model == "deployment").expect("aged configuration is visible");
+                                assert!(row.available, "{context}");
+                            } else if let Some(row) = model.model_picker_rows().into_iter().find(|row| row.model == "deployment") {
+                                assert!(!row.available, "{context}");
+                            }
+                            if aged && matches!(state, "expired" | "revoked" | "attention") {
+                                // Readiness can recover before another provider reply.
+                                // Same-incarnation listing proof must survive the
+                                // unhealthy account reply in either arrival order.
+                                let mut descriptor = oauth_descriptor("custom", "work", true);
+                                descriptor.auth_method = AuthMethod::ApiKey;
+                                descriptor.incarnation = 1;
+                                pass(&mut driver, &mut model, LiveReply::Accounts {
+                                    descriptors: vec![descriptor],
+                                    revision: Some(3),
+                                    sources: vec![],
+                                });
+                                assert!(model.providers.providers[0].model_is_selectable("deployment"), "recovered: {context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restored_private_preference_is_hidden_until_live_owner_is_proven() {
+    for scope_known in [false, true] {
+        let mut model = live_model();
+        let pick = haider_tui::settings::LastModelPick {
+            provider: "custom".into(),
+            model: "a-private".into(),
+            catalog_key: scope_known.then(|| "synthetic-producer-1".into()),
+            scope_known,
+        };
+        model.restore_last_model_pick(&pick);
+        model.identity.context_window = 123_456;
+        assert!(model.display_identity().model_short.is_empty());
+        assert_eq!(model.display_identity().context_window, 0);
+        assert_eq!(model.context_meter().window, None);
+        assert_eq!(model.composer_identity(118), None);
+        let mut driver = LiveDriver::new("restored-owner");
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![private_summary(2, "b-private")],
+                revision: 2,
+            },
+        );
+        assert!(!model.display_identity().model_short.contains("a-private"));
+        let mut account = oauth_descriptor("custom", "work", true);
+        account.incarnation = 2;
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.display_identity().model_short, "b-private");
+    }
+}
+
+#[test]
+fn retired_private_session_identity_clears_account_and_window_in_either_reply_order() {
+    for attached in [false, true] {
+        for accounts_first in [false, true] {
+            let mut model = live_model();
+            let mut driver = LiveDriver::new("retired-session-owner");
+            let mut a = oauth_descriptor("custom", "work", true);
+            a.incarnation = 1;
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Accounts {
+                    descriptors: vec![a],
+                    revision: Some(1),
+                    sources: vec![],
+                },
+            );
+            pass(
+                &mut driver,
+                &mut model,
+                LiveReply::Providers {
+                    providers: vec![private_summary(1, "a-private")],
+                    revision: 1,
+                },
+            );
+            model.apply_model_selected("custom", "a-private");
+            assert_eq!(model.identity.account, "work");
+            if attached {
+                model.active_session =
+                    Some(haider_protocol::ids::SessionId::new("synthetic-session"));
+                model.screen = haider_tui::app::Screen::Session;
+            }
+            let mut b = oauth_descriptor("custom", "replacement", true);
+            b.incarnation = 2;
+            let mut inventory = private_summary(2, "b-private");
+            inventory
+                .catalog_scope
+                .as_mut()
+                .expect("scope")
+                .account_alias = Some("replacement".into());
+            inventory.models.clear();
+            inventory.model_details.clear();
+            inventory.default_model = None;
+            inventory.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+                reason: "synthetic 503".into(),
+            };
+            inventory.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+            let accounts = LiveReply::Accounts {
+                descriptors: vec![b],
+                revision: Some(2),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![inventory],
+                revision: 2,
+            };
+            let replies = if accounts_first {
+                [accounts, providers]
+            } else {
+                [providers, accounts]
+            };
+            for reply in replies {
+                pass(&mut driver, &mut model, reply);
+            }
+            assert!(model.display_identity().model_short.is_empty());
+            assert_ne!(model.display_identity().account, "work");
+            assert_eq!(model.context_meter().window, None);
+            assert_eq!(model.composer_identity(118), None);
+            for width in [118, 80] {
+                assert!(haider_tui::render::status_left_string(&model, width).contains("unknown"));
+            }
+        }
+    }
+}
+
+/// MUTATION CHECK (catalog-fixes N1, idle efficiency): an idle launcher
+/// follows another client's account or catalog change through the daemon's
+/// `account.list_watch` signal, not a per-second poll. Expected failures:
+/// drop `AccountListWatch` from `boot`/`resume` (no subscription), map
+/// `AccountsChanged` to nothing (signal ignored), or keep the throttle on a
+/// signal (re-read suppressed); or leave the watch active across a socket
+/// loss (the runtime would neither poll nor be signalled).
+#[test]
+fn management_changes_arrive_by_watch_signal_without_polling() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+
+    let boot = driver.boot();
+    assert!(
+        boot.iter()
+            .any(|command| matches!(command, LiveCommand::AccountListWatch)),
+        "boot must subscribe to management signals: {boot:?}"
+    );
+    assert_eq!(
+        command_required_features(&LiveCommand::AccountListWatch),
+        &[haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1],
+        "an older daemon without the watch must see no request"
+    );
+    assert!(
+        !driver.management_watch_active(),
+        "until the daemon accepts, the runtime keeps its fallback poll"
+    );
+
+    // Snapshot reads may finish before the watch is registered. Acceptance
+    // must re-read even when the fallback already has a throttled refresh,
+    // closing that unobserved publication gap at boot and reconnect.
+    assert_eq!(
+        driver.refresh_management(),
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ]
+    );
+    let accepted = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: true }),
+        std::time::Instant::now(),
+    );
+    assert!(driver.management_watch_active());
+    assert_eq!(
+        accepted.commands,
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ],
+        "accepted subscription must read a baseline after registration"
+    );
+
+    // A refresh is already in flight (throttled); a pushed signal still
+    // re-reads both halves at once.
+    assert!(driver.refresh_management().is_empty());
+    let signalled = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementChanged { revision: 7 }),
+        std::time::Instant::now(),
+    );
+    assert!(
+        signalled
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountListAt { .. }))
+            && signalled
+                .commands
+                .iter()
+                .any(|command| matches!(command, LiveCommand::ProviderListAt { .. })),
+        "a management signal must re-read accounts and providers: {:?}",
+        signalled.commands
+    );
+
+    let mapped =
+        haider_tui::link::map_frame(haider_rpc::WireFrame::AccountsChanged { revision: 9 });
+    assert!(
+        matches!(
+            mapped.as_slice(),
+            [LiveReply::ManagementChanged { revision: 9 }]
+        ),
+        "the pushed frame must reach the driver: {mapped:?}"
+    );
+
+    // The watch is connection-scoped: a socket loss returns the runtime
+    // to polling, and the reconnect resume subscribes again.
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "test".into(),
+        },
+    );
+    assert!(!driver.management_watch_active());
+    let resumed = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Reconnected),
+        std::time::Instant::now(),
+    );
+    assert!(
+        resumed
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountListWatch)),
+        "a reconnect must re-open the watch: {:?}",
+        resumed.commands
+    );
+    assert!(
+        !driver.management_watch_active(),
+        "the old socket's acceptance cannot vouch for the new connection: \
+         the runtime polls until the re-opened watch is accepted"
+    );
+    let accepted = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: true }),
+        std::time::Instant::now(),
+    );
+    assert_eq!(
+        accepted.commands,
+        vec![
+            LiveCommand::AccountListAt {
+                epoch: driver.connection_epoch(),
+            },
+            LiveCommand::ProviderListAt {
+                epoch: driver.connection_epoch(),
+            },
+        ],
+        "reconnect acceptance must also close the snapshot/subscription gap"
+    );
+    let declined = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ManagementWatch { accepted: false }),
+        std::time::Instant::now(),
+    );
+    assert!(!driver.management_watch_active());
+    assert!(declined.commands.is_empty());
+}
+
+/// MUTATION CHECK (catalog-fixes, restored pick): a persisted pick keyed to
+/// the still-active producer survives a restart in BOTH boot reply orders;
+/// the account reply usually lands first, and the absence of a provider view
+/// is not evidence that the producer changed. Expected failure without the
+/// `catalog_view_known` guard: the accounts-first order retires the pick
+/// (and clears the persisted file) before the provider reply arrives.
+/// Negative control: a different active incarnation still retires it in
+/// both orders.
+#[test]
+fn restored_pick_survives_boot_reply_order_for_the_same_producer() {
+    use haider_tui::settings::LastModelPick;
+    let summary = |incarnation: u64| {
+        let mut summary = private_summary(incarnation, "a-private-alpha");
+        summary.models.push("a-private-beta".into());
+        let mut beta = summary.model_details[0].clone();
+        beta.name = "a-private-beta".into();
+        summary.model_details.push(beta);
+        summary
+    };
+    for accounts_first in [true, false] {
+        for (active, retained) in [(71_u64, true), (72, false)] {
+            let mut model = live_model();
+            model.restore_last_model_pick(&LastModelPick {
+                provider: "custom".into(),
+                model: "a-private-beta".into(),
+                catalog_key: Some("synthetic-producer-71".into()),
+                scope_known: true,
+            });
+            let mut driver = LiveDriver::new("restored");
+            let mut account = oauth_descriptor("custom", "work", true);
+            account.incarnation = active;
+            let accounts = LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(1),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![summary(active)],
+                revision: 1,
+            };
+            let (first, second) = if accounts_first {
+                (accounts, providers)
+            } else {
+                (providers, accounts)
+            };
+            pass(&mut driver, &mut model, first);
+            pass(&mut driver, &mut model, second);
+            let label = format!("accounts_first={accounts_first} active={active}");
+            if retained {
+                assert_eq!(model.identity.model_short, "a-private-beta", "{label}");
+                assert_eq!(
+                    model
+                        .last_model_pick()
+                        .and_then(|pick| pick.catalog_key)
+                        .as_deref(),
+                    Some("synthetic-producer-71"),
+                    "{label}: the persisted owner is kept"
+                );
+            } else {
+                assert_ne!(model.identity.model_short, "a-private-beta", "{label}");
+            }
+        }
+    }
+}
+
+/// A public provider name can also identify a custom or authenticated
+/// catalog. It cannot prove that a legacy saved pick is permanent.
+/// MUTATION: omit the public catalog's authority/auth/producer checks.
+#[test]
+fn legacy_restored_pick_respects_public_catalog_ownership() {
+    use haider_rpc::{ModelInventoryAuthorityWire as Authority, ProviderCatalogKindWire as Kind};
+    use haider_tui::settings::LastModelPick;
+
+    for accounts_first in [false, true] {
+        for case in [
+            "account-owned",
+            "authentication-only",
+            "alias-only-owner",
+            "incarnation-only-owner",
+            "custom-anonymous",
+            "genuine-public",
+            "legacy-public",
+            "offline-configuration",
+            "declared-configuration",
+            "static-configuration",
+        ] {
+            let mut model = live_model();
+            model.restore_last_model_pick(&LastModelPick {
+                provider: "custom".into(),
+                model: "a-private-beta".into(),
+                catalog_key: None,
+                scope_known: false,
+            });
+            let mut driver = LiveDriver::new("legacy-public");
+            let mut summary = private_summary(72, "b-current");
+            summary.catalog = Kind::Public;
+            summary.inventory_authority = Authority::Authoritative;
+            let mut descriptors = vec![];
+            if matches!(case, "account-owned" | "authentication-only") {
+                let mut account = oauth_descriptor("custom", "work", true);
+                account.incarnation = 72;
+                descriptors.push(account);
+                if case == "authentication-only" {
+                    summary.catalog_scope = None;
+                }
+            } else {
+                summary.auth_methods.clear();
+                let scope = summary.catalog_scope.as_mut().expect("scope");
+                scope.account_alias = (case == "alias-only-owner").then(|| "work".into());
+                scope.account_incarnation = (case == "incarnation-only-owner").then_some(72);
+            }
+            let retained = match case {
+                "custom-anonymous" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    false
+                }
+                "account-owned"
+                | "authentication-only"
+                | "alias-only-owner"
+                | "incarnation-only-owner" => false,
+                "genuine-public" | "legacy-public" => {
+                    if case == "legacy-public" {
+                        summary.inventory_authority = Authority::Unknown;
+                    }
+                    // A genuine public listing contains the saved public ID.
+                    summary.models.push("a-private-beta".into());
+                    true
+                }
+                "offline-configuration" => {
+                    summary.catalog = Kind::Offline;
+                    summary.inventory = haider_rpc::ModelInventoryWire::Configured;
+                    summary.models.clear();
+                    summary.model_details.clear();
+                    summary.default_model = None;
+                    true
+                }
+                "declared-configuration" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    summary.configured_models.push("a-private-beta".into());
+                    true
+                }
+                "static-configuration" => {
+                    summary.inventory_authority = Authority::Advisory;
+                    summary.static_models.push("a-private-beta".into());
+                    true
+                }
+                _ => unreachable!(),
+            };
+            let accounts = LiveReply::Accounts {
+                descriptors,
+                revision: Some(1),
+                sources: vec![],
+            };
+            let providers = LiveReply::Providers {
+                providers: vec![summary],
+                revision: 1,
+            };
+            let replies = if accounts_first {
+                [accounts, providers]
+            } else {
+                [providers, accounts]
+            };
+            for reply in replies {
+                pass(&mut driver, &mut model, reply);
+            }
+            assert_eq!(
+                model.display_identity().model_short == "a-private-beta",
+                retained,
+                "{case}: accounts_first={accounts_first}"
+            );
+            if !retained {
+                assert_ne!(
+                    model.last_model_pick().map(|pick| pick.model).as_deref(),
+                    Some("a-private-beta")
+                );
+            }
+        }
+    }
+}
+
+/// MUTATION: classify every public namespace as configuration in
+/// `model_is_configuration`, or omit private account fallback when the
+/// publisher has no producer field. A real pick must retain its observed
+/// owner and retire when that owner changes, including public namespaces.
+#[test]
+fn picked_public_namespace_model_retains_its_private_producer() {
+    const PROVIDER: &str = "haider-code";
+    for with_scope in [false, true] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("public-private-pick");
+        let mut account = oauth_descriptor(PROVIDER, "work", true);
+        account.incarnation = 71;
+        let mut summary = private_summary(71, "a-private-alpha");
+        summary.models.push("a-private-beta".into());
+        let mut beta = summary.model_details[0].clone();
+        beta.name = "a-private-beta".into();
+        summary.model_details.push(beta);
+        summary.provider = PROVIDER.into();
+        summary.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+        if !with_scope {
+            summary.catalog_scope = None;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(1),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![summary.clone()],
+                revision: 1,
+            },
+        );
+        model.apply_model_selected(PROVIDER, "a-private-beta");
+        assert_eq!(model.display_identity().model_short, "a-private-beta");
+        assert_eq!(
+            model.last_model_pick().and_then(|pick| pick.catalog_key),
+            with_scope.then(|| "synthetic-producer-71".into()),
+            "a fetched pick must retain its available producer"
+        );
+
+        // Re-reading the same owner preserves an explicit beta pick rather
+        // than silently falling back to that owner's alpha default.
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account.clone()],
+                revision: Some(2),
+                sources: vec![],
+            },
+        );
+        assert_eq!(model.display_identity().model_short, "a-private-beta");
+
+        account.incarnation = 72;
+        let mut replacement = private_summary(72, "b-current");
+        replacement.provider = PROVIDER.into();
+        replacement.catalog = haider_rpc::ProviderCatalogKindWire::Public;
+        replacement.models.clear();
+        replacement.model_details.clear();
+        replacement.default_model = None;
+        replacement.inventory = haider_rpc::ModelInventoryWire::Unavailable {
+            reason: "synthetic 503".into(),
+        };
+        replacement.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+        if !with_scope {
+            replacement.catalog_scope = None;
+        }
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Accounts {
+                descriptors: vec![account],
+                revision: Some(3),
+                sources: vec![],
+            },
+        );
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![replacement],
+                revision: 3,
+            },
+        );
+        assert!(
+            model.display_identity().model_short.is_empty(),
+            "with_scope={with_scope}"
+        );
+        assert_eq!(model.context_meter().window, None);
+    }
+}
+
+fn catalog_order_setup() -> (AppModel, LiveDriver, haider_protocol::ids::SessionId) {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("catalog-order");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 42;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(42, "shared-model")],
+            revision: 2,
+        },
+    );
+    let session = haider_protocol::ids::SessionId::new("catalog-order-session");
+    model.upsert_live_session(&session);
+    model.open_session(&session);
+    let reply = catalog_order_reply(&session, 20, Some("synthetic-producer-42"));
+    pass(&mut driver, &mut model, reply);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(model.display_identity().model_short, "shared-model");
+    (model, driver, session)
+}
+fn catalog_order_reply(
+    session: &haider_protocol::ids::SessionId,
+    seq: u64,
+    key: Option<&str>,
+) -> LiveReply {
+    LiveReply::ModelSelected {
+        connection_epoch: None,
+        selected_seq: seq,
+        command_id: haider_rpc::CommandId::new(format!("catalog-order-{seq}")),
+        session: session.clone(),
+        provider: "custom".into(),
+        model: "shared-model".into(),
+        worker_generation: 1,
+        output_budget: None,
+        model_catalog_key: key.map(str::to_owned),
+    }
+}
+#[test]
+fn catalog_order_older_same_pair_reply_keeps_current_header() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-41")),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "older reply cannot retire the current account's selected model"
+    );
+}
+#[test]
+fn catalog_order_same_owner_reply_control() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-42")),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(model.display_identity().model_short, "shared-model");
+}
+#[test]
+fn catalog_order_older_unowned_reply_cannot_remove_current_owner() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, None),
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    let mut next = oauth_descriptor("custom", "work", true);
+    next.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![next],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "different-model")],
+            revision: 3,
+        },
+    );
+    catalog_order_render(&model);
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "account B's fetched choice must retire under C even after an older ownerless reply"
+    );
+}
+#[test]
+fn catalog_order_parked_reply_keeps_current_header_on_reopen() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-order-other-session");
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    pass(
+        &mut driver,
+        &mut model,
+        catalog_order_reply(&session, 10, Some("synthetic-producer-41")),
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "parked current owner must survive an older reply"
+    );
+}
+
+#[test]
+fn catalog_order_older_same_pair_create_receipt_keeps_current_header() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let metadata: haider_protocol::session::SessionMetadataV1 =
+        serde_json::from_value(serde_json::json!({
+            "cwd":"/tmp", "provider":"custom", "model":"shared-model", "max_tokens":4096,
+            "created_at_ms":1, "selection_epoch":10, "model_catalog_key":"synthetic-producer-41"
+        }))
+        .expect("synthetic metadata");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-order-old-create"),
+            session,
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "shared-model".into(),
+            model_catalog_key: Some("synthetic-producer-41".into()),
+            metadata: Some(metadata),
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(20));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "an older same-pair create receipt must not replace the current owner"
+    );
+}
+fn catalog_order_newer_list_case(parked: bool, reopen: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    if parked {
+        let other = haider_protocol::ids::SessionId::new("catalog-list-other-session");
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let summary: haider_rpc::SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id":session, "head_seq":30, "worker_generation":1,
+        "metadata":{"cwd":"/tmp", "provider":"custom", "model":"shared-model", "max_tokens":4096,
+        "created_at_ms":1, "selection_epoch":30, "model_catalog_key":"synthetic-producer-43"}
+    }))
+    .expect("synthetic list");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+    if reopen {
+        let other = haider_protocol::ids::SessionId::new("catalog-list-reopen-other");
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    if parked || reopen {
+        model.open_session(&session);
+    }
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "newer list metadata must install its current catalog owner"
+    );
+}
+#[test]
+fn catalog_order_newer_active_list_installs_current_owner() {
+    catalog_order_newer_list_case(false, false);
+}
+#[test]
+fn catalog_order_newer_parked_list_installs_current_owner() {
+    catalog_order_newer_list_case(true, false);
+}
+
+fn catalog_order_render(model: &AppModel) {
+    for (width, height) in [(118_u16, 36_u16), (80, 24)] {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                haider_tui::render::render(model, frame);
+            })
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        eprintln!(
+            "CATALOG_HEADER {width}x{height} epoch={:?}\n{}",
+            model.meter_epoch.selection_epoch,
+            lines.join("\n")
+        );
+    }
+}
+
+#[test]
+fn catalog_order_newer_active_list_keeps_owner_after_reopen() {
+    catalog_order_newer_list_case(false, true);
+}
+fn catalog_order_child_case(changed: bool) {
+    catalog_order_child_snapshot_case(changed, true);
+}
+
+fn catalog_order_steer_child(
+    model: &mut AppModel,
+    child_session: &haider_protocol::ids::SessionId,
+) {
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{AgentId, LeaseId, SessionId};
+    use haider_tui::app::{ChipModel, Screen};
+    let parent = SessionId::new("catalog-child-parent");
+    model.upsert_live_session(&parent);
+    model.open_session(&parent);
+    let manifest = AgentManifest {
+        agent: AgentId::new("catalog-child"),
+        role: AgentRole::Subagent,
+        task: "catalog display check".into(),
+        callsign: Some("catalog child".into()),
+        model_profile: "shared-model".into(),
+        grant: Grant {
+            tools: vec![],
+            effect_ceiling: vec![],
+        },
+        budget_tokens: None,
+        placement: Placement::Local,
+        lease: LeaseId::new("catalog-child-lease"),
+        fencing_epoch: 1,
+        attempt: 0,
+        parent: None,
+        coordinates: None,
+        cli_scope: None,
+    };
+    let mut chip = ChipModel::from_manifest(&manifest);
+    chip.child_session = Some(child_session.as_str().into());
+    chip.provider = Some("custom".into());
+    model.chips = vec![chip];
+    model.view_path = vec!["catalog-child".into()];
+    model.screen = Screen::Subagent;
+}
+
+fn catalog_order_child_snapshot_case(changed: bool, provider_reply: bool) {
+    let (mut model, mut driver, child_session) = catalog_order_setup();
+    catalog_order_steer_child(&mut model, &child_session);
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .is_some_and(|s| s.contains("shared-model")),
+        "child positive control"
+    );
+    catalog_order_render(&model);
+    let incarnation = if changed { 43 } else { 42 };
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = incarnation;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    if provider_reply {
+        pass(
+            &mut driver,
+            &mut model,
+            LiveReply::Providers {
+                providers: vec![private_summary(
+                    incarnation,
+                    if changed {
+                        "different-model"
+                    } else {
+                        "shared-model"
+                    },
+                )],
+                revision: 3,
+            },
+        );
+    }
+    catalog_order_render(&model);
+    let identity = model.surface_composer_identity(100);
+    if changed {
+        assert!(
+            !identity.is_some_and(|s| s.contains("shared-model")),
+            "steered child composer must retire account A's fetched model under B"
+        );
+    } else {
+        assert!(
+            identity.is_some_and(|s| s.contains("shared-model")),
+            "same-owner child control must retain its model"
+        );
+    }
+}
+#[test]
+fn catalog_order_child_composer_retires_previous_account_model() {
+    catalog_order_child_case(true);
+}
+#[test]
+fn catalog_order_child_composer_same_owner_control() {
+    catalog_order_child_case(false);
+}
+
+#[test]
+fn catalog_order_legacy_create_receipt_cannot_replace_newer_selection() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-legacy-create"),
+            session,
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "old-legacy-model".into(),
+            model_catalog_key: None,
+            metadata: None,
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a legacy create receipt cannot replace a newer known selection"
+    );
+}
+#[test]
+fn catalog_order_initial_legacy_create_control() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("catalog-legacy-first");
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 42;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(2),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(42, "shared-model")],
+            revision: 2,
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Created {
+            command_id: haider_rpc::CommandId::new("catalog-legacy-first-create"),
+            session: haider_protocol::ids::SessionId::new("catalog-legacy-first-session"),
+            worker_generation: 1,
+            cwd: "/tmp".into(),
+            provider: "custom".into(),
+            model: "shared-model".into(),
+            model_catalog_key: None,
+            metadata: None,
+        },
+    );
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "initial legacy create remains usable"
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // One complete daemon metadata fixture.
+fn catalog_order_list_metadata(
+    model: &mut AppModel,
+    driver: &mut LiveDriver,
+    session: &haider_protocol::ids::SessionId,
+    provider: &str,
+    slug: &str,
+    epoch: u64,
+    key: &str,
+    route: (Option<&str>, Option<&str>),
+) {
+    let summary = serde_json::from_value(serde_json::json!({
+        "session_id":session, "head_seq":epoch, "worker_generation":1,
+        "metadata":{"cwd":"/tmp", "provider":provider, "model":slug, "max_tokens":4096,
+        "created_at_ms":1, "selection_epoch":epoch, "model_catalog_key":key,
+        "provider_base_url":route.0, "account_alias":route.1}
+    }))
+    .expect("synthetic list metadata");
+    pass(
+        driver,
+        model,
+        LiveReply::Listed {
+            sessions: vec![summary],
+            next_cursor: None,
+        },
+    );
+}
+
+fn catalog_order_list_pair_case(change_provider: bool, parked: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-pair-other");
+    if parked {
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let provider = if change_provider { "another" } else { "custom" };
+    let mut account = oauth_descriptor(provider, "work", true);
+    account.incarnation = 43;
+    let mut summary = private_summary(43, "new-model");
+    summary.provider = provider.into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        provider,
+        "new-model",
+        30,
+        "synthetic-producer-43",
+        (None, None),
+    );
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    model.open_session(&session);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(model.display_identity().model_short, "new-model");
+    account.incarnation = 44;
+    let mut summary = private_summary(44, "replacement-model");
+    summary.provider = provider.into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(4),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 4,
+        },
+    );
+    catalog_order_render(&model);
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "the newer list's owner must survive its changed pair and reopening"
+    );
+}
+#[test]
+fn catalog_order_newer_list_model_change_active() {
+    catalog_order_list_pair_case(false, false);
+}
+#[test]
+fn catalog_order_newer_list_model_change_parked() {
+    catalog_order_list_pair_case(false, true);
+}
+#[test]
+fn catalog_order_newer_list_provider_change_active() {
+    catalog_order_list_pair_case(true, false);
+}
+#[test]
+fn catalog_order_newer_list_provider_change_parked() {
+    catalog_order_list_pair_case(true, true);
+}
+
+fn catalog_order_list_route_case(change_alias: bool, parked: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let old = "https://old.synthetic.invalid/v1";
+    let new = "https://new.synthetic.invalid/v1";
+    let mut initial = private_summary(42, "shared-model");
+    initial.endpoint = Some(old.into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![initial],
+            revision: 2,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        20,
+        "synthetic-producer-42",
+        (Some(old), Some("work")),
+    );
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "initial route control"
+    );
+    let other = haider_protocol::ids::SessionId::new("catalog-route-other");
+    if parked {
+        model.upsert_live_session(&other);
+        model.open_session(&other);
+    }
+    let alias = if change_alias { "next-work" } else { "work" };
+    let origin = if change_alias { old } else { new };
+    let mut account = oauth_descriptor("custom", alias, true);
+    account.incarnation = 43;
+    let mut summary = private_summary(43, "shared-model");
+    summary.endpoint = Some(origin.into());
+    summary.catalog_scope.as_mut().expect("scope").account_alias = Some(alias.into());
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        30,
+        "synthetic-producer-43",
+        (Some(origin), Some(alias)),
+    );
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    model.open_session(&session);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "newer route must replace the old route together with the owner"
+    );
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        10,
+        "synthetic-producer-41",
+        (Some(old), Some("work")),
+    );
+    model.open_session(&other);
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "older metadata cannot change the admitted route or owner"
+    );
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+}
+#[test]
+fn catalog_order_newer_list_endpoint_active() {
+    catalog_order_list_route_case(false, false);
+}
+#[test]
+fn catalog_order_newer_list_endpoint_parked() {
+    catalog_order_list_route_case(false, true);
+}
+#[test]
+fn catalog_order_newer_list_pinned_alias_active() {
+    catalog_order_list_route_case(true, false);
+}
+#[test]
+fn catalog_order_newer_list_pinned_alias_parked() {
+    catalog_order_list_route_case(true, true);
+}
+
+#[test]
+fn catalog_order_parked_journal_selection_installs_owner() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let attachment = haider_rpc::AttachmentId::new("catalog-journal");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Attached {
+            session: session.clone(),
+            attachment: attachment.clone(),
+            worker_generation: 1,
+            replay_through_seq: 0,
+            launch_origin: None,
+        },
+    );
+    let other = haider_protocol::ids::SessionId::new("catalog-journal-other");
+    model.upsert_live_session(&other);
+    model.open_session(&other);
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let selected = haider_protocol::session::ModelSelected {
+        provider: "custom".into(),
+        model: "shared-model".into(),
+        selection_epoch: Some(30),
+        model_catalog_key: Some("synthetic-producer-43".into()),
+        route_only: false,
+        cleared_account_pin: None,
+        cleared_provider_endpoint: None,
+        output_budget_clamp: None,
+    };
+    let envelope=serde_json::from_value(serde_json::json!({"schema_version":1,"event_id":"catalog-journal-1","seq":1,"session_id":session,"device_id":"synthetic","authority_epoch":1,"worker_generation":1,"committed_at_ms":1,"render":{"ui":true,"durable":true,"prompt":"omit"},"payload":selected.to_payload_value().expect("selection")})).expect("envelope");
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Event {
+            attachment,
+            session: session.clone(),
+            envelope: Box::new(envelope),
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a parked journal selection must keep its admitted owner on reopen"
+    );
+}
+
+#[test]
+fn catalog_order_child_account_reply_retires_before_provider_reply() {
+    catalog_order_child_snapshot_case(true, false);
+}
+
+#[test]
+fn catalog_order_child_same_account_reply_keeps_model_while_provider_is_delayed() {
+    catalog_order_child_snapshot_case(false, false);
+}
+
+fn catalog_order_pinned_account_case(child: bool, producing_account_changed: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    catalog_order_list_metadata(
+        &mut model,
+        &mut driver,
+        &session,
+        "custom",
+        "shared-model",
+        30,
+        "synthetic-producer-42",
+        (None, Some("work")),
+    );
+    if child {
+        catalog_order_steer_child(&mut model, &session);
+    }
+    assert!(
+        model
+            .surface_composer_identity(100)
+            .is_some_and(|label| label.contains("shared-model")),
+        "explicit-pin positive control"
+    );
+    catalog_order_render(&model);
+
+    let mut pinned = oauth_descriptor("custom", "work", false);
+    pinned.incarnation = if producing_account_changed { 43 } else { 42 };
+    let mut default = oauth_descriptor("custom", "other", true);
+    default.incarnation = 99;
+    default.identity = "other@example.test".into();
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![pinned, default],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    // Keep the provider reply delayed. A pin names its own producing account,
+    // so the newly selected default alone cannot retire that account's data.
+    catalog_order_render(&model);
+    let identity = model.surface_composer_identity(100);
+    if producing_account_changed {
+        assert!(
+            !identity.is_some_and(|label| label.contains("shared-model")),
+            "an explicit account pin must retire a changed producing account"
+        );
+    } else {
+        assert!(
+            identity.is_some_and(|label| label.contains("shared-model")),
+            "an explicit account pin must preserve its unchanged producing account"
+        );
+    }
+}
+
+#[test]
+fn catalog_order_pinned_parent_keeps_unchanged_producer() {
+    catalog_order_pinned_account_case(false, false);
+}
+
+#[test]
+fn catalog_order_pinned_child_keeps_unchanged_producer() {
+    catalog_order_pinned_account_case(true, false);
+}
+
+#[test]
+fn catalog_order_pinned_parent_retires_changed_producer() {
+    catalog_order_pinned_account_case(false, true);
+}
+
+#[test]
+fn catalog_order_pinned_child_retires_changed_producer() {
+    catalog_order_pinned_account_case(true, true);
+}
+
+#[test]
+fn c5_creation_literal_binds_the_recorded_coordinate_for_tui_capabilities() {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let mut summary = private_summary(42, "shared-model");
+    summary.model_details[0].supported_efforts = vec!["high".into()];
+    summary.model_details[0].supported_speeds = vec!["fast".into()];
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![summary],
+            revision: 3,
+        },
+    );
+    let metadata: haider_protocol::session::SessionMetadataV1 =
+        serde_json::from_value(serde_json::json!({
+            "cwd":"/tmp", "provider":"custom", "model":"SHARED_MODEL",
+            "resolved_model":"shared-model", "max_tokens":4096, "created_at_ms":1,
+            "selection_epoch":30, "model_catalog_key":"synthetic-producer-42"
+        }))
+        .expect("recorded literal creation");
+    assert!(
+        model.note_session_catalog_metadata(&session, &metadata),
+        "C5 TUI binds the admitted coordinate"
+    );
+    assert_eq!(
+        metadata.model, "SHARED_MODEL",
+        "public creation spelling is preserved"
+    );
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "C5 TUI binds the admitted coordinate"
+    );
+    assert!(
+        model.pair_supports_fast(),
+        "C5 fast capability comes from the admitted row"
+    );
+    assert!(
+        model
+            .effort_picker_rows()
+            .iter()
+            .any(|row| row.effort.as_deref() == Some("high")),
+        "C5 effort capability comes from the admitted row"
+    );
+}
+
+// Both summary sources share catalog-owner and selection-version admission.
+fn catalog_order_roster_case(parked: bool, stale_unowned: bool) {
+    let (mut model, mut driver, session) = catalog_order_setup();
+    let other = haider_protocol::ids::SessionId::new("catalog-roster-other");
+    model.upsert_live_session(&other);
+    if parked {
+        model.open_session(&other);
+    }
+    let mut account = oauth_descriptor("custom", "work", true);
+    account.incarnation = 43;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account.clone()],
+            revision: Some(3),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(43, "shared-model")],
+            revision: 3,
+        },
+    );
+    let summary = |epoch, key: Option<&str>| {
+        serde_json::from_value(serde_json::json!({
+            "session_id":session, "head_seq":epoch, "worker_generation":1,
+            "metadata":{"cwd":"/tmp", "provider":"custom", "model":"SHARED_MODEL",
+                "resolved_model":"shared-model",
+                "max_tokens":4096, "created_at_ms":1, "selection_epoch":epoch,
+                "model_catalog_key":key}
+        }))
+        .expect("synthetic roster metadata")
+    };
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![summary(30, Some("synthetic-producer-43"))],
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a newer roster must install its catalog owner"
+    );
+    if parked {
+        model.open_session(&other);
+    }
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::RosterUpdated {
+            sessions: vec![summary(
+                10,
+                if stale_unowned {
+                    None
+                } else {
+                    Some("synthetic-producer-41")
+                },
+            )],
+        },
+    );
+    model.open_session(&session);
+    catalog_order_render(&model);
+    assert_eq!(model.meter_epoch.selection_epoch, Some(30));
+    assert_eq!(
+        model.display_identity().model_short,
+        "shared-model",
+        "a stale roster cannot replace or erase the newer catalog selection"
+    );
+    account.incarnation = 44;
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Accounts {
+            descriptors: vec![account],
+            revision: Some(4),
+            sources: vec![],
+        },
+    );
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::Providers {
+            providers: vec![private_summary(44, "replacement-model")],
+            revision: 4,
+        },
+    );
+    catalog_order_render(&model);
+    assert!(
+        model.display_identity().model_short.is_empty(),
+        "the roster's admitted owner must retire when its account changes"
+    );
+}
+
+#[test]
+fn catalog_order_stale_owned_roster_active() {
+    catalog_order_roster_case(false, false);
+}
+#[test]
+fn catalog_order_stale_owned_roster_parked() {
+    catalog_order_roster_case(true, false);
+}
+#[test]
+fn catalog_order_stale_unowned_roster_active() {
+    catalog_order_roster_case(false, true);
+}
+#[test]
+fn catalog_order_stale_unowned_roster_parked() {
+    catalog_order_roster_case(true, true);
 }

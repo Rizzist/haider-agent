@@ -75,12 +75,14 @@ pub enum TranscriptEntry {
     /// A turn item and its streaming accumulation state.
     Item(ItemBlock),
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
-    /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
+    /// mid-turn echoes. Workspace receipts remain structured until rendering.
     Note {
         text: String,
         /// Stable identity for a selection warning echoed by reply and journal.
         selection_notice_epoch: Option<u64>,
     },
+    /// Keep workspace facts structured until the renderer has session homes.
+    Workspace { event: WorkspaceEventPayload },
     /// A daemon-enforced provider capability refusal. This is deliberately
     /// neither a failed run nor a generic note: the model can adapt and the
     /// turn remains healthy.
@@ -600,6 +602,12 @@ fn is_foldable_tool_item(item: &TurnItem) -> bool {
     )
 }
 
+#[derive(Debug)]
+struct PendingMenu {
+    menu: Menu,
+    instance: u64,
+}
+
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
@@ -663,10 +671,13 @@ pub struct SessionProjection {
     /// Unresolved decisions in arrival order. A blocking question owns input
     /// ahead of a deferred approval, while the newest decision of equal
     /// priority is shown until it is resolved.
-    menus: Vec<Menu>,
+    menus: Vec<PendingMenu>,
     /// Answered locally and hidden at once, retained only until the daemon
     /// acknowledges so permission outcome notes still use the original row.
     retired_menus: std::collections::HashMap<haider_protocol::ids::MenuId, Menu>,
+    pending_menus: std::collections::HashSet<haider_protocol::ids::MenuId>,
+    menu_instance: u64,
+    permission_instance: u64,
     /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
     /// starts it empty, and a menu with no recorded opening falls back to
     /// the pre-W3c3 broadcast.
@@ -871,7 +882,11 @@ impl SessionProjection {
             user_entries,
             screen_control_items,
             has_tool_entries,
-            menus: menu.into_iter().collect(),
+            pending_menus: menu.iter().map(|menu| menu.id.clone()).collect(),
+            menus: menu
+                .into_iter()
+                .map(|menu| PendingMenu { menu, instance: 0 })
+                .collect(),
             todos,
             usage,
             interrupted,
@@ -998,18 +1013,15 @@ impl SessionProjection {
         match payload {
             WorkspaceEventPayload::WorkspaceUnavailable(unavailable) => {
                 self.workspace_unavailable = Some(unavailable.clone());
-                self.push_note(format!(
-                    "⚠ workspace unavailable — {} · {} ({})",
-                    unavailable.path,
-                    unavailable.reason.as_str(),
-                    unavailable.detail
-                ));
             }
-            WorkspaceEventPayload::WorkspaceSelected(selected) => {
+            WorkspaceEventPayload::WorkspaceSelected(_) => {
                 self.workspace_unavailable = None;
-                self.push_note(format!("⇄ workspace → {}", selected.path));
             }
         }
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.entries.push(TranscriptEntry::Workspace {
+            event: payload.clone(),
+        });
     }
 
     #[must_use]
@@ -1122,15 +1134,22 @@ impl SessionProjection {
             }
             EventPayload::IdleDecayed => self.interrupted = false,
             EventPayload::MenuOpened(menu) => {
-                self.menus.retain(|open| open.id != menu.id);
+                self.pending_menus.insert(menu.id.clone());
+                self.menu_instance = self.menu_instance.wrapping_add(1);
+                self.menus.retain(|open| open.menu.id != menu.id);
                 self.retired_menus.remove(&menu.id);
-                self.menus.push(menu.clone());
+                self.menus.push(PendingMenu {
+                    menu: menu.clone(),
+                    instance: self.menu_instance,
+                });
             }
             EventPayload::MenuAnswered(answer) => {
+                self.pending_menus.remove(&answer.menu);
                 if let Some(menu) = self
                     .menus
                     .iter()
-                    .find(|menu| menu.id == answer.menu)
+                    .find(|pending| pending.menu.id == answer.menu)
+                    .map(|pending| &pending.menu)
                     .or_else(|| self.retired_menus.get(&answer.menu))
                 {
                     if matches!(
@@ -1161,15 +1180,16 @@ impl SessionProjection {
                             });
                         }
                     }
-                    self.menus.retain(|menu| menu.id != answer.menu);
+                    self.menus.retain(|pending| pending.menu.id != answer.menu);
                     self.retired_menus.remove(&answer.menu);
                     self.menu_owner.remove(&answer.menu);
                 }
             }
             EventPayload::MenuClosed { menu, .. } => {
-                self.menus.retain(|open| open.id != *menu);
+                self.menus.retain(|open| open.menu.id != *menu);
                 self.retired_menus.remove(menu);
                 self.menu_owner.remove(menu);
+                self.pending_menus.remove(menu);
             }
             EventPayload::UserMessage {
                 text, attachments, ..
@@ -1366,10 +1386,9 @@ impl SessionProjection {
                     self.graph_epoch = opened.attempt;
                     if opened.attempt > 1 {
                         self.push_note(format!(
-                            "{} attempt {}/{} — earlier greens are stale",
+                            "{} attempt {} — earlier greens are stale",
                             opened.node.label(),
                             opened.attempt,
-                            haider_protocol::graph::GRAPH_MAX_ATTEMPTS
                         ));
                     }
                 }
@@ -2316,6 +2335,7 @@ impl SessionProjection {
                         name: (*name).to_owned(),
                         args: serde_json::json!({ "desc": desc, "meta": meta }),
                         status: haider_protocol::item::ToolStatus::Completed,
+                        activity: None,
                     },
                 }));
             }
@@ -2661,13 +2681,17 @@ impl SessionProjection {
 
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
+        self.open_menu_state().map(|pending| &pending.menu)
+    }
+
+    fn open_menu_state(&self) -> Option<&PendingMenu> {
         self.menus
             .iter()
             .rev()
-            .find(|menu| {
-                menu.blocking
+            .find(|pending| {
+                pending.menu.blocking
                     && !matches!(
-                        menu.kind,
+                        pending.menu.kind,
                         haider_protocol::menu::MenuKind::DeferredApproval { .. }
                     )
             })
@@ -2677,11 +2701,46 @@ impl SessionProjection {
     /// Hide an answer immediately without treating it as a daemon receipt.
     /// Repeated local gestures cannot queue a second answer for this menu.
     pub fn retire_local_answer(&mut self, id: &haider_protocol::ids::MenuId) {
-        if let Some(index) = self.menus.iter().position(|menu| &menu.id == id) {
+        if let Some(index) = self.menus.iter().position(|pending| &pending.menu.id == id) {
             let menu = self.menus.remove(index);
-            self.retired_menus.insert(id.clone(), menu);
+            self.pending_menus.remove(id);
+            self.retired_menus.insert(id.clone(), menu.menu);
             self.render_revision = self.render_revision.wrapping_add(1);
         }
+    }
+
+    /// Incarnations are minted at ingestion, so input identity does not
+    /// format or copy the card body (which can contain a large file diff).
+    #[must_use]
+    pub(crate) fn menu_instance(&self) -> u64 {
+        self.open_menu_state().map_or(0, |pending| pending.instance)
+    }
+
+    #[must_use]
+    pub(crate) fn permission_instance(&self) -> u64 {
+        self.permission_instance
+    }
+
+    /// Stable pending identities for snapshot persistence.
+    pub(crate) fn pending_menu_ids(&self) -> Vec<haider_protocol::ids::MenuId> {
+        let mut ids: Vec<_> = self.pending_menus.iter().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
+    pub(crate) fn restore_pending_menu_ids(&mut self, ids: Vec<haider_protocol::ids::MenuId>) {
+        self.pending_menus.extend(ids);
+    }
+
+    /// Unresolved decisions, including cards covered by a later question.
+    #[must_use]
+    pub fn pending_menu_count(&self) -> usize {
+        self.pending_menus.len()
+            + usize::from(
+                self.permission_card
+                    .as_ref()
+                    .is_some_and(|card| !self.pending_menus.contains(&card.menu_id)),
+            )
     }
 
     /// The active computer OS-permission grant card, if any.
@@ -2696,6 +2755,7 @@ impl SessionProjection {
         &mut self,
         card: haider_protocol::permission::PermissionGrantNeeded,
     ) {
+        self.permission_instance = self.permission_instance.wrapping_add(1);
         self.permission_card = Some(card);
     }
 
@@ -2990,29 +3050,62 @@ pub(crate) fn retry_marker_label(kind: &str, data: &serde_json::Value) -> Option
     }
 }
 
-/// Decode and format the durable image-created fact shared by styled and
-/// plain transcript renderers. Keeping this at the projection boundary makes
-/// the extension payload, rather than a renderer-specific side channel, the
-/// complete UI contract.
+/// Decode the durable image fact without projecting its action path.
 #[must_use]
-pub(crate) fn image_created_fact(
+pub(crate) fn image_created(
     kind: &str,
     data: &serde_json::Value,
-) -> Option<(haider_protocol::image::ImageCreatedV1, String)> {
+) -> Option<haider_protocol::image::ImageCreatedV1> {
     if kind != haider_protocol::image::IMAGE_CREATED_EXTENSION_KIND {
         return None;
     }
-    let image =
-        serde_json::from_value::<haider_protocol::image::ImageCreatedV1>(data.clone()).ok()?;
+    serde_json::from_value(data.clone()).ok()
+}
+
+/// Styled and plain image rows share the session's path projection.
+pub(crate) fn image_created_fact_with_context(
+    kind: &str,
+    data: &serde_json::Value,
+    paths: &crate::toolview::PathContext,
+) -> Option<(haider_protocol::image::ImageCreatedV1, String)> {
+    let image = image_created(kind, data)?;
+    let homes = paths
+        .homes
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect::<Vec<_>>();
+    let protected = haider_client::launch_origin::sanitize_origin_path_with_homes(
+        Some(std::path::Path::new(&image.path)),
+        &homes,
+    )
+    .map(|projection| {
+        matches!(
+            projection.kind,
+            haider_client::launch_origin::OriginPathKind::Redacted
+                | haider_client::launch_origin::OriginPathKind::HomeRelative
+        )
+    })
+    .unwrap_or(true);
+    let in_workspace = paths.workspace.as_deref().is_some_and(|root| {
+        haider_client::launch_origin::workspace_relative_display(
+            std::path::Path::new(&image.path),
+            std::path::Path::new(root),
+        )
+        .is_some()
+    });
+    // A wire-relative label is useful when the client lacks workspace
+    // metadata, but it cannot erase an account mask from a broad root.
+    let display = if protected || in_workspace {
+        paths.shorten(&image.path)
+    } else {
+        paths.shorten(&image.display_path)
+    };
     let dimensions = match (image.width, image.height) {
         (Some(width), Some(height)) => format!(" · {width}×{height}"),
         _ => String::new(),
     };
     let kilobytes = image.byte_len.div_ceil(1024);
-    let label = format!(
-        "🖼 image · {}{dimensions} · {kilobytes} KB",
-        image.display_path
-    );
+    let label = format!("🖼 image · {}{dimensions} · {kilobytes} KB", display);
     Some((image, label))
 }
 

@@ -111,6 +111,7 @@ impl DuplexClient {
             client_instance_id: "duplex-cancellation-client".into(),
             client_kind: ClientKind::Headless,
             capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            features_requested: Default::default(),
             max_receive_frame: u32::try_from(FRAME_LIMIT).expect("frame limit fits"),
             encodings: Vec::new(),
         }))
@@ -146,12 +147,14 @@ fn connection_context(
 
 fn create_command(session_id: &SessionId, workspace: &std::path::Path) -> SessionCreateCommand {
     SessionCreateCommand {
+        resolved_model: None,
         command_id: "duplex-create".into(),
         request_digest: "duplex-create-digest".into(),
         request_json: r#"{"fixture":"duplex-cancellation"}"#.into(),
         session_id: session_id.clone(),
         cwd: workspace.to_string_lossy().into_owned(),
         provider: "fake".into(),
+        model_catalog_key: None,
         model: "fake-v1".into(),
         max_tokens: 4_096,
         max_tokens_source: None,

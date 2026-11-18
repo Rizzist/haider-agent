@@ -188,9 +188,9 @@ struct CodexClaims {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
     sub: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
     #[serde(default)]
     chatgpt_account_id: Option<String>,
     #[serde(default, rename = "https://api.openai.com/auth")]
@@ -302,9 +302,13 @@ pub(crate) fn linked_credential_path(
 }
 
 fn kimi_slot_path(root: &Path) -> Result<PathBuf, LinkedSourceReadFailure> {
-    let Ok(entries) = std::fs::read_dir(root.join("credentials")) else {
-        return Err(LinkedSourceReadFailure::RequiresOriginClient);
-    };
+    let entries = std::fs::read_dir(root.join("credentials")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LinkedSourceReadFailure::RequiresOriginClient
+        } else {
+            LinkedSourceReadFailure::Unreadable
+        }
+    })?;
     let mut candidates = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -406,6 +410,7 @@ fn linked_codex_material(
         .unwrap_or_default();
     let member_subject = id.sub.clone().and_then(nonempty);
     let email = id.email.and_then(nonempty);
+    let user = id.sub.and_then(nonempty);
     let account_id = id
         .chatgpt_account_id
         .and_then(nonempty)
@@ -437,7 +442,9 @@ fn linked_codex_material(
         subject_hash: Some(subject_hash.clone()),
         email,
         display_name: None,
-        account_id: account_id.clone(),
+        account_id: user.map(|user| {
+            haider_provider::openai_user_account_coordinate(&user, account_id.as_deref())
+        }),
         plan,
         issuer: Some("https://auth.openai.com".to_owned()),
         captured_at,
@@ -907,6 +914,7 @@ fn discover_codex() -> Option<DeviceCandidate> {
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
     let email = legacy_identity.email.and_then(nonempty);
+    let user = legacy_identity.sub.and_then(nonempty);
     let account_id = legacy_identity
         .chatgpt_account_id
         .and_then(nonempty)
@@ -936,11 +944,15 @@ fn discover_codex() -> Option<DeviceCandidate> {
                 .flatten()
         })
         .or_else(|| {
-            (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+            (email.is_some() || account_id.is_some() || user.is_some()).then(|| AccountIdentity {
                 subject_hash: None,
                 email,
                 display_name: None,
-                account_id,
+                // The fallback has no stable coordinate without a user sub:
+                // a workspace id alone is shared by multiple members.
+                account_id: user.map(|user| {
+                    haider_provider::openai_user_account_coordinate(&user, account_id.as_deref())
+                }),
                 plan: None,
                 issuer: Some("https://auth.openai.com".to_owned()),
                 captured_at,

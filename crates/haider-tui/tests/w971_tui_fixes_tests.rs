@@ -556,19 +556,31 @@ fn an_open_add_form_is_always_on_screen() {
         "a pinned form costs the roster no scrolling"
     );
 
-    // Short frame: the ladder unpins the form into the scrolling body, and
-    // the frame scrolls to it rather than leaving an invisible modal card
-    // eating keystrokes (the W5g-5 trap).
-    model.accounts.scroll.set(0);
-    let (rows, _) = draw(&model, 120, 16);
-    assert!(
-        rows.iter().any(|row| row.contains("deepseek · API key")),
-        "the unpinned form is scrolled into view: {rows:?}"
-    );
-    assert!(
-        model.accounts.scroll.get() > 0,
-        "the frame scrolled the body to reach it"
-    );
+    // The pinned header and wrapped feedback must leave enough body rows
+    // for every inked form line; the provider grid yields first.
+    for width in [80, 118, 120] {
+        for height in [16, 18, 24, 36] {
+            for notice in [
+                None,
+                Some("Could not save the account; correct the key and retry the open form"),
+            ] {
+                model.accounts.set_message(notice.map(str::to_owned));
+                model.accounts.scroll.set(0);
+                let (rows, _) = draw(&model, width, height);
+                for text in [
+                    "deepseek · API key",
+                    "alias ❯",
+                    "key   ❯",
+                    "the key is masked",
+                ] {
+                    assert!(
+                        rows.iter().any(|row| row.contains(text)),
+                        "form line {text:?} hidden at {width}x{height}: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -812,4 +824,118 @@ fn a_banked_accounts_offset_folds_to_the_frame_that_measured_it() {
         has_rows(&rows),
         "the shorter roster is on screen, not scrolled past: {rows:?}"
     );
+}
+
+#[test]
+fn a23_long_select_and_cache_notices_expand_without_hiding_the_action() {
+    use haider_tui::app::PendingCacheChange;
+    for (width, height) in [(118, 36), (80, 24)] {
+        for cache in [false, true] {
+            let mut model = live_model();
+            model.screen = Screen::Accounts;
+            let message = format!(
+                "{} final reason",
+                "public account selection reason ".repeat(200)
+            );
+            if cache {
+                model.cache_epoch_confirmation_required(
+                    PendingCacheChange::Account {
+                        alias: "saved".into(),
+                    },
+                    &message,
+                );
+            } else {
+                model.account_select_failed("saved", &message);
+            }
+            let (rows, _) = draw(&model, width, height);
+            let text = rows.join(" ");
+            assert!(text.contains("F2 full notice"));
+            assert!(text.contains("ACCOUNTS"));
+            if cache {
+                assert!(text.contains("repeat this selection to create the new epoch"));
+            }
+            key(&mut model, KeyCode::F(2));
+            draw(&model, width, height);
+            key(&mut model, KeyCode::End);
+            let (rows, _) = draw(&model, width, height);
+            assert!(rows.join(" ").contains("final reason"));
+            key(&mut model, KeyCode::Esc);
+            assert!(!model.accounts.message_expanded);
+        }
+    }
+}
+
+#[test]
+fn a23_full_notice_owns_input_above_an_open_sign_in_form() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = live_model();
+        model.screen = Screen::Accounts;
+        model.handle_hit(Hit::AccountAdd(AccountAddKind::DeepSeekApi));
+        model.handle(AppEvent::Paste("synthetic-form-value".to_owned().into()));
+        let typed = model.login.as_ref().expect("form").masked_len();
+        assert!(typed > 0);
+        model.account_select_failed("saved", &"long public account notice ".repeat(200));
+        let (rows, _) = draw(&model, width, height);
+        assert!(rows.join(" ").contains("F2 full notice"));
+        key(&mut model, KeyCode::F(2));
+        let (rows, _) = draw(&model, width, height);
+        assert!(rows.join(" ").contains("ACCOUNT NOTICE"));
+        key(&mut model, KeyCode::End);
+        key(&mut model, KeyCode::Char('x'));
+        model.handle(AppEvent::Paste("more synthetic text".to_owned().into()));
+        assert_eq!(
+            model.login.as_ref().expect("covered form").masked_len(),
+            typed
+        );
+        model.help_open = true;
+        let offset = model.accounts.message_scroll.get();
+        assert!(offset > 0, "the covered notice has a real paging offset");
+        key(&mut model, KeyCode::PageUp);
+        assert_eq!(
+            model.accounts.message_scroll.get(),
+            offset,
+            "covered notice does not page"
+        );
+        model.help_open = false;
+        assert!(
+            model.accounts.message_expanded,
+            "covering the notice does not dismiss it"
+        );
+        model.account_select_failed("saved", "a new public notice");
+        assert!(
+            model.accounts.message_expanded,
+            "an incoming notice keeps the reader in charge of input"
+        );
+        let (rows, _) = draw(&model, width, height);
+        assert!(rows.join(" ").contains("ACCOUNT NOTICE"));
+        key(&mut model, KeyCode::Esc);
+        assert!(!model.accounts.message_expanded);
+        assert_eq!(
+            model.login.as_ref().expect("restored form").masked_len(),
+            typed
+        );
+        let (rows, _) = draw(&model, width, height);
+        assert!(rows.join(" ").contains("deepseek · API key"));
+    }
+}
+
+#[test]
+fn a23_short_account_confirmations_keep_their_existing_keys() {
+    for (width, height) in [(118, 36), (80, 24)] {
+        let mut model = live_model();
+        model.screen = Screen::Accounts;
+        key(&mut model, KeyCode::Char('x'));
+        let alias = model.accounts.pending_remove.clone().expect("confirmation");
+        let (rows, _) = draw(&model, width, height);
+        assert!(!rows.join(" ").contains("F2 full notice"));
+        key(&mut model, KeyCode::F(2));
+        assert!(!model.accounts.message_expanded);
+        key(&mut model, KeyCode::Esc);
+        assert!(model.accounts.pending_remove.is_none());
+        key(&mut model, KeyCode::Char('x'));
+        draw(&model, width, height);
+        key(&mut model, KeyCode::F(2));
+        key(&mut model, KeyCode::Enter);
+        assert!(model.requests.iter().any(|request| matches!(request, haider_tui::app::AppRequest::AccountRemove { alias: requested } if requested == &alias)));
+    }
 }

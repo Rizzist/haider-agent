@@ -14,6 +14,10 @@ bench = false
 
 [features]
 android-standalone = []
+# Test-only seams for dependent crates' tests (dev-dependencies only, the same
+# pattern as haider-provider's `test-support`). Release builds never enable it,
+# and nothing it exposes is reachable from configuration or model input.
+test-support = []
 native-macos-presence-gate = []
 
 [[test]]

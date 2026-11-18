@@ -245,6 +245,12 @@ appendix list every spelling in context.
 
 - `EffectClass` (`crates/haider-protocol/src/effect.rs:34`; `class` tag):
   `"fs_read"` | `"fs_write"` | `"process_exec"` | `"remote_execution"` | `"network"` | `"git_op"` | `"agent_spawn"` | `"peer_message"` | `"credential_access"` | `"gui_act"` | `"screen_observe"` | `"screen_control"` | `"mobile_observe"` | `"mobile_control"` | `"read_sms"` | `"usage_reset_apply"`.
+  `EffectIntent` encodes reset apply with the released `credential_access`
+  carrier and additive `effect_origin: usage_reset_apply`; current readers
+  restore the dedicated class only with that carrier.
+  Direct tool inventory effects and remembered-grant class objects apply the
+  same carrier mapping with origin metadata beside the class tag. The direct
+  released class vocabulary remains frozen.
 - `AuthorizationVerdict` (`crates/haider-protocol/src/effect.rs:68`; `verdict` tag):
   `"allow"` | `"pre_authorized"` | `"ask"` | `"deny"`.
 - `AuthorizationSource` (`crates/haider-protocol/src/effect.rs:86`): `"user_typed"`.
@@ -369,6 +375,9 @@ appendix list every spelling in context.
 
 - `MenuKind` (`crates/haider-protocol/src/menu.rs:35`; `kind` tag):
   `"permission"` | `"recovery"` | `"error_recovery"` | `"exhausted"` | `"trust_hook"` | `"update"` | `"question"` | `"choice"` | `"secret"` | `"file"` | `"conflict"` | `"graph_human_confirm"` | `"graph_abandon_confirm"` | `"deferred_approval"`.
+  Within `Menu`, deferred approval encodes as `choice` with additive
+  `deferred_approval` coordinates inside the kind object. Current readers
+  restore the typed kind; old recovery readers ignore the added coordinates.
 - `ErrorRecoveryCardKind` (`crates/haider-protocol/src/menu.rs:106`):
   `"oauth_expired"` | `"invalid_api_key"` | `"account_revoked"` | `"account_deleted"` | `"rate_limit"` | `"quota_exhausted"` | `"partial_stream"` | `"keychain_relink"` | `"store_unwritable"` | `"generic"`.
 - `EffectRecoveryAction` (`crates/haider-protocol/src/menu.rs:124`):
