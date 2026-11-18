@@ -134,3 +134,4 @@ catalog-owner-inactive-removed-success	linux	haider-daemon	lib	catalog_owner_ina
 catalog-owner-inactive-removed-304	linux	haider-daemon	lib	catalog_owner_inactive_removed_304	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
 catalog-owner-stale-cache-removal	linux	haider-daemon	lib	catalog_owner_removed_alias_cannot_serve_a_stale_cached_model	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
 catalog-owner-active-identity-busy	linux	haider-daemon	lib	catalog_control_active_identity_change_rejects_inflight_a	crates/haider-daemon/src/accounts_catalog_ownership_tests.rs
+usage-ui-account-requests	all	haider-tui	test:w973_usage_wire_tests	concurrent_account_requests_keep_separate_latches_until_their_own_receipts	crates/haider-tui/tests/w973_usage_wire_tests.rs
